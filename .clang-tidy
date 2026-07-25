@@ -1,0 +1,23 @@
+# clang-tidy config for helmholz C code (mirrors diam).
+# Focus: memory-safety static analysis (null deref, leak, use-after-free,
+# double-free) via clang-analyzer, plus bugprone/cert correctness checks.
+# Style/readability noise is mostly off — ccheck.sh is a safety gate, not a
+# style enforcer (clang-format handles formatting separately).
+Checks: >
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  cert-*,
+  misc-*,
+  performance-*,
+  portability-*,
+  readability-non-const-parameter,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -cert-err33-c,
+  -misc-no-recursion,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -clang-analyzer-security.ArrayBound
+WarningsAsErrors: ''
+HeaderFilterRegex: 'src/.*\.h$'
+FormatStyle: none

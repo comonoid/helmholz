@@ -38,7 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { MAXCELL = 4096, MAXSUB = 8192, MAXDIR = 64, MAXDIM = 80000, MAXROW = 400000 };
+enum { MAXCELL = 40000, MAXSUB = 48000, MAXDIR = 64, MAXDIM = 200000, MAXROW = 2000000 };
 static const double LAM = 1.0;
 
 typedef struct {
@@ -46,28 +46,50 @@ typedef struct {
   int nd, ne, oracle, lev;
   double lodk;
   double nhx, nhy, thx, thy;
-  double complex amp[3];
-  double px[3], py[3];
+  /* TWO incident waves with their Fresnel partners: 0,1,2 = incident, reflected,
+   * transmitted of the first; 3,4,5 of the second. The BASIS is given only the
+   * first triple, so with amp2 != 0 the field contains a component that is
+   * genuinely NOT representable — which is how this bench stops measuring an
+   * exactly-representable field and starts measuring approximation. */
+  double complex amp[6];
+  double px[6], py[6];
+  double amp2, theta2;
+  int nwave;
 } cfg;
 
-/* --- exact Fresnel solution: incident + reflected outside, transmitted inside */
 static void fresnel(cfg *c) {
   c->nhx = cos(c->alpha);
   c->nhy = sin(c->alpha);
   c->thx = -sin(c->alpha);
   c->thy = cos(c->alpha);
   double k1 = c->k0, k2 = c->k0 * c->n;
-  double kt = k1 * sin(c->theta);
-  double c1 = sqrt(k1 * k1 - kt * kt), c2 = sqrt(k2 * k2 - kt * kt);
+  /* Written UNROLLED with literal indices. The loop form (3*w + j) is correct —
+   * nw is 1 or 2 by construction — but gcc's analyzer cannot carry that bound
+   * through the index expression and reports a phantom overflow. Six literal
+   * assignments cost nothing and leave the gate clean, which is the trade
+   * CLAUDE.md prescribes for this class of finding. */
+  double ka = k1 * sin(c->theta), kb = k1 * sin(c->theta2);
+  double a1 = sqrt(k1 * k1 - ka * ka), a2 = sqrt(k2 * k2 - ka * ka);
+  double b1 = sqrt(k1 * k1 - kb * kb), b2 = sqrt(k2 * k2 - kb * kb);
+  c->nwave = (fabs(c->amp2) > 0.0) ? 6 : 3;
   c->amp[0] = 1.0;
-  c->amp[1] = (c1 - c2) / (c1 + c2);
-  c->amp[2] = 2.0 * c1 / (c1 + c2);
-  c->px[0] = kt * c->thx - c1 * c->nhx;
-  c->py[0] = kt * c->thy - c1 * c->nhy;
-  c->px[1] = kt * c->thx + c1 * c->nhx;
-  c->py[1] = kt * c->thy + c1 * c->nhy;
-  c->px[2] = kt * c->thx - c2 * c->nhx;
-  c->py[2] = kt * c->thy - c2 * c->nhy;
+  c->amp[1] = (a1 - a2) / (a1 + a2);
+  c->amp[2] = 2.0 * a1 / (a1 + a2);
+  c->px[0] = ka * c->thx - a1 * c->nhx;
+  c->py[0] = ka * c->thy - a1 * c->nhy;
+  c->px[1] = ka * c->thx + a1 * c->nhx;
+  c->py[1] = ka * c->thy + a1 * c->nhy;
+  c->px[2] = ka * c->thx - a2 * c->nhx;
+  c->py[2] = ka * c->thy - a2 * c->nhy;
+  c->amp[3] = c->amp2;
+  c->amp[4] = c->amp2 * (b1 - b2) / (b1 + b2);
+  c->amp[5] = c->amp2 * 2.0 * b1 / (b1 + b2);
+  c->px[3] = kb * c->thx - b1 * c->nhx;
+  c->py[3] = kb * c->thy - b1 * c->nhy;
+  c->px[4] = kb * c->thx + b1 * c->nhx;
+  c->py[4] = kb * c->thy + b1 * c->nhy;
+  c->px[5] = kb * c->thx - b2 * c->nhx;
+  c->py[5] = kb * c->thy - b2 * c->nhy;
 }
 
 static double sdist(const cfg *c, double x, double y) {
@@ -75,11 +97,13 @@ static double sdist(const cfg *c, double x, double y) {
 }
 
 static double complex uexact(const cfg *c, double x, double y) {
-  double complex i1 = CMPLX(0.0, 1.0);
-  if (sdist(c, x, y) > 0.0)
-    return c->amp[0] * cexp(i1 * (c->px[0] * x + c->py[0] * y)) +
-           c->amp[1] * cexp(i1 * (c->px[1] * x + c->py[1] * y));
-  return c->amp[2] * cexp(i1 * (c->px[2] * x + c->py[2] * y));
+  double complex i1 = CMPLX(0.0, 1.0), u = 0.0;
+  int out = sdist(c, x, y) > 0.0;
+  for (int q = 0; q < c->nwave; q++) {
+    if (((q % 3) == 2) == (out != 0)) continue; /* transmitted lives inside only */
+    u += c->amp[q] * cexp(i1 * (c->px[q] * x + c->py[q] * y));
+  }
+  return u;
 }
 
 /* Integral over the segment P0->P1 of exp(i g.x) ds, closed form. */
@@ -132,10 +156,12 @@ static sub S[MAXSUB];
 static int subof[MAXCELL][2];
 static double cellx[MAXCELL], celly[MAXCELL], cellh[MAXCELL];
 static int celld[MAXCELL];
+static double skey[2][MAXCELL];
+static int ord[2][MAXCELL];
 
 int main(int argc, char **argv) {
-  static const char *const KEYS[] = {"W",     "nd",  "ne",     "th",  "it",   "n",
-                                     "alpha", "dth", "oracle", "lev", "lodk", NULL};
+  static const char *const KEYS[] = {"W",   "nd",     "ne",  "th",   "it",   "n",   "alpha",
+                                     "dth", "oracle", "lev", "lodk", "amp2", "th2", NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -149,6 +175,19 @@ int main(int argc, char **argv) {
       for (int k = 0; KEYS[k]; k++)
         printf(" %s", KEYS[k]);
       printf("\n");
+      return 1;
+    }
+    /* THE VALUE MUST PARSE WHOLE. Validating only the key let "ne=8 lev=3"
+     * through as ONE argument (zsh does not word-split an unquoted expansion),
+     * atof read 8 and silently dropped lev — a sweep that looked like it varied
+     * a parameter and did not. That is the project's most frequent artefact
+     * signature, arriving this time through the command line. */
+    char *end = NULL;
+    strtod(eq + 1, &end);
+    while (end && (*end == ' ' || *end == '\t'))
+      end++;
+    if (!end || *end != '\0') {
+      printf("tdg2d: argument '%s' has trailing junk after the number\n", argv[i]);
       return 1;
     }
   }
@@ -175,6 +214,8 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "oracle=", 7)) c.oracle = (int)v;
     if (!strncmp(argv[i], "lev=", 4)) c.lev = (int)v;
     if (!strncmp(argv[i], "lodk=", 5)) c.lodk = v;
+    if (!strncmp(argv[i], "amp2=", 5)) c.amp2 = v;
+    if (!strncmp(argv[i], "th2=", 4)) c.theta2 = v;
   }
   if (c.nd > MAXDIR || c.ne * c.ne > MAXCELL) return 1;
   fresnel(&c);
@@ -353,7 +394,7 @@ int main(int argc, char **argv) {
           }                                                                                        \
           double complex dr = 0.0;                                                                 \
           if (!isint)                                                                              \
-            for (int q2 = 0; q2 < 3; q2++) {                                                       \
+            for (int q2 = 0; q2 < c.nwave; q2++) {                                                 \
               if (!((WMASK) & (1 << q2))) continue;                                                \
               double gx = c.px[q2] + tgx, gy = c.py[q2] + tgy;                                     \
               double complex Iv = seg_exp(gx, gy, (X0), (Y0), (X1), (Y1)) * tph;                   \
@@ -372,6 +413,22 @@ int main(int argc, char **argv) {
    * fine cell's length. Emitted once per pair: only the +x and +y sides of the
    * cell behind the normal are scanned. */
   int nfint = 0, nfwall = 0;
+  for (int ax2 = 0; ax2 < 2; ax2++) {
+    for (int q = 0; q < ncell; q++) {
+      skey[ax2][q] = (ax2 == 0 ? cellx[q] : celly[q]) - 0.5 * cellh[q];
+      ord[ax2][q] = q;
+    }
+    for (int i = 1; i < ncell; i++) { /* insertion sort on a nearly sorted list */
+      int v = ord[ax2][i];
+      double kv = skey[ax2][v];
+      int j = i - 1;
+      while (j >= 0 && skey[ax2][ord[ax2][j]] > kv) {
+        ord[ax2][j + 1] = ord[ax2][j];
+        j--;
+      }
+      ord[ax2][j + 1] = v;
+    }
+  }
   for (int qa = 0; qa < ncell; qa++)
     for (int ax2 = 0; ax2 < 2; ax2++) {
       double ha = 0.5 * cellh[qa];
@@ -387,17 +444,28 @@ int main(int argc, char **argv) {
           if (contrast && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
           int sa = subof[qa][sd];
           if (sa < 0) continue;
-          int mask = !contrast ? 1 : (sd == 0 ? 4 : 3);
+          int mask = (sd == 0) ? 0x24 : 0x1b; /* inside: q=2,5   outside: q=0,1,3,4 */
           nfwall++;
           ADDFACE(sa, -1, px0, py0, px1, py1, nx, ny, mask);
         }
         continue;
       }
-      for (int qb = 0; qb < ncell; qb++) {
+      /* Neighbours by binary search on the sorted "-x / -y side" coordinate.
+       * A quadratic scan caps the mesh at a couple of thousand cells, which is
+       * two orders below what the scaling question needs. */
+      int lo_i = 0, hi_i = ncell;
+      while (lo_i < hi_i) {
+        int mid = (lo_i + hi_i) / 2;
+        if (skey[ax2][ord[ax2][mid]] < coord - 1e-9 * c.W)
+          lo_i = mid + 1;
+        else
+          hi_i = mid;
+      }
+      for (int ii = lo_i; ii < ncell; ii++) {
+        int qb = ord[ax2][ii];
+        if (skey[ax2][qb] > coord + 1e-9 * c.W) break;
         if (qb == qa) continue;
         double hb = 0.5 * cellh[qb];
-        double cb = (ax2 == 0) ? cellx[qb] - hb : celly[qb] - hb; /* B's -x / -y side */
-        if (fabs(cb - coord) > 1e-9 * c.W) continue;
         double blo = (ax2 == 0) ? celly[qb] - hb : cellx[qb] - hb, bhi = blo + cellh[qb];
         double olo = lo > blo ? lo : blo, ohi = hi < bhi ? hi : bhi;
         if (!(ohi - olo > 1e-9 * c.W)) continue;
@@ -407,7 +475,7 @@ int main(int argc, char **argv) {
           double px1 = (ax2 == 0) ? coord : ohi, py1 = (ax2 == 0) ? ohi : coord;
           if (contrast && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
           int sa = subof[qa][sd], sb = subof[qb][sd];
-          int mask = !contrast ? 1 : (sd == 0 ? 4 : 3);
+          int mask = (sd == 0) ? 0x24 : 0x1b; /* inside: q=2,5   outside: q=0,1,3,4 */
           if (sa >= 0 && sb >= 0) {
             nfint++;
             ADDFACE(sa, sb, px0, py0, px1, py1, nx, ny, mask);
@@ -430,7 +498,7 @@ int main(int argc, char **argv) {
         if (contrast && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
         int sa = subof[qa][sd];
         if (sa < 0) continue;
-        int mask = !contrast ? 1 : (sd == 0 ? 4 : 3);
+        int mask = (sd == 0) ? 0x24 : 0x1b;
         nfwall++;
         ADDFACE(sa, -1, px0, py0, px1, py1, nx, ny, mask);
       }

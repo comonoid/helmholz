@@ -76,7 +76,7 @@ typedef struct {
    * amplitude, because the face conditions demand continuity; a localised beam
    * needs the angular spread lam/w around each mode direction, and fan/spread
    * are how much of it the basis is given. */
-  int fan, nmode, obj, ss, acc;
+  int fan, nmode, obj, ss, acc, opaque, pix;
   double kmul; /* scales k0: several runs over a band = a source of finite coherence */
   double orad, oxc, oyc;
   double spread;
@@ -297,10 +297,10 @@ static int ord[2][MAXCELL];
 int main(int argc, char **argv) {
   double t_start = now_s();
   static const char *const KEYS[] = {
-      "W",     "nd",     "ne",   "th",  "it",   "n",    "alpha", "dth", "oracle",
-      "lev",   "lodk",   "amp2", "th2", "spec", "ex1",  "ex2",   "ex3", "ex4",
-      "abc",   "mirror", "mode", "img", "drop", "beam", "by0",   "fan", "spread",
-      "nmode", "obj",    "orad", "oxc", "oyc",  "ss",   "kmul",  "acc", NULL};
+      "W",    "nd",   "ne",   "th",   "it",  "n",      "alpha",  "dth",   "oracle", "lev",
+      "lodk", "amp2", "th2",  "spec", "ex1", "ex2",    "ex3",    "ex4",   "abc",    "mirror",
+      "mode", "img",  "drop", "beam", "by0", "fan",    "spread", "nmode", "obj",    "orad",
+      "oxc",  "oyc",  "ss",   "kmul", "acc", "opaque", "pix",    NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -373,6 +373,8 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "ss=", 3)) c.ss = (int)v;
     if (!strncmp(argv[i], "kmul=", 5)) c.kmul = v;
     if (!strncmp(argv[i], "acc=", 4)) c.acc = (int)v;
+    if (!strncmp(argv[i], "opaque=", 7)) c.opaque = (int)v;
+    if (!strncmp(argv[i], "pix=", 4)) c.pix = (int)v;
     for (int e = 0; e < 4; e++) {
       char key[8];
       snprintf(key, sizeof key, "ex%d=", e + 1);
@@ -488,6 +490,11 @@ int main(int argc, char **argv) {
          * wholly out and the material boundary is a set of ordinary faces */
         cut = 0;
         own = inside_obj(&c, cellx[q], celly[q]) ? 0 : 1;
+        /* AN OPAQUE OBJECT IS A HOLE IN THE DOMAIN. Glass casts no shadow — it
+         * transmits — so a picture with a shadow needs a body the light does not
+         * enter: cells inside it carry no unknowns at all, and the faces that
+         * touch it become mirrors. */
+        if (c.opaque && own == 0) continue;
       }
       for (int sd = 0; sd < 2; sd++) {
         if (!cut && sd != own) continue;
@@ -501,7 +508,41 @@ int main(int argc, char **argv) {
         if (c.oracle) {
           /* the field's OWN directions: transmitted inside, incident + reflected
            * outside; with no contrast the two outside waves coincide */
-          if (c.mirror) {
+          if (c.obj) {
+            /* THE DIRECTIONS A BOX ACTUALLY PRODUCES, not a fan. Its faces are
+             * axis-aligned, so the only specular directions are the incident one
+             * and its reflections in x, in y, and in both — four at most, and
+             * fewer once duplicates are dropped. This is what makes a cell of a
+             * million wavelengths legal: the count comes from the GEOMETRY, not
+             * from k W. Edge diffraction is NOT in this set, so the error will
+             * sit at the two shadow boundaries and nowhere else. */
+            double sx[4] = {1.0, -1.0, 1.0, -1.0}, sy[4] = {1.0, 1.0, -1.0, -1.0};
+            s->nd = 0;
+            for (int v = 0; v < 4; v++) {
+              double ax = km * cos(c.theta) * sx[v], ay = km * sin(c.theta) * sy[v];
+              int dup = 0;
+              for (int e = 0; e < s->nd; e++)
+                if (fabs(s->kx[e] - ax) + fabs(s->ky[e] - ay) < 1e-9 * km) dup = 1;
+              if (dup) continue;
+              s->kx[s->nd] = ax;
+              s->ky[s->nd] = ay;
+              s->nd++;
+            }
+            /* DIFFRACTION LIVES AT THE EDGES AND NOWHERE ELSE. A corner radiates
+             * into every direction, and no specular set contains that. Measured:
+             * leaving it out does NOT merely spoil the corner — the system goes
+             * inconsistent and least squares smears the misfit over the WHOLE
+             * domain, tilting the far field that should be a clean plane wave.
+             * So the fan is spent only where it is needed: within `spread` of the
+             * surface, `fan` extra directions. */
+            if (c.fan > 0 && objdist(&c, s->cx, s->cy) < c.spread)
+              for (int e = 0; e < c.fan && s->nd < MAXDIR; e++) {
+                double aa = 2.0 * M_PI * ((double)e + 0.5) / (double)c.fan;
+                s->kx[s->nd] = km * cos(aa);
+                s->ky[s->nd] = km * sin(aa);
+                s->nd++;
+              }
+          } else if (c.mirror) {
             /* two directions for the corridor, four for the dead end — and this
              * number does NOT depend on the bounce count */
             /* drop = the negative control: take away directions the mode needs
@@ -784,6 +825,11 @@ int main(int argc, char **argv) {
           if (sa >= 0 && sb >= 0) {
             nfint++;
             ADDFACE(sa, sb, px0, py0, px1, py1, nx, ny, mask);
+          } else if (c.opaque && (sa >= 0) != (sb >= 0)) {
+            /* exactly one side exists: the other is inside the opaque body, so
+             * this face IS the object's surface */
+            nfwall++;
+            ADDMIRROR(sa >= 0 ? sa : sb, px0, py0, px1, py1);
           }
         }
       }
@@ -1165,6 +1211,33 @@ int main(int argc, char **argv) {
           if (planecut && ((SU->side == 0) != (sdist(&c, xc, yc) < 0.0))) continue;
           double acc = 0.0;
           double complex ctr = 0.0;
+          if (c.pix) {
+            /* EXACT PIXEL INTEGRAL. At metre scale one pixel spans thousands of
+             * wavelengths, so |u|^2 cannot be sampled — point samples of a fringe
+             * pattern that fine are just noise. But |u|^2 of a sum of plane waves
+             * is a sum of exp(i (k_d - k_e).x), and the integral of that over a
+             * rectangle is a product of two sinc factors in closed form. So the
+             * sensor's own average over its pixel is computed exactly, at any
+             * scale, for ND^2 terms per pixel. */
+            for (int d = 0; d < SU->nd; d++)
+              for (int e = 0; e < SU->nd; e++) {
+                double gx = SU->kx[d] - SU->kx[e], gy = SU->ky[d] - SU->ky[e];
+                double tx = 0.5 * gx * px, ty = 0.5 * gy * px;
+                double sx = fabs(tx) < 1e-12 ? 1.0 : sin(tx) / tx;
+                double sy2 = fabs(ty) < 1e-12 ? 1.0 : sin(ty) / ty;
+                double complex ce = xs[SU->base + d] * conj(xs[SU->base + e]) *
+                                    cexp(i1 * (gx * (xc - SU->cx) + gy * (yc - SU->cy)));
+                acc += creal(ce) * sx * sy2;
+              }
+            if (acc < 0.0) acc = 0.0;
+            for (int d = 0; d < SU->nd; d++)
+              ctr += xs[SU->base + d] *
+                     cexp(i1 * (SU->kx[d] * (xc - SU->cx) + SU->ky[d] * (yc - SU->cy)));
+            size_t p = (size_t)(N - 1 - jj) * (size_t)N + (size_t)ii;
+            fre[p] = (float)creal(ctr);
+            fab[p] = (float)sqrt(acc);
+            continue;
+          }
           for (int sy = 0; sy < ns; sy++)
             for (int sx = 0; sx < ns; sx++) {
               double x = -L + ((double)ii + ((double)sx + 0.5) / (double)ns) * px;

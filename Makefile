@@ -56,11 +56,17 @@ build/fdtd: tools/fdtd.c src/image.c src/image.h | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/fdtd.c src/image.c -lm'
 
 # fast tests (seconds..minutes); test_solver3d is the slow validation (~10 min)
-test: build/test_phi build/test_carrier build/test_carrier_op build/test_helm1d build/test_m2forms build/test_octree build/test_asm3d \
+test: build/test_phi build/test_carrier build/test_carrier_op build/test_carrier2d build/test_cut2d build/test_nitsche2d build/test_bessel build/test_mie2d build/test_dtn2d build/test_helm1d build/test_m2forms build/test_octree build/test_asm3d \
       build/test_mg3d
 	./build/test_phi
 	./build/test_carrier
 	./build/test_carrier_op
+	./build/test_carrier2d
+	./build/test_cut2d
+	./build/test_nitsche2d
+	./build/test_bessel
+	./build/test_mie2d
+	./build/test_dtn2d
 	./build/test_helm1d
 	./build/test_m2forms
 	./build/test_octree
@@ -76,7 +82,7 @@ check:
 	  tests/test_phi.c tests/test_helm1d.c tests/test_m2forms.c tests/test_octree.c \
 	  tests/test_asm3d.c tests/test_solver3d.c tests/test_mg3d.c tools/render.c \
 	  tools/carrier1d.c tools/fdtd.c src/carrier.c tools/carrier_scale.c tools/carrier_proj.c \
-  tests/test_carrier.c tests/test_carrier_op.c tools/carrier_term.c tools/scene2d.c tools/carrier_shell.c tools/carrier_angle.c tools/carrier_cascade.c
+  tests/test_carrier.c tests/test_carrier_op.c tools/carrier_term.c tools/scene2d.c tools/carrier_shell.c tools/carrier_angle.c tools/carrier_cascade.c tools/carrier_solve.c tools/carrier_iter.c tools/carrier_incr.c src/carrier2d.c tests/test_carrier2d.c src/cut2d.c tests/test_cut2d.c tools/carrier_cut2d.c src/bessel.c tests/test_bessel.c src/mie2d.c tests/test_mie2d.c src/dtn2d.c tests/test_dtn2d.c src/nitsche2d.c tests/test_nitsche2d.c tools/slice2d.c
 
 .PHONY: all test test-slow check
 
@@ -126,3 +132,35 @@ build/carrier_solve: tools/carrier_solve.c src/carrier.c src/carrier.h src/phi.c
 build/carrier_iter: tools/carrier_iter.c src/carrier.c src/carrier.h src/phi.c src/phi.h | build
 	$(RUN) 'gcc $(CFLAGS) $$(pkg-config --cflags lapacke) -o $@ \
 	  tools/carrier_iter.c src/carrier.c src/phi.c $(LIBS)'
+
+build/carrier_incr: tools/carrier_incr.c src/carrier.c src/carrier.h src/phi.c src/phi.h | build
+	$(RUN) 'gcc $(CFLAGS) $$(pkg-config --cflags lapacke) -o $@ \
+	  tools/carrier_incr.c src/carrier.c src/phi.c $(LIBS)'
+
+build/test_carrier2d: tests/test_carrier2d.c src/carrier2d.c src/carrier2d.h src/phi.c src/phi.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_carrier2d.c src/carrier2d.c src/phi.c -lm'
+
+build/test_cut2d: tests/test_cut2d.c src/cut2d.c src/cut2d.h src/phi.c src/phi.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_cut2d.c src/cut2d.c src/phi.c -lm'
+
+build/test_nitsche2d: tests/test_nitsche2d.c src/nitsche2d.c src/nitsche2d.h src/cut2d.c \
+                      src/cut2d.h src/carrier2d.h src/phi.c src/phi.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_nitsche2d.c src/nitsche2d.c src/cut2d.c \
+	  src/phi.c -lm'
+
+build/carrier_cut2d: tools/carrier_cut2d.c src/cut2d.c src/cut2d.h src/phi.c src/phi.h | build
+	$(RUN) 'gcc $(CFLAGS) $$(pkg-config --cflags lapacke) -o $@ \
+	  tools/carrier_cut2d.c src/cut2d.c src/phi.c $(LIBS)'
+
+build/test_bessel: tests/test_bessel.c src/bessel.c src/bessel.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_bessel.c src/bessel.c -lm'
+
+build/test_mie2d: tests/test_mie2d.c src/mie2d.c src/mie2d.h src/bessel.c src/bessel.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_mie2d.c src/mie2d.c src/bessel.c -lm'
+
+build/test_dtn2d: tests/test_dtn2d.c src/dtn2d.c src/dtn2d.h src/bessel.c src/carrier2d.c src/phi.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_dtn2d.c src/dtn2d.c src/bessel.c src/carrier2d.c src/phi.c -lm'
+
+build/slice2d: tools/slice2d.c src/cut2d.c src/nitsche2d.c src/dtn2d.c src/bessel.c src/mie2d.c src/carrier2d.c src/phi.c | build
+	$(RUN) 'gcc $(CFLAGS) $$(pkg-config --cflags lapacke) -o $@ \
+	  tools/slice2d.c src/cut2d.c src/nitsche2d.c src/dtn2d.c src/bessel.c src/mie2d.c src/carrier2d.c src/phi.c $(LIBS)'

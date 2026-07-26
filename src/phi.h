@@ -28,6 +28,15 @@ typedef struct {
   int deriv;
 } hz_phi_factor;
 
+/* Coefficients of ONE factor on the piece containing x = m, in the local
+ * coordinate s = x - m:  f(x) = q[0] + q[1]*s + q[2]*s^2. m must not sit exactly
+ * on a knot (callers pass piece midpoints). Local coordinates keep the
+ * expansion well-conditioned for narrow pieces far from the origin.
+ * Exposed for src/cut2d.c, which needs the polynomial itself rather than an
+ * integral of it; duplicating the piece logic there would let the two copies
+ * drift apart. */
+void hz_phi_local_poly(hz_phi_factor f, double m, double q[3]);
+
 /* Exact integral over [a,b] of f1(x)*f2(x). Piecewise-polynomial closed form:
  * the integrand is a polynomial of degree <= 4 between knots of the two
  * factors; no quadrature involved. Returns exactly 0.0 when supports do not

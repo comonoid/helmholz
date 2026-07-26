@@ -69,6 +69,10 @@ static void local_poly(hz_phi_factor f, double m, double q[3]) {
   }
 }
 
+void hz_phi_local_poly(hz_phi_factor f, double m, double q[3]) {
+  local_poly(f, m, q);
+}
+
 static void dsort(double *v, int n) {
   for (int i = 1; i < n; i++) {
     double x = v[i];

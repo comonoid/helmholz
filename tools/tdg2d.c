@@ -76,7 +76,8 @@ typedef struct {
    * amplitude, because the face conditions demand continuity; a localised beam
    * needs the angular spread lam/w around each mode direction, and fan/spread
    * are how much of it the basis is given. */
-  int fan, nmode;
+  int fan, nmode, obj, ss;
+  double orad, oxc, oyc;
   double spread;
   double Lbox, kap, bet;
 } cfg;
@@ -118,6 +119,22 @@ static void fresnel(cfg *c) {
 
 static double sdist(const cfg *c, double x, double y) {
   return x * c->nhx + y * c->nhy;
+}
+
+/* AN OBJECT, not an infinite plane. obj=1 is a square block (the cross-section of
+ * a cube), obj=2 a disc (the cross-section of a sphere). Both sit inside the box
+ * and are lit by a plane wave arriving at angle th, so the picture has a stated
+ * light direction and casts a shadow.
+ * The block is placed on cell boundaries, so NO cell is cut and the material
+ * boundary is exactly a set of ordinary interior faces — which in this
+ * formulation already carry the transmission conditions. The disc is a staircase
+ * at cell resolution and is therefore APPROXIMATE geometry: it is here to be
+ * looked at, not to be measured against Mie. */
+static int inside_obj(const cfg *c, double x, double y) {
+  double dx = x - c->oxc, dy = y - c->oyc;
+  if (c->obj == 1) return fabs(dx) < c->orad && fabs(dy) < c->orad;
+  if (c->obj == 2) return dx * dx + dy * dy < c->orad * c->orad;
+  return 0;
 }
 
 /* The two or four plane waves of the mirror scene, in the same amp/px/py slots
@@ -271,10 +288,11 @@ static int ord[2][MAXCELL];
 
 int main(int argc, char **argv) {
   double t_start = now_s();
-  static const char *const KEYS[] = {
-      "W",    "nd",   "ne",   "th",   "it",  "n",   "alpha",  "dth",   "oracle", "lev",
-      "lodk", "amp2", "th2",  "spec", "ex1", "ex2", "ex3",    "ex4",   "abc",    "mirror",
-      "mode", "img",  "drop", "beam", "by0", "fan", "spread", "nmode", NULL};
+  static const char *const KEYS[] = {"W",   "nd",     "ne",   "th",   "it",   "n",      "alpha",
+                                     "dth", "oracle", "lev",  "lodk", "amp2", "th2",    "spec",
+                                     "ex1", "ex2",    "ex3",  "ex4",  "abc",  "mirror", "mode",
+                                     "img", "drop",   "beam", "by0",  "fan",  "spread", "nmode",
+                                     "obj", "orad",   "oxc",  "oyc",  "ss",   NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -340,6 +358,11 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "fan=", 4)) c.fan = (int)v;
     if (!strncmp(argv[i], "spread=", 7)) c.spread = v;
     if (!strncmp(argv[i], "nmode=", 6)) c.nmode = (int)v;
+    if (!strncmp(argv[i], "obj=", 4)) c.obj = (int)v;
+    if (!strncmp(argv[i], "orad=", 5)) c.orad = v;
+    if (!strncmp(argv[i], "oxc=", 4)) c.oxc = v;
+    if (!strncmp(argv[i], "oyc=", 4)) c.oyc = v;
+    if (!strncmp(argv[i], "ss=", 3)) c.ss = (int)v;
     for (int e = 0; e < 4; e++) {
       char key[8];
       snprintf(key, sizeof key, "ex%d=", e + 1);
@@ -354,10 +377,24 @@ int main(int argc, char **argv) {
   int ncell = c.ne * c.ne;
   double L = 0.5 * (double)c.ne * c.W;
   int contrast = fabs(c.n - 1.0) > 1e-12;
+  int planecut = contrast && !c.obj; /* the object sits on cell boundaries: nothing to clip */
   if (c.mirror) {
     c.Lbox = L;
     c.abc = 1; /* the open ends are characteristic, and only they */
     mirror_setup(&c);
+  }
+  if (c.obj) {
+    /* ONE incident plane wave — a distant light of stated direction. Everything
+     * else in the picture (reflection, refraction, shadow) is solved, not
+     * prescribed, so there is no exact reference and the quality measure is the
+     * LSQR residual alone. */
+    c.abc = 1;
+    c.nwave = 1;
+    c.amp[0] = 1.0;
+    c.px[0] = c.k0 * cos(c.theta);
+    c.py[0] = c.k0 * sin(c.theta);
+    printf("  [scene] %s of n=%.2f, half-size %.4g lam at (%.4g,%.4g); light from %.1f deg\n",
+           c.obj == 1 ? "block" : "disc", c.n, c.orad, c.oxc, c.oyc, c.theta * 180.0 / M_PI);
   }
   printf("tdg2d: W=%.4g lam  kW=%.4g  ND=%d  NE=%d  box=%.4g lam  n=%.3f alpha=%.2f th=%.2f\n",
          c.W / LAM, c.k0 * c.W, c.nd, c.ne, 2.0 * L / LAM, c.n, c.alpha, c.theta);
@@ -429,8 +466,14 @@ int main(int argc, char **argv) {
         if (s < smin) smin = s;
         if (s > smax) smax = s;
       }
-      int cut = contrast && smin < 0.0 && smax > 0.0;
+      int cut = contrast && !c.obj && smin < 0.0 && smax > 0.0;
       int own = (contrast && sdist(&c, cellx[q], celly[q]) < 0.0) ? 0 : 1;
+      if (c.obj) {
+        /* the object is placed on cell boundaries, so a cell is wholly in or
+         * wholly out and the material boundary is a set of ordinary faces */
+        cut = 0;
+        own = inside_obj(&c, cellx[q], celly[q]) ? 0 : 1;
+      }
       for (int sd = 0; sd < 2; sd++) {
         if (!cut && sd != own) continue;
         if (nsub >= MAXSUB) return 1;
@@ -493,7 +536,12 @@ int main(int argc, char **argv) {
         } else {
           s->nd = c.nd;
           for (int d = 0; d < c.nd; d++) {
-            double th = 2.0 * M_PI * ((double)d + 0.5) / (double)c.nd;
+            /* With an object the fan is ANCHORED to the illumination direction,
+             * so d=0 is exactly the incident wave. The characteristic wall can
+             * only prescribe an amplitude for a direction that is in the basis,
+             * and an unanchored fan therefore leaves the scene unlit. */
+            double th = c.obj ? c.theta + 2.0 * M_PI * (double)d / (double)c.nd
+                              : 2.0 * M_PI * ((double)d + 0.5) / (double)c.nd;
             s->kx[d] = km * cos(th);
             s->ky[d] = km * sin(th);
           }
@@ -620,7 +668,7 @@ int main(int argc, char **argv) {
 
 #define ADDWALL(SA, X0, Y0, X1, Y1, NX, NY, WMASK)                                                 \
   do {                                                                                             \
-    if (c.mirror && (fabs(NY) > 0.0 || (c.mirror == 2 && (NX) < 0.0))) {                            \
+    if (c.mirror && (fabs(NY) > 0.0 || (c.mirror == 2 && (NX) < 0.0))) {                           \
       ADDMIRROR((SA), (X0), (Y0), (X1), (Y1)); /* the guide walls, and the dead end */             \
       break;                                                                                       \
     }                                                                                              \
@@ -638,7 +686,7 @@ int main(int argc, char **argv) {
       double complex vin = 0.0;                                                                    \
       for (int q2 = 0; q2 < c.nwave; q2++) {                                                       \
         /* the mirror scene has no inside/outside split, so no mask applies */                     \
-        if (!c.mirror && !((WMASK) & (1 << q2))) continue;                                         \
+        if (!c.mirror && !c.obj && !((WMASK) & (1 << q2))) continue;                               \
         if (fabs(SW->kx[d] - c.px[q2]) + fabs(SW->ky[d] - c.py[q2]) > 1e-9 * c.k0) continue;       \
         vin = c.amp[q2] * cexp(i1 * (c.px[q2] * SW->cx + c.py[q2] * SW->cy));                      \
         break;                                                                                     \
@@ -679,11 +727,11 @@ int main(int argc, char **argv) {
       /* the box wall: no neighbour there by construction */
       if (fabs(coord - L) < 1e-9 * c.W) {
         for (int sd = 0; sd < 2; sd++) {
-          if (!contrast && sd == 0) continue;
+          if (c.obj ? sd != 0 : !contrast && sd == 0) continue; /* obj: one sub per cell */
           double px0 = (ax2 == 0) ? coord : lo, py0 = (ax2 == 0) ? lo : coord;
           double px1 = (ax2 == 0) ? coord : hi, py1 = (ax2 == 0) ? hi : coord;
-          if (contrast && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
-          int sa = subof[qa][sd];
+          if (planecut && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
+          int sa = c.obj ? (subof[qa][0] >= 0 ? subof[qa][0] : subof[qa][1]) : subof[qa][sd];
           if (sa < 0) continue;
           int mask = (sd == 0) ? 0x24 : 0x1b; /* inside: q=2,5   outside: q=0,1,3,4 */
           nfwall++;
@@ -711,11 +759,12 @@ int main(int argc, char **argv) {
         double olo = lo > blo ? lo : blo, ohi = hi < bhi ? hi : bhi;
         if (!(ohi - olo > 1e-9 * c.W)) continue;
         for (int sd = 0; sd < 2; sd++) {
-          if (!contrast && sd == 0) continue;
+          if (c.obj ? sd != 0 : !contrast && sd == 0) continue;
           double px0 = (ax2 == 0) ? coord : olo, py0 = (ax2 == 0) ? olo : coord;
           double px1 = (ax2 == 0) ? coord : ohi, py1 = (ax2 == 0) ? ohi : coord;
-          if (contrast && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
-          int sa = subof[qa][sd], sb = subof[qb][sd];
+          if (planecut && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
+          int sa = c.obj ? (subof[qa][0] >= 0 ? subof[qa][0] : subof[qa][1]) : subof[qa][sd];
+          int sb = c.obj ? (subof[qb][0] >= 0 ? subof[qb][0] : subof[qb][1]) : subof[qb][sd];
           int mask = (sd == 0) ? 0x24 : 0x1b; /* inside: q=2,5   outside: q=0,1,3,4 */
           if (sa >= 0 && sb >= 0) {
             nfint++;
@@ -733,11 +782,11 @@ int main(int argc, char **argv) {
       double lo = (ax2 == 0) ? celly[qa] - ha : cellx[qa] - ha, hi = lo + cellh[qa];
       double nx = (ax2 == 0) ? -1.0 : 0.0, ny = (ax2 == 0) ? 0.0 : -1.0;
       for (int sd = 0; sd < 2; sd++) {
-        if (!contrast && sd == 0) continue;
+        if (c.obj ? sd != 0 : !contrast && sd == 0) continue;
         double px0 = (ax2 == 0) ? coord : lo, py0 = (ax2 == 0) ? lo : coord;
         double px1 = (ax2 == 0) ? coord : hi, py1 = (ax2 == 0) ? hi : coord;
-        if (contrast && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
-        int sa = subof[qa][sd];
+        if (planecut && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
+        int sa = c.obj ? (subof[qa][0] >= 0 ? subof[qa][0] : subof[qa][1]) : subof[qa][sd];
         if (sa < 0) continue;
         int mask = (sd == 0) ? 0x24 : 0x1b;
         nfwall++;
@@ -749,7 +798,7 @@ int main(int argc, char **argv) {
    * cut cell. Same two conditions as every interior face — they ARE the physical
    * transmission conditions. */
   int nif = 0;
-  if (contrast)
+  if (planecut)
     for (int q = 0; q < ncell; q++) {
       if (subof[q][0] < 0 || subof[q][1] < 0) continue;
       double sc = sdist(&c, cellx[q], celly[q]);
@@ -969,7 +1018,7 @@ int main(int argc, char **argv) {
             for (int t = 0; t < NSMP; t++) {
               double u = lo + cellh[q] * ((double)t + 0.5) / (double)NSMP;
               double x = (ax2 == 0) ? coord : u, y = (ax2 == 0) ? u : coord;
-              if (contrast && ((SU->side == 0) != (sdist(&c, x, y) < 0.0))) continue;
+              if (planecut && ((SU->side == 0) != (sdist(&c, x, y) < 0.0))) continue;
               double complex uu2 = 0.0, du = 0.0;
               for (int d = 0; d < SU->nd; d++) {
                 double complex e = cexp(i1 * (SU->kx[d] * (x - SU->cx) + SU->ky[d] * (y - SU->cy)));
@@ -1022,7 +1071,7 @@ int main(int argc, char **argv) {
     for (int p = 0; p < 25; p++) {
       double ox = ((double)(p % 5) - 2.0) * 0.2 * c.W, oy = ((double)(p / 5) - 2.0) * 0.2 * c.W;
       double x = SU->cx + ox, y = SU->cy + oy;
-      if (contrast && ((SU->side == 0) != (sdist(&c, x, y) < 0.0))) continue;
+      if (planecut && ((SU->side == 0) != (sdist(&c, x, y) < 0.0))) continue;
       double complex got = 0.0;
       for (int d = 0; d < SU->nd; d++)
         got += xs[SU->base + d] * cexp(i1 * (SU->kx[d] * (x - SU->cx) + SU->ky[d] * (y - SU->cy)));
@@ -1070,20 +1119,34 @@ int main(int argc, char **argv) {
       if (j0 < 0) j0 = 0;
       if (i1x > N) i1x = N;
       if (j1 > N) j1 = N;
-      for (int jj = j0; jj < j1; jj++) {
-        double y = -L + ((double)jj + 0.5) * px;
+      /* A PIXEL IS AN AREA, NOT A POINT. A sensor integrates |u|^2 over its own
+       * cell, and a coherent field oscillates at lam/2 — sampling it at one
+       * point per pixel produces the moire that made the first pictures
+       * unreadable. ss x ss subsamples per pixel is that integration; the phase
+       * picture keeps the centre sample, since averaging a signed oscillation
+       * would erase it. */
+      int ns = c.ss > 0 ? c.ss : 1;
+      for (int jj = j0; jj < j1; jj++)
         for (int ii = i0; ii < i1x; ii++) {
-          double x = -L + ((double)ii + 0.5) * px;
-          if (contrast && ((SU->side == 0) != (sdist(&c, x, y) < 0.0))) continue;
-          double complex got = 0.0;
-          for (int d = 0; d < SU->nd; d++)
-            got +=
-                xs[SU->base + d] * cexp(i1 * (SU->kx[d] * (x - SU->cx) + SU->ky[d] * (y - SU->cy)));
+          double xc = -L + ((double)ii + 0.5) * px, yc = -L + ((double)jj + 0.5) * px;
+          if (planecut && ((SU->side == 0) != (sdist(&c, xc, yc) < 0.0))) continue;
+          double acc = 0.0;
+          double complex ctr = 0.0;
+          for (int sy = 0; sy < ns; sy++)
+            for (int sx = 0; sx < ns; sx++) {
+              double x = -L + ((double)ii + ((double)sx + 0.5) / (double)ns) * px;
+              double y = -L + ((double)jj + ((double)sy + 0.5) / (double)ns) * px;
+              double complex got = 0.0;
+              for (int d = 0; d < SU->nd; d++)
+                got += xs[SU->base + d] *
+                       cexp(i1 * (SU->kx[d] * (x - SU->cx) + SU->ky[d] * (y - SU->cy)));
+              acc += cabs(got) * cabs(got);
+              if (sx == ns / 2 && sy == ns / 2) ctr = got;
+            }
           size_t p = (size_t)(N - 1 - jj) * (size_t)N + (size_t)ii;
-          fre[p] = (float)creal(got);
-          fab[p] = (float)cabs(got);
+          fre[p] = (float)creal(ctr);
+          fab[p] = (float)sqrt(acc / (double)(ns * ns));
         }
-      }
     }
     t_img = now_s() - t_img0;
     double amax = 0.0;
@@ -1092,7 +1155,7 @@ int main(int argc, char **argv) {
     if (!(amax > 0.0)) amax = 1.0;
     char nm[64];
     for (int which = 0; which < 2; which++) {
-      snprintf(nm, sizeof nm, "img/tdg_%s_%d.ppm", which ? "re" : "abs", c.mirror);
+      snprintf(nm, sizeof nm, "img/tdg_%s_%d%d.ppm", which ? "re" : "abs", c.mirror, c.obj);
       FILE *f = fopen(nm, "wb");
       if (!f) continue;
       fprintf(f, "P6\n%d %d\n255\n", N, N);
@@ -1112,13 +1175,39 @@ int main(int argc, char **argv) {
             row[3 * ii + 0] = (unsigned char)(255.0 * (v > 0.0 ? 1.0 : lo));
             row[3 * ii + 1] = (unsigned char)(255.0 * lo);
             row[3 * ii + 2] = (unsigned char)(255.0 * (v > 0.0 ? lo : 1.0));
-          } else { /* |u|^2, what a sensor integrates */
+          } else { /* |u|^2, what a sensor integrates, on a display gamma */
             double v = (double)fab[p] / amax;
             v = v * v;
-            unsigned char g = (unsigned char)(255.0 * (v < 1.0 ? v : 1.0));
+            if (v > 1.0) v = 1.0;
+            unsigned char g = (unsigned char)(255.0 * pow(v, 1.0 / 2.2));
             row[3 * ii + 0] = g;
             row[3 * ii + 1] = g;
             row[3 * ii + 2] = g;
+            /* THE GEOMETRY DRAWN IN. Without it the viewer cannot tell object
+             * from interference, which is precisely how the first pictures
+             * failed: green = the material boundary, yellow = the incoming
+             * light, drawn along its direction of travel. */
+            if (c.obj) {
+              double xw = -L + ((double)ii + 0.5) * px;
+              double yw = -L + ((double)(N - 1 - jj) + 0.5) * px;
+              int in0 = inside_obj(&c, xw, yw);
+              if (in0 != inside_obj(&c, xw + px, yw) || in0 != inside_obj(&c, xw, yw + px)) {
+                row[3 * ii + 0] = 0;
+                row[3 * ii + 1] = 255;
+                row[3 * ii + 2] = 0;
+              }
+              double dxl = cos(c.theta), dyl = sin(c.theta);
+              double ax = -0.92 * L * dxl, ay = -0.92 * L * dyl;
+              double tt = (xw - ax) * dxl + (yw - ay) * dyl;
+              if (tt > 0.0 && tt < 0.35 * L) {
+                double dperp = fabs(-(xw - ax) * dyl + (yw - ay) * dxl);
+                if (dperp < 1.5 * px) {
+                  row[3 * ii + 0] = 255;
+                  row[3 * ii + 1] = 220;
+                  row[3 * ii + 2] = 0;
+                }
+              }
+            }
           }
         }
         fwrite(row, 3u, (size_t)N, f);

@@ -54,6 +54,8 @@ typedef struct {
   double complex amp[6];
   double px[6], py[6];
   double amp2, theta2;
+  double ex[4]; /* extra carrier directions, angles in radians, magnitude from the medium */
+  int nex;
   int nwave;
 } cfg;
 
@@ -160,8 +162,9 @@ static double skey[2][MAXCELL];
 static int ord[2][MAXCELL];
 
 int main(int argc, char **argv) {
-  static const char *const KEYS[] = {"W",      "nd",  "ne",   "th",   "it",  "n",    "alpha", "dth",
-                                     "oracle", "lev", "lodk", "amp2", "th2", "spec", NULL};
+  static const char *const KEYS[] = {"W",   "nd",     "ne",  "th",   "it",   "n",   "alpha",
+                                     "dth", "oracle", "lev", "lodk", "amp2", "th2", "spec",
+                                     "ex1", "ex2",    "ex3", "ex4",  NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -217,6 +220,14 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "amp2=", 5)) c.amp2 = v;
     if (!strncmp(argv[i], "th2=", 4)) c.theta2 = v;
     if (!strncmp(argv[i], "spec=", 5)) c.spec = (int)v;
+    for (int e = 0; e < 4; e++) {
+      char key[8];
+      snprintf(key, sizeof key, "ex%d=", e + 1);
+      if (!strncmp(argv[i], key, 4)) {
+        c.ex[e] = v;
+        if (e + 1 > c.nex) c.nex = e + 1;
+      }
+    }
   }
   if (c.nd > MAXDIR || c.ne * c.ne > MAXCELL) return 1;
   fresnel(&c);
@@ -333,6 +344,15 @@ int main(int argc, char **argv) {
             s->kx[d] = km * cos(th);
             s->ky[d] = km * sin(th);
           }
+        }
+        /* EXTRA DIRECTIONS, appended to every sub-cell. This is the mechanism the
+         * residual-driven search needs: propose an angle, add it everywhere,
+         * see what the residual does. The magnitude follows the sub-cell's own
+         * medium, so one angle serves both sides of an interface. */
+        for (int e = 0; e < c.nex && s->nd < MAXDIR; e++) {
+          s->kx[s->nd] = km * cos(c.ex[e]);
+          s->ky[s->nd] = km * sin(c.ex[e]);
+          s->nd++;
         }
         s->base = dim;
         dim += s->nd;

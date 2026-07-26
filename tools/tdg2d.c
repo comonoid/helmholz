@@ -37,8 +37,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
-enum { MAXCELL = 40000, MAXSUB = 48000, MAXDIR = 64, MAXDIM = 200000, MAXROW = 2000000 };
+static double now_s(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (double)t.tv_sec + 1e-9 * (double)t.tv_nsec;
+}
+
+enum { MAXCELL = 40000, MAXSUB = 48000, MAXDIR = 160, MAXDIM = 200000, MAXROW = 2000000 };
 static const double LAM = 1.0;
 
 typedef struct {
@@ -51,12 +58,27 @@ typedef struct {
    * first triple, so with amp2 != 0 the field contains a component that is
    * genuinely NOT representable — which is how this bench stops measuring an
    * exactly-representable field and starts measuring approximation. */
-  double complex amp[6];
-  double px[6], py[6];
+  double complex amp[256];
+  double px[256], py[256];
   double amp2, theta2;
   double ex[4]; /* extra carrier directions, angles in radians, magnitude from the medium */
   int nex;
   int nwave;
+  /* MIRROR SCENES. 1 = corridor: mirrors on the y walls, characteristic ends in
+   * x, exact field = the guided mode sin(kap(y+L)) exp(i bet x). 2 = dead end:
+   * the -x wall is a mirror too, exact field = sin(kap(y+L)) sin(bet(x+L)).
+   * The mode index sets how many times the ray bounces along the guide
+   * (bounces = kap/bet) WITHOUT changing the number of directions, which is 2
+   * and 4. That is the whole claim being measured. */
+  int mirror, mode, img, drop;
+  double beam, by0; /* beam=0 means the pure mode; beam>0 localises the drive */
+  /* A BEAM HAS ANGULAR WIDTH. Two directions can only carry a field of constant
+   * amplitude, because the face conditions demand continuity; a localised beam
+   * needs the angular spread lam/w around each mode direction, and fan/spread
+   * are how much of it the basis is given. */
+  int fan, nmode;
+  double spread;
+  double Lbox, kap, bet;
 } cfg;
 
 static void fresnel(cfg *c) {
@@ -98,8 +120,94 @@ static double sdist(const cfg *c, double x, double y) {
   return x * c->nhx + y * c->nhy;
 }
 
+/* The two or four plane waves of the mirror scene, in the same amp/px/py slots
+ * the rest of the bench already reads: the wall term, the column diagnostic and
+ * the oracle basis then need no special case at all. */
+static void mirror_setup(cfg *c) {
+  double complex i1 = CMPLX(0.0, 1.0);
+  double L = c->Lbox;
+  c->kap = (double)c->mode * M_PI / (2.0 * L);
+  double r2 = c->k0 * c->k0 - c->kap * c->kap;
+  if (!(r2 > 0.0)) {
+    printf("  ABORT: mode %d is below cutoff in a guide of %.4g lam\n", c->mode, 2.0 * L / LAM);
+    exit(1);
+  }
+  c->bet = sqrt(r2);
+  double complex ep = cexp(i1 * c->kap * L), em = cexp(-i1 * c->kap * L);
+  if (c->nmode > 1) {
+    /* A BEAM AS A SUM OF MODES. Every mode satisfies the mirrors exactly, so the
+     * sum does too, and the drive is an exact trace rather than the staircase a
+     * per-cell envelope produced (measured: that staircase pinned the residual
+     * at W/w, 0.16 for W=2 w=8, and no amount of extra directions moved it).
+     * A packet of M modes centred on m0 is localised to about (guide height)/M
+     * across, so the direction count of a LOCALISED field is 2 * height/width —
+     * it is set by how tight the beam is, not by how far it travels or how many
+     * times it bounces. The weight sin(kap (y0+L)) projects a point source at
+     * y0; the Gaussian in m keeps the packet smooth. */
+    int M = c->nmode;
+    c->nwave = 0;
+    double sw = (double)M / 3.0;
+    for (int j = 0; j < M; j++) {
+      int mm = c->mode - M / 2 + j;
+      if (mm < 1) continue;
+      double kp = (double)mm * M_PI / (2.0 * L);
+      double r2m = c->k0 * c->k0 - kp * kp;
+      if (!(r2m > 0.0)) continue;
+      double bt = sqrt(r2m);
+      double dm = ((double)mm - (double)c->mode) / sw;
+      double wgt = exp(-dm * dm) * sin(kp * (c->by0 + L));
+      if (c->nwave + 2 > 256) break;
+      c->amp[c->nwave] = wgt * cexp(i1 * kp * L) / (2.0 * i1);
+      c->px[c->nwave] = bt;
+      c->py[c->nwave] = kp;
+      c->nwave++;
+      c->amp[c->nwave] = -wgt * cexp(-i1 * kp * L) / (2.0 * i1);
+      c->px[c->nwave] = bt;
+      c->py[c->nwave] = -kp;
+      c->nwave++;
+    }
+    printf("  [mirror] BEAM of %d modes around m=%d at y0=%.1f: %d directions, waist ~%.1f lam, "
+           "ray angle %.1f deg, bounces %.1f\n",
+           M, c->mode, c->by0, c->nwave, 2.0 * L / (double)M, atan2(c->kap, c->bet) * 180.0 / M_PI,
+           c->kap / c->bet);
+    return;
+  }
+  if (c->mirror == 1) {
+    c->nwave = 2;
+    c->amp[0] = ep / (2.0 * i1);
+    c->amp[1] = -em / (2.0 * i1);
+    c->px[0] = c->bet;
+    c->py[0] = c->kap;
+    c->px[1] = c->bet;
+    c->py[1] = -c->kap;
+  } else {
+    double complex fp = cexp(i1 * c->bet * L), fm = cexp(-i1 * c->bet * L);
+    c->nwave = 4;
+    c->amp[0] = ep * fp / (2.0 * i1 * 2.0 * i1);
+    c->amp[1] = -em * fp / (2.0 * i1 * 2.0 * i1);
+    c->amp[2] = -ep * fm / (2.0 * i1 * 2.0 * i1);
+    c->amp[3] = em * fm / (2.0 * i1 * 2.0 * i1);
+    c->px[0] = c->bet;
+    c->py[0] = c->kap;
+    c->px[1] = c->bet;
+    c->py[1] = -c->kap;
+    c->px[2] = -c->bet;
+    c->py[2] = c->kap;
+    c->px[3] = -c->bet;
+    c->py[3] = -c->kap;
+  }
+  printf("  [mirror] scene %d  mode m=%d  kap=%.4f bet=%.4f  ray bounces along the guide = %.1f  "
+         "directions = %d\n",
+         c->mirror, c->mode, c->kap, c->bet, c->kap / c->bet, c->nwave);
+}
+
 static double complex uexact(const cfg *c, double x, double y) {
   double complex i1 = CMPLX(0.0, 1.0), u = 0.0;
+  if (c->mirror) {
+    for (int q = 0; q < c->nwave; q++)
+      u += c->amp[q] * cexp(i1 * (c->px[q] * x + c->py[q] * y));
+    return u;
+  }
   int out = sdist(c, x, y) > 0.0;
   for (int q = 0; q < c->nwave; q++) {
     if (((q % 3) == 2) == (out != 0)) continue; /* transmitted lives inside only */
@@ -162,9 +270,11 @@ static double skey[2][MAXCELL];
 static int ord[2][MAXCELL];
 
 int main(int argc, char **argv) {
-  static const char *const KEYS[] = {"W",   "nd",     "ne",  "th",   "it",   "n",   "alpha",
-                                     "dth", "oracle", "lev", "lodk", "amp2", "th2", "spec",
-                                     "ex1", "ex2",    "ex3", "ex4",  "abc",  NULL};
+  double t_start = now_s();
+  static const char *const KEYS[] = {
+      "W",    "nd",   "ne",   "th",   "it",  "n",   "alpha",  "dth",   "oracle", "lev",
+      "lodk", "amp2", "th2",  "spec", "ex1", "ex2", "ex3",    "ex4",   "abc",    "mirror",
+      "mode", "img",  "drop", "beam", "by0", "fan", "spread", "nmode", NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -221,6 +331,15 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "th2=", 4)) c.theta2 = v;
     if (!strncmp(argv[i], "spec=", 5)) c.spec = (int)v;
     if (!strncmp(argv[i], "abc=", 4)) c.abc = (int)v;
+    if (!strncmp(argv[i], "mirror=", 7)) c.mirror = (int)v;
+    if (!strncmp(argv[i], "mode=", 5)) c.mode = (int)v;
+    if (!strncmp(argv[i], "img=", 4)) c.img = (int)v;
+    if (!strncmp(argv[i], "drop=", 5)) c.drop = (int)v;
+    if (!strncmp(argv[i], "beam=", 5)) c.beam = v;
+    if (!strncmp(argv[i], "by0=", 4)) c.by0 = v;
+    if (!strncmp(argv[i], "fan=", 4)) c.fan = (int)v;
+    if (!strncmp(argv[i], "spread=", 7)) c.spread = v;
+    if (!strncmp(argv[i], "nmode=", 6)) c.nmode = (int)v;
     for (int e = 0; e < 4; e++) {
       char key[8];
       snprintf(key, sizeof key, "ex%d=", e + 1);
@@ -235,6 +354,11 @@ int main(int argc, char **argv) {
   int ncell = c.ne * c.ne;
   double L = 0.5 * (double)c.ne * c.W;
   int contrast = fabs(c.n - 1.0) > 1e-12;
+  if (c.mirror) {
+    c.Lbox = L;
+    c.abc = 1; /* the open ends are characteristic, and only they */
+    mirror_setup(&c);
+  }
   printf("tdg2d: W=%.4g lam  kW=%.4g  ND=%d  NE=%d  box=%.4g lam  n=%.3f alpha=%.2f th=%.2f\n",
          c.W / LAM, c.k0 * c.W, c.nd, c.ne, 2.0 * L / LAM, c.n, c.alpha, c.theta);
 
@@ -319,7 +443,35 @@ int main(int argc, char **argv) {
         if (c.oracle) {
           /* the field's OWN directions: transmitted inside, incident + reflected
            * outside; with no contrast the two outside waves coincide */
-          if (!contrast) {
+          if (c.mirror) {
+            /* two directions for the corridor, four for the dead end — and this
+             * number does NOT depend on the bounce count */
+            /* drop = the negative control: take away directions the mode needs
+             * and it must become unrepresentable. Direction 0 is kept because it
+             * is the one the characteristic wall drives through — the wall can
+             * only prescribe an incoming amplitude for a direction that IS in
+             * the basis, so dropping it would silence the source instead of
+             * breaking the approximation, and the control would be vacuous. */
+            s->nd = c.nwave - c.drop;
+            if (s->nd < 1) s->nd = 1;
+            for (int d = 0; d < s->nd; d++) {
+              s->kx[d] = c.px[d];
+              s->ky[d] = c.py[d];
+            }
+            /* the fan, appended AFTER the exact directions so the wall drive
+             * still finds direction 0 by exact match */
+            int nb = s->nd;
+            for (int b = 0; b < nb; b++) {
+              double a0 = atan2(c.py[b], c.px[b]);
+              for (int j = 1; j <= c.fan && s->nd < MAXDIR - 1; j++)
+                for (int sg = -1; sg <= 1; sg += 2) {
+                  double aa = a0 + (double)sg * c.spread * (double)j / (double)c.fan;
+                  s->kx[s->nd] = c.k0 * cos(aa);
+                  s->ky[s->nd] = c.k0 * sin(aa);
+                  s->nd++;
+                }
+            }
+          } else if (!contrast) {
             /* the incident wave's OWN direction, which fresnel() defines against
              * the interface normal — not the raw angle theta. dth rotates it
              * deliberately, which is how the direction tolerance is measured. */
@@ -439,8 +591,39 @@ int main(int argc, char **argv) {
    * they get no equation at all; incoming ones are exactly the illumination
    * entering the domain, so their amplitudes are prescribed. Nothing reflects,
    * and the only datum needed is what a scene actually knows: what comes IN. */
+/* A PERFECT MIRROR is one more kind of wall and costs one equation per test
+ * function: Int_F u conj(T) ds = 0, i.e. Dirichlet. Nothing else changes — and
+ * that is the point of the scene family below: a wave bouncing between mirrors
+ * an unbounded number of times is still only a FEW directions, so the cost does
+ * not grow with the number of bounces at all. A path tracer pays depth and
+ * variance per bounce; here the bounces are not traversed, they are solved. */
+#define ADDMIRROR(SA, X0, Y0, X1, Y1)                                                              \
+  do {                                                                                             \
+    const sub *SM = &S[(SA)];                                                                      \
+    for (int tm = 0; tm < SM->nd; tm++) {                                                          \
+      double tgx = -SM->kx[tm], tgy = -SM->ky[tm];                                                 \
+      double complex tph = cexp(-i1 * (tgx * SM->cx + tgy * SM->cy));                              \
+      if (nrow >= MAXROW) return 1;                                                                \
+      rp[nrow] = nnz;                                                                              \
+      for (int d = 0; d < SM->nd; d++) {                                                           \
+        double gx = SM->kx[d] + tgx, gy = SM->ky[d] + tgy;                                         \
+        double complex ph = cexp(-i1 * (SM->kx[d] * SM->cx + SM->ky[d] * SM->cy));                 \
+        double complex w = seg_exp(gx, gy, (X0), (Y0), (X1), (Y1)) * ph * tph;                     \
+        if (!(cabs(w) > 0.0) || nnz >= cap) continue;                                              \
+        ja[nnz] = SM->base + d;                                                                    \
+        va[nnz++] = w;                                                                             \
+      }                                                                                            \
+      rhs[nrow] = 0.0;                                                                             \
+      nrow++;                                                                                      \
+    }                                                                                              \
+  } while (0)
+
 #define ADDWALL(SA, X0, Y0, X1, Y1, NX, NY, WMASK)                                                 \
   do {                                                                                             \
+    if (c.mirror && (fabs(NY) > 0.0 || (c.mirror == 2 && (NX) < 0.0))) {                            \
+      ADDMIRROR((SA), (X0), (Y0), (X1), (Y1)); /* the guide walls, and the dead end */             \
+      break;                                                                                       \
+    }                                                                                              \
     if (!c.abc) {                                                                                  \
       ADDFACE((SA), -1, (X0), (Y0), (X1), (Y1), (NX), (NY), (WMASK));                              \
       break;                                                                                       \
@@ -454,7 +637,8 @@ int main(int argc, char **argv) {
       va[nnz++] = 1.0;                                                                             \
       double complex vin = 0.0;                                                                    \
       for (int q2 = 0; q2 < c.nwave; q2++) {                                                       \
-        if (!((WMASK) & (1 << q2))) continue;                                                      \
+        /* the mirror scene has no inside/outside split, so no mask applies */                     \
+        if (!c.mirror && !((WMASK) & (1 << q2))) continue;                                         \
         if (fabs(SW->kx[d] - c.px[q2]) + fabs(SW->ky[d] - c.py[q2]) > 1e-9 * c.k0) continue;       \
         vin = c.amp[q2] * cexp(i1 * (c.px[q2] * SW->cx + c.py[q2] * SW->cy));                      \
         break;                                                                                     \
@@ -652,6 +836,7 @@ int main(int argc, char **argv) {
   }
 
   /* --- LSQR --------------------------------------------------------------- */
+  double t_asm = now_s() - t_start, t_solve0 = now_s();
   double complex *xs = calloc((size_t)dim, sizeof(double complex));
   double complex *uu = calloc((size_t)nrow, sizeof(double complex));
   double complex *vv = calloc((size_t)dim, sizeof(double complex));
@@ -739,6 +924,7 @@ int main(int argc, char **argv) {
   }
   printf("  LSQR |r|/|b| = %.3e   iters to 1e-2/1e-3/1e-4/1e-6/1e-8: %d/%d/%d/%d/%d\n", phibar / b0,
          n2, n3, n4, n6, n8);
+  double t_solve = now_s() - t_solve0;
   printf("  LSQR stopped after %d iters: %s\n", itdone,
          brk == 1   ? "BETA breakdown (Krylov space exhausted)"
          : brk == 2 ? "ALPHA breakdown"
@@ -847,6 +1033,107 @@ int main(int argc, char **argv) {
     }
   }
   printf("  FIELD ERROR = %.4e   (%d samples)\n", sqrt(num / den), nsamp);
+
+  /* --- RENDER --------------------------------------------------------------
+   * The picture is not a second solve. The coefficients already ARE the field
+   * everywhere, in closed form, so a pixel costs one evaluation of its own
+   * cell's ND plane waves — nothing else, at any resolution. That is the
+   * architecture's "the field does not depend on the camera" made literal, and
+   * it is why solve time and render time are reported SEPARATELY here: quoting
+   * one as the other is exactly the kind of cheating PLAN.md forbids.
+   * The loop is over CELLS, not pixels: a pixel lookup would need a tree walk,
+   * while scattering each cell into the pixels it covers is O(pixels) flat. */
+  double t_img = 0.0;
+  if (c.img > 0) {
+    int N = c.img;
+    double t_img0 = now_s();
+    float *fre = malloc((size_t)N * (size_t)N * sizeof(float));
+    float *fab = malloc((size_t)N * (size_t)N * sizeof(float));
+    if (!fre || !fab) {
+      free(fre);
+      free(fab);
+      printf("  ABORT: image buffers\n");
+      exit(1);
+    }
+    for (size_t p = 0; p < (size_t)N * (size_t)N; p++) {
+      fre[p] = 0.0f;
+      fab[p] = 0.0f;
+    }
+    double px = 2.0 * L / (double)N;
+    for (int s = 0; s < nsub; s++) {
+      const sub *SU = &S[s];
+      int q = SU->cell;
+      double h = 0.5 * cellh[q];
+      int i0 = (int)floor((cellx[q] - h + L) / px), i1x = (int)ceil((cellx[q] + h + L) / px);
+      int j0 = (int)floor((celly[q] - h + L) / px), j1 = (int)ceil((celly[q] + h + L) / px);
+      if (i0 < 0) i0 = 0;
+      if (j0 < 0) j0 = 0;
+      if (i1x > N) i1x = N;
+      if (j1 > N) j1 = N;
+      for (int jj = j0; jj < j1; jj++) {
+        double y = -L + ((double)jj + 0.5) * px;
+        for (int ii = i0; ii < i1x; ii++) {
+          double x = -L + ((double)ii + 0.5) * px;
+          if (contrast && ((SU->side == 0) != (sdist(&c, x, y) < 0.0))) continue;
+          double complex got = 0.0;
+          for (int d = 0; d < SU->nd; d++)
+            got +=
+                xs[SU->base + d] * cexp(i1 * (SU->kx[d] * (x - SU->cx) + SU->ky[d] * (y - SU->cy)));
+          size_t p = (size_t)(N - 1 - jj) * (size_t)N + (size_t)ii;
+          fre[p] = (float)creal(got);
+          fab[p] = (float)cabs(got);
+        }
+      }
+    }
+    t_img = now_s() - t_img0;
+    double amax = 0.0;
+    for (size_t p = 0; p < (size_t)N * (size_t)N; p++)
+      if ((double)fab[p] > amax) amax = (double)fab[p];
+    if (!(amax > 0.0)) amax = 1.0;
+    char nm[64];
+    for (int which = 0; which < 2; which++) {
+      snprintf(nm, sizeof nm, "img/tdg_%s_%d.ppm", which ? "re" : "abs", c.mirror);
+      FILE *f = fopen(nm, "wb");
+      if (!f) continue;
+      fprintf(f, "P6\n%d %d\n255\n", N, N);
+      unsigned char *row = malloc(3u * (size_t)N);
+      if (!row) {
+        fclose(f);
+        continue;
+      }
+      for (int jj = 0; jj < N; jj++) {
+        for (int ii = 0; ii < N; ii++) {
+          size_t p = (size_t)jj * (size_t)N + (size_t)ii;
+          if (which) { /* Re u: blue - white - red, so the phase is visible */
+            double v = (double)fre[p] / amax;
+            double a = v > 0.0 ? v : -v;
+            if (a > 1.0) a = 1.0;
+            double lo = 1.0 - a;
+            row[3 * ii + 0] = (unsigned char)(255.0 * (v > 0.0 ? 1.0 : lo));
+            row[3 * ii + 1] = (unsigned char)(255.0 * lo);
+            row[3 * ii + 2] = (unsigned char)(255.0 * (v > 0.0 ? lo : 1.0));
+          } else { /* |u|^2, what a sensor integrates */
+            double v = (double)fab[p] / amax;
+            v = v * v;
+            unsigned char g = (unsigned char)(255.0 * (v < 1.0 ? v : 1.0));
+            row[3 * ii + 0] = g;
+            row[3 * ii + 1] = g;
+            row[3 * ii + 2] = g;
+          }
+        }
+        fwrite(row, 3u, (size_t)N, f);
+      }
+      free(row);
+      fclose(f);
+      printf("  wrote %s\n", nm);
+    }
+    free(fre);
+    free(fab);
+  }
+  printf("  [time] assemble %.3f s   solve %.3f s (%d iters, %.2f ms/iter)   render %.3f s", t_asm,
+         t_solve, itdone, 1e3 * t_solve / (double)(itdone > 0 ? itdone : 1), t_img);
+  if (c.img > 0) printf("  = %.0f ns/pixel", 1e9 * t_img / ((double)c.img * (double)c.img));
+  printf("\n");
 
   free(ja);
   free(va);

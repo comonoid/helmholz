@@ -43,7 +43,8 @@ static const double LAM = 1.0;
 
 typedef struct {
   double W, k0, theta, n, alpha, dth;
-  int nd, ne, oracle;
+  int nd, ne, oracle, lev;
+  double lodk;
   double nhx, nhy, thx, thy;
   double complex amp[3];
   double px[3], py[3];
@@ -129,11 +130,12 @@ typedef struct {
 
 static sub S[MAXSUB];
 static int subof[MAXCELL][2];
-static double cellx[MAXCELL], celly[MAXCELL];
+static double cellx[MAXCELL], celly[MAXCELL], cellh[MAXCELL];
+static int celld[MAXCELL];
 
 int main(int argc, char **argv) {
-  static const char *const KEYS[] = {"W", "nd",    "ne",  "th",     "it",
-                                     "n", "alpha", "dth", "oracle", NULL};
+  static const char *const KEYS[] = {"W",     "nd",  "ne",     "th",  "it",   "n",
+                                     "alpha", "dth", "oracle", "lev", "lodk", NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -171,6 +173,8 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "dth=", 4)) c.dth = v;
     if (!strncmp(argv[i], "it=", 3)) itmax = (int)v;
     if (!strncmp(argv[i], "oracle=", 7)) c.oracle = (int)v;
+    if (!strncmp(argv[i], "lev=", 4)) c.lev = (int)v;
+    if (!strncmp(argv[i], "lodk=", 5)) c.lodk = v;
   }
   if (c.nd > MAXDIR || c.ne * c.ne > MAXCELL) return 1;
   fresnel(&c);
@@ -180,18 +184,69 @@ int main(int argc, char **argv) {
   printf("tdg2d: W=%.4g lam  kW=%.4g  ND=%d  NE=%d  box=%.4g lam  n=%.3f alpha=%.2f th=%.2f\n",
          c.W / LAM, c.k0 * c.W, c.nd, c.ne, 2.0 * L / LAM, c.n, c.alpha, c.theta);
 
+  /* --- CELLS: a graded ladder, not a grid --------------------------------
+   * The architecture sizes elements by LOD, so the mesh has to carry cells of
+   * different sizes side by side. In DG that costs nothing structurally: a face
+   * between a coarse and a fine cell is just the segment they share, and a
+   * coarse cell simply has several faces along the side a fine neighbour
+   * touches. "Hanging nodes" are not a concept here.
+   * Refinement rule: split while the cell is larger than lodk times its distance
+   * to the interface — regulator 2 of the plan (a FLOOR on size driven by
+   * geometry), capped by lev. lev = 0 gives back the uniform grid. */
+  int ncellv = 0;
+  {
+    int head = 0;
+    for (int a = 0; a < c.ne; a++)
+      for (int bb = 0; bb < c.ne; bb++) {
+        cellx[ncellv] = -L + ((double)a + 0.5) * c.W;
+        celly[ncellv] = -L + ((double)bb + 0.5) * c.W;
+        cellh[ncellv] = c.W;
+        celld[ncellv] = 0;
+        ncellv++;
+      }
+    while (head < ncellv) {
+      int q = head++;
+      if (celld[q] >= c.lev) continue;
+      double d = fabs(sdist(&c, cellx[q], celly[q]));
+      if (!(cellh[q] > c.lodk * d)) continue;
+      if (ncellv + 3 >= MAXCELL) break;
+      double h2 = 0.5 * cellh[q], x0 = cellx[q], y0 = celly[q];
+      int dep = celld[q] + 1;
+      cellh[q] = h2;
+      celld[q] = dep;
+      cellx[q] = x0 - 0.5 * h2;
+      celly[q] = y0 - 0.5 * h2;
+      const double ox[3] = {0.5, -0.5, 0.5}, oy[3] = {-0.5, 0.5, 0.5};
+      for (int t = 0; t < 3; t++) {
+        cellx[ncellv] = x0 + ox[t] * h2;
+        celly[ncellv] = y0 + oy[t] * h2;
+        cellh[ncellv] = h2;
+        celld[ncellv] = dep;
+        ncellv++;
+      }
+      head = 0; /* the split cell and its siblings must be reconsidered */
+    }
+  }
+  ncell = ncellv;
+  {
+    double hmin = 1e300, hmax = 0.0;
+    for (int q = 0; q < ncell; q++) {
+      if (cellh[q] < hmin) hmin = cellh[q];
+      if (cellh[q] > hmax) hmax = cellh[q];
+    }
+    printf("  cells=%d  sizes %.4g..%.4g lam  (ratio %.0f)\n", ncell, hmin / LAM, hmax / LAM,
+           hmax / hmin);
+  }
+
   /* --- sub-cells ---------------------------------------------------------- */
   int nsub = 0, dim = 0;
-  for (int a = 0; a < c.ne; a++)
-    for (int bb = 0; bb < c.ne; bb++) {
-      int q = a * c.ne + bb;
-      cellx[q] = -L + ((double)a + 0.5) * c.W;
-      celly[q] = -L + ((double)bb + 0.5) * c.W;
+  {
+    for (int q = 0; q < ncell; q++) {
       subof[q][0] = subof[q][1] = -1;
       double smin = 1e300, smax = -1e300;
       for (int i = 0; i < 4; i++) {
-        double x = cellx[q] + ((i & 1) ? 0.5 : -0.5) * c.W;
-        double y = celly[q] + ((i & 2) ? 0.5 : -0.5) * c.W;
+        double x = cellx[q] + ((i & 1) ? 0.5 : -0.5) * cellh[q];
+        double y = celly[q] + ((i & 2) ? 0.5 : -0.5) * cellh[q];
         double s = sdist(&c, x, y);
         if (s < smin) smin = s;
         if (s > smax) smax = s;
@@ -242,6 +297,7 @@ int main(int argc, char **argv) {
         subof[q][sd] = nsub++;
       }
     }
+  }
   if (dim > MAXDIM) {
     printf("tdg2d: dim %d too large\n", dim);
     return 1;
@@ -310,39 +366,75 @@ int main(int argc, char **argv) {
     }                                                                                              \
   } while (0)
 
-  /* inter-cell faces, each split by the interface into its two sides */
-  for (int dir = 0; dir < 2; dir++)
-    for (int a = 0; a < c.ne; a++)
-      for (int bb = 0; bb <= c.ne; bb++) {
-        int qa = -1, qb = -1;
-        double x0, y0, x1, y1, nx, ny;
-        if (dir == 0) {
-          double xf = -L + (double)bb * c.W;
-          x0 = xf, y0 = -L + (double)a * c.W, x1 = xf, y1 = y0 + c.W, nx = 1.0, ny = 0.0;
-          if (bb > 0) qa = (bb - 1) * c.ne + a;
-          if (bb < c.ne) qb = bb * c.ne + a;
-        } else {
-          double yf = -L + (double)bb * c.W;
-          x0 = -L + (double)a * c.W, y0 = yf, x1 = x0 + c.W, y1 = yf, nx = 0.0, ny = 1.0;
-          if (bb > 0) qa = a * c.ne + (bb - 1);
-          if (bb < c.ne) qb = a * c.ne + bb;
-        }
+  /* INTER-CELL FACES BY GEOMETRIC ADJACENCY, not by grid indices. A face is the
+   * OVERLAP of two cell sides that lie on the same line, so a coarse cell facing
+   * several fine ones simply yields several faces along that side, each of the
+   * fine cell's length. Emitted once per pair: only the +x and +y sides of the
+   * cell behind the normal are scanned. */
+  int nfint = 0, nfwall = 0;
+  for (int qa = 0; qa < ncell; qa++)
+    for (int ax2 = 0; ax2 < 2; ax2++) {
+      double ha = 0.5 * cellh[qa];
+      double coord = (ax2 == 0) ? cellx[qa] + ha : celly[qa] + ha; /* the +x / +y side */
+      double lo = (ax2 == 0) ? celly[qa] - ha : cellx[qa] - ha, hi = lo + cellh[qa];
+      double nx = (ax2 == 0) ? 1.0 : 0.0, ny = (ax2 == 0) ? 0.0 : 1.0;
+      /* the box wall: no neighbour there by construction */
+      if (fabs(coord - L) < 1e-9 * c.W) {
         for (int sd = 0; sd < 2; sd++) {
           if (!contrast && sd == 0) continue;
-          double ax = x0, ay = y0, bx = x1, by = y1;
-          if (contrast && !clip_side(&c, sd, &ax, &ay, &bx, &by)) continue;
-          int sa = (qa >= 0) ? subof[qa][sd] : -1;
-          int sb = (qb >= 0) ? subof[qb][sd] : -1;
+          double px0 = (ax2 == 0) ? coord : lo, py0 = (ax2 == 0) ? lo : coord;
+          double px1 = (ax2 == 0) ? coord : hi, py1 = (ax2 == 0) ? hi : coord;
+          if (contrast && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
+          int sa = subof[qa][sd];
+          if (sa < 0) continue;
+          int mask = !contrast ? 1 : (sd == 0 ? 4 : 3);
+          nfwall++;
+          ADDFACE(sa, -1, px0, py0, px1, py1, nx, ny, mask);
+        }
+        continue;
+      }
+      for (int qb = 0; qb < ncell; qb++) {
+        if (qb == qa) continue;
+        double hb = 0.5 * cellh[qb];
+        double cb = (ax2 == 0) ? cellx[qb] - hb : celly[qb] - hb; /* B's -x / -y side */
+        if (fabs(cb - coord) > 1e-9 * c.W) continue;
+        double blo = (ax2 == 0) ? celly[qb] - hb : cellx[qb] - hb, bhi = blo + cellh[qb];
+        double olo = lo > blo ? lo : blo, ohi = hi < bhi ? hi : bhi;
+        if (!(ohi - olo > 1e-9 * c.W)) continue;
+        for (int sd = 0; sd < 2; sd++) {
+          if (!contrast && sd == 0) continue;
+          double px0 = (ax2 == 0) ? coord : olo, py0 = (ax2 == 0) ? olo : coord;
+          double px1 = (ax2 == 0) ? coord : ohi, py1 = (ax2 == 0) ? ohi : coord;
+          if (contrast && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
+          int sa = subof[qa][sd], sb = subof[qb][sd];
           int mask = !contrast ? 1 : (sd == 0 ? 4 : 3);
           if (sa >= 0 && sb >= 0) {
-            ADDFACE(sa, sb, ax, ay, bx, by, nx, ny, mask);
-          } else if (sa >= 0) {
-            ADDFACE(sa, -1, ax, ay, bx, by, nx, ny, mask);
-          } else if (sb >= 0) {
-            ADDFACE(sb, -1, ax, ay, bx, by, -nx, -ny, mask);
+            nfint++;
+            ADDFACE(sa, sb, px0, py0, px1, py1, nx, ny, mask);
           }
         }
       }
+    }
+  /* the -x and -y sides that lie on the box wall */
+  for (int qa = 0; qa < ncell; qa++)
+    for (int ax2 = 0; ax2 < 2; ax2++) {
+      double ha = 0.5 * cellh[qa];
+      double coord = (ax2 == 0) ? cellx[qa] - ha : celly[qa] - ha;
+      if (fabs(coord + L) > 1e-9 * c.W) continue;
+      double lo = (ax2 == 0) ? celly[qa] - ha : cellx[qa] - ha, hi = lo + cellh[qa];
+      double nx = (ax2 == 0) ? -1.0 : 0.0, ny = (ax2 == 0) ? 0.0 : -1.0;
+      for (int sd = 0; sd < 2; sd++) {
+        if (!contrast && sd == 0) continue;
+        double px0 = (ax2 == 0) ? coord : lo, py0 = (ax2 == 0) ? lo : coord;
+        double px1 = (ax2 == 0) ? coord : hi, py1 = (ax2 == 0) ? hi : coord;
+        if (contrast && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
+        int sa = subof[qa][sd];
+        if (sa < 0) continue;
+        int mask = !contrast ? 1 : (sd == 0 ? 4 : 3);
+        nfwall++;
+        ADDFACE(sa, -1, px0, py0, px1, py1, nx, ny, mask);
+      }
+    }
 
   /* THE MATERIAL INTERFACE, as an ordinary face between the two sub-cells of a
    * cut cell. Same two conditions as every interior face — they ARE the physical

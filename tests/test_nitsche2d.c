@@ -297,6 +297,49 @@ int main(void) {
     check("N6 swapping i and j exchanges t1i and t1j", es < 1e-15, es);
   }
 
+  /* ------------- N7: plane-wave partner against the same witness ---------- */
+  {
+    /* A bare plane wave is the limit of a basis function whose envelope is 1, so
+     * the general routine must reproduce it when the partner's phi factors are
+     * removed. The witness is the same composite Gauss rule. */
+    double W = 1.0;
+    double x0 = -1.35, y0 = -0.9, x1 = 1.15, y1 = 1.6;
+    double dx = x1 - x0, dy = y1 - y0, L = sqrt(dx * dx + dy * dy);
+    double nx = dy / L, ny = -dx / L;
+    static const double gx[4] = {-0.8611363115940526, -0.3399810435848563, 0.3399810435848563,
+                                 0.8611363115940526};
+    static const double gw[4] = {0.3478548451374538, 0.6521451548625461, 0.6521451548625461,
+                                 0.3478548451374538};
+    const double kk[3] = {0.0, 1.9, 6.0};
+    for (int c = 0; c < 3; c++) {
+      double k = kk[c];
+      hz_carrier2d bi = {W, 0, 0, k * cos(0.4), k * sin(0.4)};
+      double px = 1.7 * cos(2.4), py = 1.7 * sin(2.4);
+      double complex i0, i1;
+      hz_nitsche2d_seg_pw(bi, px, py, x0, y0, x1, y1, nx, ny, &i0, &i1);
+      double complex r0 = 0.0, r1 = 0.0;
+      for (int p = 0; p < NPAN; p++) {
+        double ta = (double)p / (double)NPAN, tb = (double)(p + 1) / (double)NPAN;
+        double cc = 0.5 * (ta + tb), h = 0.5 * (tb - ta);
+        for (int q = 0; q < 4; q++) {
+          double t = cc + h * gx[q], w = gw[q] * h * L;
+          double x = x0 + dx * t, y = y0 + dy * t;
+          double complex pw = cexp(CMPLX(0.0, 1.0) * (px * x + py * y));
+          double complex gix, giy;
+          bgrad(bi, x, y, &gix, &giy);
+          r0 += w * bval(bi, x, y) * pw;
+          r1 += w * pw * (nx * gix + ny * giy);
+        }
+      }
+      double sc0 = 4.0 * L, sc1 = 4.0 * L * (k + 1.0 / W);
+      char nm[64];
+      snprintf(nm, sizeof nm, "N7 plane-wave i0  vs quadrature, kW = %.1f", k * W);
+      check(nm, cabs(i0 - r0) / sc0 < 1e-12, cabs(i0 - r0) / sc0);
+      snprintf(nm, sizeof nm, "N7 plane-wave i1  vs quadrature, kW = %.1f", k * W);
+      check(nm, cabs(i1 - r1) / sc1 < 1e-12, cabs(i1 - r1) / sc1);
+    }
+  }
+
   printf("test_nitsche2d: %d/%d passed\n", pass_count, pass_count + fail_count);
   return fail_count == 0 ? 0 : 1;
 }

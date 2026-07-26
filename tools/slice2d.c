@@ -479,7 +479,7 @@ static void applyAT(size_t nrow, int dim, const size_t *rp, const int *ja, const
 static const char *const KEYS[] = {"W",       "nd",     "facets", "R",       "mmax",     "dtnw",
                                    "it",      "n",      "pen",    "nit",     "forcecut", "rrow",
                                    "ngam",    "gamw",   "sym",    "a5",      "rm",       "plateau",
-                                   "carrier", "square", "nomega", "ftarget", NULL};
+                                   "carrier", "square", "nomega", "ftarget", "a",        NULL};
 
 static double argval(int argc, char **argv, const char *key, double def) {
   size_t kl = strlen(key);
@@ -510,7 +510,7 @@ static int args_ok(int argc, char **argv) {
 
 int main(int argc, char **argv) {
   cfg c = {0};
-  c.a = 1.0 * LAM;
+  c.a = argval(argc, argv, "a", 1.0) * LAM;
   c.k0 = 2.0 * M_PI / LAM;
   c.ntheta = 512;
   if (!args_ok(argc, argv)) return 1;
@@ -920,7 +920,9 @@ int main(int argc, char **argv) {
     printf("  Mie tail |c_M|/max = %.2e\n", cabs(mc[c.mmax]) / cabs(mc[0]));
   else
     printf("  Mie coefficients identically zero (no contrast): exact = incident wave\n");
-  double rm = argval(argc, argv, "rm", 2.0) * LAM; /* gate window, NEVER swept */
+  /* the measurement window scales with the OBJECT, not with lambda: at a = 8 lam
+   * a fixed r_m = 2 lam would sit inside the scatterer */
+  double rm = argval(argc, argv, "rm", 2.0 * c.a / LAM) * LAM; /* gate window, NEVER swept */
   int plateau = (int)argval(argc, argv, "plateau", 0.0);
 
   /* --- LSQR (Paige-Saunders), min-norm least squares, matrix by CSR ------- */

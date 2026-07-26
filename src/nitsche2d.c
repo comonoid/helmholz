@@ -162,6 +162,77 @@ hz_nit2d hz_nitsche2d_seg(hz_carrier2d bi, hz_carrier2d bj, double x0, double y0
   return out;
 }
 
+void hz_nitsche2d_seg_pw(hz_carrier2d bi, double complex px, double complex py, double x0,
+                         double y0, double x1, double y1, double nx, double ny, double complex *i0,
+                         double complex *i1) {
+  *i0 = 0.0;
+  *i1 = 0.0;
+  double W = bi.W;
+  double dx = x1 - x0, dy = y1 - y0;
+  double L = sqrt(dx * dx + dy * dy);
+  if (!(L > 0.0) || !(W > 0.0)) return;
+  double tx = dx / L, ty = dy / L;
+  double lo = 0.0, hi = L;
+  if (!clip_ax(x0, tx, W * ((double)bi.nx - 2.0), W * ((double)bi.nx + 2.0), &lo, &hi)) return;
+  if (!clip_ax(y0, ty, W * ((double)bi.ny - 2.0), W * ((double)bi.ny + 2.0), &lo, &hi)) return;
+  if (!(lo < hi)) return;
+  double pt[NPT];
+  int np = 0;
+  pt[np++] = lo;
+  pt[np++] = hi;
+  add_knots(W, bi.nx, x0, tx, lo, hi, pt, &np);
+  add_knots(W, bi.ny, y0, ty, lo, hi, pt, &np);
+  for (int i = 1; i < np; i++) {
+    double v = pt[i];
+    int j = i - 1;
+    while (j >= 0 && pt[j] > v) {
+      pt[j + 1] = pt[j];
+      j--;
+    }
+    pt[j + 1] = v;
+  }
+  double complex omx = bi.kx + px, omy = bi.ky + py;
+  for (int p = 0; p + 1 < np; p++) {
+    double hw = 0.5 * (pt[p + 1] - pt[p]);
+    if (!(hw > 0.0)) continue;
+    double sm = 0.5 * (pt[p] + pt[p + 1]);
+    double xm = x0 + tx * sm, ym = y0 + ty * sm;
+    double complex Xi[3], Yi[3], Xid[3], Yid[3];
+    hz_phi_factor f;
+    f.h = W;
+    f.n = (double)bi.nx;
+    f.deriv = 0;
+    fac_u(f, xm, tx * hw, Xi);
+    f.deriv = 1;
+    fac_u(f, xm, tx * hw, Xid);
+    f.n = (double)bi.ny;
+    f.deriv = 0;
+    fac_u(f, ym, ty * hw, Yi);
+    f.deriv = 1;
+    fac_u(f, ym, ty * hw, Yid);
+    double complex P00[5], Px[5], Py[5];
+    pmul(Xi, 2, Yi, 2, P00);
+    pmul(Xid, 2, Yi, 2, Px);
+    pmul(Xi, 2, Yid, 2, Py);
+    double complex mom[5];
+    hz_cut2d_osc_moments((omx * tx + omy * ty) * hw, 4, mom);
+    double complex a00 = 0.0, ax = 0.0, ay = 0.0;
+    for (int k = 0; k <= 4; k++) {
+      a00 += P00[k] * mom[k];
+      ax += Px[k] * mom[k];
+      ay += Py[k] * mom[k];
+    }
+    /* phase of B_i in its own local reference, of the plane wave in the global
+     * one — that is what the caller's amplitude is defined against */
+    double complex ph =
+        bi.kx * (xm - W * (double)bi.nx) + bi.ky * (ym - W * (double)bi.ny) + px * xm + py * ym;
+    double complex E = hw * cexp(CMPLX(0.0, 1.0) * ph);
+    double complex i1c = CMPLX(0.0, 1.0);
+    *i0 += E * a00;
+    *i1 += E * (nx * (ax + i1c * bi.kx * a00) + ny * (ay + i1c * bi.ky * a00));
+  }
+}
+
 hz_nit2d hz_nitsche2d_poly(hz_carrier2d bi, hz_carrier2d bj, const double *vx, const double *vy,
                            int nv) {
   hz_nit2d out = {0.0, 0.0, 0.0};

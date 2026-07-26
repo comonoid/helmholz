@@ -65,4 +65,15 @@ hz_nit2d hz_nitsche2d_seg(hz_carrier2d bi, hz_carrier2d bj, double x0, double y0
 hz_nit2d hz_nitsche2d_poly(hz_carrier2d bi, hz_carrier2d bj, const double *vx, const double *vy,
                            int nv);
 
+/* The same two integrals with the partner replaced by a BARE PLANE WAVE
+ * exp(i(px x + py y)) — no envelope. This is what a Nitsche-Dirichlet condition
+ * needs on its right-hand side, where the datum is an analytic field rather than
+ * a basis function:
+ *   *i0 = Int_seg B_i exp(i p.x) ds        *i1 = Int_seg exp(i p.x) (n.grad B_i) ds
+ * Same exactness and the same piecewise machinery; only two phi factors instead
+ * of four, so the integrand is degree <= 4. */
+void hz_nitsche2d_seg_pw(hz_carrier2d bi, double complex px, double complex py, double x0,
+                         double y0, double x1, double y1, double nx, double ny, double complex *i0,
+                         double complex *i1);
+
 #endif

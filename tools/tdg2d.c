@@ -721,10 +721,16 @@ int main(int argc, char **argv) {
    * estimator — an a priori rule cannot know about edges, caustics or multiple
    * scattering, and the residual does. */
   if (c.spec > 0) {
-    enum { NPHI = 1440, NSMP = 64 };
-    static double complex acc[NPHI];
-    for (int p = 0; p < NPHI; p++)
-      acc[p] = 0.0;
+    /* TWO wavenumber circles, not one. A wave living inside the denser medium
+     * has |k| = n k0 and is INVISIBLE to a filter that scans only |k| = k0 —
+     * measured: with only the transmitted wave missing, the peak landed nowhere
+     * near it. */
+    enum { NPHI = 1440, NSMP = 64, NKC = 2 };
+    static double complex acc[NKC][NPHI];
+    const double kc[NKC] = {c.k0, c.k0 * c.n};
+    for (int m = 0; m < NKC; m++)
+      for (int p = 0; p < NPHI; p++)
+        acc[m][p] = 0.0;
     double norm = 0.0;
     for (int q = 0; q < ncell; q++)
       for (int ax2 = 0; ax2 < 2; ax2++)
@@ -757,28 +763,30 @@ int main(int argc, char **argv) {
               double complex r = (du - i1 * c.k0 * uu2) - hh;
               double w = cellh[q] / (double)NSMP;
               norm += cabs(r) * cabs(r) * w;
-              for (int p = 0; p < NPHI; p++) {
-                double ph = 2.0 * M_PI * (double)p / (double)NPHI;
-                double gx = c.k0 * cos(ph), gy = c.k0 * sin(ph);
-                acc[p] += w * r * cexp(-i1 * (gx * x + gy * y));
-              }
+              for (int m = 0; m < NKC; m++)
+                for (int p = 0; p < NPHI; p++) {
+                  double ph = 2.0 * M_PI * (double)p / (double)NPHI;
+                  double gx = kc[m] * cos(ph), gy = kc[m] * sin(ph);
+                  acc[m][p] += w * r * cexp(-i1 * (gx * x + gy * y));
+                }
             }
           }
         }
-    int best = 0;
+    int best = 0, bestm = 0;
     double bv = 0.0, tot = 0.0;
-    for (int p = 0; p < NPHI; p++) {
-      double v = cabs(acc[p]);
-      tot += v * v;
-      if (v > bv) {
-        bv = v;
-        best = p;
+    for (int m = 0; m < NKC; m++)
+      for (int p = 0; p < NPHI; p++) {
+        double v = cabs(acc[m][p]);
+        tot += v * v;
+        if (v > bv) {
+          bv = v;
+          best = p;
+          bestm = m;
+        }
       }
-    }
     double bphi = 2.0 * M_PI * (double)best / (double)NPHI;
-    printf("  [spectrum] wall residual %.3e; matched-filter peak at %.5f rad, "
-           "sharpness %.3f\n",
-           sqrt(norm), bphi, bv / sqrt(tot / (double)NPHI));
+    printf("  [spectrum] wall residual %.3e; peak at %.5f rad on |k|=%s, sharpness %.3f\n",
+           sqrt(norm), bphi, bestm ? "n*k0" : "k0", bv / sqrt(tot / (double)(NKC * NPHI)));
     /* what the peak SHOULD be if it is finding the wave the basis lacks */
     for (int q = 3; q < c.nwave; q++)
       printf("             missing wave %d true direction %.15f rad\n", q, atan2(c.py[q], c.px[q]));

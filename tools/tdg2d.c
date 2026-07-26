@@ -77,7 +77,8 @@ typedef struct {
    * needs the angular spread lam/w around each mode direction, and fan/spread
    * are how much of it the basis is given. */
   int fan, nmode, obj, ss, acc, opaque, pix;
-  double kmul; /* scales k0: several runs over a band = a source of finite coherence */
+  double cgrade; /* geometric grading towards the edges, where the field is self-similar */
+  double kmul;   /* scales k0: several runs over a band = a source of finite coherence */
   double orad, oxc, oyc;
   double spread;
   double Lbox, kap, bet;
@@ -131,6 +132,27 @@ static double sdist(const cfg *c, double x, double y) {
  * formulation already carry the transmission conditions. The disc is a staircase
  * at cell resolution and is therefore APPROXIMATE geometry: it is here to be
  * looked at, not to be measured against Mie. */
+/* DISTANCE TO THE NEAREST EDGE OF THE BODY — the only place the field is not a
+ * handful of plane waves. The diffracted field there is SELF-SIMILAR: at
+ * distance rho from the edge it varies on the Fresnel scale sqrt(rho lam), which
+ * shrinks like sqrt(rho) all the way in. So the mesh that fits it is not a fine
+ * uniform one but a GEOMETRICALLY GRADED one, cells shrinking with the distance
+ * to the corner — and that costs O(levels) cells per corner, not O(1/h).
+ * Refining towards the whole SURFACE instead (what was tried first) only
+ * multiplies the cells that touch two mirror faces at once, which is why it made
+ * the residual worse rather than better. */
+static double cornerdist(const cfg *c, double x, double y) {
+  if (c->obj != 1) return 1e300;
+  double best = 1e300;
+  for (int i = 0; i < 4; i++) {
+    double cx = c->oxc + ((i & 1) ? c->orad : -c->orad);
+    double cy = c->oyc + ((i & 2) ? c->orad : -c->orad);
+    double d = sqrt((x - cx) * (x - cx) + (y - cy) * (y - cy));
+    if (d < best) best = d;
+  }
+  return best;
+}
+
 static int inside_obj(const cfg *c, double x, double y) {
   double dx = x - c->oxc, dy = y - c->oyc;
   if (c->obj == 1) return fabs(dx) < c->orad && fabs(dy) < c->orad;
@@ -297,10 +319,10 @@ static int ord[2][MAXCELL];
 int main(int argc, char **argv) {
   double t_start = now_s();
   static const char *const KEYS[] = {
-      "W",    "nd",   "ne",   "th",   "it",  "n",      "alpha",  "dth",   "oracle", "lev",
-      "lodk", "amp2", "th2",  "spec", "ex1", "ex2",    "ex3",    "ex4",   "abc",    "mirror",
-      "mode", "img",  "drop", "beam", "by0", "fan",    "spread", "nmode", "obj",    "orad",
-      "oxc",  "oyc",  "ss",   "kmul", "acc", "opaque", "pix",    NULL};
+      "W",    "nd",   "ne",   "th",   "it",  "n",      "alpha",  "dth",    "oracle", "lev",
+      "lodk", "amp2", "th2",  "spec", "ex1", "ex2",    "ex3",    "ex4",    "abc",    "mirror",
+      "mode", "img",  "drop", "beam", "by0", "fan",    "spread", "nmode",  "obj",    "orad",
+      "oxc",  "oyc",  "ss",   "kmul", "acc", "opaque", "pix",    "cgrade", NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -375,6 +397,7 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "acc=", 4)) c.acc = (int)v;
     if (!strncmp(argv[i], "opaque=", 7)) c.opaque = (int)v;
     if (!strncmp(argv[i], "pix=", 4)) c.pix = (int)v;
+    if (!strncmp(argv[i], "cgrade=", 7)) c.cgrade = v;
     for (int e = 0; e < 4; e++) {
       char key[8];
       snprintf(key, sizeof key, "ex%d=", e + 1);
@@ -440,7 +463,13 @@ int main(int argc, char **argv) {
        * object the field is the incident plane wave and one huge cell carries
        * it exactly; only the surface needs small cells. */
       double d = c.obj ? objdist(&c, cellx[q], celly[q]) : fabs(sdist(&c, cellx[q], celly[q]));
-      if (!(cellh[q] > c.lodk * d)) continue;
+      /* TWO INDEPENDENT GRADING RULES, not one blended threshold: lodk sizes
+       * cells by distance to the SURFACE, cgrade by distance to the EDGE. The
+       * second is the one the self-similar diffracted field asks for, and it
+       * must be usable with the first switched off. */
+      int split = (c.lodk > 0.0 && cellh[q] > c.lodk * d);
+      if (c.cgrade > 0.0 && cellh[q] > c.cgrade * cornerdist(&c, cellx[q], celly[q])) split = 1;
+      if (!split) continue;
       if (ncellv + 3 >= MAXCELL) break;
       double h2 = 0.5 * cellh[q], x0 = cellx[q], y0 = celly[q];
       int dep = celld[q] + 1;
@@ -639,6 +668,13 @@ int main(int argc, char **argv) {
 #define ADDFACE(SA, SB, X0, Y0, X1, Y1, NX, NY, WMASK)                                             \
   do {                                                                                             \
     int scs[2] = {(SA), (SB)};                                                                     \
+    /* ROWS SCALED BY 1/sqrt(face length). A row is an integral over the face, so                  \
+     * unscaled it grows with the face and a graded mesh silently weights long                     \
+     * faces above short ones. With the traces normalised, sum of |row|^2 IS the                   \
+     * L2 norm of the jump on that face, which is the quantity the formulation                     \
+     * means to minimise. */                                                                       \
+    double flen = hypot((X1) - (X0), (Y1) - (Y0));                                                 \
+    double fsc = flen > 0.0 ? 1.0 / sqrt(flen) : 0.0;                                              \
     int isint = ((SB) >= 0);                                                                       \
     for (int ti = 0; ti < 2; ti++) {                                                               \
       if (scs[ti] < 0) continue;                                                                   \
@@ -665,6 +701,7 @@ int main(int argc, char **argv) {
                 w = sgn * Iv;                                                                      \
               else                                                                                 \
                 w = sgn * i1 * dn * Iv / (i1 * c.k0);                                              \
+              w *= fsc;                                                                            \
               if (!(cabs(w) > 0.0) || nnz >= cap) continue;                                        \
               ja[nnz] = SU->base + d;                                                              \
               va[nnz++] = w;                                                                       \
@@ -678,7 +715,7 @@ int main(int argc, char **argv) {
               double complex Iv = seg_exp(gx, gy, (X0), (Y0), (X1), (Y1)) * tph;                   \
               dr += c.amp[q2] * (i1 * (c.px[q2] * (NX) + c.py[q2] * (NY)) - i1 * c.k0) * Iv;       \
             }                                                                                      \
-          rhs[nrow] = dr;                                                                          \
+          rhs[nrow] = dr * fsc;                                                                    \
           nrow++;                                                                                  \
         }                                                                                          \
       }                                                                                            \
@@ -704,6 +741,8 @@ int main(int argc, char **argv) {
 #define ADDMIRROR(SA, X0, Y0, X1, Y1)                                                              \
   do {                                                                                             \
     const sub *SM = &S[(SA)];                                                                      \
+    double mlen = hypot((X1) - (X0), (Y1) - (Y0));                                                 \
+    double msc = mlen > 0.0 ? 1.0 / sqrt(mlen) : 0.0;                                              \
     for (int tm = 0; tm < SM->nd; tm++) {                                                          \
       double tgx = -SM->kx[tm], tgy = -SM->ky[tm];                                                 \
       double complex tph = cexp(-i1 * (tgx * SM->cx + tgy * SM->cy));                              \
@@ -712,7 +751,7 @@ int main(int argc, char **argv) {
       for (int d = 0; d < SM->nd; d++) {                                                           \
         double gx = SM->kx[d] + tgx, gy = SM->ky[d] + tgy;                                         \
         double complex ph = cexp(-i1 * (SM->kx[d] * SM->cx + SM->ky[d] * SM->cy));                 \
-        double complex w = seg_exp(gx, gy, (X0), (Y0), (X1), (Y1)) * ph * tph;                     \
+        double complex w = seg_exp(gx, gy, (X0), (Y0), (X1), (Y1)) * ph * tph * msc;               \
         if (!(cabs(w) > 0.0) || nnz >= cap) continue;                                              \
         ja[nnz] = SM->base + d;                                                                    \
         va[nnz++] = w;                                                                             \

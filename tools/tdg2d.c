@@ -1,63 +1,94 @@
-/* TREFFTZ-DG: the reformulation the slab2d bench forced.
+/* TREFFTZ-DG at the element size the project actually targets, with a material
+ * interface. Derivation and numbers: PLAN.md, "ПОСТАНОВКА СМЕНЕНА НА ТРЕФТЦ-DG".
  *
- * WHAT slab2d PROVED. With a CONTINUOUS (partition-of-unity) carrier basis the
- * volume Galerkin residual is VACUOUS at k W >> 1: the carrier cancels k^2
- * analytically, so a plane wave — the whole solution — sits in the kernel of the
- * volume operator. Measured: the exact solution satisfies the assembled system
- * to 3e-13 while LSQR drives the residual to 9e-8 and walks AWAY from it (field
- * error 0.84 -> 1.13 as the residual falls). Independent of the box size
- * (NE = 8/16/24/32 gave 0.88/1.03/1.05/1.05) and reproduced in the simplest
- * possible setting — one medium, one plane wave, one true direction per element.
+ * WHAT slab2d PROVED AND WHY THIS EXISTS. With a CONTINUOUS (partition-of-unity)
+ * carrier basis the volume Galerkin residual is VACUOUS at k W >> 1: the carrier
+ * cancels k^2 analytically, so a plane wave — the whole solution — sits in the
+ * kernel of the volume operator, while a C^1 basis has continuity built in and so
+ * yields no equations either. That leaves NE^2 * ND unknowns against O(NE * ND)
+ * boundary conditions. Measured: the exact solution satisfied the assembled
+ * system to 3e-13 while LSQR drove the residual to 9e-8 and walked AWAY from it.
  *
- * WHY IT IS STRUCTURAL AND NOT A BUG. A C^1 basis has continuity BUILT IN, so
- * continuity yields no equations; and the volume residual yields none either,
- * because every basis combination nearly solves the PDE. That leaves only the
- * outer boundary: NE^2 * ND unknowns against O(NE * ND) conditions. A
- * DISCONTINUOUS basis is what supplies interior equations — one set per face,
- * ~2 NE^2 faces — and that is why every Trefftz method in the literature is a DG
- * method.
- *
- * THIS BENCH. Cells do not overlap; on each cell the basis is PURE plane waves,
- * so every basis function solves the Helmholtz equation exactly and there is no
- * volume integral at all. All equations live on the skeleton:
+ * HERE cells do not overlap and the basis is PURE plane waves, so every basis
+ * function solves the Helmholtz equation exactly on a region of ANY shape and
+ * there is no volume integral anywhere. Everything lives on the skeleton:
  *     interior face:  [u] = 0   and   [dn u]/(i k) = 0
- *     boundary face:  dn u - i k u = h                    (impedance, data exact)
- * The two interior conditions carry the SAME units, so the relative weight is
- * derived rather than tuned — there is no penalty parameter anywhere.
+ *     box wall:       dn u - i k u = h     (impedance; the data come from the
+ *                                           exact solution, so termination is
+ *                                           NOT what this bench tests)
+ * The two interior conditions carry the same units, so there is no penalty
+ * parameter anywhere in the formulation.
  *
- * Every integral is elementary: a segment integral of exp(i(k_j - k_m).x). No
- * phi, no polygons, no quadrature.
+ * THE MATERIAL INTERFACE IS NOT A SPECIAL CASE. A cell the interface crosses is
+ * split into two sub-cells carrying their own wavenumbers, and the interface
+ * becomes an ORDINARY FACE between them with the very same two conditions —
+ * which are exactly the physical transmission conditions. Nothing is "cut": the
+ * apparatus a continuous basis needed (exact phi x phi x plane-wave integration
+ * over polygons, a Nitsche term on the cut locus) is not required at all, because
+ * there are no volume integrals to restrict. A cut costs only the clipping of
+ * SEGMENTS, since every integral is a face integral.
  *
- * TEST FUNCTIONS ARE CONJUGATED, unlike the rest of the project's bilinear
- * assembly. Here the tests on a face are the traces of the same plane waves that
- * make up the jump; testing bilinearly would give a symmetric (not Hermitian)
- * Gram which can be singular, and "all rows zero" would then not mean "the jump
- * is zero" — the condition would be vacuous in a new way. */
+ * TEST FUNCTIONS ARE CONJUGATED, unlike the project's bilinear volume assembly:
+ * the tests on a face are traces of the same plane waves that make up the jump,
+ * and a bilinear test would give a symmetric rather than Hermitian Gram, so "all
+ * rows zero" would stop meaning "the jump is zero". */
 #include <complex.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-enum { MAXCELL = 4096, MAXDIR = 64, MAXDIM = 60000 };
+enum { MAXCELL = 4096, MAXSUB = 8192, MAXDIR = 64, MAXDIM = 80000, MAXROW = 400000 };
 static const double LAM = 1.0;
 
 typedef struct {
-  double W, k0, theta;
-  int nd, ne;
-  int oracle; /* 1 = the exact direction is in the fan */
-  double dth; /* deliberate angular error of that direction, in radians */
+  double W, k0, theta, n, alpha, dth;
+  int nd, ne, oracle;
+  double nhx, nhy, thx, thy;
+  double complex amp[3];
+  double px[3], py[3];
 } cfg;
+
+/* --- exact Fresnel solution: incident + reflected outside, transmitted inside */
+static void fresnel(cfg *c) {
+  c->nhx = cos(c->alpha);
+  c->nhy = sin(c->alpha);
+  c->thx = -sin(c->alpha);
+  c->thy = cos(c->alpha);
+  double k1 = c->k0, k2 = c->k0 * c->n;
+  double kt = k1 * sin(c->theta);
+  double c1 = sqrt(k1 * k1 - kt * kt), c2 = sqrt(k2 * k2 - kt * kt);
+  c->amp[0] = 1.0;
+  c->amp[1] = (c1 - c2) / (c1 + c2);
+  c->amp[2] = 2.0 * c1 / (c1 + c2);
+  c->px[0] = kt * c->thx - c1 * c->nhx;
+  c->py[0] = kt * c->thy - c1 * c->nhy;
+  c->px[1] = kt * c->thx + c1 * c->nhx;
+  c->py[1] = kt * c->thy + c1 * c->nhy;
+  c->px[2] = kt * c->thx - c2 * c->nhx;
+  c->py[2] = kt * c->thy - c2 * c->nhy;
+}
+
+static double sdist(const cfg *c, double x, double y) {
+  return x * c->nhx + y * c->nhy;
+}
+
+static double complex uexact(const cfg *c, double x, double y) {
+  double complex i1 = CMPLX(0.0, 1.0);
+  if (sdist(c, x, y) > 0.0)
+    return c->amp[0] * cexp(i1 * (c->px[0] * x + c->py[0] * y)) +
+           c->amp[1] * cexp(i1 * (c->px[1] * x + c->py[1] * y));
+  return c->amp[2] * cexp(i1 * (c->px[2] * x + c->py[2] * y));
+}
 
 /* Integral over the segment P0->P1 of exp(i g.x) ds, closed form. */
 static double complex seg_exp(double gx, double gy, double x0, double y0, double x1, double y1) {
   double dx = x1 - x0, dy = y1 - y0;
   double len = sqrt(dx * dx + dy * dy);
   if (!(len > 0.0)) return 0.0;
-  double gam = gx * dx + gy * dy; /* phase across the whole segment */
+  double gam = gx * dx + gy * dy;
   double complex e0 = cexp(CMPLX(0.0, 1.0) * (gx * x0 + gy * y0));
-  if (fabs(gam) < 1e-8) {
-    /* series, because (e^{ig}-1)/(ig) loses everything at small g */
+  if (fabs(gam) < 1e-8) { /* (e^{ig}-1)/(ig) loses everything at small g */
     double complex s = 1.0, t = 1.0;
     for (int m = 1; m < 12; m++) {
       t *= CMPLX(0.0, 1.0) * gam / (double)(m + 1);
@@ -68,8 +99,41 @@ static double complex seg_exp(double gx, double gy, double x0, double y0, double
   return len * e0 * (cexp(CMPLX(0.0, 1.0) * gam) - 1.0) / (CMPLX(0.0, 1.0) * gam);
 }
 
+/* Clip a segment to one side of the interface: side 0 = medium (s<0), 1 = the
+ * rest. This is the ONLY geometry a cut costs here, because every integral in the
+ * formulation is a face integral. */
+static int clip_side(const cfg *c, int side, double *ax, double *ay, double *bx, double *by) {
+  double s0 = sdist(c, *ax, *ay), s1 = sdist(c, *bx, *by);
+  int in0 = (side == 0) ? (s0 < 0.0) : (s0 > 0.0);
+  int in1 = (side == 0) ? (s1 < 0.0) : (s1 > 0.0);
+  if (!in0 && !in1) return 0;
+  if (in0 && in1) return 1;
+  double t = s0 / (s0 - s1);
+  double mx = *ax + t * (*bx - *ax), my = *ay + t * (*by - *ay);
+  if (in0) {
+    *bx = mx;
+    *by = my;
+  } else {
+    *ax = mx;
+    *ay = my;
+  }
+  return 1;
+}
+
+typedef struct {
+  int cell, side; /* side 0 = medium, 1 = the rest */
+  double cx, cy;  /* phase reference: the cell centre */
+  int base, nd;   /* first unknown, and how many directions */
+  double kx[MAXDIR], ky[MAXDIR];
+} sub;
+
+static sub S[MAXSUB];
+static int subof[MAXCELL][2];
+static double cellx[MAXCELL], celly[MAXCELL];
+
 int main(int argc, char **argv) {
-  static const char *const KEYS[] = {"W", "nd", "ne", "th", "it", "oracle", "dth", NULL};
+  static const char *const KEYS[] = {"W", "nd",    "ne",  "th",     "it",
+                                     "n", "alpha", "dth", "oracle", NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -86,7 +150,15 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
-  cfg c = {1.0 * LAM, 2.0 * M_PI / LAM, 0.3, 8, 8, 0, 0.0};
+  cfg c;
+  memset(&c, 0, sizeof c);
+  c.W = 1.0 * LAM;
+  c.k0 = 2.0 * M_PI / LAM;
+  c.theta = 0.3;
+  c.n = 1.0;
+  c.alpha = 0.4;
+  c.nd = 8;
+  c.ne = 8;
   int itmax = 4000;
   for (int i = 1; i < argc; i++) {
     double v = atof(strchr(argv[i], '=') + 1);
@@ -94,135 +166,222 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "nd=", 3)) c.nd = (int)v;
     if (!strncmp(argv[i], "ne=", 3)) c.ne = (int)v;
     if (!strncmp(argv[i], "th=", 3)) c.theta = v;
+    if (!strncmp(argv[i], "n=", 2)) c.n = v;
+    if (!strncmp(argv[i], "alpha=", 6)) c.alpha = v;
+    if (!strncmp(argv[i], "dth=", 4)) c.dth = v;
     if (!strncmp(argv[i], "it=", 3)) itmax = (int)v;
     if (!strncmp(argv[i], "oracle=", 7)) c.oracle = (int)v;
-    if (!strncmp(argv[i], "dth=", 4)) c.dth = v;
   }
   if (c.nd > MAXDIR || c.ne * c.ne > MAXCELL) return 1;
-  int ncell = c.ne * c.ne, dim = ncell * c.nd;
+  fresnel(&c);
+  int ncell = c.ne * c.ne;
+  double L = 0.5 * (double)c.ne * c.W;
+  int contrast = fabs(c.n - 1.0) > 1e-12;
+  printf("tdg2d: W=%.4g lam  kW=%.4g  ND=%d  NE=%d  box=%.4g lam  n=%.3f alpha=%.2f th=%.2f\n",
+         c.W / LAM, c.k0 * c.W, c.nd, c.ne, 2.0 * L / LAM, c.n, c.alpha, c.theta);
+
+  /* --- sub-cells ---------------------------------------------------------- */
+  int nsub = 0, dim = 0;
+  for (int a = 0; a < c.ne; a++)
+    for (int bb = 0; bb < c.ne; bb++) {
+      int q = a * c.ne + bb;
+      cellx[q] = -L + ((double)a + 0.5) * c.W;
+      celly[q] = -L + ((double)bb + 0.5) * c.W;
+      subof[q][0] = subof[q][1] = -1;
+      double smin = 1e300, smax = -1e300;
+      for (int i = 0; i < 4; i++) {
+        double x = cellx[q] + ((i & 1) ? 0.5 : -0.5) * c.W;
+        double y = celly[q] + ((i & 2) ? 0.5 : -0.5) * c.W;
+        double s = sdist(&c, x, y);
+        if (s < smin) smin = s;
+        if (s > smax) smax = s;
+      }
+      int cut = contrast && smin < 0.0 && smax > 0.0;
+      int own = (contrast && sdist(&c, cellx[q], celly[q]) < 0.0) ? 0 : 1;
+      for (int sd = 0; sd < 2; sd++) {
+        if (!cut && sd != own) continue;
+        if (nsub >= MAXSUB) return 1;
+        sub *s = &S[nsub];
+        s->cell = q;
+        s->side = sd;
+        s->cx = cellx[q];
+        s->cy = celly[q];
+        double km = (sd == 0 && contrast) ? c.k0 * c.n : c.k0;
+        if (c.oracle) {
+          /* the field's OWN directions: transmitted inside, incident + reflected
+           * outside; with no contrast the two outside waves coincide */
+          if (!contrast) {
+            /* the incident wave's OWN direction, which fresnel() defines against
+             * the interface normal — not the raw angle theta. dth rotates it
+             * deliberately, which is how the direction tolerance is measured. */
+            double a0 = atan2(c.py[0], c.px[0]) + c.dth;
+            s->nd = 1;
+            s->kx[0] = c.k0 * cos(a0);
+            s->ky[0] = c.k0 * sin(a0);
+          } else if (sd == 0) {
+            s->nd = 1;
+            s->kx[0] = c.px[2];
+            s->ky[0] = c.py[2];
+          } else {
+            s->nd = 2;
+            for (int d = 0; d < 2; d++) {
+              s->kx[d] = c.px[d];
+              s->ky[d] = c.py[d];
+            }
+          }
+        } else {
+          s->nd = c.nd;
+          for (int d = 0; d < c.nd; d++) {
+            double th = 2.0 * M_PI * ((double)d + 0.5) / (double)c.nd;
+            s->kx[d] = km * cos(th);
+            s->ky[d] = km * sin(th);
+          }
+        }
+        s->base = dim;
+        dim += s->nd;
+        subof[q][sd] = nsub++;
+      }
+    }
   if (dim > MAXDIM) {
     printf("tdg2d: dim %d too large\n", dim);
     return 1;
   }
-  double L = 0.5 * (double)c.ne * c.W;
-  printf("tdg2d: W=%.4g lam  kW=%.4g  ND=%d  NE=%d  box=%.4g lam  dim=%d\n", c.W / LAM, c.k0 * c.W,
-         c.nd, c.ne, 2.0 * L / LAM, dim);
+  printf("  cells=%d  sub-cells=%d  unknowns=%d\n", ncell, nsub, dim);
 
-  /* directions: a uniform fan, offset so the exact direction is NOT in it unless
-   * asked for — otherwise the exact solution is reproduced trivially */
-  static double dkx[MAXDIR], dky[MAXDIR];
-  for (int d = 0; d < c.nd; d++) {
-    double th = 2.0 * M_PI * ((double)d + 0.5) / (double)c.nd;
-    if (c.oracle && d == 0) th = c.theta + c.dth;
-    dkx[d] = c.k0 * cos(th);
-    dky[d] = c.k0 * sin(th);
-  }
-  double ekx = c.k0 * cos(c.theta), eky = c.k0 * sin(c.theta);
-
-  /* cell centres; the basis of cell q is exp(i k_d . (x - x_q)) */
-  static double cx[MAXCELL], cy[MAXCELL];
-  for (int a = 0; a < c.ne; a++)
-    for (int bb = 0; bb < c.ne; bb++) {
-      int q = a * c.ne + bb;
-      cx[q] = -L + ((double)a + 0.5) * c.W;
-      cy[q] = -L + ((double)bb + 0.5) * c.W;
-    }
-
-  size_t cap = 32u << 20;
+  size_t cap = 48u << 20;
   int *ja = malloc(cap * sizeof(int));
   double complex *va = malloc(cap * sizeof(double complex));
-  size_t *rp = malloc(200000 * sizeof(size_t));
-  double complex *rhs = calloc(200000, sizeof(double complex));
+  size_t *rp = malloc((MAXROW + 1) * sizeof(size_t));
+  double complex *rhs = calloc(MAXROW, sizeof(double complex));
   if (!ja || !va || !rp || !rhs) return 1;
   size_t nnz = 0;
   int nrow = 0;
   double complex i1 = CMPLX(0.0, 1.0);
 
-  /* ---- faces ------------------------------------------------------------
-   * For each face: the two adjacent cells (or one, at the boundary), the
-   * segment, and the normal pointing from cell A to cell B. */
+  /* One face. sb < 0 marks a box wall, where the impedance condition and its
+   * analytic drive replace the two jump conditions; wmask selects which exact
+   * waves live on that side. */
+#define ADDFACE(SA, SB, X0, Y0, X1, Y1, NX, NY, WMASK)                                             \
+  do {                                                                                             \
+    int scs[2] = {(SA), (SB)};                                                                     \
+    int isint = ((SB) >= 0);                                                                       \
+    for (int ti = 0; ti < 2; ti++) {                                                               \
+      if (scs[ti] < 0) continue;                                                                   \
+      const sub *ST = &S[scs[ti]];                                                                 \
+      for (int tm = 0; tm < ST->nd; tm++) {                                                        \
+        double tgx = -ST->kx[tm], tgy = -ST->ky[tm];                                               \
+        double complex tph = cexp(-i1 * (tgx * ST->cx + tgy * ST->cy));                            \
+        for (int cond = 0; cond < (isint ? 2 : 1); cond++) {                                       \
+          if (nrow >= MAXROW) return 1;                                                            \
+          rp[nrow] = nnz;                                                                          \
+          for (int t2 = 0; t2 < 2; t2++) {                                                         \
+            if (scs[t2] < 0) continue;                                                             \
+            const sub *SU = &S[scs[t2]];                                                           \
+            double sgn = isint ? (t2 == 0 ? -1.0 : 1.0) : 1.0;                                     \
+            for (int d = 0; d < SU->nd; d++) {                                                     \
+              double gx = SU->kx[d] + tgx, gy = SU->ky[d] + tgy;                                   \
+              double complex ph = cexp(-i1 * (SU->kx[d] * SU->cx + SU->ky[d] * SU->cy));           \
+              double complex Iv = seg_exp(gx, gy, (X0), (Y0), (X1), (Y1)) * ph * tph;              \
+              double dn = SU->kx[d] * (NX) + SU->ky[d] * (NY);                                     \
+              double complex w;                                                                    \
+              if (!isint)                                                                          \
+                w = (i1 * dn - i1 * c.k0) * Iv;                                                    \
+              else if (cond == 0)                                                                  \
+                w = sgn * Iv;                                                                      \
+              else                                                                                 \
+                w = sgn * i1 * dn * Iv / (i1 * c.k0);                                              \
+              if (!(cabs(w) > 0.0) || nnz >= cap) continue;                                        \
+              ja[nnz] = SU->base + d;                                                              \
+              va[nnz++] = w;                                                                       \
+            }                                                                                      \
+          }                                                                                        \
+          double complex dr = 0.0;                                                                 \
+          if (!isint)                                                                              \
+            for (int q2 = 0; q2 < 3; q2++) {                                                       \
+              if (!((WMASK) & (1 << q2))) continue;                                                \
+              double gx = c.px[q2] + tgx, gy = c.py[q2] + tgy;                                     \
+              double complex Iv = seg_exp(gx, gy, (X0), (Y0), (X1), (Y1)) * tph;                   \
+              dr += c.amp[q2] * (i1 * (c.px[q2] * (NX) + c.py[q2] * (NY)) - i1 * c.k0) * Iv;       \
+            }                                                                                      \
+          rhs[nrow] = dr;                                                                          \
+          nrow++;                                                                                  \
+        }                                                                                          \
+      }                                                                                            \
+    }                                                                                              \
+  } while (0)
+
+  /* inter-cell faces, each split by the interface into its two sides */
   for (int dir = 0; dir < 2; dir++)
     for (int a = 0; a < c.ne; a++)
       for (int bb = 0; bb <= c.ne; bb++) {
         int qa = -1, qb = -1;
         double x0, y0, x1, y1, nx, ny;
-        if (dir == 0) { /* vertical face at x = -L + bb*W */
+        if (dir == 0) {
           double xf = -L + (double)bb * c.W;
-          x0 = xf;
-          y0 = -L + (double)a * c.W;
-          x1 = xf;
-          y1 = y0 + c.W;
-          nx = 1.0;
-          ny = 0.0;
+          x0 = xf, y0 = -L + (double)a * c.W, x1 = xf, y1 = y0 + c.W, nx = 1.0, ny = 0.0;
           if (bb > 0) qa = (bb - 1) * c.ne + a;
           if (bb < c.ne) qb = bb * c.ne + a;
-        } else { /* horizontal face at y = -L + bb*W */
+        } else {
           double yf = -L + (double)bb * c.W;
-          x0 = -L + (double)a * c.W;
-          y0 = yf;
-          x1 = x0 + c.W;
-          y1 = yf;
-          nx = 0.0;
-          ny = 1.0;
+          x0 = -L + (double)a * c.W, y0 = yf, x1 = x0 + c.W, y1 = yf, nx = 0.0, ny = 1.0;
           if (bb > 0) qa = a * c.ne + (bb - 1);
           if (bb < c.ne) qb = a * c.ne + bb;
         }
-        /* tests on this face: the traces of every basis function of the
-         * adjacent cells, conjugated */
-        int qs[2] = {qa, qb};
-        int interior = (qa >= 0 && qb >= 0);
-        for (int ti = 0; ti < 2; ti++) {
-          if (qs[ti] < 0) continue;
-          for (int tm = 0; tm < c.nd; tm++) {
-            int qt = qs[ti];
-            /* conj(T) = exp(-i k_tm .(x - x_qt)) */
-            double tgx = -dkx[tm], tgy = -dky[tm];
-            double complex tph = cexp(-i1 * (tgx * cx[qt] + tgy * cy[qt]));
-            int nc = interior ? 2 : 1;
-            for (int cond = 0; cond < nc; cond++) {
-              rp[nrow] = nnz;
-              double complex acc = 0.0;
-              for (int ti2 = 0; ti2 < 2; ti2++) {
-                int q = qs[ti2];
-                if (q < 0) continue;
-                double sgn = interior ? (ti2 == 0 ? -1.0 : 1.0) : 1.0; /* [.] = B - A */
-                for (int d = 0; d < c.nd; d++) {
-                  double gx = dkx[d] + tgx, gy = dky[d] + tgy;
-                  double complex ph = cexp(-i1 * (dkx[d] * cx[q] + dky[d] * cy[q]));
-                  double complex Iv = seg_exp(gx, gy, x0, y0, x1, y1) * ph * tph;
-                  double complex w;
-                  if (!interior) {
-                    /* impedance: dn u - i k u */
-                    w = (i1 * (dkx[d] * nx + dky[d] * ny) - i1 * c.k0) * Iv;
-                  } else if (cond == 0) {
-                    w = sgn * Iv; /* [u] */
-                  } else {
-                    w = sgn * i1 * (dkx[d] * nx + dky[d] * ny) * Iv / (i1 * c.k0);
-                  }
-                  if (!(cabs(w) > 0.0) || nnz >= cap) continue;
-                  ja[nnz] = q * c.nd + d;
-                  va[nnz++] = w;
-                }
-              }
-              (void)acc;
-              if (!interior) {
-                /* drive: the same impedance combination of the exact wave */
-                double gx = ekx + tgx, gy = eky + tgy;
-                double complex Iv = seg_exp(gx, gy, x0, y0, x1, y1) * tph;
-                rhs[nrow] = (i1 * (ekx * nx + eky * ny) - i1 * c.k0) * Iv;
-              } else {
-                rhs[nrow] = 0.0;
-              }
-              nrow++;
-            }
+        for (int sd = 0; sd < 2; sd++) {
+          if (!contrast && sd == 0) continue;
+          double ax = x0, ay = y0, bx = x1, by = y1;
+          if (contrast && !clip_side(&c, sd, &ax, &ay, &bx, &by)) continue;
+          int sa = (qa >= 0) ? subof[qa][sd] : -1;
+          int sb = (qb >= 0) ? subof[qb][sd] : -1;
+          int mask = !contrast ? 1 : (sd == 0 ? 4 : 3);
+          if (sa >= 0 && sb >= 0) {
+            ADDFACE(sa, sb, ax, ay, bx, by, nx, ny, mask);
+          } else if (sa >= 0) {
+            ADDFACE(sa, -1, ax, ay, bx, by, nx, ny, mask);
+          } else if (sb >= 0) {
+            ADDFACE(sb, -1, ax, ay, bx, by, -nx, -ny, mask);
           }
         }
       }
-  rp[nrow] = nnz;
-  printf("  rows=%d  unknowns=%d  (%.1fx overdetermined)  nnz=%zu\n", nrow, dim,
-         (double)nrow / (double)dim, nnz);
 
-  /* row equilibration */
+  /* THE MATERIAL INTERFACE, as an ordinary face between the two sub-cells of a
+   * cut cell. Same two conditions as every interior face — they ARE the physical
+   * transmission conditions. */
+  int nif = 0;
+  if (contrast)
+    for (int q = 0; q < ncell; q++) {
+      if (subof[q][0] < 0 || subof[q][1] < 0) continue;
+      double sc = sdist(&c, cellx[q], celly[q]);
+      double ox = cellx[q] - sc * c.nhx, oy = celly[q] - sc * c.nhy;
+      double t0 = -1e300, t1 = 1e300;
+      const double lo[2] = {cellx[q] - 0.5 * c.W, celly[q] - 0.5 * c.W};
+      const double hi[2] = {cellx[q] + 0.5 * c.W, celly[q] + 0.5 * c.W};
+      const double dd[2] = {c.thx, c.thy}, oo[2] = {ox, oy};
+      int empty = 0;
+      for (int ax2 = 0; ax2 < 2; ax2++) {
+        if (fabs(dd[ax2]) < 1e-300) {
+          if (oo[ax2] < lo[ax2] || oo[ax2] > hi[ax2]) empty = 1;
+          continue;
+        }
+        double ta = (lo[ax2] - oo[ax2]) / dd[ax2], tb = (hi[ax2] - oo[ax2]) / dd[ax2];
+        if (ta > tb) {
+          double sw = ta;
+          ta = tb;
+          tb = sw;
+        }
+        if (ta > t0) t0 = ta;
+        if (tb < t1) t1 = tb;
+      }
+      if (empty || !(t0 < t1)) continue;
+      double ax = ox + c.thx * t0, ay = oy + c.thy * t0;
+      double bx = ox + c.thx * t1, by = oy + c.thy * t1;
+      nif++;
+      ADDFACE(subof[q][0], subof[q][1], ax, ay, bx, by, c.nhx, c.nhy, 0);
+    }
+  rp[nrow] = nnz;
+  printf("  rows=%d  (%.1fx overdetermined)  nnz=%zu  interface faces=%d\n", nrow,
+         (double)nrow / (double)dim, nnz, nif);
+
   for (int r = 0; r < nrow; r++) {
     double s = 0.0;
     for (size_t p = rp[r]; p < rp[r + 1]; p++)
@@ -234,27 +393,33 @@ int main(int argc, char **argv) {
     rhs[r] /= s;
   }
 
-  /* the exact solution IS in the span when oracle=1: coefficient 1 on direction
-   * 0 of every cell, with the cell's phase reference */
-  double complex *ce = calloc((size_t)dim, sizeof(double complex));
-  if (!ce) return 1;
-  if (c.oracle)
-    for (int q = 0; q < ncell; q++)
-      ce[q * c.nd + 0] = cexp(i1 * (ekx * cx[q] + eky * cy[q]));
-  if (c.oracle) {
-    double e2 = 0.0, nb = 0.0;
-    for (int r = 0; r < nrow; r++) {
-      double complex s = 0.0;
-      for (size_t p = rp[r]; p < rp[r + 1]; p++)
-        s += va[p] * ce[ja[p]];
-      e2 += cabs(s - rhs[r]) * cabs(s - rhs[r]);
-      nb += cabs(rhs[r]) * cabs(rhs[r]);
+  /* With the field's own directions and no deliberate angular error the exact
+   * solution is IN THE SPAN exactly, so the assembled rows must reproduce it. */
+  if (c.oracle && !(fabs(c.dth) > 0.0)) {
+    double complex *ce = calloc((size_t)dim, sizeof(double complex));
+    if (ce) {
+      for (int s = 0; s < nsub; s++) {
+        const sub *SU = &S[s];
+        for (int d = 0; d < SU->nd; d++) {
+          int q2 = (contrast && SU->side == 0) ? 2 : (contrast ? d : 0);
+          ce[SU->base + d] = c.amp[q2] * cexp(i1 * (SU->kx[d] * SU->cx + SU->ky[d] * SU->cy));
+        }
+      }
+      double e2 = 0.0, nb = 0.0;
+      for (int r = 0; r < nrow; r++) {
+        double complex s = 0.0;
+        for (size_t p = rp[r]; p < rp[r + 1]; p++)
+          s += va[p] * ce[ja[p]];
+        e2 += cabs(s - rhs[r]) * cabs(s - rhs[r]);
+        nb += cabs(rhs[r]) * cabs(rhs[r]);
+      }
+      printf("  [diag] exact solution in assembled rows: |Ac-b| = %.3e of |b| = %.3e\n", sqrt(e2),
+             sqrt(nb));
+      free(ce);
     }
-    printf("  [diag] exact solution in assembled rows: |Ac-b| = %.3e of |b| = %.3e\n", sqrt(e2),
-           sqrt(nb));
   }
 
-  /* ---- LSQR ------------------------------------------------------------- */
+  /* --- LSQR --------------------------------------------------------------- */
   double complex *xs = calloc((size_t)dim, sizeof(double complex));
   double complex *uu = calloc((size_t)nrow, sizeof(double complex));
   double complex *vv = calloc((size_t)dim, sizeof(double complex));
@@ -267,6 +432,10 @@ int main(int argc, char **argv) {
   for (int r = 0; r < nrow; r++)
     beta += cabs(uu[r]) * cabs(uu[r]);
   beta = sqrt(beta);
+  if (!(beta > 0.0)) {
+    printf("  ABORT: zero drive\n");
+    return 1;
+  }
   for (int r = 0; r < nrow; r++)
     uu[r] /= beta;
   for (int j = 0; j < dim; j++)
@@ -314,13 +483,13 @@ int main(int argc, char **argv) {
       vv[j] /= alpha;
     double rho = sqrt(rhobar * rhobar + beta * beta);
     double cs = rhobar / rho, sn = beta / rho;
-    double theta = sn * alpha;
+    double th2 = sn * alpha;
     rhobar = -cs * alpha;
     double phi = cs * phibar;
     phibar = sn * phibar;
     for (int j = 0; j < dim; j++) {
       xs[j] += (phi / rho) * ww[j];
-      ww[j] = vv[j] - (theta / rho) * ww[j];
+      ww[j] = vv[j] - (th2 / rho) * ww[j];
     }
     double rr = phibar / b0;
     if (!n2 && rr <= 1e-2) n2 = it + 1;
@@ -332,26 +501,30 @@ int main(int argc, char **argv) {
   printf("  LSQR |r|/|b| = %.3e   iters to 1e-2/1e-3/1e-4/1e-6/1e-8: %d/%d/%d/%d/%d\n", phibar / b0,
          n2, n3, n4, n6, n8);
 
-  /* ---- error against the exact plane wave, cell centres and quarter points */
+  /* --- error against Fresnel, sampled inside each sub-cell's own region ---- */
   double num = 0.0, den = 0.0;
-  for (int q = 0; q < ncell; q++)
-    for (int s = 0; s < 9; s++) {
-      double ox = ((double)(s % 3) - 1.0) * 0.3 * c.W, oy = ((double)(s / 3) - 1.0) * 0.3 * c.W;
-      double x = cx[q] + ox, y = cy[q] + oy;
+  int nsamp = 0;
+  for (int s = 0; s < nsub; s++) {
+    const sub *SU = &S[s];
+    for (int p = 0; p < 25; p++) {
+      double ox = ((double)(p % 5) - 2.0) * 0.2 * c.W, oy = ((double)(p / 5) - 2.0) * 0.2 * c.W;
+      double x = SU->cx + ox, y = SU->cy + oy;
+      if (contrast && ((SU->side == 0) != (sdist(&c, x, y) < 0.0))) continue;
       double complex got = 0.0;
-      for (int d = 0; d < c.nd; d++)
-        got += xs[q * c.nd + d] * cexp(i1 * (dkx[d] * (x - cx[q]) + dky[d] * (y - cy[q])));
-      double complex ex = cexp(i1 * (ekx * x + eky * y));
+      for (int d = 0; d < SU->nd; d++)
+        got += xs[SU->base + d] * cexp(i1 * (SU->kx[d] * (x - SU->cx) + SU->ky[d] * (y - SU->cy)));
+      double complex ex = uexact(&c, x, y);
       num += cabs(got - ex) * cabs(got - ex);
       den += cabs(ex) * cabs(ex);
+      nsamp++;
     }
-  printf("  FIELD ERROR = %.4e\n", sqrt(num / den));
+  }
+  printf("  FIELD ERROR = %.4e   (%d samples)\n", sqrt(num / den), nsamp);
 
   free(ja);
   free(va);
   free(rp);
   free(rhs);
-  free(ce);
   free(xs);
   free(uu);
   free(vv);

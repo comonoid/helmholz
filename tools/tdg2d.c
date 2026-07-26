@@ -43,7 +43,7 @@ static const double LAM = 1.0;
 
 typedef struct {
   double W, k0, theta, n, alpha, dth;
-  int nd, ne, oracle, lev;
+  int nd, ne, oracle, lev, spec;
   double lodk;
   double nhx, nhy, thx, thy;
   /* TWO incident waves with their Fresnel partners: 0,1,2 = incident, reflected,
@@ -160,8 +160,8 @@ static double skey[2][MAXCELL];
 static int ord[2][MAXCELL];
 
 int main(int argc, char **argv) {
-  static const char *const KEYS[] = {"W",   "nd",     "ne",  "th",   "it",   "n",   "alpha",
-                                     "dth", "oracle", "lev", "lodk", "amp2", "th2", NULL};
+  static const char *const KEYS[] = {"W",      "nd",  "ne",   "th",   "it",  "n",    "alpha", "dth",
+                                     "oracle", "lev", "lodk", "amp2", "th2", "spec", NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -216,6 +216,7 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "lodk=", 5)) c.lodk = v;
     if (!strncmp(argv[i], "amp2=", 5)) c.amp2 = v;
     if (!strncmp(argv[i], "th2=", 4)) c.theta2 = v;
+    if (!strncmp(argv[i], "spec=", 5)) c.spec = (int)v;
   }
   if (c.nd > MAXDIR || c.ne * c.ne > MAXCELL) return 1;
   fresnel(&c);
@@ -660,6 +661,82 @@ int main(int argc, char **argv) {
   }
   printf("  LSQR |r|/|b| = %.3e   iters to 1e-2/1e-3/1e-4/1e-6/1e-8: %d/%d/%d/%d/%d\n", phibar / b0,
          n2, n3, n4, n6, n8);
+
+  /* --- WHICH DIRECTION IS MISSING? A MATCHED FILTER ON THE RESIDUAL --------
+   * A direction absent from the basis cannot be reproduced, so it survives in
+   * the residual of the boundary condition; along a wall its phase runs as
+   * k (d.t) s, and referenced to absolute position it is exp(i k d.x). So
+   * projecting the sampled residual onto exp(i k d.x) over all walls and
+   * scanning d over the circle is a matched filter whose peak NAMES the missing
+   * direction.
+   * If this works, directions need not be supplied by geometry at all: they can
+   * be DISCOVERED from a solve and added where the residual asks for them. That
+   * is the whole point of doing it this way rather than building an a priori
+   * estimator — an a priori rule cannot know about edges, caustics or multiple
+   * scattering, and the residual does. */
+  if (c.spec > 0) {
+    enum { NPHI = 1440, NSMP = 64 };
+    static double complex acc[NPHI];
+    for (int p = 0; p < NPHI; p++)
+      acc[p] = 0.0;
+    double norm = 0.0;
+    for (int q = 0; q < ncell; q++)
+      for (int ax2 = 0; ax2 < 2; ax2++)
+        for (int sgn = -1; sgn <= 1; sgn += 2) {
+          double h = 0.5 * cellh[q];
+          double coord = (ax2 == 0) ? cellx[q] + sgn * h : celly[q] + sgn * h;
+          if (fabs(fabs(coord) - L) > 1e-9 * c.W) continue;
+          double nx = (ax2 == 0) ? (double)sgn : 0.0, ny = (ax2 == 0) ? 0.0 : (double)sgn;
+          double lo = (ax2 == 0) ? celly[q] - h : cellx[q] - h;
+          for (int sd = 0; sd < 2; sd++) {
+            int sa = subof[q][sd];
+            if (sa < 0) continue;
+            const sub *SU = &S[sa];
+            for (int t = 0; t < NSMP; t++) {
+              double u = lo + cellh[q] * ((double)t + 0.5) / (double)NSMP;
+              double x = (ax2 == 0) ? coord : u, y = (ax2 == 0) ? u : coord;
+              if (contrast && ((SU->side == 0) != (sdist(&c, x, y) < 0.0))) continue;
+              double complex uu2 = 0.0, du = 0.0;
+              for (int d = 0; d < SU->nd; d++) {
+                double complex e = cexp(i1 * (SU->kx[d] * (x - SU->cx) + SU->ky[d] * (y - SU->cy)));
+                uu2 += xs[SU->base + d] * e;
+                du += xs[SU->base + d] * i1 * (SU->kx[d] * nx + SU->ky[d] * ny) * e;
+              }
+              double complex hh = 0.0;
+              for (int qq = 0; qq < c.nwave; qq++) {
+                if (((qq % 3) == 2) == (sdist(&c, x, y) > 0.0)) continue;
+                hh += c.amp[qq] * (i1 * (c.px[qq] * nx + c.py[qq] * ny) - i1 * c.k0) *
+                      cexp(i1 * (c.px[qq] * x + c.py[qq] * y));
+              }
+              double complex r = (du - i1 * c.k0 * uu2) - hh;
+              double w = cellh[q] / (double)NSMP;
+              norm += cabs(r) * cabs(r) * w;
+              for (int p = 0; p < NPHI; p++) {
+                double ph = 2.0 * M_PI * (double)p / (double)NPHI;
+                double gx = c.k0 * cos(ph), gy = c.k0 * sin(ph);
+                acc[p] += w * r * cexp(-i1 * (gx * x + gy * y));
+              }
+            }
+          }
+        }
+    int best = 0;
+    double bv = 0.0, tot = 0.0;
+    for (int p = 0; p < NPHI; p++) {
+      double v = cabs(acc[p]);
+      tot += v * v;
+      if (v > bv) {
+        bv = v;
+        best = p;
+      }
+    }
+    double bphi = 2.0 * M_PI * (double)best / (double)NPHI;
+    printf("  [spectrum] wall residual %.3e; matched-filter peak at %.5f rad, "
+           "sharpness %.3f\n",
+           sqrt(norm), bphi, bv / sqrt(tot / (double)NPHI));
+    /* what the peak SHOULD be if it is finding the wave the basis lacks */
+    for (int q = 3; q < c.nwave; q++)
+      printf("             missing wave %d true direction %.5f rad\n", q, atan2(c.py[q], c.px[q]));
+  }
 
   /* --- error against Fresnel, sampled inside each sub-cell's own region ---- */
   double num = 0.0, den = 0.0;

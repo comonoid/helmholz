@@ -77,7 +77,10 @@ typedef struct {
   int nitmode;      /* NIT_* above */
   int forcecut;     /* cut the basis even at zero contrast (falsifier F-N1) */
   int carrier;      /* 0 = cost baseline: plain partition-of-unity basis, no plane wave */
-  int nv;           /* vertices of the cut polygon = facets */
+  int square;       /* 1 = square formulation: integrate over Omega, DtN as a boundary term */
+  int nomega;       /* facets of the truncation polygon approximating r = R */
+  hz_half2 omhp[HZ_CUT_MAXHP];
+  int nv; /* vertices of the cut polygon = facets */
   double vx[HZ_CUT_MAXHP], vy[HZ_CUT_MAXHP];
 } cfg;
 
@@ -105,7 +108,10 @@ static int build(const cfg *c, elem *b) {
     for (int ny = -nmax; ny <= nmax; ny++) {
       double px = c->W * (double)nx, py = c->W * (double)ny;
       double r = sqrt(px * px + py * py);
-      if (r > c->R + 4.0 * c->W) continue; /* columns: rows need n+-4 neighbours */
+      /* Square formulation: the space is the set of functions whose support MEETS
+       * Omega; anything further out is an all-zero column. Otherwise the old
+       * rule, where columns run past the rows on purpose. */
+      if (r > (c->square ? c->R + 2.0 * c->W * sqrt(2.0) : c->R + 4.0 * c->W)) continue;
       int str = straddles(c, nx, ny);
       for (int pass = 0; pass < 2; pass++) {
         int side, inside;
@@ -146,17 +152,32 @@ static int build(const cfg *c, elem *b) {
 
 /* One term of the Galerkin entry over the region of the pair. side handling:
  * inside is the convex polygon, outside is "whole minus inside". */
-static double complex region_int(const hz_half2 *hp, int nhp, int sidei, int sidej, double xlo,
-                                 double xhi, double ylo, double yhi, hz_axis2 fx, hz_axis2 fy,
-                                 double complex omx, double complex omy) {
+/* om/nom: half-planes of the TRUNCATION polygon (the domain Omega). In the
+ * square formulation every volume integral is taken over Omega and nothing
+ * outside it, because that is what makes Green's identity produce a boundary
+ * term on r = R for the DtN condition to hang on. Passing nom = 0 restores the
+ * old behaviour (integrate over whole supports).
+ * Both regions stay CONVEX and so remain one call each: "inside" is
+ * (material disc) ^ Omega, "outside" is Omega minus that. */
+static double complex region_int(const hz_half2 *hp, int nhp, const hz_half2 *om, int nom,
+                                 int sidei, int sidej, double xlo, double xhi, double ylo,
+                                 double yhi, hz_axis2 fx, hz_axis2 fy, double complex omx,
+                                 double complex omy) {
   int in = (sidei == 0) || (sidej == 0);
   int out = (sidei == 1) || (sidej == 1);
   if (in && out) return 0.0; /* opposite sides of the cut: disjoint */
-  if (in) return hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, hp, nhp);
+  hz_half2 both[HZ_CUT_MAXHP];
+  int nboth = 0;
+  for (int i = 0; i < nom && nboth < HZ_CUT_MAXHP; i++)
+    both[nboth++] = om[i];
+  int nom_only = nboth;
+  for (int i = 0; i < nhp && nboth < HZ_CUT_MAXHP; i++)
+    both[nboth++] = hp[i];
+  if (in) return hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, both, nboth);
   if (out)
-    return hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, hp, 0) -
-           hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, hp, nhp);
-  return hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, hp, 0);
+    return hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, both, nom_only) -
+           hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, both, nboth);
+  return hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, both, nom_only);
 }
 
 /* k^2 of the MEDIUM on the region a pair shares.
@@ -246,14 +267,26 @@ static double complex nitsche_term(const cfg *c, elem ei, elem ej) {
   return v;
 }
 
-static double complex entry(const cfg *c, const hz_half2 *hp, int nhp, elem ei, elem ej) {
+static double complex entry(const cfg *c, const hz_half2 *hp, int nhp, const hz_half2 *om, int nom,
+                            elem ei, elem ej) {
   double W = c->W;
-  if (ei.side < 0 && ej.side < 0) return entry_sep(W, ei, ej);
   double xlo = W * ((double)(ei.nx > ej.nx ? ei.nx : ej.nx) - 2.0);
   double xhi = W * ((double)(ei.nx < ej.nx ? ei.nx : ej.nx) + 2.0);
   double ylo = W * ((double)(ei.ny > ej.ny ? ei.ny : ej.ny) - 2.0);
   double yhi = W * ((double)(ei.ny < ej.ny ? ei.ny : ej.ny) + 2.0);
   if (!(xlo < xhi) || !(ylo < yhi)) return 0.0;
+  /* Does the truncation actually bite on THIS pair? Almost never: only a ring of
+   * elements reaches r = R, and for everyone else the clip is a no-op that would
+   * cost 96 half-planes per integral and would forfeit the separable fast path. */
+  if (nom > 0) {
+    double ax = fabs(xlo) > fabs(xhi) ? fabs(xlo) : fabs(xhi);
+    double ay = fabs(ylo) > fabs(yhi) ? fabs(ylo) : fabs(yhi);
+    if (sqrt(ax * ax + ay * ay) <= c->R * cos(M_PI / (double)nom)) nom = 0;
+  }
+  /* The separable fast path is valid only when the pair meets neither the cut
+   * NOR the truncation boundary: either makes the region something other than
+   * the plain support rectangle. */
+  if (ei.side < 0 && ej.side < 0 && nom == 0) return entry_sep(W, ei, ej);
   double complex omx = ei.kx + ej.kx, omy = ei.ky + ej.ky; /* bilinear: add */
   double complex i1 = CMPLX(0.0, 1.0);
   double complex pref = cexp(-i1 * (ei.kx * W * (double)ei.nx + ej.kx * W * (double)ej.nx +
@@ -265,17 +298,17 @@ static double complex entry(const cfg *c, const hz_half2 *hp, int nhp, elem ei, 
   hz_axis2 X0 = {{fi0, fj0}, 2}, X1 = {{fi0, fj1}, 2}, X2 = {{fi0, fj2}, 2};
   hz_axis2 Y0 = {{gi0, gj0}, 2}, Y1 = {{gi0, gj1}, 2}, Y2 = {{gi0, gj2}, 2};
   double complex t = 0.0;
-  t += region_int(hp, nhp, ei.side, ej.side, xlo, xhi, ylo, yhi, X2, Y0, omx, omy);
+  t += region_int(hp, nhp, om, nom, ei.side, ej.side, xlo, xhi, ylo, yhi, X2, Y0, omx, omy);
   t += 2.0 * i1 * ej.kx *
-       region_int(hp, nhp, ei.side, ej.side, xlo, xhi, ylo, yhi, X1, Y0, omx, omy);
-  t += region_int(hp, nhp, ei.side, ej.side, xlo, xhi, ylo, yhi, X0, Y2, omx, omy);
+       region_int(hp, nhp, om, nom, ei.side, ej.side, xlo, xhi, ylo, yhi, X1, Y0, omx, omy);
+  t += region_int(hp, nhp, om, nom, ei.side, ej.side, xlo, xhi, ylo, yhi, X0, Y2, omx, omy);
   t += 2.0 * i1 * ej.ky *
-       region_int(hp, nhp, ei.side, ej.side, xlo, xhi, ylo, yhi, X0, Y1, omx, omy);
+       region_int(hp, nhp, om, nom, ei.side, ej.side, xlo, xhi, ylo, yhi, X0, Y1, omx, omy);
   /* Medium term: identically zero while the carrier is local to the medium (see
    * entry_sep), the whole Helmholtz term once the carrier is switched off. */
   double dk2 = pair_k2(ei, ej) - ej.kc2;
   if (fabs(dk2) > 0.0)
-    t += dk2 * region_int(hp, nhp, ei.side, ej.side, xlo, xhi, ylo, yhi, X0, Y0, omx, omy);
+    t += dk2 * region_int(hp, nhp, om, nom, ei.side, ej.side, xlo, xhi, ylo, yhi, X0, Y0, omx, omy);
   return pref * t + nitsche_term(c, ei, ej);
 }
 
@@ -378,13 +411,75 @@ static double field_err(const cfg *c, const elem *b, int dim, const double compl
   return sqrt(num / den);
 }
 
+/* The DtN boundary block as a FACTORED operator rather than a matrix.
+ *   D_ij = -2 pi R * sum_m hu_i(-m) * [ dr B_j - Lam B_j ]_m
+ * couples every boundary function to every other, so as a matrix it costs
+ * nbnd^2; as an operator it is rank 2 mmax + 1. Row equilibration scaled the
+ * sparse rows, so the same factor has to be applied here or the two halves of a
+ * row would sit at different scales. */
+typedef struct {
+  int on, n, nm;
+  const int *idx;           /* column index of each boundary function */
+  const double complex *ut; /* test side:  ut[t*nm+mi] = hu_i(-m) */
+  const double complex *f;  /* trial side: f[t*nm+mi]  = (dr B_j - Lam B_j)_m */
+  const double *rowsc;
+  double scale;
+} lowrank;
+
+static void applyA(size_t nrow, const size_t *rp, const int *ja, const double complex *va,
+                   const double complex *x, double complex *y, const lowrank *L) {
+  for (size_t r = 0; r < nrow; r++) {
+    double complex s = 0.0;
+    for (size_t p = rp[r]; p < rp[r + 1]; p++)
+      s += va[p] * x[ja[p]];
+    y[r] = s;
+  }
+  if (!L->on) return;
+  double complex t[2 * MAXM + 1];
+  for (int mi = 0; mi < L->nm; mi++)
+    t[mi] = 0.0;
+  for (int q = 0; q < L->n; q++)
+    for (int mi = 0; mi < L->nm; mi++)
+      t[mi] += L->f[(size_t)q * (size_t)L->nm + (size_t)mi] * x[L->idx[q]];
+  for (int q = 0; q < L->n; q++) {
+    double complex s = 0.0;
+    for (int mi = 0; mi < L->nm; mi++)
+      s += L->ut[(size_t)q * (size_t)L->nm + (size_t)mi] * t[mi];
+    y[L->idx[q]] += L->scale * L->rowsc[L->idx[q]] * s;
+  }
+}
+
+static void applyAT(size_t nrow, int dim, const size_t *rp, const int *ja, const double complex *va,
+                    const double complex *y, double complex *z, const lowrank *L) {
+  for (int j = 0; j < dim; j++)
+    z[j] = 0.0;
+  for (size_t r = 0; r < nrow; r++)
+    for (size_t p = rp[r]; p < rp[r + 1]; p++)
+      z[ja[p]] += conj(va[p]) * y[r];
+  if (!L->on) return;
+  double complex t[2 * MAXM + 1];
+  for (int mi = 0; mi < L->nm; mi++)
+    t[mi] = 0.0;
+  for (int q = 0; q < L->n; q++)
+    for (int mi = 0; mi < L->nm; mi++)
+      t[mi] +=
+          conj(L->ut[(size_t)q * (size_t)L->nm + (size_t)mi]) * L->rowsc[L->idx[q]] * y[L->idx[q]];
+  for (int q = 0; q < L->n; q++) {
+    double complex s = 0.0;
+    for (int mi = 0; mi < L->nm; mi++)
+      s += conj(L->f[(size_t)q * (size_t)L->nm + (size_t)mi]) * t[mi];
+    z[L->idx[q]] += conj(L->scale) * s;
+  }
+}
+
 /* KEY=VALUE arguments, and an unknown key is an ABORT rather than a default.
  * Thirteen positional arguments were ready ground for the seventeenth artefact
  * of this project: one misplaced position in a sweep is indistinguishable from
  * physics in the output. */
-static const char *const KEYS[] = {"W",   "nd",  "facets", "R",        "mmax",    "dtnw",    "it",
-                                   "n",   "pen", "nit",    "forcecut", "rrow",    "ngam",    "gamw",
-                                   "sym", "a5",  "rm",     "plateau",  "carrier", "ftarget", NULL};
+static const char *const KEYS[] = {"W",       "nd",     "facets", "R",       "mmax",     "dtnw",
+                                   "it",      "n",      "pen",    "nit",     "forcecut", "rrow",
+                                   "ngam",    "gamw",   "sym",    "a5",      "rm",       "plateau",
+                                   "carrier", "square", "nomega", "ftarget", NULL};
 
 static double argval(int argc, char **argv, const char *key, double def) {
   size_t kl = strlen(key);
@@ -442,6 +537,21 @@ int main(int argc, char **argv) {
   double kmax = c.k0 * (c.n > 1.0 ? c.n : 1.0);
   c.beta = c.pen * (kmax + CINV / c.W);
   c.nv = hz_cut2d_disc_verts(0.0, 0.0, c.a, c.nfacet, 1, c.vx, c.vy);
+  c.square = (int)argval(argc, argv, "square", 0.0);
+  c.nomega = (int)argval(argc, argv, "nomega", 96);
+  if (c.square) {
+    c.nomega = hz_cut2d_disc(0.0, 0.0, c.R, c.nomega, 1, c.omhp);
+    /* THE ONE INCONSISTENCY OF THIS FORMULATION, PRINTED RATHER THAN HIDDEN.
+     * The volume is truncated by a POLYGON while the DtN symbol diagonalises on
+     * a CIRCLE, so the two boundaries differ by the sagitta. It has to sit well
+     * below the target accuracy or it becomes an unattributed part of "method
+     * error" — which is how this project has lost readings before. */
+    double sag = c.R * (1.0 - cos(M_PI / (double)c.nomega));
+    printf("  square formulation: Omega = %d-gon at R, sagitta = %.3e lam = %.2e of R\n", c.nomega,
+           sag / LAM, sag / c.R);
+  } else {
+    c.nomega = 0;
+  }
   printf("slice2d: ka=%.2f n=%.2f R=%.2flam W=%.3flam ND=%d facets=%d mmax=%d\n", c.k0 * c.a, c.n,
          c.R / LAM, c.W / LAM, c.nd, c.nfacet, c.mmax);
   printf("  nitsche: mode=%d pen=%.4g beta=%.4f (kmax=%.3f + %.3f/W) forcecut=%d dtnw=%.4g\n",
@@ -450,7 +560,7 @@ int main(int argc, char **argv) {
   static elem b[MAXDIM];
   int dim = build(&c, b);
   int ngam0 = (int)argval(argc, argv, "ngam", 0);
-  int nrow = dim + 2 * c.mmax + 1 + 2 * ngam0;
+  int nrow = c.square ? dim : dim + 2 * c.mmax + 1 + 2 * ngam0;
   printf("  dim=%d  operator rows=%d  DtN rows=%d  total rows=%d\n", dim, dim, 2 * c.mmax + 1,
          nrow);
   if (dim >= MAXDIM) {
@@ -496,22 +606,120 @@ int main(int argc, char **argv) {
    * rrow= restores the cutoff for comparison. */
   double rrow = argval(argc, argv, "rrow", 0.0) * c.W;
   if (!(rrow > 0.0)) rrow = c.R;
+  if (c.square) rrow = 1e300; /* square: one equation per basis function, no exceptions */
+
+  /* --- THE BOUNDARY BLOCK OF THE SQUARE FORMULATION ------------------------
+   * Green's identity over Omega turns the strong form into the weak one and
+   * leaves a term on r = R for the radiation condition to hang on:
+   *   a(u,v) - l(v) = -[Strong^Omega + Nitsche] + Int_{r=R} v (dr u - Lam u - g)
+   * so the assembled row is the OLD entry() clipped to Omega, MINUS
+   *   D_ij = Int_{r=R} B_i (dr B_j - Lam B_j) ds,
+   * with right-hand side -Int_{r=R} B_i g ds. Nothing else changes, and in
+   * particular the volume machinery and the Nitsche term are untouched.
+   *
+   * Lam is diagonal in harmonics, so its part of D is LOW RANK: 2 mmax + 1
+   * harmonics, stored as the coefficients of each boundary-touching function.
+   * Int B_i dr B_j is taken through the same harmonics (Parseval), which keeps
+   * the two halves consistent to the same truncation instead of pitting an
+   * exact quadrature against a truncated operator. */
+  double reach = 2.0 * c.W * sqrt(2.0);
+  int nm = 2 * c.mmax + 1;
+  double complex *hu = NULL, *hd = NULL, *lru = NULL, *lrf = NULL;
+  int *bnd = NULL, nbnd = 0;
+  if (c.square) {
+    hu = calloc((size_t)dim * (size_t)nm, sizeof(double complex));
+    hd = calloc((size_t)dim * (size_t)nm, sizeof(double complex));
+    bnd = calloc((size_t)dim, sizeof(int));
+    if (!hu || !hd || !bnd) exit(1); /* fatal: earlier buffers are the OS problem now */
+    for (int j = 0; j < dim; j++) {
+      double px = c.W * (double)b[j].nx, py = c.W * (double)b[j].ny;
+      if (fabs(sqrt(px * px + py * py) - c.R) > reach) continue;
+      bnd[nbnd++] = j;
+      hz_carrier2d cb = {c.W, b[j].nx, b[j].ny, b[j].kx, b[j].ky};
+      for (int mi = 0; mi < nm; mi++)
+        hz_dtn_harm(&dt, mi - c.mmax, cb, &hu[(size_t)j * (size_t)nm + (size_t)mi],
+                    &hd[(size_t)j * (size_t)nm + (size_t)mi]);
+    }
+    /* pack the two factors of the boundary operator, indexed by boundary slot */
+    lru = malloc((size_t)nbnd * (size_t)nm * sizeof(double complex));
+    lrf = malloc((size_t)nbnd * (size_t)nm * sizeof(double complex));
+    if (!lru || !lrf) exit(1);
+    for (int q = 0; q < nbnd; q++)
+      for (int mi = 0; mi < nm; mi++) {
+        size_t s = (size_t)bnd[q] * (size_t)nm, d2 = (size_t)q * (size_t)nm + (size_t)mi;
+        lru[d2] = hu[s + (size_t)(nm - 1 - mi)]; /* harmonic -m of the TEST function */
+        lrf[d2] = hd[s + (size_t)mi] - hz_dtn_symbol(&dt, mi - c.mmax) * hu[s + (size_t)mi];
+      }
+    printf("  square: %d of %d functions reach the boundary; boundary block kept factored, "
+           "rank %d (as a matrix it would be %.2e entries)\n",
+           nbnd, dim, nm, (double)nbnd * (double)nbnd);
+  }
+
+  /* A row is accumulated in a scratch vector before being emitted, because the
+   * volume block and the boundary block can hit the SAME column and a CSR row
+   * with duplicate indices, while harmless to a matvec, silently breaks the
+   * symmetry check that reads entries back by binary search. */
+  double complex *acc = calloc((size_t)dim, sizeof(double complex));
+  int *touch = malloc((size_t)dim * sizeof(int));
+  if (!acc || !touch) exit(1);
+  double twopiR = 2.0 * M_PI * c.R;
   for (int i = 0; i < dim; i++) {
     rp[i] = nnz;
     double px = c.W * (double)b[i].nx, py = c.W * (double)b[i].ny;
     if (sqrt(px * px + py * py) > rrow) continue;
     nop++;
+    int nt = 0;
     for (int j = 0; j < dim; j++) {
       if (abs(b[i].nx - b[j].nx) > 3 || abs(b[i].ny - b[j].ny) > 3) continue;
-      double complex v = entry(&c, hp, nhp, b[i], b[j]);
-      if (!(cabs(v) > 0.0) || nnz >= cap) continue;
-      ja[nnz] = j;
-      va[nnz++] = v;
+      double complex v = entry(&c, hp, nhp, c.omhp, c.nomega, b[i], b[j]);
+      if (!(cabs(v) > 0.0)) continue;
+      if (!(cabs(acc[j]) > 0.0)) touch[nt++] = j;
+      acc[j] += v;
+    }
+    /* THE BOUNDARY BLOCK IS NEVER EXPANDED INTO THE SPARSE MATRIX. It couples
+     * every boundary function to every other, and at W = lambda/2 with 8
+     * directions that is 2835^2 = 8e6 entries — more than the whole volume
+     * block, and it grows as the SQUARE of the boundary ring. As an operator it
+     * is rank 2 mmax + 1 = 51, so it is kept factored (hu, hf) and applied in
+     * the matvec. Only the drive is materialised here. */
+    if (c.square && fabs(sqrt(px * px + py * py) - c.R) <= reach) {
+      /* drive: -Int_{r=R} B_i g ds, g_m = i^|m| (k J'_|m| - Z_m J_|m|) — the
+       * incoming half of the plane wave, gate D2-1 to 7.8e-15 */
+      double complex gsum = 0.0;
+      for (int mi = 0; mi < nm; mi++) {
+        int m = mi - c.mmax, am = m < 0 ? -m : m;
+        double j0v, y0v, dj0, dy0;
+        hz_bessel_jy(am, c.k0 * c.R, &j0v, &y0v, &dj0, &dy0);
+        double complex gm = cexp(CMPLX(0.0, 1.0) * M_PI * 0.5 * (double)am) *
+                            (c.k0 * dj0 - hz_dtn_symbol(&dt, m) * j0v);
+        gsum += hu[(size_t)i * (size_t)nm + (size_t)(nm - 1 - mi)] * gm;
+      }
+      rhs[i] = -twopiR * gsum;
+    }
+    for (int p = 1; p < nt; p++) { /* insertion sort: columns must ascend */
+      int v = touch[p], q = p - 1;
+      while (q >= 0 && touch[q] > v) {
+        touch[q + 1] = touch[q];
+        q--;
+      }
+      touch[q + 1] = v;
+    }
+    for (int p = 0; p < nt; p++) {
+      if (nnz >= cap) break;
+      ja[nnz] = touch[p];
+      va[nnz++] = acc[touch[p]];
+      acc[touch[p]] = 0.0;
     }
   }
+  free(acc);
+  free(touch);
+  free(hu);
+  free(hd);
   printf("  operator rows with a complete neighbourhood: %d of %d, nnz=%zu\n", nop, dim, nnz);
-  double reach = 2.0 * c.W * sqrt(2.0);
-  for (int mi = 0; mi <= 2 * c.mmax; mi++) {
+  /* The old EXTRA DtN rows. In the square formulation the radiation condition
+   * is already inside the equations as a boundary term, so these must not be
+   * added a second time. */
+  for (int mi = 0; !c.square && mi <= 2 * c.mmax; mi++) {
     int m = mi - c.mmax;
     size_t row = (size_t)(dim + mi);
     rp[row] = nnz;
@@ -637,7 +845,10 @@ int main(int argc, char **argv) {
     for (size_t p = rp[r]; p < rp[r + 1]; p++)
       s += cabs(va[p]) * cabs(va[p]);
     s = sqrt(s);
-    if (!(s > 0.0)) continue;
+    if (!(s > 0.0)) {
+      rowsc[r] = 1.0; /* nothing sparse in this row; the factored part still is */
+      continue;
+    }
     if (r < (size_t)dim) {
       if (s < rnmin) rnmin = s;
       if (s > rnmax) rnmax = s;
@@ -657,6 +868,9 @@ int main(int argc, char **argv) {
    * the weight of a real equation. Alarm below 1e-10. */
   printf("  operator row norms before equilibration: min=%.3e max=%.3e ratio=%.2e\n", rnmin, rnmax,
          rnmax > 0.0 ? rnmin / rnmax : 0.0);
+  lowrank LR = {c.square && nbnd > 0, nbnd, nm, bnd, lru, lrf, rowsc, -2.0 * M_PI * c.R};
+  double complex *tmpA = calloc((size_t)nrow, sizeof(double complex));
+  if (!tmpA) exit(1);
 
   /* --- DIAGNOSTIC: feed the KNOWN vector into the assembled rows ----------
    * In vacuum the exact solution is the incident plane wave, and its expansion
@@ -675,12 +889,10 @@ int main(int argc, char **argv) {
     ctrue[j] = cexp(CMPLX(0.0, 1.0) * (creal(b[j].kx) * c.W * (double)b[j].nx)) / 16.0;
   }
   {
+    applyA((size_t)nrow, rp, ja, va, ctrue, tmpA, &LR);
     double eop = 0.0, edt = 0.0, nbd = 0.0;
     for (size_t r = 0; r < (size_t)nrow; r++) {
-      double complex s = 0.0;
-      for (size_t p = rp[r]; p < rp[r + 1]; p++)
-        s += va[p] * ctrue[ja[p]];
-      double d2 = cabs(s - rhs[r]) * cabs(s - rhs[r]);
+      double d2 = cabs(tmpA[r] - rhs[r]) * cabs(tmpA[r] - rhs[r]);
       if (r < (size_t)dim)
         eop += d2;
       else {
@@ -726,11 +938,7 @@ int main(int argc, char **argv) {
   beta = sqrt(beta);
   for (int r = 0; r < nrow; r++)
     uu[r] /= beta;
-  for (int j = 0; j < dim; j++)
-    vv[j] = 0.0;
-  for (size_t r = 0; r < (size_t)nrow; r++)
-    for (size_t p = rp[r]; p < rp[r + 1]; p++)
-      vv[ja[p]] += conj(va[p]) * uu[r];
+  applyAT((size_t)nrow, dim, rp, ja, va, uu, vv, &LR);
   double alpha = 0.0;
   for (int j = 0; j < dim; j++)
     alpha += cabs(vv[j]) * cabs(vv[j]);
@@ -749,12 +957,9 @@ int main(int argc, char **argv) {
   int itdone = 0, stop = 0; /* 1 = beta breakdown, 2 = alpha breakdown */
   for (int it = 0; it < itmax; it++) {
     itdone = it + 1;
-    for (size_t r = 0; r < (size_t)nrow; r++) {
-      double complex s = 0.0;
-      for (size_t p = rp[r]; p < rp[r + 1]; p++)
-        s += va[p] * vv[ja[p]];
-      uu[r] = s - alpha * uu[r];
-    }
+    applyA((size_t)nrow, rp, ja, va, vv, tmpA, &LR);
+    for (int r = 0; r < nrow; r++)
+      uu[r] = tmpA[r] - alpha * uu[r];
     beta = 0.0;
     for (int r = 0; r < nrow; r++)
       beta += cabs(uu[r]) * cabs(uu[r]);
@@ -765,11 +970,7 @@ int main(int argc, char **argv) {
     }
     for (int r = 0; r < nrow; r++)
       uu[r] /= beta;
-    for (int j = 0; j < dim; j++)
-      tv[j] = 0.0;
-    for (size_t r = 0; r < (size_t)nrow; r++)
-      for (size_t p = rp[r]; p < rp[r + 1]; p++)
-        tv[ja[p]] += conj(va[p]) * uu[r];
+    applyAT((size_t)nrow, dim, rp, ja, va, uu, tv, &LR);
     alpha = 0.0;
     for (int j = 0; j < dim; j++) {
       vv[j] = tv[j] - beta * vv[j];

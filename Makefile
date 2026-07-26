@@ -167,3 +167,6 @@ build/slice2d: tools/slice2d.c src/cut2d.c src/nitsche2d.c src/dtn2d.c src/besse
 
 build/slab2d: tools/slab2d.c src/cut2d.c src/nitsche2d.c src/carrier2d.c src/phi.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/slab2d.c src/cut2d.c src/nitsche2d.c src/carrier2d.c src/phi.c -lm'
+
+build/tdg2d: tools/tdg2d.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/tdg2d.c -lm'

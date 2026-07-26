@@ -46,6 +46,7 @@ typedef struct {
   double W, k0, theta;
   int nd, ne;
   int oracle; /* 1 = the exact direction is in the fan */
+  double dth; /* deliberate angular error of that direction, in radians */
 } cfg;
 
 /* Integral over the segment P0->P1 of exp(i g.x) ds, closed form. */
@@ -68,7 +69,7 @@ static double complex seg_exp(double gx, double gy, double x0, double y0, double
 }
 
 int main(int argc, char **argv) {
-  static const char *const KEYS[] = {"W", "nd", "ne", "th", "it", "oracle", NULL};
+  static const char *const KEYS[] = {"W", "nd", "ne", "th", "it", "oracle", "dth", NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -85,7 +86,7 @@ int main(int argc, char **argv) {
       return 1;
     }
   }
-  cfg c = {1.0 * LAM, 2.0 * M_PI / LAM, 0.3, 8, 8, 0};
+  cfg c = {1.0 * LAM, 2.0 * M_PI / LAM, 0.3, 8, 8, 0, 0.0};
   int itmax = 4000;
   for (int i = 1; i < argc; i++) {
     double v = atof(strchr(argv[i], '=') + 1);
@@ -95,6 +96,7 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "th=", 3)) c.theta = v;
     if (!strncmp(argv[i], "it=", 3)) itmax = (int)v;
     if (!strncmp(argv[i], "oracle=", 7)) c.oracle = (int)v;
+    if (!strncmp(argv[i], "dth=", 4)) c.dth = v;
   }
   if (c.nd > MAXDIR || c.ne * c.ne > MAXCELL) return 1;
   int ncell = c.ne * c.ne, dim = ncell * c.nd;
@@ -111,7 +113,7 @@ int main(int argc, char **argv) {
   static double dkx[MAXDIR], dky[MAXDIR];
   for (int d = 0; d < c.nd; d++) {
     double th = 2.0 * M_PI * ((double)d + 0.5) / (double)c.nd;
-    if (c.oracle && d == 0) th = c.theta;
+    if (c.oracle && d == 0) th = c.theta + c.dth;
     dkx[d] = c.k0 * cos(th);
     dky[d] = c.k0 * sin(th);
   }

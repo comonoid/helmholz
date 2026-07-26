@@ -164,24 +164,88 @@ static double pair_k2(elem ei, elem ej) {
   return ei.side >= 0 ? ei.km2 : ej.km2;
 }
 
-static double complex region_int(const cfg *c, const hz_half2 *box, int sidei, int sidej,
+/* Does a half-plane actually cut this rectangle? Deep inside the box neither the
+ * walls nor (for an uncut pair) the interface do, and then the region is the
+ * plain support rectangle and the integral factorises. Keeping every pair on the
+ * polygon path costs the whole assembly for nothing. */
+static int bites(hz_half2 h, double xlo, double xhi, double ylo, double yhi) {
+  double lo = 1e300, hi = -1e300;
+  const double xs[2] = {xlo, xhi}, ys[2] = {ylo, yhi};
+  for (int a = 0; a < 2; a++)
+    for (int d = 0; d < 2; d++) {
+      double s = xs[a] * h.ca + ys[d] * h.sa - h.c;
+      if (s < lo) lo = s;
+      if (s > hi) hi = s;
+    }
+  return lo < 0.0 && hi > 0.0;
+}
+
+/* Is the rectangle wholly on the far side of the plane, i.e. the region empty?
+ * This is NOT the same question as "does the plane bite", and conflating them
+ * was the bug: an element whose node sits up to 2W outside the box has a support
+ * rectangle that a wall does not cut because it lies entirely BEYOND it, and
+ * dropping that wall integrated over the whole rectangle instead of over
+ * nothing. */
+static int wholly_out(hz_half2 h, double xlo, double xhi, double ylo, double yhi) {
+  const double xs[2] = {xlo, xhi}, ys[2] = {ylo, yhi};
+  for (int a = 0; a < 2; a++)
+    for (int d = 0; d < 2; d++)
+      if (xs[a] * h.ca + ys[d] * h.sa - h.c <= 0.0) return 0;
+  return 1;
+}
+
+/* Returns the number of half-planes that matter, filling hp; -1 if the region is
+ * empty. */
+static int region_planes(const cfg *c, const hz_half2 *box, int cut, double xlo, double xhi,
+                         double ylo, double yhi, hz_half2 *hp, int *nbox) {
+  int n = 0;
+  for (int i = 0; i < 4; i++) {
+    if (wholly_out(box[i], xlo, xhi, ylo, yhi)) return -1;
+    if (bites(box[i], xlo, xhi, ylo, yhi)) hp[n++] = box[i];
+  }
+  *nbox = n;
+  if (cut) {
+    hp[n].ca = c->nhx;
+    hp[n].sa = c->nhy;
+    hp[n].c = 0.0;
+    hp[n].keep_le = 1; /* the medium is s <= 0 */
+    n++;
+  }
+  return n;
+}
+
+static double complex region_int(const hz_half2 *hp, int nbox, int nall, int sidei, int sidej,
                                  double xlo, double xhi, double ylo, double yhi, hz_axis2 fx,
                                  hz_axis2 fy, double complex omx, double complex omy) {
   int in = (sidei == 0) || (sidej == 0);
   int out = (sidei == 1) || (sidej == 1);
   if (in && out) return 0.0;
-  hz_half2 hp[5];
-  for (int i = 0; i < 4; i++)
-    hp[i] = box[i];
-  hp[4].ca = c->nhx;
-  hp[4].sa = c->nhy;
-  hp[4].c = 0.0;
-  hp[4].keep_le = 1; /* the medium is s <= 0 */
-  if (in) return hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, hp, 5);
+  if (in) return hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, hp, nall);
   if (out)
-    return hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, hp, 4) -
-           hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, hp, 5);
-  return hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, hp, 4);
+    return hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, hp, nbox) -
+           hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, hp, nall);
+  return hz_cut2d_poly(xlo, xhi, ylo, yhi, fx, fy, omx, omy, hp, nbox);
+}
+
+/* Separable fast path: nothing cuts the support rectangle, so the region is the
+ * rectangle itself and the whole entry is six 1D closed forms. */
+static double complex entry_sep(double W, elem ei, elem ej, double xlo, double xhi, double ylo,
+                                double yhi) {
+  double complex omx = ei.kx + ej.kx, omy = ei.ky + ej.ky, i1 = CMPLX(0.0, 1.0);
+  hz_phi_factor fi = {W, (double)ei.nx, 0}, gi = {W, (double)ei.ny, 0};
+  hz_phi_factor f0 = {W, (double)ej.nx, 0}, f1 = {W, (double)ej.nx, 1}, f2 = {W, (double)ej.nx, 2};
+  hz_phi_factor g0 = {W, (double)ej.ny, 0}, g1 = {W, (double)ej.ny, 1}, g2 = {W, (double)ej.ny, 2};
+  double complex X0 = hz_phi_prod_integral_osc(xlo, xhi, fi, f0, omx);
+  double complex X1 = hz_phi_prod_integral_osc(xlo, xhi, fi, f1, omx);
+  double complex X2 = hz_phi_prod_integral_osc(xlo, xhi, fi, f2, omx);
+  double complex Y0 = hz_phi_prod_integral_osc(ylo, yhi, gi, g0, omy);
+  double complex Y1 = hz_phi_prod_integral_osc(ylo, yhi, gi, g1, omy);
+  double complex Y2 = hz_phi_prod_integral_osc(ylo, yhi, gi, g2, omy);
+  double complex pref = cexp(-i1 * (ei.kx * W * (double)ei.nx + ej.kx * W * (double)ej.nx +
+                                    ei.ky * W * (double)ei.ny + ej.ky * W * (double)ej.ny));
+  double dk2 = pair_k2(ei, ej) - ej.kc2;
+  return pref *
+         ((X2 + 2.0 * i1 * ej.kx * X1) * Y0 + X0 * (Y2 + 2.0 * i1 * ej.ky * Y1) + dk2 * X0 * Y0);
 }
 
 static double trace_alpha(int side) {
@@ -189,6 +253,26 @@ static double trace_alpha(int side) {
 }
 static double trace_beta(int side) {
   return side < 0 ? 1.0 : 0.5;
+}
+
+/* Clip a segment to one side of the interface. side 0 = the medium (s < 0),
+ * side 1 = outside. Returns 0 when nothing of the segment survives. */
+static int clip_side(const cfg *c, int side, double *ax, double *ay, double *bx, double *by) {
+  double s0 = sdist(c, *ax, *ay), s1 = sdist(c, *bx, *by);
+  int k0in = (side == 0) ? (s0 < 0.0) : (s0 > 0.0);
+  int k1in = (side == 0) ? (s1 < 0.0) : (s1 > 0.0);
+  if (!k0in && !k1in) return 0;
+  if (k0in && k1in) return 1;
+  double t = s0 / (s0 - s1);
+  double mx = *ax + t * (*bx - *ax), my = *ay + t * (*by - *ay);
+  if (k0in) {
+    *bx = mx;
+    *by = my;
+  } else {
+    *ax = mx;
+    *ay = my;
+  }
+  return 1;
 }
 
 /* the interface chord clipped to the box, as a segment */
@@ -305,6 +389,30 @@ int main(int argc, char **argv) {
   size_t nnz = 0;
   double complex i1 = CMPLX(0.0, 1.0);
 
+  /* The exact solution's coefficients, built BEFORE assembly so each block can be
+   * tested against it as it is formed. With oracle directions the partition of
+   * unity holds across the whole box (elements out to L+2W are kept), so this
+   * vector represents the exact field with no approximation at all. */
+  double complex *ce = NULL, *dvol = NULL, *dnit = NULL, *dbnd = NULL;
+  if (oracle) {
+    ce = calloc((size_t)dim, sizeof(double complex));
+    dvol = calloc((size_t)dim, sizeof(double complex));
+    dnit = calloc((size_t)dim, sizeof(double complex));
+    dbnd = calloc((size_t)dim, sizeof(double complex));
+    if (!ce || !dvol || !dnit || !dbnd) exit(1);
+    for (int j = 0; j < dim; j++) {
+      int q = (b[j].side == 0 || (b[j].side < 0 && sdist(&c, c.W * b[j].nx, c.W * b[j].ny) < 0.0))
+                  ? 2
+                  : -1;
+      if (q < 0) /* outside: two waves, match this column to its own direction */
+        for (int t = 0; t < 2; t++)
+          if (cabs(b[j].kx - creal(c.px[t])) + cabs(b[j].ky - creal(c.py[t])) < 1e-9 * c.k0) q = t;
+      if (q < 0) continue;
+      double xn = c.W * (double)b[j].nx, yn = c.W * (double)b[j].ny;
+      ce[j] = c.amp[q] * cexp(i1 * (c.px[q] * xn + c.py[q] * yn)) / 16.0;
+    }
+  }
+
   for (int i = 0; i < dim; i++) {
     rp[i] = nnz;
     for (int j = 0; j < dim; j++) {
@@ -325,33 +433,66 @@ int main(int argc, char **argv) {
       hz_phi_factor gj1 = {W, (double)b[j].ny, 1}, gj2 = {W, (double)b[j].ny, 2};
       hz_axis2 X0 = {{fi0, fj0}, 2}, X1 = {{fi0, fj1}, 2}, X2 = {{fi0, fj2}, 2};
       hz_axis2 Y0 = {{gi0, gj0}, 2}, Y1 = {{gi0, gj1}, 2}, Y2 = {{gi0, gj2}, 2};
-      double complex t = 0.0;
-      t += region_int(&c, box, b[i].side, b[j].side, xlo, xhi, ylo, yhi, X2, Y0, omx, omy);
-      t += 2.0 * i1 * b[j].kx *
-           region_int(&c, box, b[i].side, b[j].side, xlo, xhi, ylo, yhi, X1, Y0, omx, omy);
-      t += region_int(&c, box, b[i].side, b[j].side, xlo, xhi, ylo, yhi, X0, Y2, omx, omy);
-      t += 2.0 * i1 * b[j].ky *
-           region_int(&c, box, b[i].side, b[j].side, xlo, xhi, ylo, yhi, X0, Y1, omx, omy);
+      int cutpair = (b[i].side >= 0 || b[j].side >= 0);
+      hz_half2 hp[5];
+      int nbox = 0;
+      int nall = region_planes(&c, box, cutpair, xlo, xhi, ylo, yhi, hp, &nbox);
+      if (nall < 0) continue; /* support lies wholly outside the box */
       double dk2 = pair_k2(b[i], b[j]) - b[j].kc2;
-      if (fabs(dk2) > 0.0)
-        t += dk2 * region_int(&c, box, b[i].side, b[j].side, xlo, xhi, ylo, yhi, X0, Y0, omx, omy);
-      double complex v = pref * t;
+      double complex vvol;
+      if (nall == 0) {
+        vvol = entry_sep(W, b[i], b[j], xlo, xhi, ylo, yhi);
+      } else {
+        double complex t = 0.0;
+        t += region_int(hp, nbox, nall, b[i].side, b[j].side, xlo, xhi, ylo, yhi, X2, Y0, omx, omy);
+        t += 2.0 * i1 * b[j].kx *
+             region_int(hp, nbox, nall, b[i].side, b[j].side, xlo, xhi, ylo, yhi, X1, Y0, omx, omy);
+        t += region_int(hp, nbox, nall, b[i].side, b[j].side, xlo, xhi, ylo, yhi, X0, Y2, omx, omy);
+        t += 2.0 * i1 * b[j].ky *
+             region_int(hp, nbox, nall, b[i].side, b[j].side, xlo, xhi, ylo, yhi, X0, Y1, omx, omy);
+        if (fabs(dk2) > 0.0)
+          t += dk2 * region_int(hp, nbox, nall, b[i].side, b[j].side, xlo, xhi, ylo, yhi, X0, Y0,
+                                omx, omy);
+        vvol = pref * t;
+      }
 
       hz_carrier2d ci = {W, b[i].nx, b[i].ny, b[i].kx, b[i].ky};
       hz_carrier2d cj = {W, b[j].nx, b[j].ny, b[j].kx, b[j].ky};
       /* Nitsche on the material interface (M15) */
-      if (have_iface && (b[i].side >= 0 || b[j].side >= 0)) {
+      double complex vnit = 0.0;
+      if (have_iface && cutpair) {
         hz_nit2d s = hz_nitsche2d_seg(ci, cj, ix0, iy0, ix1, iy1, c.nhx, c.nhy);
         double ai = trace_alpha(b[i].side), aj = trace_alpha(b[j].side), bi = trace_beta(b[i].side);
-        v += (bi * aj) * (s.t1j - s.t1i) - c.beta * (ai * aj) * s.t0;
+        vnit = (bi * aj) * (s.t1j - s.t1i) - c.beta * (ai * aj) * s.t0;
       }
-      /* impedance on the box walls: -Int B_i (dn B_j - i k B_j) */
-      for (int w = 0; w < 4; w++) {
-        double dx = wx1[w] - wx0[w], dy = wy1[w] - wy0[w];
-        double len = sqrt(dx * dx + dy * dy);
-        hz_nit2d s = hz_nitsche2d_seg(ci, cj, wx0[w], wy0[w], wx1[w], wy1[w], dy / len, -dx / len);
-        v -= s.t1j - i1 * c.k0 * s.t0;
+      /* Impedance on the box walls: -Int B_i (dn B_j - i k B_j).
+       * A CUT function is zero on the far side of the interface, and the line
+       * integrator knows nothing about sides, so the wall has to be clipped to
+       * the side the pair shares — otherwise the two halves of a cut element
+       * each contribute their whole trace and the wall term is counted twice. */
+      double complex vbnd = 0.0;
+      int sidepair = (b[i].side >= 0) ? b[i].side : b[j].side;
+      if (!(b[i].side >= 0 && b[j].side >= 0 && b[i].side != b[j].side)) {
+        for (int w = 0; w < 4; w++) {
+          double ax = wx0[w], ay = wy0[w], bx = wx1[w], by = wy1[w];
+          if (sidepair >= 0 && !clip_side(&c, sidepair, &ax, &ay, &bx, &by)) continue;
+          double dx = wx1[w] - wx0[w], dy = wy1[w] - wy0[w];
+          double len = sqrt(dx * dx + dy * dy);
+          hz_nit2d s = hz_nitsche2d_seg(ci, cj, ax, ay, bx, by, dy / len, -dx / len);
+          vbnd -= s.t1j - i1 * c.k0 * s.t0;
+        }
       }
+      /* EACH BLOCK KEPT APART FOR THE DIAGNOSTIC. The exact solution must be
+       * annihilated by the volume block on its own (it satisfies the PDE
+       * pointwise), by the Nitsche block on its own (all its jumps vanish), and
+       * the boundary block on its own must reproduce the drive. One number per
+       * block instead of one number for the sum. */
+      if (dvol) {
+        dvol[i] += vvol * ce[j];
+        dnit[i] += vnit * ce[j];
+        dbnd[i] += vbnd * ce[j];
+      }
+      double complex v = vvol + vnit + vbnd;
       if (!(cabs(v) > 0.0) || nnz >= cap) continue;
       ja[nnz] = j;
       va[nnz++] = v;
@@ -401,56 +542,49 @@ int main(int argc, char **argv) {
    * elements out to L+2W are kept), so the assembled system must reproduce it.
    * Whichever block does not is the defective one — one run instead of a hunt. */
   if (oracle) {
-    double complex *ce = calloc((size_t)dim, sizeof(double complex));
-    if (ce) {
-      for (int j = 0; j < dim; j++) {
-        int q = (b[j].side == 0 || (b[j].side < 0 && sdist(&c, c.W * b[j].nx, c.W * b[j].ny) < 0.0))
-                    ? 2
-                    : -1;
-        if (q < 0) { /* outside: two waves, match this column to its own direction */
-          for (int t = 0; t < 2; t++)
-            if (cabs(b[j].kx - creal(c.px[t])) + cabs(b[j].ky - creal(c.py[t])) < 1e-9 * c.k0)
-              q = t;
+    /* Is the COEFFICIENT VECTOR right? A separate question from whether the
+     * matrix is, and conflating the two is how a hunt starts. */
+    double e = 0.0, dn = 0.0;
+    for (int a = 0; a < 21; a++)
+      for (int d2 = 0; d2 < 21; d2++) {
+        /* the WHOLE box, not the central half: the volume rows integrate over all
+         * of it, so a partition of unity that fails only near the wall would be
+         * invisible to a central-half check and would show up as a volume block
+         * that refuses to annihilate */
+        double x = -0.999 * c.L + 1.998 * c.L * (double)a / 20.0;
+        double y = -0.999 * c.L + 1.998 * c.L * (double)d2 / 20.0;
+        int in2 = sdist(&c, x, y) < 0.0;
+        double complex g = 0.0;
+        for (int j = 0; j < dim; j++) {
+          if (b[j].side == 0 && !in2) continue;
+          if (b[j].side == 1 && in2) continue;
+          hz_carrier2d cb = {c.W, b[j].nx, b[j].ny, b[j].kx, b[j].ky};
+          g += ce[j] * hz_carrier2d_val(cb, x, y);
         }
-        if (q < 0) continue;
-        double xn = c.W * (double)b[j].nx, yn = c.W * (double)b[j].ny;
-        ce[j] = c.amp[q] * cexp(CMPLX(0.0, 1.0) * (c.px[q] * xn + c.py[q] * yn)) / 16.0;
+        double complex ex2 = uexact(&c, x, y);
+        e += cabs(g - ex2) * cabs(g - ex2);
+        dn += cabs(ex2) * cabs(ex2);
       }
-      /* Two separate questions, and conflating them is how a hunt starts: is the
-       * COEFFICIENT VECTOR right, and is the MATRIX right? */
-      {
-        double e = 0.0, dn = 0.0;
-        for (int a = 0; a < 21; a++)
-          for (int d2 = 0; d2 < 21; d2++) {
-            double x = -0.5 * c.L + c.L * (double)a / 20.0;
-            double y = -0.5 * c.L + c.L * (double)d2 / 20.0;
-            int in2 = sdist(&c, x, y) < 0.0;
-            double complex g = 0.0;
-            for (int j = 0; j < dim; j++) {
-              if (b[j].side == 0 && !in2) continue;
-              if (b[j].side == 1 && in2) continue;
-              hz_carrier2d cb = {c.W, b[j].nx, b[j].ny, b[j].kx, b[j].ky};
-              g += ce[j] * hz_carrier2d_val(cb, x, y);
-            }
-            double complex ex2 = uexact(&c, x, y);
-            e += cabs(g - ex2) * cabs(g - ex2);
-            dn += cabs(ex2) * cabs(ex2);
-          }
-        printf("  [diag] exact COEFFICIENT VECTOR reproduces the field to %.3e\n", sqrt(e / dn));
-      }
-      double e2 = 0.0, n2e = 0.0;
-      for (int r = 0; r < dim; r++) {
-        double complex s = 0.0;
-        for (size_t p = rp[r]; p < rp[r + 1]; p++)
-          s += va[p] * ce[ja[p]];
-        e2 += cabs(s - rhs[r]) * cabs(s - rhs[r]);
-        n2e += cabs(rhs[r]) * cabs(rhs[r]);
-      }
-      printf("  [diag] exact vector in assembled rows: |Ac-b| = %.3e  of |b| = %.3e\n", sqrt(e2),
-             sqrt(n2e));
-      free(ce);
+    printf("  [diag] exact COEFFICIENT VECTOR reproduces the field to %.3e\n", sqrt(e / dn));
+    double v2 = 0.0, n2 = 0.0, b2 = 0.0, nb = 0.0, tot = 0.0;
+    for (int r = 0; r < dim; r++) {
+      v2 += cabs(dvol[r]) * cabs(dvol[r]);
+      n2 += cabs(dnit[r]) * cabs(dnit[r]);
+      b2 += cabs(dbnd[r] - rhs[r]) * cabs(dbnd[r] - rhs[r]);
+      nb += cabs(rhs[r]) * cabs(rhs[r]);
+      double complex t = dvol[r] + dnit[r] + dbnd[r] - rhs[r];
+      tot += cabs(t) * cabs(t);
     }
+    printf("  [diag] BLOCK BY BLOCK on the exact solution, against |b| = %.3e:\n", sqrt(nb));
+    printf("         volume   |Av| = %.3e   (must annihilate: it satisfies the PDE)\n", sqrt(v2));
+    printf("         Nitsche  |An| = %.3e   (must annihilate: every jump is zero)\n", sqrt(n2));
+    printf("         boundary |Ab-b| = %.3e (must reproduce the drive)\n", sqrt(b2));
+    printf("         total    |Ac-b| = %.3e\n", sqrt(tot));
   }
+  free(ce);
+  free(dvol);
+  free(dnit);
+  free(dbnd);
 
   /* row equilibration, once */
   for (int r = 0; r < dim; r++) {

@@ -579,13 +579,28 @@ int main(int argc, char **argv) {
   if (c.oracle && !(fabs(c.dth) > 0.0)) {
     double complex *ce = calloc((size_t)dim, sizeof(double complex));
     if (ce) {
+      /* Match each basis direction to a wave of the exact field BY ITS VECTOR,
+       * not by its index. With extra directions the index correspondence is
+       * gone, and this is the only way the diagnostic survives enrichment: a
+       * direction that matches a wave gets that wave's amplitude, one that
+       * matches nothing gets zero. If the exact field is in the span, this
+       * vector satisfies the system. */
+      int matched = 0;
       for (int s = 0; s < nsub; s++) {
         const sub *SU = &S[s];
         for (int d = 0; d < SU->nd; d++) {
-          int q2 = (contrast && SU->side == 0) ? 2 : (contrast ? d : 0);
-          ce[SU->base + d] = c.amp[q2] * cexp(i1 * (SU->kx[d] * SU->cx + SU->ky[d] * SU->cy));
+          ce[SU->base + d] = 0.0;
+          for (int q2 = 0; q2 < c.nwave; q2++) {
+            int wave_inside = ((q2 % 3) == 2);
+            if (contrast && wave_inside != (SU->side == 0)) continue;
+            if (fabs(SU->kx[d] - c.px[q2]) + fabs(SU->ky[d] - c.py[q2]) > 1e-9 * c.k0) continue;
+            ce[SU->base + d] = c.amp[q2] * cexp(i1 * (c.px[q2] * SU->cx + c.py[q2] * SU->cy));
+            matched++;
+            break;
+          }
         }
       }
+      printf("  [diag] %d of %d columns matched a wave of the exact field\n", matched, dim);
       double e2 = 0.0, nb = 0.0;
       for (int r = 0; r < nrow; r++) {
         double complex s = 0.0;
@@ -633,8 +648,9 @@ int main(int argc, char **argv) {
     ww[j] = vv[j];
   }
   double phibar = beta, rhobar = alpha, b0 = beta;
-  int n2 = 0, n3 = 0, n4 = 0, n6 = 0, n8 = 0;
+  int n2 = 0, n3 = 0, n4 = 0, n6 = 0, n8 = 0, brk = 0, itdone = 0;
   for (int it = 0; it < itmax; it++) {
+    itdone = it + 1;
     for (int r = 0; r < nrow; r++) {
       double complex s = 0.0;
       for (size_t p = rp[r]; p < rp[r + 1]; p++)
@@ -645,7 +661,10 @@ int main(int argc, char **argv) {
     for (int r = 0; r < nrow; r++)
       beta += cabs(uu[r]) * cabs(uu[r]);
     beta = sqrt(beta);
-    if (!(beta > 0.0)) break;
+    if (!(beta > 0.0)) {
+      brk = 1;
+      break;
+    }
     for (int r = 0; r < nrow; r++)
       uu[r] /= beta;
     for (int j = 0; j < dim; j++)
@@ -659,7 +678,10 @@ int main(int argc, char **argv) {
       alpha += cabs(vv[j]) * cabs(vv[j]);
     }
     alpha = sqrt(alpha);
-    if (!(alpha > 0.0)) break;
+    if (!(alpha > 0.0)) {
+      brk = 2;
+      break;
+    }
     for (int j = 0; j < dim; j++)
       vv[j] /= alpha;
     double rho = sqrt(rhobar * rhobar + beta * beta);
@@ -681,6 +703,10 @@ int main(int argc, char **argv) {
   }
   printf("  LSQR |r|/|b| = %.3e   iters to 1e-2/1e-3/1e-4/1e-6/1e-8: %d/%d/%d/%d/%d\n", phibar / b0,
          n2, n3, n4, n6, n8);
+  printf("  LSQR stopped after %d iters: %s\n", itdone,
+         brk == 1   ? "BETA breakdown (Krylov space exhausted)"
+         : brk == 2 ? "ALPHA breakdown"
+                    : "iteration cap");
 
   /* --- WHICH DIRECTION IS MISSING? A MATCHED FILTER ON THE RESIDUAL --------
    * A direction absent from the basis cannot be reproduced, so it survives in
@@ -755,7 +781,7 @@ int main(int argc, char **argv) {
            sqrt(norm), bphi, bv / sqrt(tot / (double)NPHI));
     /* what the peak SHOULD be if it is finding the wave the basis lacks */
     for (int q = 3; q < c.nwave; q++)
-      printf("             missing wave %d true direction %.5f rad\n", q, atan2(c.py[q], c.px[q]));
+      printf("             missing wave %d true direction %.15f rad\n", q, atan2(c.py[q], c.px[q]));
   }
 
   /* --- error against Fresnel, sampled inside each sub-cell's own region ---- */

@@ -59,6 +59,7 @@ typedef struct {
   int nd, ne;
   double pen, beta;
   int oracle;                  /* 1 = put the TRUE Fresnel directions in the fan */
+  int nocut;                   /* 1 = suppress the cut entirely (isolation of the other blocks) */
   double L;                    /* half-side of the box */
   double nhx, nhy;             /* interface normal, pointing OUT of the medium */
   double thx, thy;             /* interface tangent */
@@ -103,6 +104,7 @@ static double complex uexact(const cfg *c, double x, double y) {
 
 /* --- basis ---------------------------------------------------------------- */
 static int straddles(const cfg *c, int nx, int ny) {
+  if (c->nocut) return 0; /* isolation: no cut at all, leaving only volume + impedance */
   double d = fabs(sdist(c, c->W * (double)nx, c->W * (double)ny));
   return d < 2.0 * c->W * sqrt(2.0);
 }
@@ -168,7 +170,19 @@ static double pair_k2(elem ei, elem ej) {
  * walls nor (for an uncut pair) the interface do, and then the region is the
  * plain support rectangle and the integral factorises. Keeping every pair on the
  * polygon path costs the whole assembly for nothing. */
-static int bites(hz_half2 h, double xlo, double xhi, double ylo, double yhi) {
+/* THREE cases, and collapsing them into two was the bug. Signed distance of the
+ * rectangle's corners to the plane, keeping {s <= 0}:
+ *   lo >= 0  the rectangle is wholly OUTSIDE — the region is EMPTY;
+ *   hi >  0  the plane genuinely cuts — it must be carried;
+ *   else     the rectangle is wholly inside — the plane is a no-op and dropping
+ *            it is what buys the separable fast path.
+ * The first and second used to be tested by one predicate, so a support lying
+ * beyond a wall and merely TOUCHING it (lo = 0, hi > 0 — no strict crossing) was
+ * read as "no cut" and integrated over its whole rectangle, which lies outside
+ * the domain entirely. Elements have nodes up to 2W beyond the box, so this is
+ * not a corner case, it is a whole ring of them. */
+enum { PLANE_EMPTY = -1, PLANE_SKIP = 0, PLANE_CUTS = 1 };
+static int classify(hz_half2 h, double xlo, double xhi, double ylo, double yhi) {
   double lo = 1e300, hi = -1e300;
   const double xs[2] = {xlo, xhi}, ys[2] = {ylo, yhi};
   for (int a = 0; a < 2; a++)
@@ -177,21 +191,8 @@ static int bites(hz_half2 h, double xlo, double xhi, double ylo, double yhi) {
       if (s < lo) lo = s;
       if (s > hi) hi = s;
     }
-  return lo < 0.0 && hi > 0.0;
-}
-
-/* Is the rectangle wholly on the far side of the plane, i.e. the region empty?
- * This is NOT the same question as "does the plane bite", and conflating them
- * was the bug: an element whose node sits up to 2W outside the box has a support
- * rectangle that a wall does not cut because it lies entirely BEYOND it, and
- * dropping that wall integrated over the whole rectangle instead of over
- * nothing. */
-static int wholly_out(hz_half2 h, double xlo, double xhi, double ylo, double yhi) {
-  const double xs[2] = {xlo, xhi}, ys[2] = {ylo, yhi};
-  for (int a = 0; a < 2; a++)
-    for (int d = 0; d < 2; d++)
-      if (xs[a] * h.ca + ys[d] * h.sa - h.c <= 0.0) return 0;
-  return 1;
+  if (lo >= 0.0) return PLANE_EMPTY;
+  return hi > 0.0 ? PLANE_CUTS : PLANE_SKIP;
 }
 
 /* Returns the number of half-planes that matter, filling hp; -1 if the region is
@@ -200,8 +201,9 @@ static int region_planes(const cfg *c, const hz_half2 *box, int cut, double xlo,
                          double ylo, double yhi, hz_half2 *hp, int *nbox) {
   int n = 0;
   for (int i = 0; i < 4; i++) {
-    if (wholly_out(box[i], xlo, xhi, ylo, yhi)) return -1;
-    if (bites(box[i], xlo, xhi, ylo, yhi)) hp[n++] = box[i];
+    int cl = classify(box[i], xlo, xhi, ylo, yhi);
+    if (cl == PLANE_EMPTY) return -1;
+    if (cl == PLANE_CUTS) hp[n++] = box[i];
   }
   *nbox = n;
   if (cut) {
@@ -307,8 +309,8 @@ static int iface_seg(const cfg *c, double *x0, double *y0, double *x1, double *y
 }
 
 int main(int argc, char **argv) {
-  static const char *const KEYS[] = {"W",  "nd",  "ne", "n",      "alpha",
-                                     "th", "pen", "it", "oracle", NULL};
+  static const char *const KEYS[] = {"W",   "nd", "ne",     "n",     "alpha", "th",
+                                     "pen", "it", "oracle", "nocut", NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -349,6 +351,7 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "pen=", 4)) c.pen = v;
     if (!strncmp(argv[i], "it=", 3)) itmax = (int)v;
     if (!strncmp(argv[i], "oracle=", 7)) oracle = (int)v;
+    if (!strncmp(argv[i], "nocut=", 6)) c.nocut = (int)v;
   }
   c.oracle = oracle;
   c.L = 0.5 * (double)c.ne * c.W;
@@ -509,22 +512,15 @@ int main(int argc, char **argv) {
        * own side. The exact field is a plane wave on each side, so the integral
        * splits at the interface crossing. */
       for (int q = 0; q < 3; q++) {
-        int outside = (q != 2);
-        double s0 = sdist(&c, wx0[w], wy0[w]), s1 = sdist(&c, wx1[w], wy1[w]);
+        /* TWO clips, and the second is the one that was missing. The datum h is
+         * a different plane wave on each side, so the wall splits at the
+         * interface — that is the first clip. But the TEST function may itself
+         * be cut, and then it is identically zero on the far side, so the wall
+         * splits again by ITS side — and without that a cut test function was
+         * being driven by the wave living on the other side of the interface. */
         double ax = wx0[w], ay = wy0[w], bx = wx1[w], by = wy1[w];
-        if ((s0 > 0.0) != (s1 > 0.0)) { /* wall crosses the interface: clip */
-          double tt = s0 / (s0 - s1);
-          double mx = ax + tt * (bx - ax), my = ay + tt * (by - ay);
-          if ((s0 > 0.0) == (outside != 0)) {
-            bx = mx;
-            by = my;
-          } else {
-            ax = mx;
-            ay = my;
-          }
-        } else if ((s0 > 0.0) != (outside != 0)) {
-          continue; /* this wall is entirely on the other side */
-        }
+        if (!clip_side(&c, (q != 2) ? 1 : 0, &ax, &ay, &bx, &by)) continue;
+        if (b[i].side >= 0 && !clip_side(&c, b[i].side, &ax, &ay, &bx, &by)) continue;
         double complex i0v, i1v;
         hz_nitsche2d_seg_pw(ci, c.px[q], c.py[q], ax, ay, bx, by, nx, ny, &i0v, &i1v);
         (void)i1v;

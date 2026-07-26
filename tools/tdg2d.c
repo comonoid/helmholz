@@ -43,7 +43,7 @@ static const double LAM = 1.0;
 
 typedef struct {
   double W, k0, theta, n, alpha, dth;
-  int nd, ne, oracle, lev, spec;
+  int nd, ne, oracle, lev, spec, abc;
   double lodk;
   double nhx, nhy, thx, thy;
   /* TWO incident waves with their Fresnel partners: 0,1,2 = incident, reflected,
@@ -164,7 +164,7 @@ static int ord[2][MAXCELL];
 int main(int argc, char **argv) {
   static const char *const KEYS[] = {"W",   "nd",     "ne",  "th",   "it",   "n",   "alpha",
                                      "dth", "oracle", "lev", "lodk", "amp2", "th2", "spec",
-                                     "ex1", "ex2",    "ex3", "ex4",  NULL};
+                                     "ex1", "ex2",    "ex3", "ex4",  "abc",  NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -220,6 +220,7 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "amp2=", 5)) c.amp2 = v;
     if (!strncmp(argv[i], "th2=", 4)) c.theta2 = v;
     if (!strncmp(argv[i], "spec=", 5)) c.spec = (int)v;
+    if (!strncmp(argv[i], "abc=", 4)) c.abc = (int)v;
     for (int e = 0; e < 4; e++) {
       char key[8];
       snprintf(key, sizeof key, "ex%d=", e + 1);
@@ -428,6 +429,41 @@ int main(int argc, char **argv) {
     }                                                                                              \
   } while (0)
 
+  /* THE TERMINATION, AND WHY KNOWING THE DIRECTIONS MAKES IT EXACT.
+   * The impedance condition dn u - i k u = h is only first order: it absorbs a
+   * normally incident wave and reflects an oblique one, and its data h had to
+   * carry the OUTGOING field as well — which a real scene does not know.
+   * With a directional basis the split is exact instead of approximate: on a
+   * wall with outward normal n every basis direction is unambiguously OUTGOING
+   * (d.n > 0) or INCOMING (d.n < 0). Outgoing waves must leave untouched, so
+   * they get no equation at all; incoming ones are exactly the illumination
+   * entering the domain, so their amplitudes are prescribed. Nothing reflects,
+   * and the only datum needed is what a scene actually knows: what comes IN. */
+#define ADDWALL(SA, X0, Y0, X1, Y1, NX, NY, WMASK)                                                 \
+  do {                                                                                             \
+    if (!c.abc) {                                                                                  \
+      ADDFACE((SA), -1, (X0), (Y0), (X1), (Y1), (NX), (NY), (WMASK));                              \
+      break;                                                                                       \
+    }                                                                                              \
+    const sub *SW = &S[(SA)];                                                                      \
+    for (int d = 0; d < SW->nd; d++) {                                                             \
+      if (SW->kx[d] * (NX) + SW->ky[d] * (NY) >= 0.0) continue; /* outgoing: free */               \
+      if (nrow >= MAXROW || nnz >= cap) return 1;                                                  \
+      rp[nrow] = nnz;                                                                              \
+      ja[nnz] = SW->base + d;                                                                      \
+      va[nnz++] = 1.0;                                                                             \
+      double complex vin = 0.0;                                                                    \
+      for (int q2 = 0; q2 < c.nwave; q2++) {                                                       \
+        if (!((WMASK) & (1 << q2))) continue;                                                      \
+        if (fabs(SW->kx[d] - c.px[q2]) + fabs(SW->ky[d] - c.py[q2]) > 1e-9 * c.k0) continue;       \
+        vin = c.amp[q2] * cexp(i1 * (c.px[q2] * SW->cx + c.py[q2] * SW->cy));                      \
+        break;                                                                                     \
+      }                                                                                            \
+      rhs[nrow] = vin;                                                                             \
+      nrow++;                                                                                      \
+    }                                                                                              \
+  } while (0)
+
   /* INTER-CELL FACES BY GEOMETRIC ADJACENCY, not by grid indices. A face is the
    * OVERLAP of two cell sides that lie on the same line, so a coarse cell facing
    * several fine ones simply yields several faces along that side, each of the
@@ -467,7 +503,7 @@ int main(int argc, char **argv) {
           if (sa < 0) continue;
           int mask = (sd == 0) ? 0x24 : 0x1b; /* inside: q=2,5   outside: q=0,1,3,4 */
           nfwall++;
-          ADDFACE(sa, -1, px0, py0, px1, py1, nx, ny, mask);
+          ADDWALL(sa, px0, py0, px1, py1, nx, ny, mask);
         }
         continue;
       }
@@ -521,7 +557,7 @@ int main(int argc, char **argv) {
         if (sa < 0) continue;
         int mask = (sd == 0) ? 0x24 : 0x1b;
         nfwall++;
-        ADDFACE(sa, -1, px0, py0, px1, py1, nx, ny, mask);
+        ADDWALL(sa, px0, py0, px1, py1, nx, ny, mask);
       }
     }
 

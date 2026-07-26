@@ -332,7 +332,8 @@ static int subof[MAXCELL][2];
 static double cellx[MAXCELL], celly[MAXCELL], cellh[MAXCELL];
 static int celld[MAXCELL];
 static double skey[2][MAXCELL];
-static unsigned char rowcat[MAXROW]; /* 0 interior [u], 1 interior [dn u], 2 mirror, 3 wall */
+static unsigned char rowcat[MAXROW];     /* 0 interior [u], 1 interior [dn u], 2 mirror, 3 wall */
+static float rowx[MAXROW], rowy[MAXROW]; /* where the condition lives, to map the misfit */
 static int ord[2][MAXCELL];
 
 int main(int argc, char **argv) {
@@ -710,6 +711,8 @@ int main(int argc, char **argv) {
           if (nrow >= MAXROW) return 1;                                                            \
           rp[nrow] = nnz;                                                                          \
           rowcat[nrow] = (unsigned char)(isint ? cond : 3);                                        \
+          rowx[nrow] = (float)(0.5 * ((X0) + (X1)));                                               \
+          rowy[nrow] = (float)(0.5 * ((Y0) + (Y1)));                                               \
           for (int t2 = 0; t2 < 2; t2++) {                                                         \
             if (scs[t2] < 0) continue;                                                             \
             const sub *SU = &S[scs[t2]];                                                           \
@@ -774,6 +777,8 @@ int main(int argc, char **argv) {
       if (nrow >= MAXROW) return 1;                                                                \
       rp[nrow] = nnz;                                                                              \
       rowcat[nrow] = 2;                                                                            \
+      rowx[nrow] = (float)(0.5 * ((X0) + (X1)));                                                   \
+      rowy[nrow] = (float)(0.5 * ((Y0) + (Y1)));                                                   \
       for (int d = 0; d < SM->nd; d++) {                                                           \
         double gx = SM->kx[d] + tgx, gy = SM->ky[d] + tgy;                                         \
         double complex ph = cexp(-i1 * (SM->kx[d] * SM->cx + SM->ky[d] * SM->cy));                 \
@@ -803,6 +808,8 @@ int main(int argc, char **argv) {
       if (nrow >= MAXROW || nnz >= cap) return 1;                                                  \
       rp[nrow] = nnz;                                                                              \
       rowcat[nrow] = 3;                                                                            \
+      rowx[nrow] = (float)(0.5 * ((X0) + (X1)));                                                   \
+      rowy[nrow] = (float)(0.5 * ((Y0) + (Y1)));                                                   \
       ja[nnz] = SW->base + d;                                                                      \
       va[nnz++] = 1.0;                                                                             \
       double complex vin = 0.0;                                                                    \
@@ -1155,7 +1162,95 @@ int main(int argc, char **argv) {
          : brk == 2 ? "ALPHA breakdown"
          : brk == 3 ? "stalled at the least-squares floor"
                     : "iteration cap");
-
+  /* --- IS THE MISFIT WHERE THE GEOMETRY SAYS IT SHOULD BE? ------------------
+   * If the residual really points at the amplitude structure, then on this scene
+   * it must sit on six lines: the two edges of the shadow slab, and two edges
+   * for each of the two reflected beams. If instead it is spread evenly, then
+   * placing cuts by the residual cannot work and the whole adaptive idea dies
+   * here. The null expectation is the AREA fraction of those bands, printed
+   * beside the measurement so the comparison is not eyeballed. */
+  if (c.obj && c.opaque) {
+    double dx = cos(c.theta), dy = sin(c.theta);
+    double a = c.orad;
+    double ox[6], oy[6], vx[6], vy[6];
+    /* shadow: from the two silhouette corners along the light */
+    double pbest = -1e300, pworst = 1e300, sxb = 0, syb = 0, sxw = 0, syw = 0;
+    for (int i = 0; i < 4; i++) {
+      double cx = c.oxc + ((i & 1) ? a : -a), cy = c.oyc + ((i & 2) ? a : -a);
+      double pp = -(cx - c.oxc) * dy + (cy - c.oyc) * dx;
+      if (pp > pbest) {
+        pbest = pp;
+        sxb = cx;
+        syb = cy;
+      }
+      if (pp < pworst) {
+        pworst = pp;
+        sxw = cx;
+        syw = cy;
+      }
+    }
+    ox[0] = sxb;
+    oy[0] = syb;
+    vx[0] = dx;
+    vy[0] = dy;
+    ox[1] = sxw;
+    oy[1] = syw;
+    vx[1] = dx;
+    vy[1] = dy;
+    /* beam off the -x face, and off the -y face */
+    ox[2] = c.oxc - a;
+    oy[2] = c.oyc - a;
+    vx[2] = -dx;
+    vy[2] = dy;
+    ox[3] = c.oxc - a;
+    oy[3] = c.oyc + a;
+    vx[3] = -dx;
+    vy[3] = dy;
+    ox[4] = c.oxc - a;
+    oy[4] = c.oyc - a;
+    vx[4] = dx;
+    vy[4] = -dy;
+    ox[5] = c.oxc + a;
+    oy[5] = c.oyc - a;
+    vx[5] = dx;
+    vy[5] = -dy;
+    double hit = 0.0, tot = 0.0;
+    double band = c.spread > 0.0 ? c.spread : c.W;
+    for (int r = 0; r < nrow; r++) {
+      double complex s = 0.0;
+      for (size_t p = rp[r]; p < rp[r + 1]; p++)
+        s += va[p] * xs[ja[p]];
+      double e = cabs(s - rhs[r]) * cabs(s - rhs[r]);
+      tot += e;
+      double X = rowx[r], Y = rowy[r];
+      int on = 0;
+      for (int L2 = 0; L2 < 6 && !on; L2++) {
+        double t = (X - ox[L2]) * vx[L2] + (Y - oy[L2]) * vy[L2];
+        if (t < 0.0) continue; /* the ray starts at the corner */
+        double q = fabs(-(X - ox[L2]) * vy[L2] + (Y - oy[L2]) * vx[L2]);
+        if (q < band) on = 1;
+      }
+      if (on) hit += e;
+    }
+    /* the null: what fraction of the domain those bands cover */
+    double area = 0.0;
+    for (int i = 0; i < 200; i++)
+      for (int j = 0; j < 200; j++) {
+        double X = -L + (2.0 * L) * ((double)i + 0.5) / 200.0;
+        double Y = -L + (2.0 * L) * ((double)j + 0.5) / 200.0;
+        int on = 0;
+        for (int L2 = 0; L2 < 6 && !on; L2++) {
+          double t = (X - ox[L2]) * vx[L2] + (Y - oy[L2]) * vy[L2];
+          if (t < 0.0) continue;
+          double q = fabs(-(X - ox[L2]) * vy[L2] + (Y - oy[L2]) * vx[L2]);
+          if (q < band) on = 1;
+        }
+        area += on ? 1.0 : 0.0;
+      }
+    printf("  [misfit map] within one cell of the 6 geometric lines: %.1f%% of |r|^2   "
+           "(those bands cover %.1f%% of the area)\n",
+           tot > 0.0 ? 100.0 * hit / tot : 0.0, 100.0 * area / 40000.0);
+  }
   /* --- WHICH DIRECTION IS MISSING? A MATCHED FILTER ON THE RESIDUAL --------
    * A direction absent from the basis cannot be reproduced, so it survives in
    * the residual of the boundary condition; along a wall its phase runs as

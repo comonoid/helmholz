@@ -76,7 +76,7 @@ typedef struct {
    * amplitude, because the face conditions demand continuity; a localised beam
    * needs the angular spread lam/w around each mode direction, and fan/spread
    * are how much of it the basis is given. */
-  int fan, nmode, obj, ss, acc, opaque, pix;
+  int fan, nmode, obj, ss, acc, opaque, pix, shcut;
   double cgrade; /* geometric grading towards the edges, where the field is self-similar */
   double kmul;   /* scales k0: several runs over a band = a source of finite coherence */
   double orad, oxc, oyc;
@@ -119,7 +119,25 @@ static void fresnel(cfg *c) {
   c->py[5] = kb * c->thy - b2 * c->nhy;
 }
 
+/* THE SHADOW BOUNDARY IS A CUT LOCUS, NOT A REFINEMENT TARGET. The field steps
+ * from lit to dark across it by O(1), and a handful of plane waves cannot put a
+ * step inside a cell — which is why 93% of the misfit sat on interior faces.
+ * But the architecture already has the answer: CUT the cell, never shrink it.
+ * The two silhouette rays of a box are PARALLEL (both perpendicular to the
+ * light), so the shadow is a slab and one signed function describes both edges:
+ * negative inside the shadow, positive outside. Cells the slab edge crosses get
+ * two independent sub-cells and carry the step exactly, at full size.
+ * Cost: one extra sub-cell per crossed cell, i.e. one per PIXEL of the
+ * boundary's screen length — so a distant object, spanning fewer pixels, costs
+ * less. Refinement would cost the same everywhere, which is exactly the loss of
+ * distance economy the plan forbids. */
 static double sdist(const cfg *c, double x, double y) {
+  if (c->shcut) {
+    double dx = cos(c->theta), dy = sin(c->theta);
+    if ((x - c->oxc) * dx + (y - c->oyc) * dy < 0.0) return 1.0; /* upstream: no shadow */
+    double perp = -(x - c->oxc) * dy + (y - c->oyc) * dx;
+    return fabs(perp) - c->orad * (fabs(dx) + fabs(dy));
+  }
   return x * c->nhx + y * c->nhy;
 }
 
@@ -314,6 +332,7 @@ static int subof[MAXCELL][2];
 static double cellx[MAXCELL], celly[MAXCELL], cellh[MAXCELL];
 static int celld[MAXCELL];
 static double skey[2][MAXCELL];
+static unsigned char rowcat[MAXROW]; /* 0 interior [u], 1 interior [dn u], 2 mirror, 3 wall */
 static int ord[2][MAXCELL];
 
 int main(int argc, char **argv) {
@@ -322,7 +341,7 @@ int main(int argc, char **argv) {
       "W",    "nd",   "ne",   "th",   "it",  "n",      "alpha",  "dth",    "oracle", "lev",
       "lodk", "amp2", "th2",  "spec", "ex1", "ex2",    "ex3",    "ex4",    "abc",    "mirror",
       "mode", "img",  "drop", "beam", "by0", "fan",    "spread", "nmode",  "obj",    "orad",
-      "oxc",  "oyc",  "ss",   "kmul", "acc", "opaque", "pix",    "cgrade", NULL};
+      "oxc",  "oyc",  "ss",   "kmul", "acc", "opaque", "pix",    "cgrade", "shcut",  NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -398,6 +417,7 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "opaque=", 7)) c.opaque = (int)v;
     if (!strncmp(argv[i], "pix=", 4)) c.pix = (int)v;
     if (!strncmp(argv[i], "cgrade=", 7)) c.cgrade = v;
+    if (!strncmp(argv[i], "shcut=", 6)) c.shcut = (int)v;
     for (int e = 0; e < 4; e++) {
       char key[8];
       snprintf(key, sizeof key, "ex%d=", e + 1);
@@ -413,7 +433,7 @@ int main(int argc, char **argv) {
   int ncell = c.ne * c.ne;
   double L = 0.5 * (double)c.ne * c.W;
   int contrast = fabs(c.n - 1.0) > 1e-12;
-  int planecut = contrast && !c.obj; /* the object sits on cell boundaries: nothing to clip */
+  int planecut = (contrast && !c.obj) || c.shcut; /* shcut clips by the shadow slab instead */
   if (c.mirror) {
     c.Lbox = L;
     c.abc = 1; /* the open ends are characteristic, and only they */
@@ -524,6 +544,10 @@ int main(int argc, char **argv) {
          * enter: cells inside it carry no unknowns at all, and the faces that
          * touch it become mirrors. */
         if (c.opaque && own == 0) continue;
+        if (c.shcut) { /* the shadow slab cuts, the body does not */
+          cut = smin < 0.0 && smax > 0.0;
+          own = sdist(&c, cellx[q], celly[q]) < 0.0 ? 0 : 1;
+        }
       }
       for (int sd = 0; sd < 2; sd++) {
         if (!cut && sd != own) continue;
@@ -685,6 +709,7 @@ int main(int argc, char **argv) {
         for (int cond = 0; cond < (isint ? 2 : 1); cond++) {                                       \
           if (nrow >= MAXROW) return 1;                                                            \
           rp[nrow] = nnz;                                                                          \
+          rowcat[nrow] = (unsigned char)(isint ? cond : 3);                                        \
           for (int t2 = 0; t2 < 2; t2++) {                                                         \
             if (scs[t2] < 0) continue;                                                             \
             const sub *SU = &S[scs[t2]];                                                           \
@@ -748,6 +773,7 @@ int main(int argc, char **argv) {
       double complex tph = cexp(-i1 * (tgx * SM->cx + tgy * SM->cy));                              \
       if (nrow >= MAXROW) return 1;                                                                \
       rp[nrow] = nnz;                                                                              \
+      rowcat[nrow] = 2;                                                                            \
       for (int d = 0; d < SM->nd; d++) {                                                           \
         double gx = SM->kx[d] + tgx, gy = SM->ky[d] + tgy;                                         \
         double complex ph = cexp(-i1 * (SM->kx[d] * SM->cx + SM->ky[d] * SM->cy));                 \
@@ -776,6 +802,7 @@ int main(int argc, char **argv) {
       if (SW->kx[d] * (NX) + SW->ky[d] * (NY) >= 0.0) continue; /* outgoing: free */               \
       if (nrow >= MAXROW || nnz >= cap) return 1;                                                  \
       rp[nrow] = nnz;                                                                              \
+      rowcat[nrow] = 3;                                                                            \
       ja[nnz] = SW->base + d;                                                                      \
       va[nnz++] = 1.0;                                                                             \
       double complex vin = 0.0;                                                                    \
@@ -822,11 +849,12 @@ int main(int argc, char **argv) {
       /* the box wall: no neighbour there by construction */
       if (fabs(coord - L) < 1e-9 * c.W) {
         for (int sd = 0; sd < 2; sd++) {
-          if (c.obj ? sd != 0 : !contrast && sd == 0) continue; /* obj: one sub per cell */
+          if (c.shcut ? subof[qa][sd] < 0 : (c.obj ? sd != 0 : !contrast && sd == 0)) continue;
           double px0 = (ax2 == 0) ? coord : lo, py0 = (ax2 == 0) ? lo : coord;
           double px1 = (ax2 == 0) ? coord : hi, py1 = (ax2 == 0) ? hi : coord;
           if (planecut && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
-          int sa = c.obj ? (subof[qa][0] >= 0 ? subof[qa][0] : subof[qa][1]) : subof[qa][sd];
+          int sa = (c.obj && !c.shcut) ? (subof[qa][0] >= 0 ? subof[qa][0] : subof[qa][1])
+                                       : subof[qa][sd];
           if (sa < 0) continue;
           int mask = (sd == 0) ? 0x24 : 0x1b; /* inside: q=2,5   outside: q=0,1,3,4 */
           nfwall++;
@@ -854,12 +882,14 @@ int main(int argc, char **argv) {
         double olo = lo > blo ? lo : blo, ohi = hi < bhi ? hi : bhi;
         if (!(ohi - olo > 1e-9 * c.W)) continue;
         for (int sd = 0; sd < 2; sd++) {
-          if (c.obj ? sd != 0 : !contrast && sd == 0) continue;
+          if (c.shcut ? subof[qa][sd] < 0 : (c.obj ? sd != 0 : !contrast && sd == 0)) continue;
           double px0 = (ax2 == 0) ? coord : olo, py0 = (ax2 == 0) ? olo : coord;
           double px1 = (ax2 == 0) ? coord : ohi, py1 = (ax2 == 0) ? ohi : coord;
           if (planecut && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
-          int sa = c.obj ? (subof[qa][0] >= 0 ? subof[qa][0] : subof[qa][1]) : subof[qa][sd];
-          int sb = c.obj ? (subof[qb][0] >= 0 ? subof[qb][0] : subof[qb][1]) : subof[qb][sd];
+          int sa = (c.obj && !c.shcut) ? (subof[qa][0] >= 0 ? subof[qa][0] : subof[qa][1])
+                                       : subof[qa][sd];
+          int sb = (c.obj && !c.shcut) ? (subof[qb][0] >= 0 ? subof[qb][0] : subof[qb][1])
+                                       : subof[qb][sd];
           int mask = (sd == 0) ? 0x24 : 0x1b; /* inside: q=2,5   outside: q=0,1,3,4 */
           if (sa >= 0 && sb >= 0) {
             nfint++;
@@ -882,11 +912,12 @@ int main(int argc, char **argv) {
       double lo = (ax2 == 0) ? celly[qa] - ha : cellx[qa] - ha, hi = lo + cellh[qa];
       double nx = (ax2 == 0) ? -1.0 : 0.0, ny = (ax2 == 0) ? 0.0 : -1.0;
       for (int sd = 0; sd < 2; sd++) {
-        if (c.obj ? sd != 0 : !contrast && sd == 0) continue;
+        if (c.shcut ? subof[qa][sd] < 0 : (c.obj ? sd != 0 : !contrast && sd == 0)) continue;
         double px0 = (ax2 == 0) ? coord : lo, py0 = (ax2 == 0) ? lo : coord;
         double px1 = (ax2 == 0) ? coord : hi, py1 = (ax2 == 0) ? hi : coord;
         if (planecut && !clip_side(&c, sd, &px0, &py0, &px1, &py1)) continue;
-        int sa = c.obj ? (subof[qa][0] >= 0 ? subof[qa][0] : subof[qa][1]) : subof[qa][sd];
+        int sa =
+            (c.obj && !c.shcut) ? (subof[qa][0] >= 0 ? subof[qa][0] : subof[qa][1]) : subof[qa][sd];
         if (sa < 0) continue;
         int mask = (sd == 0) ? 0x24 : 0x1b;
         nfwall++;
@@ -898,7 +929,7 @@ int main(int argc, char **argv) {
    * cut cell. Same two conditions as every interior face — they ARE the physical
    * transmission conditions. */
   int nif = 0;
-  if (planecut)
+  if (planecut && !c.shcut) /* the shadow cut is UNCOUPLED: the step is the point */
     for (int q = 0; q < ncell; q++) {
       if (subof[q][0] < 0 || subof[q][1] < 0) continue;
       double sc = sdist(&c, cellx[q], celly[q]);
@@ -1091,6 +1122,34 @@ int main(int argc, char **argv) {
   printf("  LSQR |r|/|b| = %.3e   iters to 1e-2/1e-3/1e-4/1e-6/1e-8: %d/%d/%d/%d/%d\n", phibar / b0,
          n2, n3, n4, n6, n8);
   double t_solve = now_s() - t_solve0;
+  /* WHERE DOES THE MISFIT ACTUALLY LIVE? Splitting |r|^2 by the kind of
+   * condition is the cheapest way to stop guessing. If the edge really were the
+   * culprit, the mirror rows would carry it; if it is the continuity between
+   * cells, the interior rows would. The physics says the edge wave is 1/sqrt(k
+   * rho) ~ 3e-4 of the incident at metre scale, which cannot produce a residual
+   * of 0.13 — so the answer decides whether refining the edge is worth a single
+   * cell. */
+  {
+    double rc[4] = {0.0, 0.0, 0.0, 0.0}, bc[4] = {0.0, 0.0, 0.0, 0.0};
+    long nc[4] = {0, 0, 0, 0};
+    for (int r = 0; r < nrow; r++) {
+      double complex s = 0.0;
+      for (size_t p = rp[r]; p < rp[r + 1]; p++)
+        s += va[p] * xs[ja[p]];
+      int g = rowcat[r] & 3;
+      rc[g] += cabs(s - rhs[r]) * cabs(s - rhs[r]);
+      bc[g] += cabs(rhs[r]) * cabs(rhs[r]);
+      nc[g]++;
+    }
+    double tot = rc[0] + rc[1] + rc[2] + rc[3];
+    static const char *const NM[4] = {"interior [u]", "interior [dn u]", "mirror u=0",
+                                      "wall / incoming"};
+    printf("  [residual by condition]  total |r|^2 = %.4e\n", tot);
+    for (int g = 0; g < 4; g++)
+      if (nc[g])
+        printf("    %-16s rows %7ld   |r|^2 %9.3e  = %5.1f%% of misfit   |b|^2 %9.3e\n", NM[g],
+               nc[g], rc[g], tot > 0.0 ? 100.0 * rc[g] / tot : 0.0, bc[g]);
+  }
   printf("  LSQR stopped after %d iters: %s\n", itdone,
          brk == 1   ? "BETA breakdown (Krylov space exhausted)"
          : brk == 2 ? "ALPHA breakdown"

@@ -76,7 +76,8 @@ typedef struct {
    * amplitude, because the face conditions demand continuity; a localised beam
    * needs the angular spread lam/w around each mode direction, and fan/spread
    * are how much of it the basis is given. */
-  int fan, nmode, obj, ss;
+  int fan, nmode, obj, ss, acc;
+  double kmul; /* scales k0: several runs over a band = a source of finite coherence */
   double orad, oxc, oyc;
   double spread;
   double Lbox, kap, bet;
@@ -135,6 +136,13 @@ static int inside_obj(const cfg *c, double x, double y) {
   if (c->obj == 1) return fabs(dx) < c->orad && fabs(dy) < c->orad;
   if (c->obj == 2) return dx * dx + dy * dy < c->orad * c->orad;
   return 0;
+}
+
+static double objdist(const cfg *c, double x, double y) {
+  double dx = fabs(x - c->oxc), dy = fabs(y - c->oyc);
+  if (c->obj == 1) return fabs((dx > dy ? dx : dy) - c->orad);
+  if (c->obj == 2) return fabs(sqrt(dx * dx + dy * dy) - c->orad);
+  return 1e300;
 }
 
 /* The two or four plane waves of the mirror scene, in the same amp/px/py slots
@@ -288,11 +296,11 @@ static int ord[2][MAXCELL];
 
 int main(int argc, char **argv) {
   double t_start = now_s();
-  static const char *const KEYS[] = {"W",   "nd",     "ne",   "th",   "it",   "n",      "alpha",
-                                     "dth", "oracle", "lev",  "lodk", "amp2", "th2",    "spec",
-                                     "ex1", "ex2",    "ex3",  "ex4",  "abc",  "mirror", "mode",
-                                     "img", "drop",   "beam", "by0",  "fan",  "spread", "nmode",
-                                     "obj", "orad",   "oxc",  "oyc",  "ss",   NULL};
+  static const char *const KEYS[] = {
+      "W",     "nd",     "ne",   "th",  "it",   "n",    "alpha", "dth", "oracle",
+      "lev",   "lodk",   "amp2", "th2", "spec", "ex1",  "ex2",   "ex3", "ex4",
+      "abc",   "mirror", "mode", "img", "drop", "beam", "by0",   "fan", "spread",
+      "nmode", "obj",    "orad", "oxc", "oyc",  "ss",   "kmul",  "acc", NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -363,6 +371,8 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "oxc=", 4)) c.oxc = v;
     if (!strncmp(argv[i], "oyc=", 4)) c.oyc = v;
     if (!strncmp(argv[i], "ss=", 3)) c.ss = (int)v;
+    if (!strncmp(argv[i], "kmul=", 5)) c.kmul = v;
+    if (!strncmp(argv[i], "acc=", 4)) c.acc = (int)v;
     for (int e = 0; e < 4; e++) {
       char key[8];
       snprintf(key, sizeof key, "ex%d=", e + 1);
@@ -372,6 +382,7 @@ int main(int argc, char **argv) {
       }
     }
   }
+  c.k0 = 2.0 * M_PI / LAM * (c.kmul > 0.0 ? c.kmul : 1.0); /* kmul only exists after parsing */
   if (c.nd > MAXDIR || c.ne * c.ne > MAXCELL) return 1;
   fresnel(&c);
   int ncell = c.ne * c.ne;
@@ -422,7 +433,11 @@ int main(int argc, char **argv) {
     while (head < ncellv) {
       int q = head++;
       if (celld[q] >= c.lev) continue;
-      double d = fabs(sdist(&c, cellx[q], celly[q]));
+      /* REFINE AT THE OBJECT, not at distance from the camera: regulator 2 of
+       * the plan, a FLOOR on element size driven by geometry. Far from the
+       * object the field is the incident plane wave and one huge cell carries
+       * it exactly; only the surface needs small cells. */
+      double d = c.obj ? objdist(&c, cellx[q], celly[q]) : fabs(sdist(&c, cellx[q], celly[q]));
       if (!(cellh[q] > c.lodk * d)) continue;
       if (ncellv + 3 >= MAXCELL) break;
       double h2 = 0.5 * cellh[q], x0 = cellx[q], y0 = celly[q];
@@ -919,6 +934,7 @@ int main(int argc, char **argv) {
   }
   double phibar = beta, rhobar = alpha, b0 = beta;
   int n2 = 0, n3 = 0, n4 = 0, n6 = 0, n8 = 0, brk = 0, itdone = 0;
+  double rlast = 0.0;
   for (int it = 0; it < itmax; it++) {
     itdone = it + 1;
     for (int r = 0; r < nrow; r++) {
@@ -965,6 +981,22 @@ int main(int argc, char **argv) {
       ww[j] = vv[j] - (th2 / rho) * ww[j];
     }
     double rr = phibar / b0;
+    /* STOP AT THE FLOOR. When the basis cannot represent the field, LSQR reaches
+     * the least-squares minimum and then simply stands there — measured: at 16
+     * directions the residual was identical to four digits at 2000 and at 6000
+     * iterations. Running to the cap past that point buys nothing and was the
+     * bulk of the wall-clock in the object runs. STALL_WIN iterations without
+     * STALL_REL relative improvement is the stopping rule; the window is wide
+     * enough that LSQR's normal plateaus do not trigger it. */
+    enum { STALL_WIN = 200 };
+    static const double STALL_REL = 1e-3;
+    if (it % STALL_WIN == 0) {
+      if (it > 0 && rlast > 0.0 && (rlast - rr) < STALL_REL * rlast) {
+        brk = 3;
+        break;
+      }
+      rlast = rr;
+    }
     if (!n2 && rr <= 1e-2) n2 = it + 1;
     if (!n3 && rr <= 1e-3) n3 = it + 1;
     if (!n4 && rr <= 1e-4) n4 = it + 1;
@@ -977,6 +1009,7 @@ int main(int argc, char **argv) {
   printf("  LSQR stopped after %d iters: %s\n", itdone,
          brk == 1   ? "BETA breakdown (Krylov space exhausted)"
          : brk == 2 ? "ALPHA breakdown"
+         : brk == 3 ? "stalled at the least-squares floor"
                     : "iteration cap");
 
   /* --- WHICH DIRECTION IS MISSING? A MATCHED FILTER ON THE RESIDUAL --------
@@ -1149,6 +1182,31 @@ int main(int argc, char **argv) {
         }
     }
     t_img = now_s() - t_img0;
+    /* FINITE COHERENCE, ACCUMULATED ACROSS RUNS. Real light is not
+     * monochromatic: a lamp coheres over a few microns, so interference at the
+     * scale this picture shows does not survive in nature. A strictly single-k
+     * solve invents it — the plan calls that a broken assumption, not noise.
+     * Summing |u|^2 over a band of k IS the incoherent sum a sensor performs;
+     * each run adds its intensity to img/acc.f32, so the band costs one solve
+     * per wavelength and nothing else. */
+    if (c.acc) {
+      const char *fn = "img/acc.f32";
+      size_t np = (size_t)N * (size_t)N;
+      FILE *fa = fopen(fn, "rb");
+      if (fa) {
+        float *pv = malloc(np * sizeof(float));
+        if (pv && fread(pv, sizeof(float), np, fa) == np)
+          for (size_t p = 0; p < np; p++)
+            fab[p] = (float)sqrt((double)fab[p] * (double)fab[p] + (double)pv[p] * (double)pv[p]);
+        free(pv);
+        fclose(fa);
+      }
+      fa = fopen(fn, "wb");
+      if (fa) {
+        fwrite(fab, sizeof(float), np, fa);
+        fclose(fa);
+      }
+    }
     double amax = 0.0;
     for (size_t p = 0; p < (size_t)N * (size_t)N; p++)
       if ((double)fab[p] > amax) amax = (double)fab[p];

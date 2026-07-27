@@ -93,6 +93,8 @@ int main(int argc, char **argv) {
    * учесть энергию дважды. */
   double spec = argc > 5 ? atof(argv[5]) : 0.0;
   int maxbounce = argc > 6 ? atoi(argv[6]) : 8;
+  /* сколько КАДРОВ отрисовать движущейся камерой при неподвижной сцене */
+  int nframe = argc > 7 ? atoi(argv[7]) : 1;
 
   stage_mark();
   hz_frame fr = {{0, 0, 0}, {1, 1, 1}};
@@ -308,18 +310,60 @@ int main(int argc, char **argv) {
                    .maxbounce = maxbounce};
   long nbtot = 0;
   int nbmax = 0;
-  for (int py = 0; py < H; py++)
-    for (int px = 0; px < W; px++) {
-      double o[3], d[3];
-      tr3_camera_ray(&cam, px, py, o, d);
-      int nb = 0;
-      buf[(size_t)py * (size_t)W + (size_t)px] = tr3_gather_ray(&gg, o, d, &nb);
-      nbtot += nb;
-      if (nb > nbmax) nbmax = nb;
+  /* ДВИЖУЩАЯСЯ КАМЕРА ПРИ НЕПОДВИЖНОЙ СЦЕНЕ — ЗАМЕР, А НЕ ВЫКЛАДКА.
+   *
+   * Вопрос «сколько стоит КАДР» нельзя честно ответить одним прогоном: в нём
+   * цена кадра неотличима от разовой расстановки. Поэтому камера двигается по
+   * дуге, а сцена остаётся на месте, и печатается время КАЖДОГО кадра. Что при
+   * этом НЕ пересчитывается, видно прямо по коду: между кадрами меняется только
+   * `cam`, а `gg` (сетка, разрез, хранимое поле, индекс граней) не трогается
+   * ВООБЩЕ. Развёртка позади цикла и в него не входит.
+   *
+   * Первый кадр отделён от остальных: он греет кэш, и мешать его с
+   * установившимися значило бы завысить цену движения. */
+  double t_first = 0.0, t_rest = 0.0;
+  for (int fri = 0; fri < nframe; fri++) {
+    if (fri > 0) {
+      /* дуга вокруг центра комнаты: меняется ТОЛЬКО камера */
+      double a = 0.35 * (double)fri / (double)(nframe > 1 ? nframe - 1 : 1);
+      double ex = 8.0 + 6.0 * sin(a), ey = 0.6 - 6.0 * (1.0 - cos(a));
+      double e2[3] = {ex, ey, 7.2};
+      if (tr3_camera_look(&cam, e2, at, up, 1.3, W, H)) return 1;
     }
+    double tf = now();
+    nbtot = 0;
+    nbmax = 0;
+    for (int py = 0; py < H; py++)
+      for (int px = 0; px < W; px++) {
+        double o[3], d[3];
+        tr3_camera_ray(&cam, px, py, o, d);
+        int nb = 0;
+        buf[(size_t)py * (size_t)W + (size_t)px] = tr3_gather_ray(&gg, o, d, &nb);
+        nbtot += nb;
+        if (nb > nbmax) nbmax = nb;
+      }
+    double dt = now() - tf;
+    if (nframe > 1)
+      printf("  кадр %2d: %.3f с (%.0f нс на луч, %.2f кадра в секунду)\n", fri, dt,
+             1e9 * dt / ((double)W * (double)H), 1.0 / dt);
+    if (fri == 0)
+      t_first = dt;
+    else
+      t_rest += dt;
+  }
+  if (nframe > 1)
+    printf("КАДР ПРИ НЕПОДВИЖНОЙ СЦЕНЕ: первый %.3f с, установившийся %.3f с в среднем "
+           "по %d кадрам (%.2f кадра в секунду). Между кадрами меняется ТОЛЬКО камера.\n",
+           t_first, t_rest / (double)(nframe - 1), nframe - 1,
+           (double)(nframe - 1) / (t_rest > 0.0 ? t_rest : 1.0));
 
-  double t_gather = now() - t1;
-  stage_add("СБОР ПО ПИКСЕЛЮ", 1);
+  /* В УЧЁТ ИДЁТ УСТАНОВИВШИЙСЯ КАДР, А НЕ СУММА ПО ВСЕМ. Иначе строка «сбор» и
+   * доля «на каждый кадр» растут вместе с числом кадров, а это бессмыслица:
+   * кадр стоит столько, сколько стоит ОДИН кадр. */
+  double t_gather = nframe > 1 ? t_rest / (double)(nframe - 1) : now() - t1;
+  (void)t1;
+  g_mark = now() - t_gather; /* в этап идёт УСТАНОВИВШИЙСЯ кадр, см. выше */
+  stage_add("СБОР ПО ПИКСЕЛЮ (установившийся кадр)", 1);
   /* РАЗДЕЛЬНЫЙ ДОКЛАД ХОЛОДНОГО СТАРТА И КАДРА — требование CLAUDE.md. Поле от
    * камеры не зависит, поэтому поворот камеры стоит ТОЛЬКО сбора. */
   printf("СБОР ПО ПИКСЕЛЮ (кадр): %.3f с на %dx%d = %.2f млн лучей, %.0f нс на луч\n", t_gather, W,

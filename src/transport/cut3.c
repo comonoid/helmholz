@@ -219,6 +219,13 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
           se.facet = ref >= 0 ? ref : ~ref;
           se.area = poly_mass2(m, vw, (int)nv, c, c, se.m);
           if (!(se.area > 0.0)) continue;
+          /* НУЛЕВОЙ ВЕКТОР матрицы масс — прямо из уравнения плоскости (К39).
+           * Не вычисляется численно и не угадывается: он ЗАДАН геометрией. */
+          se.nul[0] = -h[src].off;
+          for (int a = 0; a < 3; a++) {
+            se.nul[0] += h[src].n[a] * ((double)m->clo[c][a] + 0.5 * hh);
+            se.nul[a + 1] = hh * h[src].n[a];
+          }
           /* Материал держит {n·x ≤ off}, значит НАРУЖУ материала (в флюид)
            * смотрит +n. В мир — делением на u и пере-нормировкой (Г21). */
           double nw[3], nm2 = 0.0;

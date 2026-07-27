@@ -443,10 +443,27 @@ static void t_cavity(void) {
       double e = fabs(phi[c * 4] - 4.0 * M_PI * exact) / (4.0 * M_PI * exact);
       if (e > worst) worst = e;
     }
+    /* ХРАНИМОЕ ЕСТЬ КОЭФФИЦИЕНТЫ DG1, А НЕ ЗНАЧЕНИЕ (К39). Читать `bout[f·4]`
+     * как радианс НЕЛЬЗЯ: базис ячейки центрирован на ЯЧЕЙКЕ, а грань лежит на
+     * её краю, поэтому у постоянного поля c представитель минимальной нормы
+     * равен (0.8c, 0.4c, 0, 0) и значение собирается только вместе с базисом.
+     * Прежде это сходилось случайно — откат к константе обнулял наклоны, то
+     * есть тест проходил ровно потому, что проекция была сломана. */
     for (int32_t f = 0; f < r.m.nf; f++) {
       if (r.m.f[f].cb >= 0) continue;
-      double e = fabs(st.bout[f * 4] - exact) / exact;
-      if (e > wb) wb = e;
+      double v[4][3];
+      tr3_face_corners(&r.m, f, v);
+      int32_t c = r.m.f[f].ca;
+      double s = (double)r.m.csize[c];
+      for (int q = 0; q < 4; q++) {
+        double val = st.bout[f * 4];
+        for (int a = 0; a < 3; a++) {
+          double xu = (v[q][a] - r.m.fr.o[a]) / r.m.fr.u[a];
+          val += st.bout[f * 4 + a + 1] * ((xu - ((double)r.m.clo[c][a] + 0.5 * s)) / s);
+        }
+        double e = fabs(val - exact) / exact;
+        if (e > wb) wb = e;
+      }
     }
     printf("  [D полость%s] код %d, итераций %d: радианс отн. ошибка %.2e, "
            "исходящий на стенках %.2e (точно %.6f)\n",
@@ -613,8 +630,8 @@ static void t_render(void) {
   printf("    радианс на стенках от %.4f до %.4f; пикселей без грани %d\n", mn, mx, miss);
   check(miss == 0, "каждый луч нашёл свою стенку");
   check(mn > 0.0, "теней в замкнутой комнате нет — косвенный свет достаёт везде");
-  hz_ppm_write("build/room.ppm", buf, W, H);
-  printf("    картинка записана: build/room.ppm\n");
+  hz_ppm_write("img/room.ppm", buf, W, H);
+  printf("    картинка записана: img/room.ppm\n");
   free(buf);
   free(st.bout);
   free(st.sout);
@@ -771,6 +788,210 @@ static void t_cut(void) {
   printf("      замкнутость флюида: %d разрезанных ячеек, max |Σn·A| = %.3e\n", nchecked, worst);
   check(nchecked > 50, "разрезанных ячеек достаточно");
   check(worst < 1e-12, "D2: флюидная область ЗАМКНУТА — ни одна грань не потеряна");
+
+  /* ---------------------------------------------------------------- К39 ---
+   * ВЫРОЖДЕНИЕ МАТРИЦЫ МАСС ПЛОСКОГО ЭЛЕМЕНТА. Печь и полость этого не ловят
+   * ВООБЩЕ: у однородного равновесия все наклоны нули, и откат к константе там
+   * безвреден. Это ровно урок К12, повторённый на поверхностях, поэтому
+   * проверка ставится ПРЯМАЯ. */
+  {
+    double wnul = 0.0, wmom = 0.0, wgrow = 0.0, wgrow_old = 0.0;
+    int nneg = 0, nneg_old = 0, ncheck2 = 0;
+    /* пробная линейная функция: положительна на всей ячейке (при |b| ≤ ½
+     * минимум равен 1 − ½(0.1+0.2+0.15) = 0.775 > 0), поэтому у ИСПРАВНОЙ
+     * проекции повода отступать к константе нет ни у одного элемента */
+    const double ex[4] = {1.0, 0.1, -0.2, 0.15};
+    for (int32_t e = 0; e < cu.nse + m.nf; e++) {
+      const double (*M)[4];
+      double nul[4];
+      if (e < cu.nse) {
+        M = cu.se[e].m;
+        memcpy(nul, cu.se[e].nul, sizeof nul);
+      } else {
+        int32_t f = e - cu.nse;
+        if (m.f[f].cb >= 0) continue;
+        M = cu.ffm[f];
+        tr3_face_null(&m, f, m.f[f].ca, nul);
+      }
+      if (!(M[0][0] > 0.0)) continue;
+      ncheck2++;
+      /* 1. НУЛЕВОЙ ВЕКТОР ВЕРЕН И ВЫРОЖДЕНИЕ ТОЧНОЕ */
+      double nm = 0.0, nv = 0.0, r = 0.0;
+      for (int i = 0; i < 4; i++) {
+        nv += nul[i] * nul[i];
+        double acc = 0.0;
+        for (int j = 0; j < 4; j++) {
+          acc += M[i][j] * nul[j];
+          nm += M[i][j] * M[i][j];
+        }
+        r += acc * acc;
+      }
+      double rel = sqrt(r) / (sqrt(nm) * sqrt(nv));
+      if (rel > wnul) wnul = rel;
+      /* 2. ПРОЕКЦИЯ ВОСПРОИЗВОДИТ ЛИНЕЙНОЕ ПОЛЕ: моменты обязаны совпасть */
+      double rr2[4] = {0, 0, 0, 0}, ee[4], nr = 0.0;
+      for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++)
+          rr2[i] += M[i][j] * ex[j];
+        nr += rr2[i] * rr2[i];
+      }
+      nr = sqrt(nr);
+      if (tr3_project_plane(M, rr2, nul, ee) != 0) continue;
+      double dm = 0.0;
+      for (int i = 0; i < 4; i++) {
+        double acc = -rr2[i];
+        for (int j = 0; j < 4; j++)
+          acc += M[i][j] * ee[j];
+        dm += acc * acc;
+      }
+      if (nr > 0.0 && sqrt(dm) / nr > wmom) wmom = sqrt(dm) / nr;
+      /* 3. ПРЕДСТАВИТЕЛЬ ОГРАНИЧЕН, И ИМЕННО ЭТО ЛЕЧИТ ОТКАТ. Добавка вдоль
+       * нулевого вектора на плоскости НЕ ВИДНА, но вне её растёт без предела, и
+       * проверка положительности по углам ячейки съезжает в минус. */
+      double ne = 0.0, nex = 0.0;
+      for (int i = 0; i < 4; i++) {
+        ne += ee[i] * ee[i];
+        nex += ex[i] * ex[i];
+      }
+      double gr = sqrt(ne / nex);
+      if (gr > wgrow) wgrow = gr;
+      double mn = 1e300;
+      for (int k = 0; k < 8; k++) {
+        double v = ee[0];
+        for (int a = 0; a < 3; a++)
+          v += ee[a + 1] * (((k >> a) & 1) ? 0.5 : -0.5);
+        if (v < mn) mn = v;
+      }
+      if (mn < 0.0) nneg++;
+      /* НЕГАТИВНЫЙ КОНТРОЛЬ: ПРЕЖНИЙ КОД, воспроизведённый здесь дословно.
+       * `solve4` вырождения не замечает — четвёртый ведущий элемент выходит не
+       * нулём, а округлением, — и возвращает произвольную добавку вдоль nul. */
+      double a4[4][4], b4[4], x4[4];
+      memcpy(a4, M, sizeof a4);
+      memcpy(b4, rr2, sizeof b4);
+      int sing = 0;
+      for (int k = 0; k < 4 && !sing; k++) {
+        int best = k;
+        for (int i = k + 1; i < 4; i++)
+          if (fabs(a4[i][k]) > fabs(a4[best][k])) best = i;
+        if (!(fabs(a4[best][k]) > 0.0)) {
+          sing = 1;
+          break;
+        }
+        if (best != k) {
+          for (int j = 0; j < 4; j++) {
+            double tt = a4[k][j];
+            a4[k][j] = a4[best][j];
+            a4[best][j] = tt;
+          }
+          double tt = b4[k];
+          b4[k] = b4[best];
+          b4[best] = tt;
+        }
+        for (int i = k + 1; i < 4; i++) {
+          double ff = a4[i][k] / a4[k][k];
+          for (int j = k; j < 4; j++)
+            a4[i][j] -= ff * a4[k][j];
+          b4[i] -= ff * b4[k];
+        }
+      }
+      if (sing) continue;
+      for (int i = 3; i >= 0; i--) {
+        double s2 = b4[i];
+        for (int j = i + 1; j < 4; j++)
+          s2 -= a4[i][j] * x4[j];
+        x4[i] = s2 / a4[i][i];
+      }
+      double ne2 = 0.0, mn2 = 1e300;
+      for (int i = 0; i < 4; i++)
+        ne2 += x4[i] * x4[i];
+      if (sqrt(ne2 / nex) > wgrow_old) wgrow_old = sqrt(ne2 / nex);
+      for (int k = 0; k < 8; k++) {
+        double v = x4[0];
+        for (int a = 0; a < 3; a++)
+          v += x4[a + 1] * (((k >> a) & 1) ? 0.5 : -0.5);
+        if (v < mn2) mn2 = v;
+      }
+      if (mn2 < 0.0) nneg_old++;
+    }
+    printf("  [К39] элементов %d: max |M·nul|/(|M||nul|) = %.3e\n", ncheck2, wnul);
+    printf("        проекция линейного поля: max невязка моментов %.3e, ‖ee‖/‖ex‖ ≤ %.3f, "
+           "минус по углам у %d\n",
+           wmom, wgrow, nneg);
+    printf("    [НК прежний solve4] ‖ee‖/‖ex‖ до %.3e, минус по углам у %d из %d\n", wgrow_old,
+           nneg_old, ncheck2);
+    check(wnul < 1e-13,
+          "К39: матрица масс плоского элемента вырождена ТОЧНО, нулевой вектор верен");
+    check(wmom < 1e-9, "К39: проекция воспроизводит линейное поле — моменты совпали");
+    check(wgrow < 1.0 + 1e-12, "К39: представитель МИНИМАЛЬНОЙ нормы, добавки вдоль nul нет");
+    check(nneg == 0, "К39: у положительного поля откат к константе не нужен НИ РАЗУ");
+    /* ПРЕДСКАЗАНИЕ «больше половины элементов уйдут в минус» НЕ СБЫЛОСЬ:
+     * измерено 423 из 2212, то есть 19%. Причина в том, что здесь подаётся
+     * ТОЧНО ЛИНЕЙНОЕ поле, у которого моменты представимы без остатка, и
+     * величина паразитной добавки определяется только обусловленностью
+     * конкретного элемента. В настоящей сцене облучённость линейной не бывает, и
+     * там доля вышла 1536 из 1536 у стенок и 1372 из 1912 у поверхностей.
+     * Существо контроля от этого не меняется и даже сильнее: норма представителя
+     * раздувается до 1.4e17, то есть решение вырожденной системы бессмысленно
+     * само по себе. Проверка переписана на ИЗМЕРЕННОЕ существо. */
+    check(nneg_old > 100, "НК: прежний solve4 ОБЯЗАН уводить угловой минимум в минус");
+    check(wgrow_old > 1e6, "НК: и раздувать норму представителя на порядки");
+  }
+
+  /* ------------------------------------------------------------- К38 ---
+   * СХОДИМОСТЬ ПРИ ОТРАЖАЮЩЕЙ ПОВЕРХНОСТИ ВНУТРИ ОБЛАСТИ. Прежде здесь было
+   * автоколебание отката, и развёртка упиралась в maxit при невязке 1.25.
+   * Ловится это ТОЛЬКО так: у полости точный ответ однороден, наклоны нулевые,
+   * и переключателю не на чем колебаться. */
+  {
+    tr3_dirs d;
+    check(tr3_dirs_product(&d, 2, 2) == 0, "ординаты");
+    double *sig_t = calloc((size_t)m.ncell, sizeof(double));
+    double *sig_s = calloc((size_t)m.ncell, sizeof(double));
+    double *frho = calloc((size_t)ftab.n, sizeof(double));
+    double *femit = calloc((size_t)ftab.n, sizeof(double));
+    double *phi = calloc((size_t)m.ncell * 4, sizeof(double));
+    if (sig_t == NULL || sig_s == NULL || frho == NULL || femit == NULL || phi == NULL) {
+      check(0, "память");
+    } else {
+      for (int32_t c = 0; c < m.ncell; c++) {
+        sig_t[c] = 0.015;
+        sig_s[c] = 0.012;
+      }
+      for (int32_t i = 0; i < ftab.n; i++)
+        frho[i] = 0.78;
+      double wr[6] = {0.72, 0.35, 0.72, 0.72, 0.65, 0.05};
+      double we[6] = {0, 0, 0, 0, 0, 6.0};
+      tr3_problem p = {.m = &m,
+                       .d = &d,
+                       .cut = &cu,
+                       .facet_rho = frho,
+                       .facet_emit = femit,
+                       .nfacet = ftab.n,
+                       .sig_t = sig_t,
+                       .sig_s = sig_s,
+                       .wall_rho = wr,
+                       .wall_emit = we,
+                       .limiter = 1};
+      tr3_stats st;
+      int rc = tr3_sweep_solve(&p, 500, 1e-9, phi, &st);
+      printf("  [К38] комната с ОТРАЖАЮЩЕЙ сферой: код %d, итераций %d, невязка %.2e, "
+             "откатов проекции на последней итерации %d из %d\n",
+             rc, st.iters, st.resid, st.nfallback, cu.nse + m.nf);
+      check(rc == 0, "развёртка прошла");
+      check(st.resid < 1e-9, "К38: невязка ДОСТИГЛА допуска, а не упёрлась в maxit");
+      check(st.iters < 200, "К38: сходимость геометрическая — десятки итераций, а не тысячи");
+      check(st.nfallback * 20 < cu.nse, "К38: откат проекции — редкое исключение, а не правило");
+      free(st.bout);
+      free(st.sout);
+    }
+    free(sig_t);
+    free(sig_s);
+    free(frho);
+    free(femit);
+    free(phi);
+    tr3_dirs_free(&d);
+  }
 
   tr3_cut_free(&cu);
   tr3_mesh_free(&m);

@@ -316,6 +316,7 @@ int main(int argc, char **argv) {
   }
   printf("картинка: %s (%dx%d)\n", out, W, H);
   free(wallidx);
+  free(solid);
   free(buf);
   free(phi);
   free(st.bout);

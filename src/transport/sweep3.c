@@ -86,6 +86,117 @@ static int solve4(double a[4][4], double b[4], double x[4]) {
   return 0;
 }
 
+/* Решение 3x3 с частичным выбором. Возврат 1 при вырождении. */
+static int solve3(double a[3][3], double b[3], double x[3]) {
+  for (int k = 0; k < 3; k++) {
+    int best = k;
+    for (int i = k + 1; i < 3; i++)
+      if (fabs(a[i][k]) > fabs(a[best][k])) best = i;
+    if (!(fabs(a[best][k]) > 0.0)) return 1;
+    if (best != k) {
+      for (int j = 0; j < 3; j++) {
+        double t = a[k][j];
+        a[k][j] = a[best][j];
+        a[best][j] = t;
+      }
+      double t = b[k];
+      b[k] = b[best];
+      b[best] = t;
+    }
+    for (int i = k + 1; i < 3; i++) {
+      double f = a[i][k] / a[k][k];
+      for (int j = k; j < 3; j++)
+        a[i][j] -= f * a[k][j];
+      b[i] -= f * b[k];
+    }
+  }
+  for (int i = 2; i >= 0; i--) {
+    double s = b[i];
+    for (int j = i + 1; j < 3; j++)
+      s -= a[i][j] * x[j];
+    x[i] = s / a[i][i];
+  }
+  return 0;
+}
+
+/* ПРОЕКЦИЯ НА ЛИНЕЙНЫЕ ФУНКЦИИ, ЖИВУЩИЕ НА ПЛОСКОСТИ (К39).
+ *
+ * Задача: найти DG1-разложение поля, заданного своими моментами `rr_j = ∫ b_j E`,
+ * по ПЛОСКОМУ элементу — грани сетки или куску поверхности. Наивно это
+ * `solve4(M, rr)`, и ровно так было написано. НО МАТРИЦА `M` ЗДЕСЬ ВЫРОЖДЕНА
+ * ТОЧНО: элемент плоский, а базис ячейки {1, ξ, η, ζ} на плоскости связан
+ * тождеством `nul·b ≡ 0` (вывод — в `cut3.h`), поэтому ранг равен трём, а не
+ * четырём. Измерено: `|M·nul| / (|M|·|nul|) = 1.4e-16` на ВСЕХ 1912 элементах
+ * сцены, то есть вырождение не «почти», а по построению.
+ *
+ * Чем это было плохо. `solve4` вырождения НЕ ОБНАРУЖИВАЕТ — четвёртый ведущий
+ * элемент выходит не нулём, а округлением, — и возвращает решение с ПРОИЗВОЛЬНОЙ
+ * добавкой вдоль `nul`. На самой плоскости добавка не видна (там `nul·b = 0`),
+ * зато ВНЕ плоскости она огромна. А проверка положительности `corner_min` считает
+ * как раз по углам ЯЧЕЙКИ, то есть вне плоскости, и потому срабатывала почти
+ * всегда: 1536 стенок из 1536 и 1372 поверхностных элементов из 1912. Хранимый
+ * радианс падал до КОНСТАНТЫ (обещанный «DG1 по положению» не работал ни разу —
+ * отсюда блоки на стенах), а исход переключателя решали последние биты, и он
+ * МЕНЯЛСЯ от итерации к итерации: 1372 → 1330. Это и есть автоколебание, из-за
+ * которого развёртка не сходилась 4000 итераций (К38).
+ *
+ * Как правильно. Решать в ТРЁХ неизвестных, а не в четырёх: тождество `nul·b = 0`
+ * позволяет выразить одну степень свободы через остальные. Исключается та, у
+ * которой коэффициент в `nul` НАИБОЛЬШИЙ ПО МОДУЛЮ, — тогда деление устойчиво, и
+ * порога здесь не появляется, потому что выбор идёт по argmax, а не по сравнению
+ * с числом. Индекс 0 (константа) не исключается никогда: без него не представить
+ * постоянное поле.
+ *
+ * Возврат 1 — вырождение НАСТОЯЩЕЕ (элемент выродился в отрезок или точку), и
+ * тогда вызывающий обязан отступить к константе. Это отказ «в закрытую сторону».
+ */
+int tr3_project_plane(const double M[4][4], const double rr[4], const double nul[4], double ee[4]) {
+  int drop = 1;
+  for (int k = 2; k < 4; k++)
+    if (fabs(nul[k]) > fabs(nul[drop])) drop = k;
+  if (!(fabs(nul[drop]) > 0.0)) return 1; /* нулевого вектора нет — не плоскость */
+  int id[3], nid = 0;
+  for (int k = 0; k < 4; k++)
+    if (k != drop) id[nid++] = k;
+  /* P: приведённые коэффициенты -> полные. ee[drop] = −Σ nul_k·g_k / nul_drop */
+  double P[4][3];
+  memset(P, 0, sizeof P);
+  for (int k = 0; k < 3; k++) {
+    P[id[k]][k] = 1.0;
+    P[drop][k] = -nul[id[k]] / nul[drop];
+  }
+  double G[3][3], g[3], rg[3];
+  for (int i = 0; i < 3; i++) {
+    rg[i] = 0.0;
+    for (int a = 0; a < 4; a++)
+      rg[i] += P[a][i] * rr[a];
+    for (int j = 0; j < 3; j++) {
+      double s = 0.0;
+      for (int a = 0; a < 4; a++)
+        for (int b = 0; b < 4; b++)
+          s += P[a][i] * M[a][b] * P[b][j];
+      G[i][j] = s;
+    }
+  }
+  if (solve3(G, rg, g) != 0) return 1;
+  memset(ee, 0, 4 * sizeof(double));
+  for (int a = 0; a < 4; a++)
+    for (int k = 0; k < 3; k++)
+      ee[a] += P[a][k] * g[k];
+  return 0;
+}
+
+/* Нулевой вектор матрицы масс ГРАНИ СЕТКИ: та же формула, что в `cut3.h`, при
+ * нормали вдоль оси и смещении `pos`. Грань тоже плоская, и её матрица масс
+ * вырождена ровно так же — 1536 стенок из 1536 отступали к константе. */
+void tr3_face_null(const tr3_mesh *m, int32_t f, int32_t c, double nul[4]) {
+  double s = (double)m->csize[c];
+  int a = (int)m->f[f].axis;
+  memset(nul, 0, 4 * sizeof(double));
+  nul[0] = ((double)m->clo[c][a] + 0.5 * s) - (double)m->f[f].pos;
+  nul[a + 1] = s;
+}
+
 /* Минимум линейной функции по УГЛАМ ячейки: у DG1 экстремум всегда в углу. */
 static double corner_min(const double c[4]) {
   double mn = 1e300;
@@ -184,7 +295,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     if (p->facet_emit != NULL && cu->se[e].facet < p->nfacet)
       sout[e * 4] = p->facet_emit[cu->se[e].facet];
 
-  int nclip_last = 0, it = 0;
+  int nclip_last = 0, it = 0, nfb = 0;
   double resid = 0.0;
   for (it = 0; it < maxit; it++) {
     memset(phin, 0, (size_t)nc * 4 * sizeof(double));
@@ -194,6 +305,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     memset(binfall, 0, (size_t)nth * (size_t)m->nf * 4 * sizeof(double));
     memset(sinfall, 0, (size_t)nth * (size_t)(nse > 0 ? nse : 1) * 4 * sizeof(double));
     nclip_last = 0;
+    nfb = 0;
     st->pin = st->pout = st->pabs = 0.0;
     double pin_acc = 0.0, pout_acc = 0.0;
     int fail = 0;
@@ -513,12 +625,19 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         if (!(fmm[0][0] > 0.0)) continue;
         for (int j = 0; j < 4; j++)
           rr[j] = binf[f * 4 + j];
-        /* проекция облучённости на DG1: решаем M·E = rhs */
-        if (solve4(fmm, rr, ee) != 0 || corner_min(ee) < 0.0) {
-          /* ПРОЕКЦИЯ НА DG1 ПАДАЕТ ДО ПОСТОЯННОЙ, ЕСЛИ ДАЁТ ОТРИЦАТЕЛЬНОЕ. На
-           * тонком осколке грани матрица масс почти вырождена, наклоны улетают, и
-           * итерация расходится — измерено на сцене со сферой. Критерий тот же,
-           * что у ограничителя (положительность), и порога в нём нет. */
+        /* ПРОЕКЦИЯ ОБЛУЧЁННОСТИ НА DG1 — В ТРЁХ НЕИЗВЕСТНЫХ, А НЕ В ЧЕТЫРЁХ (К39).
+         * Здесь стояло `solve4(fmm, rr, ee)`, а матрица масс ГРАНИ вырождена
+         * точно: грань плоская, и базис ячейки на ней связан. Измерено, чем это
+         * оборачивалось: откат к константе срабатывал на 1536 гранях из 1536,
+         * то есть DG1 по положению не работал НИ РАЗУ, а его исход менялся от
+         * итерации к итерации и не давал развёртке сойтись. */
+        double nul[4];
+        tr3_face_null(m, f, m->f[f].ca, nul);
+        if (tr3_project_plane(fmm, rr, nul, ee) != 0 || corner_min(ee) < 0.0) {
+          nfb++;
+          /* ОТКАЗ В ЗАКРЫТУЮ СТОРОНУ: либо элемент выродился геометрически, либо
+           * проекция ушла в минус. Тогда остаётся ТОЧНОЕ среднее по грани —
+           * константа, представимая в любом случае. Порога в критерии нет. */
           ee[0] = binf[f * 4] / fmm[0][0];
           ee[1] = ee[2] = ee[3] = 0.0;
         }
@@ -535,9 +654,12 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       for (int j = 0; j < 4; j++)
         rr[j] = sinf[e * 4 + j];
       if (!(fmm[0][0] > 0.0)) continue;
-      if (solve4(fmm, rr, ee) != 0 || corner_min(ee) < 0.0) {
+      /* та же правка К39: нулевой вектор у поверхностного элемента хранится
+       * рядом с матрицей масс и выведен из уравнения плоскости (cut3.h) */
+      if (tr3_project_plane(fmm, rr, se->nul, ee) != 0 || corner_min(ee) < 0.0) {
         ee[0] = sinf[e * 4] / fmm[0][0];
         ee[1] = ee[2] = ee[3] = 0.0;
+        nfb++;
       }
       for (int j = 0; j < 4; j++)
         sout[e * 4 + j] = (hs_se[e] > 0.0 ? rho * ee[j] / hs_se[e] : 0.0);
@@ -564,6 +686,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   st->iters = it;
   st->resid = resid;
   st->nclip = nclip_last;
+  st->nfallback = nfb;
   st->bout = bout;
   st->sout = sout;
 

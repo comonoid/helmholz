@@ -41,6 +41,48 @@ static double now(void) {
 #define LOG2N 4
 #define NC (1 << LOG2N)
 
+/* УЧЁТ ХОЛОДНОГО СТАРТА ПО ЭТАПАМ, И ЭТО ТРЕБОВАНИЕ, А НЕ УДОБСТВО.
+ * Прежде «холодным стартом» звалась ОДНА развёртка, а вся расстановка сцены —
+ * дерево, фасетизация, боковая таблица, сетка граней, матрицы масс разреза —
+ * не мерилась нигде и потому молча выпадала из отчёта. Правило CLAUDE.md
+ * («докладывать холодный старт и кадр РАЗДЕЛЬНО») этим нарушалось в свою
+ * пользу: цифра выходила меньше настоящей.
+ *
+ * Столбец «на кадр» отвечает на вопрос, ради которого учёт и заведён: ЧТО ИЗ
+ * ЭТОГО ПОВТОРИТСЯ, ЕСЛИ ДВИНУТЬ КАМЕРУ. Сегодня — только сбор, потому что ни
+ * одна структура выше камеры не читает (`tr3_problem` её не содержит вовсе).
+ * ОГОВОРКА, БЕЗ КОТОРОЙ ЭТО ХВАСТОВСТВО: так выходит ещё и потому, что LOD НЕ
+ * СДЕЛАН — сетка равномерная. С камерно-привязанным LOD движение камеры меняет
+ * набор элементов, и часть расстановки вернётся в кадр. */
+typedef struct {
+  const char *name;
+  double t;
+  int per_frame; /* 1 — повторяется при движении камеры */
+} stage;
+
+#define NSTAGE 12
+static stage g_st[NSTAGE];
+static int g_ns = 0;
+static double g_mark = 0.0;
+
+static void stage_mark(void);
+static void stage_add(const char *name, int per_frame);
+
+static void stage_mark(void) {
+  g_mark = now();
+}
+
+static void stage_add(const char *name, int per_frame) {
+  double t = now();
+  if (g_ns < NSTAGE) {
+    g_st[g_ns].name = name;
+    g_st[g_ns].t = t - g_mark;
+    g_st[g_ns].per_frame = per_frame;
+    g_ns++;
+  }
+  g_mark = t;
+}
+
 int main(int argc, char **argv) {
   int W = argc > 1 ? atoi(argv[1]) : 640;
   int H = argc > 2 ? atoi(argv[2]) : 480;
@@ -52,6 +94,7 @@ int main(int argc, char **argv) {
   double spec = argc > 5 ? atof(argv[5]) : 0.0;
   int maxbounce = argc > 6 ? atoi(argv[6]) : 8;
 
+  stage_mark();
   hz_frame fr = {{0, 0, 0}, {1, 1, 1}};
   hz_octree t;
   if (hz_oct_init(&t, LOG2N, 0.0)) return 1;
@@ -64,6 +107,8 @@ int main(int argc, char **argv) {
         int lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
         hz_oct_set_box(&t, lo, hi, 1.0);
       }
+
+  stage_add("октодерево", 0);
 
   /* сфера как АНАЛИТИЧЕСКИЙ примитив плюс её фасеты для разреза */
   hz_surftab stab;
@@ -85,6 +130,8 @@ int main(int argc, char **argv) {
     nfac[b] = hz_surf_facet_sphere(&ftab, &fr, sc[b], sr[b], 2, HZ_FIT_MEAN_SAGITTA, si, &f0[b]);
     if (nfac[b] <= 0) return 1;
   }
+
+  stage_add("фасетизация примитивов", 0);
 
   /* боковая таблица: ключи ОБЯЗАНЫ идти по возрастанию (Г45) */
   typedef struct {
@@ -133,8 +180,11 @@ int main(int argc, char **argv) {
     if (hz_cutmap_add(&cmap, recs[i].cell, recs[i].f, recs[i].nf) != 0) return 1;
   free(recs);
 
+  stage_add("боковая таблица (отбор фасетов по ячейкам)", 0);
+
   tr3_mesh mesh;
   if (tr3_mesh_build(&mesh, &t, &fr)) return 1;
+  stage_add("сетка ГРАНЕЙ над деревом", 0);
   /* Г38: маска полных ячеек строится ОТДЕЛЬНО — в боковой таблице их нет */
   uint8_t *solid = calloc((size_t)mesh.ncell, 1);
   if (solid == NULL) return 1;
@@ -147,10 +197,13 @@ int main(int argc, char **argv) {
           if (hz_facets_for_box(&ftab, f0[b], nfac[b], lo, hi, sel, HZ_P3_MAXH) == 0)
             solid[mesh.cellof[hz_oct_leaf(&t, x, y, z)]] = 1;
       }
+  stage_add("маска полных ячеек (Г38)", 0);
   tr3_cut cut;
   if (tr3_cut_build(&cut, &mesh, &ftab, &cmap, solid)) return 1;
+  stage_add("РАЗРЕЗ: флюид, матрицы масс, поверхностные элементы", 0);
   tr3_dirs dirs;
   if (tr3_dirs_product(&dirs, nmu, nmu)) return 1;
+  stage_add("набор ординат", 0);
 
   double *sig_t = calloc((size_t)mesh.ncell, sizeof(double));
   double *sig_s = calloc((size_t)mesh.ncell, sizeof(double));
@@ -197,9 +250,11 @@ int main(int argc, char **argv) {
   printf("ячеек %d, граней %d, поверхностных элементов %d, направлений %d, 1:1 нарушений %d, "
          "ячеек с ДВУМЯ телами %d (обязано быть 0)\n",
          mesh.ncell, mesh.nf, cut.nse, dirs.n, cut.nbad, nboth);
+  stage_mark();
   double t0 = now();
   int rc = tr3_sweep_solve(&prob, 4000, 1e-9, phi, &st);
   double t_sweep = now() - t0;
+  stage_add("РАЗВЁРТКА (итерация по рассеянию)", 0);
   printf("развёртка (ХОЛОДНЫЙ СТАРТ): код %d, итераций %d, невязка %.2e, срезок %d, %.2f с "
          "(%.2f мс на итерацию)\n",
          rc, st.iters, st.resid, st.nclip, t_sweep, 1e3 * t_sweep / (double)(st.iters + 1));
@@ -232,6 +287,7 @@ int main(int argc, char **argv) {
         wallidx[((int32_t)wl * NC + a) * NC + b] = f;
   }
 
+  stage_add("индекс граничных граней", 0);
   double t1 = now();
   /* СБОР ВЫНЕСЕН В МОДУЛЬ (gather3.c): зеркало добавляет в него ЦИКЛ, а цикл
    * надо фальсифицировать, чего внутри main было негде делать. При spec = 0
@@ -260,10 +316,25 @@ int main(int argc, char **argv) {
     }
 
   double t_gather = now() - t1;
+  stage_add("СБОР ПО ПИКСЕЛЮ", 1);
   /* РАЗДЕЛЬНЫЙ ДОКЛАД ХОЛОДНОГО СТАРТА И КАДРА — требование CLAUDE.md. Поле от
    * камеры не зависит, поэтому поворот камеры стоит ТОЛЬКО сбора. */
   printf("СБОР ПО ПИКСЕЛЮ (кадр): %.3f с на %dx%d = %.2f млн лучей, %.0f нс на луч\n", t_gather, W,
          H, 1e-6 * (double)W * (double)H, 1e9 * t_gather / ((double)W * (double)H));
+  {
+    double tot = 0.0, per = 0.0;
+    for (int i = 0; i < g_ns; i++) {
+      tot += g_st[i].t;
+      if (g_st[i].per_frame) per += g_st[i].t;
+    }
+    printf("\n--- ХОЛОДНЫЙ СТАРТ ПО ЭТАПАМ (всё, от расстановки сцены) ---\n");
+    for (int i = 0; i < g_ns; i++)
+      printf("  %-52s %7.3f с  %5.1f%%  %s\n", g_st[i].name, g_st[i].t, 100.0 * g_st[i].t / tot,
+             g_st[i].per_frame ? "НА КАЖДЫЙ КАДР" : "один раз на сцену");
+    printf("  %-52s %7.3f с\n", "ИТОГО холодный старт", tot);
+    printf("  %-52s %7.3f с   (отношение %.1f)\n", "из них ПОВТОРИТСЯ при движении камеры", per,
+           per > 0.0 ? tot / per : 0.0);
+  }
   if (hz_ppm_write(out, buf, W, H) != 0) {
     fprintf(stderr, "не записалось: %s\n", out);
     return 1;

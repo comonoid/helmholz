@@ -76,9 +76,10 @@ typedef struct {
    * amplitude, because the face conditions demand continuity; a localised beam
    * needs the angular spread lam/w around each mode direction, and fan/spread
    * are how much of it the basis is given. */
-  int fan, nmode, obj, ss, acc, opaque, pix, shcut;
-  double cgrade; /* geometric grading towards the edges, where the field is self-similar */
-  double kmul;   /* scales k0: several runs over a band = a source of finite coherence */
+  int fan, nmode, obj, ss, acc, opaque, pix, shcut, dump;
+  double apert, apy; /* the CAMERA APERTURE as an adjoint source: importance, not light */
+  double cgrade;     /* geometric grading towards the edges, where the field is self-similar */
+  double kmul;       /* scales k0: several runs over a band = a source of finite coherence */
   double orad, oxc, oyc;
   double spread;
   double Lbox, kap, bet;
@@ -334,15 +335,16 @@ static int celld[MAXCELL];
 static double skey[2][MAXCELL];
 static unsigned char rowcat[MAXROW];     /* 0 interior [u], 1 interior [dn u], 2 mirror, 3 wall */
 static float rowx[MAXROW], rowy[MAXROW]; /* where the condition lives, to map the misfit */
+static int rowsub[MAXROW];               /* which sub-cell the test function belongs to */
 static int ord[2][MAXCELL];
 
 int main(int argc, char **argv) {
   double t_start = now_s();
   static const char *const KEYS[] = {
-      "W",    "nd",   "ne",   "th",   "it",  "n",      "alpha",  "dth",    "oracle", "lev",
-      "lodk", "amp2", "th2",  "spec", "ex1", "ex2",    "ex3",    "ex4",    "abc",    "mirror",
-      "mode", "img",  "drop", "beam", "by0", "fan",    "spread", "nmode",  "obj",    "orad",
-      "oxc",  "oyc",  "ss",   "kmul", "acc", "opaque", "pix",    "cgrade", "shcut",  NULL};
+      "W",    "nd",   "ne",     "th",  "it",     "n",     "alpha", "dth",  "oracle", "lev",  "lodk",
+      "amp2", "th2",  "spec",   "ex1", "ex2",    "ex3",   "ex4",   "abc",  "mirror", "mode", "img",
+      "drop", "beam", "by0",    "fan", "spread", "nmode", "obj",   "orad", "oxc",    "oyc",  "ss",
+      "kmul", "acc",  "opaque", "pix", "cgrade", "shcut", "apert", "apy",  "dump",   NULL};
   for (int i = 1; i < argc; i++) {
     const char *eq = strchr(argv[i], '=');
     int ok = 0;
@@ -419,6 +421,9 @@ int main(int argc, char **argv) {
     if (!strncmp(argv[i], "pix=", 4)) c.pix = (int)v;
     if (!strncmp(argv[i], "cgrade=", 7)) c.cgrade = v;
     if (!strncmp(argv[i], "shcut=", 6)) c.shcut = (int)v;
+    if (!strncmp(argv[i], "apert=", 6)) c.apert = v;
+    if (!strncmp(argv[i], "apy=", 4)) c.apy = v;
+    if (!strncmp(argv[i], "dump=", 5)) c.dump = (int)v;
     for (int e = 0; e < 4; e++) {
       char key[8];
       snprintf(key, sizeof key, "ex%d=", e + 1);
@@ -712,6 +717,7 @@ int main(int argc, char **argv) {
           rp[nrow] = nnz;                                                                          \
           rowcat[nrow] = (unsigned char)(isint ? cond : 3);                                        \
           rowx[nrow] = (float)(0.5 * ((X0) + (X1)));                                               \
+          rowsub[nrow] = scs[ti];                                                                  \
           rowy[nrow] = (float)(0.5 * ((Y0) + (Y1)));                                               \
           for (int t2 = 0; t2 < 2; t2++) {                                                         \
             if (scs[t2] < 0) continue;                                                             \
@@ -777,6 +783,7 @@ int main(int argc, char **argv) {
       if (nrow >= MAXROW) return 1;                                                                \
       rp[nrow] = nnz;                                                                              \
       rowcat[nrow] = 2;                                                                            \
+      rowsub[nrow] = (SA);                                                                         \
       rowx[nrow] = (float)(0.5 * ((X0) + (X1)));                                                   \
       rowy[nrow] = (float)(0.5 * ((Y0) + (Y1)));                                                   \
       for (int d = 0; d < SM->nd; d++) {                                                           \
@@ -808,6 +815,7 @@ int main(int argc, char **argv) {
       if (nrow >= MAXROW || nnz >= cap) return 1;                                                  \
       rp[nrow] = nnz;                                                                              \
       rowcat[nrow] = 3;                                                                            \
+      rowsub[nrow] = (SA);                                                                         \
       rowx[nrow] = (float)(0.5 * ((X0) + (X1)));                                                   \
       rowy[nrow] = (float)(0.5 * ((Y0) + (Y1)));                                                   \
       ja[nnz] = SW->base + d;                                                                      \
@@ -819,6 +827,14 @@ int main(int argc, char **argv) {
         if (fabs(SW->kx[d] - c.px[q2]) + fabs(SW->ky[d] - c.py[q2]) > 1e-9 * c.k0) continue;       \
         vin = c.amp[q2] * cexp(i1 * (c.px[q2] * SW->cx + c.py[q2] * SW->cy));                      \
         break;                                                                                     \
+      }                                                                                            \
+      if (c.apert > 0.0) {                                                                         \
+        /* ADJOINT SOURCE: the camera aperture radiating back into the scene. By                   \
+         * reciprocity its field IS the importance — how strongly each place of                  \
+         * the scene feeds this sensor. Only rows on the +x wall inside the                        \
+         * aperture are driven; everything else is silent. */                                      \
+        vin = 0.0;                                                                                 \
+        if ((NX) > 0.0 && fabs(SW->cy - c.apy) < c.apert) vin = 1.0;                               \
       }                                                                                            \
       rhs[nrow] = vin;                                                                             \
       nrow++;                                                                                      \
@@ -1162,6 +1178,41 @@ int main(int argc, char **argv) {
          : brk == 2 ? "ALPHA breakdown"
          : brk == 3 ? "stalled at the least-squares floor"
                     : "iteration cap");
+  /* --- DUMP PER ROW, so a forward run and an adjoint run can be combined ------
+   * Both runs share the mesh and the matrix exactly (only the right-hand side
+   * differs), so row i means the same condition in both files and they can be
+   * multiplied entry by entry. Forward run stores its residual; adjoint run
+   * stores |W| at the same place. Their product is the dual-weighted residual —
+   * the quantity that says how much a given condition matters TO THE PICTURE. */
+  if (c.dump) {
+    const char *fn = c.apert > 0.0 ? "img/rows_adj.bin" : "img/rows_fwd.bin";
+    FILE *fd = fopen(fn, "wb");
+    if (!fd) {
+      printf("  ABORT: cannot write %s\n", fn);
+      exit(1);
+    }
+    for (int r = 0; r < nrow; r++) {
+      float rec[3];
+      rec[0] = rowx[r];
+      rec[1] = rowy[r];
+      if (c.apert > 0.0) {
+        const sub *SU = &S[rowsub[r]];
+        double complex w = 0.0;
+        for (int d = 0; d < SU->nd; d++)
+          w += xs[SU->base + d] * cexp(i1 * (SU->kx[d] * ((double)rowx[r] - SU->cx) +
+                                             SU->ky[d] * ((double)rowy[r] - SU->cy)));
+        rec[2] = (float)cabs(w);
+      } else {
+        double complex s = 0.0;
+        for (size_t p = rp[r]; p < rp[r + 1]; p++)
+          s += va[p] * xs[ja[p]];
+        rec[2] = (float)cabs(s - rhs[r]);
+      }
+      fwrite(rec, sizeof(float), 3, fd);
+    }
+    fclose(fd);
+    printf("  wrote %s  (%d rows)\n", fn, nrow);
+  }
   /* --- IS THE MISFIT WHERE THE GEOMETRY SAYS IT SHOULD BE? ------------------
    * If the residual really points at the amplitude structure, then on this scene
    * it must sit on six lines: the two edges of the shadow slab, and two edges

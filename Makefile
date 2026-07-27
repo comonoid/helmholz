@@ -63,7 +63,7 @@ build/fdtd: tools/fdtd.c src/image.c src/image.h | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/fdtd.c src/image.c -lm'
 
 # fast tests (seconds..minutes); test_solver3d is the slow validation (~10 min)
-test: check-fp build/test_phi build/test_carrier build/test_carrier_op build/test_carrier2d build/test_cut2d build/test_nitsche2d build/test_bessel build/test_mie2d build/test_dtn2d build/test_helm1d build/test_m2forms build/test_octree build/test_octfmt build/test_poly3 build/test_asm3d \
+test: check-fp build/test_phi build/test_carrier build/test_carrier_op build/test_carrier2d build/test_cut2d build/test_nitsche2d build/test_bessel build/test_mie2d build/test_dtn2d build/test_helm1d build/test_m2forms build/test_octree build/test_octfmt build/test_poly3 build/test_surf build/test_asm3d \
       build/test_mg3d build/test_sweep build/test_rte2d
 	./build/test_phi
 	./build/test_carrier
@@ -79,6 +79,7 @@ test: check-fp build/test_phi build/test_carrier build/test_carrier_op build/tes
 	./build/test_octree
 	./build/test_octfmt
 	./build/test_poly3
+	./build/test_surf
 	./build/test_asm3d
 	./build/test_mg3d
 	./build/test_sweep
@@ -91,7 +92,7 @@ check:
 	scripts/ccheck.sh src/phi.c src/helm1d.c src/fft.c src/octree.c src/assemble3d.c \
 	  src/solver3d.c src/camera.c src/image.c \
 	  tests/test_phi.c tests/test_helm1d.c tests/test_m2forms.c tests/test_octree.c \
-	  tests/test_octfmt.c src/cut/poly3.c tests/test_poly3.c \
+	  tests/test_octfmt.c src/cut/poly3.c tests/test_poly3.c src/cut/surf.c tests/test_surf.c \
 	  tests/test_asm3d.c tests/test_solver3d.c tests/test_mg3d.c tools/render.c \
 	  tools/carrier1d.c tools/fdtd.c src/carrier.c tools/carrier_scale.c tools/carrier_proj.c \
   tests/test_carrier.c tests/test_carrier_op.c tools/carrier_term.c tools/scene2d.c tools/carrier_shell.c tools/carrier_angle.c tools/carrier_cascade.c tools/carrier_solve.c tools/carrier_iter.c tools/carrier_incr.c src/carrier2d.c tests/test_carrier2d.c src/cut2d.c tests/test_cut2d.c tools/carrier_cut2d.c src/bessel.c tests/test_bessel.c src/mie2d.c tests/test_mie2d.c src/dtn2d.c tests/test_dtn2d.c tools/slab2d.c src/nitsche2d.c tests/test_nitsche2d.c tools/slab2d.c tools/tdg2d.c tools/slice2d.c src/transport/sweep.c tests/test_sweep.c src/transport/quad.c src/transport/rte2d.c tests/test_rte2d.c
@@ -209,3 +210,6 @@ check-fp:
 	  n=$$(objdump -d build/poly3_fma.o | grep -cE "vfmadd|vfmsub" || true); \
 	  echo "Г31: fma-инструкций в poly3.o при -mfma = $$n (обязано быть 0)"; \
 	  [ "$$n" -eq 0 ]'
+
+build/test_surf: tests/test_surf.c src/cut/surf.c src/cut/surf.h src/cut/poly3.c src/octree.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_surf.c src/cut/surf.c src/cut/poly3.c src/octree.c -lm'

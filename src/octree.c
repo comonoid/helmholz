@@ -3,10 +3,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-
-/* upper bound for hz_oct_load: 2^26 nodes = 1.5 GiB of arena — beyond any
- * sane scene, and it bounds the attacker-controlled allocation (CWE-789) */
-#define HZ_OCT_MAX_NODES (1 << 26)
+#include <string.h>
 
 static int32_t node_alloc8(hz_octree *t, double complex k2) {
   if (t->n + 8 > t->cap) {
@@ -151,9 +148,9 @@ int hz_oct_set_ball(hz_octree *t, const double c[3], double r, double complex k2
 
 /* --- queries ------------------------------------------------------------- */
 
-double complex hz_oct_at(const hz_octree *t, int x, int y, int z) {
+int32_t hz_oct_leaf(const hz_octree *t, int x, int y, int z) {
   int size = 1 << t->log2size;
-  if (x < 0 || y < 0 || z < 0 || x >= size || y >= size || z >= size) return 0.0;
+  if (x < 0 || y < 0 || z < 0 || x >= size || y >= size || z >= size) return -1;
   int32_t ni = 0;
   int lo[3] = {0, 0, 0};
   while (t->nodes[ni].child0 >= 0) {
@@ -173,7 +170,15 @@ double complex hz_oct_at(const hz_octree *t, int x, int y, int z) {
     }
     ni = t->nodes[ni].child0 + idx;
   }
-  return t->nodes[ni].k2;
+  return ni;
+}
+
+double complex hz_oct_at(const hz_octree *t, int x, int y, int z) {
+  int32_t ni = hz_oct_leaf(t, x, y, z);
+  /* CMPLX and not the bare 0.0: CBMC models double complex as a struct and its
+   * symex asserts type equality on assignment, so an implicit real->complex
+   * conversion aborts the checker outright (tests/cbmc_octree.c) */
+  return ni < 0 ? CMPLX(0.0, 0.0) : t->nodes[ni].k2;
 }
 
 static int visit_rec(const hz_octree *t, int32_t ni, const int nlo[3], int size, const int lo[3],
@@ -203,32 +208,222 @@ int hz_oct_visit(const hz_octree *t, const int lo[3], const int hi[3], hz_oct_cb
   return visit_rec(t, 0, zlo, 1 << t->log2size, lo, hi, cb, ctx);
 }
 
+/* --- validation (pure, integer; PLAN_CUT.md Р-2) -------------------------- */
+
+/* depth scratch marker; real depths are <= HZ_OCT_MAX_LOG2SIZE = 20 */
+#define HZ_OCT_UNSEEN 0xFFu
+
+int hz_oct_validate(const hz_octree *t) {
+  if (t->log2size < 0 || t->log2size > HZ_OCT_MAX_LOG2SIZE) return HZ_OCT_E_LOG2SIZE;
+  /* (n-1) % 8: node 0 is the root and node_alloc8 hands out blocks of 8 after
+   * it, so any other count is a file that this code could not have written. */
+  if (t->n < 1 || t->n > HZ_OCT_MAX_NODES || (t->n - 1) % 8 != 0) return HZ_OCT_E_NCOUNT;
+
+  /* inline malloc, no allocation wrapper: gcc -fanalyzer loses the
+   * capacity<->count link through wrappers and reports phantom overflows
+   * (CLAUDE.md, diam audit 07-24) */
+  unsigned char *depth = malloc((size_t)t->n);
+  if (depth == NULL) return HZ_OCT_E_IO;
+  memset(depth, (int)HZ_OCT_UNSEEN, (size_t)t->n);
+  depth[0] = 0; /* the root is reachable by definition */
+
+  int rc = HZ_OCT_OK;
+  for (int32_t i = 0; i < t->n && rc == HZ_OCT_OK; i++) {
+    if (depth[i] == HZ_OCT_UNSEEN) {
+      rc = HZ_OCT_E_UNREACHABLE;
+      break;
+    }
+    int32_t c = t->nodes[i].child0;
+    if (c == -1) continue; /* leaf */
+    if (c < 0) {
+      rc = HZ_OCT_E_CHILD_NEG;
+      break;
+    }
+    if (c <= i) {
+      rc = HZ_OCT_E_CYCLE;
+      break;
+    }
+    if (c > t->n - 8) { /* i.e. c + 8 > n, written so it cannot overflow */
+      rc = HZ_OCT_E_RANGE;
+      break;
+    }
+    if ((c - 1) % 8 != 0) {
+      rc = HZ_OCT_E_ALIGN;
+      break;
+    }
+    if ((int)depth[i] + 1 > t->log2size) { /* a node of size 1 has no children */
+      rc = HZ_OCT_E_DEPTH;
+      break;
+    }
+    for (int j = 0; j < 8; j++) {
+      if (depth[c + j] != HZ_OCT_UNSEEN) {
+        rc = HZ_OCT_E_TWOPARENT;
+        break;
+      }
+      depth[c + j] = (unsigned char)(depth[i] + 1);
+    }
+  }
+  free(depth);
+  return rc;
+}
+
 /* --- serialization -------------------------------------------------------- */
 
+static const char hz_oct_magic[8] = {'H', 'Z', 'O', 'C', 'T', 'R', 'E', '\0'};
+#define HZ_OCT_ENDIAN_WITNESS 0x04030201u
+/* bit pattern of the IEEE754 double 1.0; the writer stores an actual 1.0, so a
+ * build with another floating-point representation fails HERE instead of
+ * reading the node values as garbage */
+#define HZ_OCT_CANARY_BITS UINT64_C(0x3FF0000000000000)
+
+/* elements per bulk read/write: 1024 int32 + 1024 double = 12 KiB of stack,
+ * inside a 32 KiB L1, and it keeps peak memory at the arena — gathering all
+ * three arrays at once would cost 1.3 GB on top of a 1.5 GB arena at n = 2^26 */
+enum { HZ_OCT_IOCHUNK = 1024 };
+
+/* One array per call, one chunked loop per call. THE SPLIT IS NOT COSMETIC:
+ * with all three loops in hz_oct_load, gcc -fanalyzer widens after the first
+ * chunk iteration, loses the calloc-capacity <-> loop-bound link and reports a
+ * phantom heap overflow (the class CLAUDE.md records from the diam audit). One
+ * loop per function keeps each state space small enough to stay exact. */
+static int read_child0(FILE *f, hz_onode *nodes, int32_t n) {
+  int32_t buf[HZ_OCT_IOCHUNK];
+  for (int32_t i = 0; i < n;) {
+    int32_t m = n - i;
+    if (m > HZ_OCT_IOCHUNK) m = HZ_OCT_IOCHUNK;
+    if (fread(buf, sizeof buf[0], (size_t)m, f) != (size_t)m) return HZ_OCT_E_IO;
+    for (int32_t j = 0; j < m; j++)
+      nodes[i + j].child0 = buf[j];
+    i += m;
+  }
+  return HZ_OCT_OK;
+}
+
+/* part 0 = real, 1 = imaginary */
+static int read_part(FILE *f, hz_onode *nodes, int32_t n, int part) {
+  double buf[HZ_OCT_IOCHUNK];
+  for (int32_t i = 0; i < n;) {
+    int32_t m = n - i;
+    if (m > HZ_OCT_IOCHUNK) m = HZ_OCT_IOCHUNK;
+    if (fread(buf, sizeof buf[0], (size_t)m, f) != (size_t)m) return HZ_OCT_E_IO;
+    for (int32_t j = 0; j < m; j++)
+      nodes[i + j].k2 =
+          part == 0 ? CMPLX(buf[j], cimag(nodes[i + j].k2)) : CMPLX(creal(nodes[i + j].k2), buf[j]);
+    i += m;
+  }
+  return HZ_OCT_OK;
+}
+
+static int write_child0(FILE *f, const hz_onode *nodes, int32_t n) {
+  int32_t buf[HZ_OCT_IOCHUNK];
+  for (int32_t i = 0; i < n;) {
+    int32_t m = n - i;
+    if (m > HZ_OCT_IOCHUNK) m = HZ_OCT_IOCHUNK;
+    for (int32_t j = 0; j < m; j++)
+      buf[j] = nodes[i + j].child0;
+    if (fwrite(buf, sizeof buf[0], (size_t)m, f) != (size_t)m) return HZ_OCT_E_IO;
+    i += m;
+  }
+  return HZ_OCT_OK;
+}
+
+static int write_part(FILE *f, const hz_onode *nodes, int32_t n, int part) {
+  double buf[HZ_OCT_IOCHUNK];
+  for (int32_t i = 0; i < n;) {
+    int32_t m = n - i;
+    if (m > HZ_OCT_IOCHUNK) m = HZ_OCT_IOCHUNK;
+    for (int32_t j = 0; j < m; j++)
+      buf[j] = part == 0 ? creal(nodes[i + j].k2) : cimag(nodes[i + j].k2);
+    if (fwrite(buf, sizeof buf[0], (size_t)m, f) != (size_t)m) return HZ_OCT_E_IO;
+    i += m;
+  }
+  return HZ_OCT_OK;
+}
+
+int hz_oct_hdr_decode(const unsigned char *h, int *log2size, int32_t *n) {
+  if (memcmp(h + HZ_OCT_OFF_MAGIC, hz_oct_magic, sizeof hz_oct_magic) != 0) return HZ_OCT_E_MAGIC;
+  uint32_t u;
+  memcpy(&u, h + HZ_OCT_OFF_VERSION, sizeof u);
+  if (u != HZ_OCT_VERSION) return HZ_OCT_E_VERSION;
+  memcpy(&u, h + HZ_OCT_OFF_FLAGS, sizeof u);
+  if (u != 0u) return HZ_OCT_E_FLAGS; /* fail closed on any unknown bit */
+  memcpy(&u, h + HZ_OCT_OFF_ENDIAN, sizeof u);
+  if (u != HZ_OCT_ENDIAN_WITNESS) return HZ_OCT_E_ENDIAN;
+  uint64_t cb;
+  memcpy(&cb, h + HZ_OCT_OFF_CANARY, sizeof cb);
+  if (cb != HZ_OCT_CANARY_BITS) return HZ_OCT_E_CANARY;
+  int32_t rsv;
+  memcpy(&rsv, h + HZ_OCT_OFF_RESERVED, sizeof rsv);
+  if (rsv != 0) return HZ_OCT_E_RESERVED;
+  int32_t l2, nn;
+  memcpy(&l2, h + HZ_OCT_OFF_LOG2SIZE, sizeof l2);
+  memcpy(&nn, h + HZ_OCT_OFF_N, sizeof nn);
+  if (l2 < 0 || l2 > HZ_OCT_MAX_LOG2SIZE) return HZ_OCT_E_LOG2SIZE;
+  if (nn < 1 || nn > HZ_OCT_MAX_NODES || (nn - 1) % 8 != 0) return HZ_OCT_E_NCOUNT;
+  *log2size = (int)l2;
+  *n = nn;
+  return HZ_OCT_OK;
+}
+
 int hz_oct_save(const hz_octree *t, FILE *f) {
-  int32_t hdr[2] = {(int32_t)t->log2size, t->n};
-  if (fwrite(hdr, sizeof(hdr), 1, f) != 1) return 1;
-  if (fwrite(t->nodes, sizeof(hz_onode), (size_t)t->n, f) != (size_t)t->n) return 1;
-  return 0;
+  unsigned char h[HZ_OCT_HDRSIZE];
+  memset(h, 0, sizeof h);
+  memcpy(h + HZ_OCT_OFF_MAGIC, hz_oct_magic, sizeof hz_oct_magic);
+  uint32_t u = HZ_OCT_VERSION;
+  memcpy(h + HZ_OCT_OFF_VERSION, &u, sizeof u);
+  u = 0u; /* flags */
+  memcpy(h + HZ_OCT_OFF_FLAGS, &u, sizeof u);
+  u = HZ_OCT_ENDIAN_WITNESS;
+  memcpy(h + HZ_OCT_OFF_ENDIAN, &u, sizeof u);
+  int32_t v = (int32_t)t->log2size;
+  memcpy(h + HZ_OCT_OFF_LOG2SIZE, &v, sizeof v);
+  v = t->n;
+  memcpy(h + HZ_OCT_OFF_N, &v, sizeof v);
+  v = 0; /* reserved */
+  memcpy(h + HZ_OCT_OFF_RESERVED, &v, sizeof v);
+  double canary = 1.0;
+  memcpy(h + HZ_OCT_OFF_CANARY, &canary, sizeof canary);
+  if (fwrite(h, sizeof h, 1, f) != 1) return HZ_OCT_E_IO;
+
+  int rc = write_child0(f, t->nodes, t->n);
+  if (rc == HZ_OCT_OK) rc = write_part(f, t->nodes, t->n, 0);
+  if (rc == HZ_OCT_OK) rc = write_part(f, t->nodes, t->n, 1);
+  return rc;
 }
 
 int hz_oct_load(hz_octree *t, FILE *f) {
-  int32_t hdr[2];
-  if (fread(hdr, sizeof(hdr), 1, f) != 1) return 1;
-  if (hdr[0] < 0 || hdr[0] > 20 || hdr[1] < 1 || hdr[1] > HZ_OCT_MAX_NODES) return 1;
-  t->log2size = hdr[0];
-  t->n = t->cap = hdr[1];
-  t->nodes = calloc((size_t)t->cap, sizeof(hz_onode));
-  if (t->nodes == NULL) return 1;
-  if (fread(t->nodes, sizeof(hz_onode), (size_t)t->n, f) != (size_t)t->n) {
-    hz_oct_free(t);
-    return 1;
+  t->nodes = NULL;
+  t->n = t->cap = 0;
+  t->log2size = 0;
+
+  unsigned char h[HZ_OCT_HDRSIZE];
+  if (fread(h, sizeof h, 1, f) != 1) return HZ_OCT_E_IO;
+  int log2size = 0;
+  int32_t n = 0;
+  int rc = hz_oct_hdr_decode(h, &log2size, &n);
+  if (rc != HZ_OCT_OK) return rc;
+
+  /* n is inside HZ_OCT_MAX_NODES before this point, so the product cannot
+   * overflow size_t on any platform where the arena could be allocated at all */
+  hz_onode *nodes = calloc((size_t)n, sizeof(hz_onode));
+  if (nodes == NULL) return HZ_OCT_E_IO;
+
+  /* real parts first, then imaginary: the file keeps the two apart, so the node
+   * is filled in two passes rather than the file carrying an interleaved copy
+   * of whatever the compiler chose for double complex */
+  if (read_child0(f, nodes, n) != HZ_OCT_OK || read_part(f, nodes, n, 0) != HZ_OCT_OK ||
+      read_part(f, nodes, n, 1) != HZ_OCT_OK) {
+    free(nodes);
+    return HZ_OCT_E_IO;
   }
-  /* child indices must stay inside the arena */
-  for (int32_t i = 0; i < t->n; i++)
-    if (t->nodes[i].child0 >= 0 && t->nodes[i].child0 + 8 > t->n) {
-      hz_oct_free(t);
-      return 1;
-    }
-  return 0;
+
+  t->nodes = nodes;
+  t->n = t->cap = n;
+  t->log2size = log2size;
+  rc = hz_oct_validate(t);
+  if (rc != HZ_OCT_OK) {
+    hz_oct_free(t);
+    return rc;
+  }
+  return HZ_OCT_OK;
 }

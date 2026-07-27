@@ -21,7 +21,17 @@ HZ=/home/n/helmholz
 # Default to --unwind 10 unless the caller passes their own.
 case " $* " in *" --unwind "*) UNW="";; *) UNW="--unwind 10 --unwinding-assertions";; esac
 
+# HARD MEMORY CAP. CBMC's SAT back end can grow without bound on a harness that
+# is one parameter too large, and an unbounded run does not fail — it invites
+# the OOM killer, which leaves NO output at all and looks exactly like "the tool
+# said nothing". A cap turns that into a fast, legible failure (CLAUDE.md: put a
+# ulimit in the launcher rather than trusting the OOM killer). Override with
+# CVERIFY_MEM_KB; the default is deliberately far below installed RAM, because
+# a run that needs more than this is a harness to shrink, not a run to feed.
+CVERIFY_MEM_KB="${CVERIFY_MEM_KB:-16000000}"
+
 nix-shell -p cbmc --run "
+ulimit -v $CVERIFY_MEM_KB || true
 # NIX_HARDENING_ENABLE='': the nix cc-wrapper force-defines _FORTIFY_SOURCE at
 # preprocessing, and fortified glibc wrappers (bits/stdio2.h printf) use
 # __builtin_va_arg_pack, which CBMC has no body for — spurious FAILURE.

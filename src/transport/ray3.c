@@ -128,10 +128,11 @@ int tr3_march(const tr3_scene *sc, const double o[3], const double d[3], double 
      * и силуэт с кромкой тени уезжали на O(dmax), то есть на несколько пикселей
      * при k = 1. Это измерено, а не предположено. */
     int32_t psurf = -1;
-    for (int j = 0; j < nh && psurf < 0; j++) {
-      int32_t fi = hid[j] >= 0 ? hid[j] : ~hid[j];
-      if (sc->ft->f[fi].surf >= 0) psurf = sc->ft->f[fi].surf;
-    }
+    if (!sc->facet_only) /* facet_only: тело есть МНОГОГРАННИК, примитива нет */
+      for (int j = 0; j < nh && psurf < 0; j++) {
+        int32_t fi = hid[j] >= 0 ? hid[j] : ~hid[j];
+        if (sc->ft->f[fi].surf >= 0) psurf = sc->ft->f[fi].surf;
+      }
     if (psurf >= 0 && sc->st != NULL && psurf < sc->st->n) {
       double tp, np[3];
       if (sphere_hit(&sc->st->s[psurf], o, d, t, texit, &tp, np)) {

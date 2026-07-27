@@ -95,6 +95,8 @@ int main(int argc, char **argv) {
   int maxbounce = argc > 6 ? atoi(argv[6]) : 8;
   /* сколько КАДРОВ отрисовать движущейся камерой при неподвижной сцене */
   int nframe = argc > 7 ? atoi(argv[7]) : 1;
+  /* ОГРАНЁННОЕ ТЕЛО: примитив выключен, тело есть многогранник (см. ray3.h) */
+  int facet_only = argc > 8 ? atoi(argv[8]) : 0;
 
   stage_mark();
   hz_frame fr = {{0, 0, 0}, {1, 1, 1}};
@@ -268,7 +270,13 @@ int main(int argc, char **argv) {
   if (rc != 0) return 1;
 
   /* --- сбор по пикселю --- */
-  tr3_scene scn = {.tree = &t, .fr = fr, .sigma = NULL, .st = &stab, .ft = &ftab, .cm = &cmap};
+  tr3_scene scn = {.tree = &t,
+                   .fr = fr,
+                   .sigma = NULL,
+                   .st = &stab,
+                   .ft = &ftab,
+                   .cm = &cmap,
+                   .facet_only = facet_only};
   tr3_camera cam;
   double eye[3] = {8.0, 0.6, 7.2}, at[3] = {8.2, 9.5, 3.6}, up[3] = {0, 0, 1};
   if (tr3_camera_look(&cam, eye, at, up, 1.3, W, H)) return 1;

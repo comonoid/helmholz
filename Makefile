@@ -64,7 +64,7 @@ build/fdtd: tools/fdtd.c src/image.c src/image.h | build
 
 # fast tests (seconds..minutes); test_solver3d is the slow validation (~10 min)
 test: check-fp build/test_phi build/test_carrier build/test_carrier_op build/test_carrier2d build/test_cut2d build/test_nitsche2d build/test_bessel build/test_mie2d build/test_dtn2d build/test_helm1d build/test_m2forms build/test_octree build/test_octfmt build/test_poly3 build/test_surf build/test_facet build/test_qef build/test_dc build/test_dcwalk build/test_asm3d \
-      build/test_mg3d build/test_sweep build/test_rte2d build/test_ray3 build/test_scat1d build/test_tet3
+      build/test_mg3d build/test_sweep build/test_rte2d build/test_ray3 build/test_scat1d build/test_tet3 build/test_sweep3
 	./build/test_phi
 	./build/test_carrier
 	./build/test_carrier_op
@@ -91,6 +91,7 @@ test: check-fp build/test_phi build/test_carrier build/test_carrier_op build/tes
 	./build/test_ray3
 	./build/test_scat1d
 	./build/test_tet3
+	./build/test_sweep3
 
 test-slow: build/test_solver3d
 	./build/test_solver3d
@@ -102,7 +103,7 @@ check:
 	  tests/test_octfmt.c src/cut/poly3.c tests/test_poly3.c src/cut/surf.c tests/test_surf.c tests/test_facet.c src/cut/qef.c tests/test_qef.c src/cut/dc.c tests/test_dc.c tests/test_dcwalk.c \
 	  tests/test_asm3d.c tests/test_solver3d.c tests/test_mg3d.c tools/render.c \
 	  tools/carrier1d.c tools/fdtd.c src/carrier.c tools/carrier_scale.c tools/carrier_proj.c \
-  tests/test_carrier.c tests/test_carrier_op.c tools/carrier_term.c tools/scene2d.c tools/carrier_shell.c tools/carrier_angle.c tools/carrier_cascade.c tools/carrier_solve.c tools/carrier_iter.c tools/carrier_incr.c src/carrier2d.c tests/test_carrier2d.c src/cut2d.c tests/test_cut2d.c tools/carrier_cut2d.c src/bessel.c tests/test_bessel.c src/mie2d.c tests/test_mie2d.c src/dtn2d.c tests/test_dtn2d.c tools/slab2d.c src/nitsche2d.c tests/test_nitsche2d.c tools/slab2d.c tools/tdg2d.c tools/slice2d.c src/transport/sweep.c tests/test_sweep.c src/transport/quad.c src/transport/rte2d.c tests/test_rte2d.c src/transport/ray3.c src/transport/cam3.c tests/test_ray3.c src/transport/scat1d.c tests/test_scat1d.c src/transport/tet3.c tests/test_tet3.c
+  tests/test_carrier.c tests/test_carrier_op.c tools/carrier_term.c tools/scene2d.c tools/carrier_shell.c tools/carrier_angle.c tools/carrier_cascade.c tools/carrier_solve.c tools/carrier_iter.c tools/carrier_incr.c src/carrier2d.c tests/test_carrier2d.c src/cut2d.c tests/test_cut2d.c tools/carrier_cut2d.c src/bessel.c tests/test_bessel.c src/mie2d.c tests/test_mie2d.c src/dtn2d.c tests/test_dtn2d.c tools/slab2d.c src/nitsche2d.c tests/test_nitsche2d.c tools/slab2d.c tools/tdg2d.c tools/slice2d.c src/transport/sweep.c tests/test_sweep.c src/transport/quad.c src/transport/rte2d.c tests/test_rte2d.c src/transport/ray3.c src/transport/cam3.c tests/test_ray3.c src/transport/scat1d.c tests/test_scat1d.c src/transport/tet3.c tests/test_tet3.c src/transport/dirs3.c src/transport/mesh3.c src/transport/sweep3.c tests/test_sweep3.c
 
 .PHONY: all test test-slow check check-fp
 
@@ -223,7 +224,7 @@ check-fp:
 	  [ "$$n" -eq 0 ] || exit 1; done'
 
 build/test_surf: tests/test_surf.c src/cut/surf.c src/cut/surf.h src/cut/poly3.c src/octree.c | build
-	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_surf.c src/cut/surf.c src/cut/poly3.c src/octree.c -lm'
+	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_surf.c src/cut/surf.c src/cut/poly3.c src/octree.c src/transport/cam3.c src/transport/ray3.c src/cut/surf.c src/image.c -lm'
 
 build/test_facet: tests/test_facet.c src/cut/surf.c src/cut/surf.h src/cut/poly3.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_facet.c src/cut/surf.c src/cut/poly3.c -lm'
@@ -253,3 +254,10 @@ build/test_tet3: tests/test_tet3.c src/transport/tet3.c src/transport/tet3.h \
                  src/cut/poly3.c src/cut/surf.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_tet3.c src/transport/tet3.c src/cut/poly3.c \
 	  src/cut/surf.c -lm'
+
+build/test_sweep3: tests/test_sweep3.c src/transport/sweep3.c src/transport/mesh3.c \
+                   src/transport/dirs3.c src/transport/tet3.c src/transport/quad.c \
+                   src/cut/poly3.c src/octree.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_sweep3.c src/transport/sweep3.c \
+	  src/transport/mesh3.c src/transport/dirs3.c src/transport/tet3.c src/transport/quad.c \
+	  src/cut/poly3.c src/octree.c src/transport/cam3.c src/transport/ray3.c src/cut/surf.c src/image.c -lm'

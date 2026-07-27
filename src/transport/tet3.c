@@ -103,3 +103,45 @@ double tr3_int_linear(const hz_poly3 *p, const hz_frame *fr, const double c[3], 
   }
   return acc * fr->u[0] * fr->u[1] * fr->u[2];
 }
+
+/* --- моменты по плоскому многоугольнику ------------------------------------ */
+
+double tr3_poly_face_area(const double (*v)[3], int nv) {
+  if (nv < 3) return 0.0;
+  double acc[3] = {0, 0, 0};
+  for (int i = 0; i < nv; i++) {
+    const double *a = v[i], *b = v[(i + 1) % nv];
+    acc[0] += a[1] * b[2] - a[2] * b[1];
+    acc[1] += a[2] * b[0] - a[0] * b[2];
+    acc[2] += a[0] * b[1] - a[1] * b[0];
+  }
+  return 0.5 * sqrt(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]);
+}
+
+int tr3_poly_face_mass(const double (*v)[3], int nv, const double c[3], double h, double m[4][4]) {
+  memset(m, 0, 16 * sizeof(double));
+  if (nv < 3) return 1;
+  /* веер от первой вершины: многоугольник грани выпуклый по построению ядра */
+  for (int e = 1; e + 1 < nv; e++) {
+    const double *tri[3] = {v[0], v[e], v[e + 1]};
+    double p[3][3];
+    for (int i = 0; i < 3; i++)
+      for (int k = 0; k < 3; k++)
+        p[i][k] = tri[i][k];
+    double area = tr3_poly_face_area(p, 3);
+    double b[3][4];
+    for (int i = 0; i < 3; i++)
+      basis(tri[i], c, h, b[i]);
+    for (int i = 0; i < 4; i++)
+      for (int j = 0; j < 4; j++) {
+        double s1 = 0.0, sf = 0.0, sg = 0.0;
+        for (int q = 0; q < 3; q++) {
+          s1 += b[q][i] * b[q][j];
+          sf += b[q][i];
+          sg += b[q][j];
+        }
+        m[i][j] += area * (s1 + sf * sg) / 12.0;
+      }
+  }
+  return 0;
+}

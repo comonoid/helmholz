@@ -54,4 +54,17 @@ int tr3_mass_matrix(const hz_poly3 *p, const hz_frame *fr, const double c[3], do
 double tr3_int_linear(const hz_poly3 *p, const hz_frame *fr, const double c[3], double h,
                       const double a[4]);
 
+/* --- моменты по ПЛОСКОМУ МНОГОУГОЛЬНИКУ (шаг A) ---------------------------
+ *
+ * Нужны потоковым членам DG: на грани стоит ∫ b_i b_j dA, а не объёмный
+ * интеграл. Вершины даются в МИРОВЫХ координатах (грань у развёртки берётся из
+ * целочисленной сетки и переводится в мир один раз), базис тот же {1, ξ, η, ζ}
+ * с ξ = (x − c)/h.
+ *
+ * Тоже ТОЧНО и тоже без узлов: ∫_T f g dA = (A/12)(Σf_i g_i + (Σf_i)(Σg_i)) для
+ * линейных f, g на треугольнике — тождество, следствие
+ * ∫λ₁^a λ₂^b λ₃^c dA = 2A·a!b!c!/(a+b+c+2)!. */
+double tr3_poly_face_area(const double (*v)[3], int nv);
+int tr3_poly_face_mass(const double (*v)[3], int nv, const double c[3], double h, double m[4][4]);
+
 #endif

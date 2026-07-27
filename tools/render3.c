@@ -338,6 +338,26 @@ int main(int argc, char **argv) {
     printf("  %-52s %7.3f с   (отношение %.1f)\n", "из них ПОВТОРИТСЯ при движении камеры", per,
            per > 0.0 ? tot / per : 0.0);
   }
+  /* ДВА ФАЙЛА, И ЭТО НЕ ИЗБЫТОЧНОСТЬ. Канонический — PFM: РАДИАНС КАК ЕСТЬ,
+   * 32-битный float, без нормировки, гаммы и раскраски. По нему можно сверять
+   * числа; по PPM нельзя ничего (К19: та же ошибка после тон-маппинга доходит
+   * до 255 уровней из 255). PPM пишется рядом и только для глаз.
+   * Имя PFM получается заменой расширения у заданного пути. */
+  char pfm[512];
+  size_t ln = strlen(out);
+  if (ln + 5 < sizeof pfm) {
+    memcpy(pfm, out, ln + 1);
+    char *dot = strrchr(pfm, '.');
+    size_t ext = dot != NULL ? (size_t)(dot - pfm) : ln;
+    memcpy(pfm + ext, ".pfm", 5);
+    /* R = G = B: спектральный канал ОДИН, и файл об этом не врёт */
+    if (hz_pfm_write(pfm, buf, buf, buf, W, H) != 0) {
+      fprintf(stderr, "не записалось: %s\n", pfm);
+      return 1;
+    }
+  } else {
+    pfm[0] = '\0';
+  }
   if (hz_ppm_write(out, buf, W, H) != 0) {
     fprintf(stderr, "не записалось: %s\n", out);
     return 1;
@@ -345,7 +365,15 @@ int main(int argc, char **argv) {
   if (spec > 0.0)
     printf("ЗЕРКАЛА: доля %.2f, предел отскоков %d, отскоков всего %ld (до %d на луч)\n", spec,
            maxbounce, nbtot, nbmax);
-  printf("картинка: %s (%dx%d)\n", out, W, H);
+  double lo = 1e300, hi2 = -1e300;
+  for (size_t i = 0; i < (size_t)W * (size_t)H; i++) {
+    if (buf[i] < lo) lo = buf[i];
+    if (buf[i] > hi2) hi2 = buf[i];
+  }
+  printf("картинки: %s — РАДИАНС как есть, float RGB (R=G=B, канал один);\n"
+         "          %s — тон-маппинг для глаз, сверять по нему НЕЛЬЗЯ (К19)\n"
+         "          %dx%d, радианс от %.6f до %.6f\n",
+         pfm[0] ? pfm : "(не записан)", out, W, H, lo, hi2);
   free(wallidx);
   free(solid);
   free(buf);

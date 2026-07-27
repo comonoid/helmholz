@@ -1099,6 +1099,64 @@ static void t_cut(void) {
   hz_oct_free(&t);
 }
 
+/* ------------------------------------- ФОРМАТ ВЫХОДА: PFM, круговой прогон */
+
+/* Писалки картинок врут МОЛЧА и ровно в трёх местах: порядок строк, порядок
+ * байт и чередование каналов. Ни одно из трёх не видно на картинке, если
+ * смотреть её тем же кодом, который писал. Поэтому файл читается ОБРАТНО
+ * сырыми байтами и сверяется с тем, что клали. */
+static void t_pfm(void) {
+  const int W = 7, H = 5;
+  double buf[35];
+  for (int y = 0; y < H; y++)
+    for (int x = 0; x < W; x++)
+      buf[y * W + x] = 0.125 * (double)(y * W + x) + 0.0625; /* точно представимо во float */
+  const char *path = "img/_pfm_roundtrip.pfm";
+  check(hz_pfm_write(path, buf, buf, buf, W, H) == 0, "PFM записан");
+  FILE *f = fopen(path, "rb");
+  if (f == NULL) {
+    check(0, "PFM открылся на чтение");
+    return;
+  }
+  int w2 = 0, h2 = 0;
+  double sc = 0.0;
+  char magic[3] = {0, 0, 0};
+  int ok_hdr = fscanf(f, "%2s %d %d %lf", magic, &w2, &h2, &sc) == 4;
+  fgetc(f); /* один перевод строки после масштаба — часть формата */
+  printf("  [PFM] заголовок: «%s» %dx%d масштаб %.1f\n", magic, w2, h2, sc);
+  check(ok_hdr && magic[0] == 'P' && magic[1] == 'F', "PFM: три канала (PF), а не Pf");
+  check(w2 == W && h2 == H, "PFM: размеры");
+  check(sc < 0.0, "PFM: масштаб отрицателен — little-endian, как на этой машине");
+  double worst = 0.0;
+  int bad_order = 0;
+  for (int r = 0; r < H; r++) {
+    /* СТРОКИ В ФАЙЛЕ ИДУТ СНИЗУ ВВЕРХ: строка r файла есть строка H−1−r буфера */
+    int y = H - 1 - r;
+    for (int x = 0; x < W; x++) {
+      float px[3];
+      if (fread(px, sizeof(float), 3, f) != 3) {
+        bad_order = 1;
+        break;
+      }
+      float want = (float)buf[y * W + x];
+      for (int c = 0; c < 3; c++) {
+        double e = fabs((double)px[c] - (double)want);
+        if (e > worst) worst = e;
+      }
+    }
+  }
+  long extra = 0;
+  while (fgetc(f) != EOF)
+    extra++;
+  fclose(f);
+  printf("  [PFM] круговой прогон: max |прочитано − записано| = %.3e, лишних байт %ld\n", worst,
+         extra);
+  check(!bad_order, "PFM: файл не оборван");
+  check(!(worst > 0.0), "PFM: значения совпали ПОБИТОВО (порядок строк и байт верны)");
+  check(extra == 0, "PFM: ни одного лишнего байта");
+  remove(path); /* временный файл теста, а не картинка на посмотреть */
+}
+
 int main(void) {
   printf("=== ПРЕДСКАЗАНИЯ (до единого результата) ===\n");
   printf("  A1 Σw = 4π, первый момент 0, второй (4π/3)·I — все ≤1e-13;\n");
@@ -1123,6 +1181,7 @@ int main(void) {
   t_balance();
   t_cavity();
   t_cut();
+  t_pfm();
   t_render();
 
   printf("%s: %d/%d\n", g_fail ? "FAILURES" : "ok", g_total - g_fail, g_total);

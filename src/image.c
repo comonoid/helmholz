@@ -2,6 +2,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* 7-stop inferno-like ramp, linear interpolation */
 static const double RAMP[7][3] = {{0.0, 0.0, 0.02},   {0.11, 0.05, 0.30}, {0.42, 0.09, 0.43},
@@ -19,6 +20,34 @@ static void colormap(double v, unsigned char px[3]) {
     double x = RAMP[i][c] * (1.0 - f) + RAMP[i + 1][c] * f;
     px[c] = (unsigned char)(255.0 * x + 0.5);
   }
+}
+
+/* PFM: радианс как есть, без тон-маппинга. Разбор — в image.h.
+ * `g` и `b` могут совпадать с `r` (один спектральный канал). */
+int hz_pfm_write(const char *path, const double *r, const double *g, const double *b, int w,
+                 int h) {
+  if (w <= 0 || h <= 0) return 1;
+  FILE *f = fopen(path, "wb");
+  if (f == NULL) return 1;
+  /* ПОРЯДОК БАЙТ ОПРЕДЕЛЯЕТСЯ, А НЕ ПРЕДПОЛАГАЕТСЯ: в PFM он объявлен знаком
+   * масштаба, и соврать здесь значит отдать файл, который прочтётся наизнанку. */
+  unsigned int probe = 1u;
+  unsigned char pb;
+  memcpy(&pb, &probe, 1);
+  double scale = pb ? -1.0 : 1.0;
+  fprintf(f, "PF\n%d %d\n%.1f\n", w, h, scale);
+  const double *ch[3] = {r, g, b};
+  int bad = 0;
+  /* СТРОКИ СНИЗУ ВВЕРХ — это часть формата PFM, а не наш порядок хранения. */
+  for (int y = h - 1; y >= 0 && !bad; y--)
+    for (int x = 0; x < w; x++) {
+      float px[3];
+      for (int c = 0; c < 3; c++)
+        px[c] = (float)ch[c][(size_t)y * (size_t)w + (size_t)x];
+      if (fwrite(px, sizeof(float), 3, f) != 3) bad = 1;
+    }
+  if (fclose(f) != 0) bad = 1;
+  return bad;
 }
 
 static int cmp_dbl(const void *a, const void *b) {

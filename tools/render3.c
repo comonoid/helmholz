@@ -29,6 +29,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static double now(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
 
 #define LOG2N 4
 #define NC (1 << LOG2N)
@@ -175,9 +182,12 @@ int main(int argc, char **argv) {
   printf("ячеек %d, граней %d, поверхностных элементов %d, направлений %d, 1:1 нарушений %d, "
          "ячеек с ДВУМЯ телами %d (обязано быть 0)\n",
          mesh.ncell, mesh.nf, cut.nse, dirs.n, cut.nbad, nboth);
+  double t0 = now();
   int rc = tr3_sweep_solve(&prob, 4000, 1e-9, phi, &st);
-  printf("развёртка: код %d, итераций %d, невязка %.2e, срезок на последней %d\n", rc, st.iters,
-         st.resid, st.nclip);
+  double t_sweep = now() - t0;
+  printf("развёртка (ХОЛОДНЫЙ СТАРТ): код %d, итераций %d, невязка %.2e, срезок %d, %.2f с "
+         "(%.2f мс на итерацию)\n",
+         rc, st.iters, st.resid, st.nclip, t_sweep, 1e3 * t_sweep / (double)(st.iters + 1));
   printf("баланс: втекло %.4f, вытекло %.4f, поглощено %.4f, невязка %.2e\n", st.pin, st.pout,
          st.pabs, st.balance);
   if (rc != 0) return 1;
@@ -190,6 +200,24 @@ int main(int argc, char **argv) {
   double *buf = calloc((size_t)W * (size_t)H, sizeof(double));
   if (buf == NULL) return 1;
 
+  /* ИНДЕКС ГРАНИЧНЫХ ГРАНЕЙ ПО СЕТКЕ. Первая редакция искала грань ЛИНЕЙНЫМ
+   * перебором всех 13056 граней на КАЖДЫЙ пиксель — это 2.7e10 сравнений на
+   * кадр, и сбор стоил 3930 нс на луч при разумных 100-200. Грани лежат на
+   * ЦЕЛОЧИСЛЕННОЙ сетке, поэтому индекс прямой: (стенка, u, v) -> грань. */
+  int32_t *wallidx = calloc((size_t)6 * NC * NC, sizeof(int32_t));
+  if (wallidx == NULL) return 1;
+  for (int32_t i = 0; i < 6 * NC * NC; i++)
+    wallidx[i] = -1;
+  for (int32_t f = 0; f < mesh.nf; f++) {
+    const tr3_face *ff = &mesh.f[f];
+    if (ff->cb >= 0) continue;
+    int wl = (int)(~ff->cb);
+    for (int32_t a = ff->lo[0]; a < ff->hi[0]; a++)
+      for (int32_t b = ff->lo[1]; b < ff->hi[1]; b++)
+        wallidx[((int32_t)wl * NC + a) * NC + b] = f;
+  }
+
+  double t1 = now();
   for (int py = 0; py < H; py++)
     for (int px = 0; px < W; px++) {
       double o[3], d[3];
@@ -255,11 +283,14 @@ int main(int argc, char **argv) {
             u = v;
             v = s2;
           }
-          for (int32_t f = 0; f < mesh.nf; f++) {
+          int32_t iu = (int32_t)floor(hp[u]), iv = (int32_t)floor(hp[v]);
+          if (iu < 0) iu = 0;
+          if (iu >= NC) iu = NC - 1;
+          if (iv < 0) iv = 0;
+          if (iv >= NC) iv = NC - 1;
+          int32_t f = wallidx[((int32_t)wall * NC + iu) * NC + iv];
+          if (f >= 0) {
             const tr3_face *ff = &mesh.f[f];
-            if (ff->cb >= 0 || (int)(~ff->cb) != wall) continue;
-            if (hp[u] < (double)ff->lo[0] || hp[u] > (double)ff->hi[0]) continue;
-            if (hp[v] < (double)ff->lo[1] || hp[v] > (double)ff->hi[1]) continue;
             int32_t cc = ff->ca;
             double sz = (double)mesh.csize[cc], b[4] = {1, 0, 0, 0};
             for (int a = 0; a < 3; a++) {
@@ -268,18 +299,23 @@ int main(int argc, char **argv) {
             }
             for (int i = 0; i < 4; i++)
               val += st.bout[f * 4 + i] * b[i];
-            break;
           }
         }
       }
       buf[(size_t)py * (size_t)W + (size_t)px] = val > 0.0 ? val : 0.0;
     }
 
+  double t_gather = now() - t1;
+  /* РАЗДЕЛЬНЫЙ ДОКЛАД ХОЛОДНОГО СТАРТА И КАДРА — требование CLAUDE.md. Поле от
+   * камеры не зависит, поэтому поворот камеры стоит ТОЛЬКО сбора. */
+  printf("СБОР ПО ПИКСЕЛЮ (кадр): %.3f с на %dx%d = %.2f млн лучей, %.0f нс на луч\n", t_gather, W,
+         H, 1e-6 * (double)W * (double)H, 1e9 * t_gather / ((double)W * (double)H));
   if (hz_ppm_write(out, buf, W, H) != 0) {
     fprintf(stderr, "не записалось: %s\n", out);
     return 1;
   }
   printf("картинка: %s (%dx%d)\n", out, W, H);
+  free(wallidx);
   free(buf);
   free(phi);
   free(st.bout);

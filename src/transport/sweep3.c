@@ -108,23 +108,42 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   st->bout = NULL;
   st->sout = NULL;
 
-  double *L = calloc((size_t)nc * 4, sizeof(double));
+  /* ПАРАЛЛЕЛЬНО ПО ОРДИНАТАМ. Внутри одной итерации направления НЕЗАВИСИМЫ:
+   * каждое строит свой порядок обхода и своё угловое поле, а связывает их только
+   * φ предыдущей итерации. Поэтому распараллеливание здесь не оптимизация с
+   * риском, а прямое следствие устройства метода. Каждому потоку — своя копия
+   * транзиентных массивов; Р1 при этом не нарушается: копий столько, сколько
+   * ПОТОКОВ, а не сколько НАПРАВЛЕНИЙ. */
+  /* ОДНОПОТОЧНО СОЗНАТЕЛЬНО: пока чинится алгоритм, параллелизм только мешает
+   * читать. Структура под него уже готова — направления внутри итерации
+   * независимы, у каждого свой транзиентный массив, — и включается он одной
+   * строкой #pragma omp parallel for над циклом по mm. */
+  int nth = 1;
+  double *Lall = calloc((size_t)nth * (size_t)nc * 4, sizeof(double));
+  double *phinall = calloc((size_t)nth * (size_t)nc * 4, sizeof(double));
+  int32_t *indegall = calloc((size_t)nth * (size_t)nc, sizeof(int32_t));
+  int32_t *orderall = calloc((size_t)nth * (size_t)nc, sizeof(int32_t));
+  int32_t *queueall = calloc((size_t)nth * (size_t)nc, sizeof(int32_t));
   double *phin = calloc((size_t)nc * 4, sizeof(double));
-  int32_t *indeg = calloc((size_t)nc, sizeof(int32_t));
-  int32_t *order = calloc((size_t)nc, sizeof(int32_t));
-  int32_t *queue = calloc((size_t)nc, sizeof(int32_t));
   double *bout = calloc((size_t)m->nf * 4, sizeof(double));
   double *binf = calloc((size_t)m->nf * 4, sizeof(double));
+  double *binfall = NULL, *sinfall = NULL;
   double *sout = calloc((size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
   double *sinf = calloc((size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
   double *hs_se = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
-  if (L == NULL || phin == NULL || indeg == NULL || order == NULL || queue == NULL ||
-      bout == NULL || binf == NULL || sout == NULL || sinf == NULL || hs_se == NULL) {
-    free(L);
+  binfall = calloc((size_t)nth * (size_t)m->nf * 4, sizeof(double));
+  sinfall = calloc((size_t)nth * (size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
+  if (Lall == NULL || phinall == NULL || indegall == NULL || orderall == NULL || queueall == NULL ||
+      phin == NULL || binfall == NULL || sinfall == NULL || bout == NULL || binf == NULL ||
+      sout == NULL || sinf == NULL || hs_se == NULL) {
+    free(Lall);
+    free(phinall);
+    free(indegall);
+    free(orderall);
+    free(queueall);
     free(phin);
-    free(indeg);
-    free(order);
-    free(queue);
+    free(binfall);
+    free(sinfall);
     free(bout);
     free(binf);
     free(sout);
@@ -171,10 +190,23 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     memset(phin, 0, (size_t)nc * 4 * sizeof(double));
     memset(binf, 0, (size_t)m->nf * 4 * sizeof(double));
     memset(sinf, 0, (size_t)(nse > 0 ? nse : 1) * 4 * sizeof(double));
+    memset(phinall, 0, (size_t)nth * (size_t)nc * 4 * sizeof(double));
+    memset(binfall, 0, (size_t)nth * (size_t)m->nf * 4 * sizeof(double));
+    memset(sinfall, 0, (size_t)nth * (size_t)(nse > 0 ? nse : 1) * 4 * sizeof(double));
     nclip_last = 0;
     st->pin = st->pout = st->pabs = 0.0;
+    double pin_acc = 0.0, pout_acc = 0.0;
+    int fail = 0;
 
     for (int mm = 0; mm < nd; mm++) {
+      int tid = 0;
+      double *L = Lall + (size_t)tid * (size_t)nc * 4;
+      double *phit = phinall + (size_t)tid * (size_t)nc * 4;
+      int32_t *indeg = indegall + (size_t)tid * (size_t)nc;
+      int32_t *order = orderall + (size_t)tid * (size_t)nc;
+      int32_t *queue = queueall + (size_t)tid * (size_t)nc;
+      double *binft = binfall + (size_t)tid * (size_t)m->nf * 4;
+      double *sinft = sinfall + (size_t)tid * (size_t)(nse > 0 ? nse : 1) * 4;
       double om[3] = {d->ox[mm], d->oy[mm], d->oz[mm]};
       /* --- топологический порядок для этого направления ---
        * ПЕРЕСТРАИВАЕТСЯ КАЖДУЮ ИТЕРАЦИЮ, И ЭТО СОЗНАТЕЛЬНО: кэш стоил бы
@@ -208,17 +240,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         }
       }
       if (no != nc) {
-        free(L);
-        free(phin);
-        free(indeg);
-        free(order);
-        free(queue);
-        free(bout);
-        free(binf);
-        free(sout);
-        free(sinf);
-        free(hs_se);
-        return 2;
+        fail = 1; /* цикл обхода: наружу выходим флагом, а не return из omp */
+        continue;
       }
 
       for (int32_t oi = 0; oi < no; oi++) {
@@ -232,15 +255,20 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         memset(A, 0, sizeof A);
         memset(rhs, 0, sizeof rhs);
         double s = (double)m->csize[c];
-        double MM[4][4];
+        /* БЕЗ КОПИРОВАНИЯ: матрица берётся ССЫЛКОЙ. memcpy по 128 байт на ячейку
+         * и на каждую грань — это килобайт лишней памяти на одно обновление
+         * ячейки, а обновлений здесь сотни миллионов. */
+        double MMbox[4][4];
+        const double (*MM)[4];
         if (cu != NULL) {
-          memcpy(MM, cu->mvol[c], sizeof MM);
+          MM = cu->mvol[c];
         } else {
-          memset(MM, 0, sizeof MM);
+          memset(MMbox, 0, sizeof MMbox);
           double vol = s * s * s * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
-          MM[0][0] = vol;
+          MMbox[0][0] = vol;
           for (int k = 1; k < 4; k++)
-            MM[k][k] = vol / 12.0;
+            MMbox[k][k] = vol / 12.0;
+          MM = MMbox;
         }
         for (int j = 0; j < 4; j++)
           for (int i = 0; i < 4; i++)
@@ -317,16 +345,18 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
                   accj[j] += lb[i] * fmine[i][j];
               for (int j = 0; j < 4; j++)
                 rhs[j] -= on * accj[j];
-              st->pin += -on * d->w[mm] * accj[0];
+              pin_acc += -on * d->w[mm] * accj[0];
             } else {
               int32_t up = mine_is_a ? m->f[f].cb : m->f[f].ca;
-              double fx[4][4];
+              double fxb[4][4];
+              const double (*fx)[4];
               if (cu != NULL) {
-                memcpy(fx, cu->ffmx[f], sizeof fx);
+                fx = cu->ffmx[f];
               } else {
                 double v[4][3];
                 tr3_face_corners(m, f, v);
-                face_mass2(m, (const double (*)[4][3]) & v, m->f[f].ca, m->f[f].cb, fx);
+                face_mass2(m, (const double (*)[4][3]) & v, m->f[f].ca, m->f[f].cb, fxb);
+                fx = fxb;
               }
               for (int j = 0; j < 4; j++) {
                 double acc = 0.0;
@@ -384,7 +414,6 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
             for (int j = 1; j < 4; j++)
               cf[j] *= alpha;
             cf[0] = (rhs0 - alpha * kk) / a0row[0];
-            st->nclip++;
             nclip_last++;
           }
         }
@@ -402,14 +431,14 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
               double acc = 0.0;
               for (int i = 0; i < 4; i++)
                 acc += cf[i] * se->m[i][j];
-              sinf[e * 4 + j] += (-on) * d->w[mm] * acc;
+              sinft[e * 4 + j] += (-on) * d->w[mm] * acc;
             }
           }
       }
 
       for (int32_t c = 0; c < nc; c++)
         for (int j = 0; j < 4; j++)
-          phin[c * 4 + j] += d->w[mm] * L[c * 4 + j];
+          phit[c * 4 + j] += d->w[mm] * L[c * 4 + j];
 
       for (int32_t f = 0; f < m->nf; f++) {
         if (m->f[f].cb >= 0) continue;
@@ -417,23 +446,56 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         double on = om[m->f[f].axis] * ((wall & 1) ? 1.0 : -1.0);
         if (!(on > 0.0)) continue;
         int32_t c = m->f[f].ca;
-        double fmm[4][4];
+        double fmmb[4][4];
+        const double (*fmm)[4];
         if (cu != NULL) {
-          memcpy(fmm, cu->ffm[f], sizeof fmm);
+          fmm = cu->ffm[f];
         } else {
           double v[4][3];
           tr3_face_corners(m, f, v);
-          face_mass2(m, (const double (*)[4][3]) & v, c, c, fmm);
+          face_mass2(m, (const double (*)[4][3]) & v, c, c, fmmb);
+          fmm = fmmb;
         }
         double accj[4] = {0, 0, 0, 0};
         for (int j = 0; j < 4; j++)
           for (int i = 0; i < 4; i++)
             accj[j] += L[c * 4 + i] * fmm[i][j];
-        st->pout += on * d->w[mm] * accj[0];
+        pout_acc += on * d->w[mm] * accj[0];
         for (int j = 0; j < 4; j++)
-          binf[f * 4 + j] += on * d->w[mm] * accj[j];
+          binft[f * 4 + j] += on * d->w[mm] * accj[j];
       }
     }
+
+    /* сведение потоковых накоплений */
+    if (fail) {
+      free(Lall);
+      free(phinall);
+      free(indegall);
+      free(orderall);
+      free(queueall);
+      free(phin);
+      free(bout);
+      free(binf);
+      free(sout);
+      free(sinf);
+      free(hs_se);
+      free(binfall);
+      free(sinfall);
+      return 2;
+    }
+    for (int th = 0; th < nth; th++) {
+      const double *pt = phinall + (size_t)th * (size_t)nc * 4;
+      for (int32_t i = 0; i < nc * 4; i++)
+        phin[i] += pt[i];
+      const double *bt = binfall + (size_t)th * (size_t)m->nf * 4;
+      for (int32_t i = 0; i < m->nf * 4; i++)
+        binf[i] += bt[i];
+      const double *stt = sinfall + (size_t)th * (size_t)(nse > 0 ? nse : 1) * 4;
+      for (int32_t i = 0; i < nse * 4; i++)
+        sinf[i] += stt[i];
+    }
+    st->pin = pin_acc;
+    st->pout = pout_acc;
 
     /* --- стенки и поверхности: новый исходящий радианс, DG1 по положению --- */
     if (p->wall_rho != NULL)
@@ -505,13 +567,16 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   st->bout = bout;
   st->sout = sout;
 
-  free(L);
+  free(Lall);
+  free(phinall);
+  free(indegall);
+  free(orderall);
+  free(queueall);
   free(phin);
-  free(indeg);
-  free(order);
-  free(queue);
   free(binf);
   free(sinf);
   free(hs_se);
+  free(binfall);
+  free(sinfall);
   return 0;
 }

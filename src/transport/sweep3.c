@@ -101,6 +101,12 @@ static double corner_min(const double c[4]) {
 int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr3_stats *st) {
   const tr3_mesh *m = p->m;
   const tr3_dirs *d = p->d;
+  /* ВЛАДЕНИЕ ОБНУЛЯЕТСЯ ПЕРВОЙ СТРОКОЙ. Найдено аудитом: на путях раннего
+   * возврата (нехватка памяти, цикл обхода) bout освобождался внутри, а поле
+   * st->bout оставалось НЕИНИЦИАЛИЗИРОВАННЫМ — и вызывающий, освобождая его по
+   * заведённому порядку, освобождал мусор. Санитайзеры этого не показали:
+   * на зелёном прогоне ранние возвраты не случаются вовсе. */
+  st->bout = NULL;
   int32_t nc = m->ncell, nd = d->n;
   double *L = calloc((size_t)nc * 4, sizeof(double));
   double *phin = calloc((size_t)nc * 4, sizeof(double));
@@ -166,16 +172,28 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     for (int32_t f = 0; f < m->nf; f++)
       if (m->f[f].cb < 0) bout[f] = p->wall_emit != NULL ? p->wall_emit[(int)(~m->f[f].cb)] : 0.0;
   st->nclip = 0;
+  int nclip_last = 0;
   int it = 0;
   double resid = 0.0;
   for (it = 0; it < maxit; it++) {
     memset(phin, 0, (size_t)nc * 4 * sizeof(double));
     memset(binf, 0, (size_t)m->nf * sizeof(double));
+    /* СРЕЗКИ СЧИТАЮТСЯ И ЗА ПОСЛЕДНЮЮ ИТЕРАЦИЮ ОТДЕЛЬНО. Суммарное число мешает
+     * переходный процесс с установившимся, а вопрос К6 — активен ли ограничитель
+     * НА СОШЕДШЕМСЯ решении: если да, он портит константу, если нет, он только
+     * держал итерацию положительной. Одним числом эти два случая неразличимы. */
+    nclip_last = 0;
     st->pin = st->pout = st->pabs = 0.0;
 
     for (int mm = 0; mm < nd; mm++) {
       double om[3] = {d->ox[mm], d->oy[mm], d->oz[mm]};
-      /* --- топологический порядок для этого направления --- */
+      /* --- топологический порядок для этого направления ---
+       * ПЕРЕСТРАИВАЕТСЯ КАЖДУЮ ИТЕРАЦИЮ, И ЭТО СОЗНАТЕЛЬНО. Порядок зависит
+       * только от направления, так что его можно было бы посчитать один раз —
+       * но хранить его пришлось бы для ВСЕХ ND направлений, то есть ND×ncell
+       * целых, а это ровно то, что запрещает Р1 («угловое поле транзиентно»).
+       * Цена пересборки O(ncell + nf) — тот же порядок, что у самого прохода,
+       * то есть постоянный множитель, а не лишняя асимптотика. */
       memset(indeg, 0, (size_t)nc * sizeof(int32_t));
       for (int32_t f = 0; f < m->nf; f++) {
         if (m->f[f].cb < 0) continue;
@@ -243,6 +261,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         for (int j = 0; j < 4; j++) {
           double q = p->sig_s[c] / (4.0 * M_PI) * phi[c * 4 + j];
           if (p->eps != NULL) q += p->eps[c * 4 + j];
+          if (j == 0) q += p->eps_dir[0] * om[0] + p->eps_dir[1] * om[1] + p->eps_dir[2] * om[2];
           rhs[j] += q * M[j];
         }
 
@@ -359,6 +378,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
               cf[j] *= alpha;
             cf[0] = (rhs0 - alpha * kk) / a0row[0];
             st->nclip++;
+            nclip_last++;
           }
         }
         for (int j = 0; j < 4; j++)
@@ -397,7 +417,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       for (int32_t f = 0; f < m->nf; f++) {
         if (m->f[f].cb >= 0) continue;
         int wall = (int)(~m->f[f].cb);
-        double e = binf[f] / farea[f];
+        double e = farea[f] > 0.0 ? binf[f] / farea[f] : 0.0;
         bout[f] =
             (p->wall_emit != NULL ? p->wall_emit[wall] : 0.0) + p->wall_rho[wall] * e / hsum[wall];
       }
@@ -420,7 +440,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   st->balance = st->pin - st->pout - st->pabs;
   st->iters = it;
   st->resid = resid;
-  st->bout = bout; /* владение переходит вызывающему: сбор по пикселю читает это */
+  st->nclip = nclip_last; /* ИМЕННО последняя итерация: см. К6 выше */
+  st->bout = bout;        /* владение переходит вызывающему: сбор по пикселю читает это */
 
   free(L);
   free(phin);

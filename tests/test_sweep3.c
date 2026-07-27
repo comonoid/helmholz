@@ -238,7 +238,67 @@ static void t_furnace(void) {
            graded ? ", градуированная" : "", rc, st.iters, st.nclip, worst, wslope);
     check(rc == 0, "развёртка прошла, цикла обхода нет");
     check(worst < 1e-12, "ПЕЧЬ: радианс однороден и равен влёту");
+    check(st.nclip == 0,
+          "К6: на СОШЕДШЕМСЯ решении ограничитель не активен — константу он не трогает");
     check(wslope < 1e-12, "и наклоны нулевые");
+    free(phi);
+    rig_free(&r);
+  }
+}
+
+static void t_linear_field(void) {
+  /* К12 В ТРЁХМЕРИИ: печь проверяет только СРЕДНЕЕ, а наклоны — две трети
+   * неизвестных DG1. Точное решение L = A + B·x достигается при σ_s = 0 и
+   * ε(x,ω) = B·ω_x + σ_t·(A + B·x), причём первый член НАПРАВЛЕННЫЙ. */
+  const hz_frame fr = {{0, 0, 0}, {1.0, 1.0, 1.0}};
+  const double A = 1.3, B = 0.21;
+  for (int graded = 0; graded < 2; graded++) {
+    rig r;
+    if (rig_init(&r, 3, graded, 2, &fr)) {
+      check(0, "оснастка");
+      rig_free(&r);
+      return;
+    }
+    for (int32_t c = 0; c < r.m.ncell; c++) {
+      r.sig_t[c] = 0.7;
+      r.sig_s[c] = 0.0;
+      double s = (double)r.m.csize[c];
+      double xc = (double)r.m.clo[c][0] + 0.5 * s;
+      r.eps[c * 4 + 0] = 0.7 * (A + B * xc); /* среднее по ячейке */
+      r.eps[c * 4 + 1] = 0.7 * B * s;        /* наклон: b_1 = (x − x_c)/s */
+    }
+    tr3_problem p = {.m = &r.m,
+                     .d = &r.d,
+                     .sig_t = r.sig_t,
+                     .sig_s = r.sig_s,
+                     .eps = r.eps,
+                     .eps_dir = {B, 0.0, 0.0},
+                     .binc0 = A,
+                     .binc = {B, 0, 0},
+                     .binx0 = {0, 0, 0},
+                     .limiter = 0};
+    double *phi = calloc((size_t)r.m.ncell * 4, sizeof(double));
+    if (phi == NULL) {
+      check(0, "память");
+      rig_free(&r);
+      return;
+    }
+    tr3_stats st;
+    int rc = tr3_sweep_solve(&p, 4, 1e-14, phi, &st);
+    free(st.bout);
+    double wm = 0.0, ws = 0.0;
+    for (int32_t c = 0; c < r.m.ncell; c++) {
+      double s = (double)r.m.csize[c];
+      double xc = (double)r.m.clo[c][0] + 0.5 * s;
+      double em = fabs(phi[c * 4] - 4.0 * M_PI * (A + B * xc));
+      double es = fabs(phi[c * 4 + 1] - 4.0 * M_PI * B * s);
+      if (em > wm) wm = em;
+      if (es > ws) ws = es;
+    }
+    printf("  [К12 линейное поле%s] код %d: ошибка среднего %.2e, ошибка НАКЛОНА %.2e\n",
+           graded ? ", градуированная" : "", rc, wm, ws);
+    check(rc == 0 && wm < 1e-12, "К12: линейное решение воспроизведено по среднему");
+    check(ws < 1e-12, "и ПО НАКЛОНУ — то, чего печь не проверяет вовсе");
     free(phi);
     rig_free(&r);
   }
@@ -561,6 +621,7 @@ int main(void) {
   t_mesh();
   t_furnace();
   t_linear();
+  t_linear_field();
   t_balance();
   t_cavity();
   t_render();

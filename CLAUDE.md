@@ -193,15 +193,62 @@ T3…T7.
   THE REFERENCE CHANGES. The join rests on the partition of unity
   (Σφ(x/W−n) = 4); break it and spurious amplitude modulation appears (measured:
   30% error in the scale bench).
-- LOD ON THE BASIS IS FREE, LOD ON THE GEOMETRY IS FORBIDDEN. Geometric data
-  precision and element size are independent: a plane is three doubles, and
-  specifying it to 1e-9 m costs exactly what 1 cm costs. An element 1e6 λ wide
-  cut by an exactly specified plane is legal — S = ∫k is computed from ANALYTIC
-  geometry. The sub-λ requirement (δx ≲ λ/(2π·Δn/n), ~0.3λ at contrast 0.5)
-  bites only when the geometry itself is coarsened: voxelised boundaries, or
-  classic mesh-simplification LOD. The medium octree must keep exact boundaries
-  EVERYWHERE, including far away. This upgrades the third regulator from an
-  optimisation to a CORRECTNESS REQUIREMENT.
+- LOD ON THE BASIS IS FREE; LOD ON THE GEOMETRY IS AN ACCOUNTING PROBLEM, NOT A
+  BAN. CORRECTED 07-27 (user objection, and it is right). The line here used to
+  read "the medium octree must keep exact boundaries EVERYWHERE, including far
+  away", and that is wrong twice over. It CONTRADICTS the output-bounded
+  requirement below — exact geometry everywhere is INPUT-bounded, by leaf and
+  brick count, and a city is then unreachable, which is the actual target. And
+  PLAN_CUT.md Г9 had ALREADY superseded it: coarsening the boundary is "NOT a
+  ban but a COUNT", the error law 0.125(kd)²√(d/W) is measured, so "how far may
+  the fit go at this λ" is COMPUTABLE. The old line survived only because it was
+  never reconciled — the same stale-text class as Г19. Three cases, and the
+  whole content is that they differ:
+  (i) ANALYTIC PRIMITIVE ALREADY IN THE SCENE — do not coarsen. A plane is three
+      doubles, and specifying it to 1e-9 m costs exactly what 1 cm costs, so
+      coarsening buys nothing and pays error: pure loss. An element 1e6 λ wide
+      cut by an exactly specified plane is legal — S = ∫k comes from ANALYTIC
+      geometry.
+  (ii) COARSENING IS AGGREGATION — many objects collapsing into ONE surface plus
+      a response — and it NEVER subdivides anything. Do not list voxelisation as
+      the hazard here: turning a wall into a staircase of cubes is a REFINEMENT,
+      not a coarsening, nobody would do it going up the hierarchy, and saying so
+      confuses where the danger is (user objection 07-27; the earlier wording
+      here made exactly that mistake).
+      Staircases enter from the INPUT side, not the LOD side: volumetric source
+      data — a scan, a destructible voxel volume — whose boundary is taken as
+      cube faces. That is a defect of the input representation, and it is
+      precisely why PLAN_CUT.md Р-5б stores HERMITE data (crossing point PLUS
+      NORMAL) rather than occupancy: occupancy gives the staircase, the normal is
+      what keeps the wall-to-floor corner sharp and the wall itself flat.
+      THE REAL COARSENING HAZARD IS IN OUR OWN CODE: facetising a CURVED surface
+      manufactures CREASES the smooth surface did not have — an icosphere at
+      k = 0 has 30 of them. dmax accounts for DISPLACEMENT, and the law
+      0.125(kd)²√(d/W) was measured for a uniform DISPLACEMENT; whether it also
+      covers diffraction off the creases is NOT ESTABLISHED. Note that the
+      mean-sagitta fit puts displacement at zero exactly AT the vertices, i.e.
+      where the crease is sharpest — so the two errors are not even co-located.
+      This is where the sub-λ requirement (δx ≲ λ/(2π·Δn/n), ~0.3λ at contrast
+      0.5) can bite, and it is an open measurement, not a settled cost.
+  (iii) UNRESOLVED DETAIL — grass, gravel, weave, a distant facade — MUST be
+      homogenised, and THIS HOLDS IN THE WAVE LINE AS FULLY AS IN TRANSPORT,
+      because the argument is itself wave optics: the element→aperture channel
+      carries N = (εD/λ)² communication modes, exactly 1 at the diffraction
+      limit, so structure finer than λR/D cannot reach the aperture AS STRUCTURE
+      at all — only as an aggregate. What is preserved is therefore not the SHAPE
+      but the RESPONSE: a complex, angle-resolved reflection/impedance operator.
+      "Solid" and "smooth with an effective BRDF" are NOT the same thing — a
+      distant pane, sheet metal or an iridescent surface sends light into
+      specific directions, and a Lambertian stand-in loses exactly what is seen.
+      Whether the sub-features add in AMPLITUDE or in INTENSITY is set by the
+      coherence length against the cell, which is why COHERENCE AND GEOMETRIC
+      PRECISION ARE THE SAME AXIS (see below) — that entry and this one are one
+      statement, not two.
+      NOT YET IN THE CODE, AND THE GAP IS NAMED: hz_facet carries dmax, the error
+      of DISPLACING a surface. The error of REPLACING structure by a response is
+      a SECOND, independent number, and nothing computes it yet. Until it exists,
+      homogenised facets are not admissible in the wave line for the same reason
+      dmax = UNKNOWN is not (PLAN_CUT.md Г25: fail closed, never substitute zero).
 - Related law, not yet measured quantitatively: the carrier phase must be right
   to ~1 rad across an element, i.e. δk/k ≲ λ/(2π·W). Large elements are bought
   with accurate knowledge of the phase. For gradient media the carrier becomes
@@ -242,13 +289,38 @@ T3…T7.
   averaged later. The coherence regime must be a SCENE PARAMETER, not a global
   assumption; strictly coherent treatment is meaningful only where the geometry
   is analytic AND the source narrowband (lens, mirror, grating).
+- TARGET SCENE IS A CITY, NOT A ROOM (user, 07-27, emphatic — and it is the
+  whole reason the LOD ladder is shaped this way). Per octave of distance the
+  element count is independent of distance, so total ≈ (c/ε²)·log2(R_max/R_min):
+  a room (~13 octaves) ≈ 2e8 elements, a city (~23 octaves) ≈ 5e8 — 2-3x the
+  cost for 1e4x the linear size. Read every LOD decision against the city, not
+  the room; anything whose cost is INPUT-bounded (proportional to scene content
+  rather than to pixels) is thereby disqualified, and that is what killed the
+  old "exact boundaries everywhere" line above.
+  FRUSTUM/VISIBILITY CULLING IS STILL NOT AVAILABLE, and asking for a city does
+  not change it: light arrives from outside the frustum and off surfaces that
+  are never seen, so the active set covers the FULL SPHERE and occluded layers.
+  The 2e8/5e8 figures already price that in. What replaces culling: (1)
+  AGGREGATION — a distant block is one surface plus a response, not a thousand
+  buildings; (2) OCCLUSION AS ATTENUATION, not a flag — the operator is
+  differential and local, so the pairwise visibility V(x,z) that dominated the
+  integral formulation does not exist as an object here; (3) a CONTRIBUTION
+  THRESHOLD, computable, same family as the dmax accounting; (4) the PERSISTENT
+  COARSE CORE — off-screen scene sits in the once-computed core and is not
+  re-solved per frame.
 - STATUS: architecture accepted, NUMBERS NOT CONFIRMED. Critical path is
   M9a/M9b/M9c (result/M9_CARRIER_AUDIT.md — audited before running, falsifiers
-  fixed in advance; M9a done). Two architectural pieces are NOT specified yet
+  fixed in advance; M9a done). THREE architectural pieces are NOT specified yet
   and must not be improvised: (i) how continuous LOD sizing maps onto the
-  DYADIC level ladder that M1's two-scale relation needs, (ii) what solves the
-  system now that there is neither a floor nor a dense cascade head. PLAN.md
-  open questions 12-13.
+  DYADIC level ladder that M1's two-scale relation needs — and note this one is
+  a PRECONDITION for incrementality, not a later refinement: with a continuous
+  L = εR a camera shift changes R for EVERY element, so no increment exists at
+  all (PLAN.md A2 / open question 3); (ii) what solves the system now that there
+  is neither a floor nor a dense cascade head; (iii) THE CAMERA OPERATOR —
+  sampled aperture (src/camera.c, v1) versus projection onto the (εD/λ)²
+  communication modes; the sampled form needs ~1e5 samples per side for a real
+  lens and does not scale, added 07-27 as PLAN.md open question 14.
+  PLAN.md open questions 12-14.
   Everything λ-calibrated in PLAN.md (λ/8 floor, Toeplitz/FFT floor, "domain
   ≥5-6λ", shell thickness and ramp profile, transport percentages, BiCGStab
   verdict) is v1: measured, superseded — DO NOT carry those numbers over.

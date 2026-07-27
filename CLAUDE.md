@@ -49,8 +49,12 @@
 - Scene: two octrees — one for the medium, a separate one for the light
   sources f(x) (tactically simpler than one shared tree). k is piecewise-constant
   per material (later: linear gradient). A node at ANY level may, instead of
-  subdividing, store a linear function (corner interpolation) whose zero set is
-  the material boundary — sloped walls/floors as one coarse node, no staircase.
+  subdividing, REFERENCE a shared analytic surface that is the material boundary
+  — sloped walls/floors as one coarse node, no staircase. (Until 07-27 this line
+  read "store a linear function (corner interpolation) whose zero set is the
+  material boundary". That wording says we interpolate the medium FIELD and take
+  its zero set; what is actually meant is the BOUNDARY, and a boundary is a
+  surface, so it is given directly — see PLAN_CUT.md Г3.)
   Large empty regions = one empty node.
   Staging: STAGE 1 = plain hierarchical (cubic) voxels, no boundary
   interpolation — then every operator integral is separable and reduces to a
@@ -67,13 +71,23 @@
   correct for the TRANSPORT line, whose integrand is a real low-degree
   polynomial — which is exactly why the shared layer stops at the polyhedron and
   its topology, and each line brings its own integrator.
-  The boundary payload is CORNER VALUES, and it lives in a SIDE TABLE, not in
-  the node struct: 8 doubles per node would grow the tree 3.7x for the small
-  fraction of nodes that carry a boundary (PLAN_CUT.md, Г3/Г4). Note the zero
-  set of corner interpolation is CURVED (trilinear), while all the machinery is
-  planar — so the surface is reconstructed per cell as a plane through the
-  EDGE crossings, which are shared bitwise between neighbouring cells. A
-  per-cell least-squares plane would leave GAPS at cell faces.
+  The boundary payload is NOT interpolated values of any kind — it is an INDEX
+  into a shared table of ANALYTIC PRIMITIVES (a plane = normal + offset, four
+  doubles, stored ONCE per surface), and it lives in a SIDE TABLE keyed by node,
+  not in the node struct (PLAN_CUT.md, Г3/Г4, rewritten 07-27 after the user
+  corrected an error of mine). Neighbouring cells reference the SAME object, so
+  watertightness is exact by construction — edge crossings, cross-cell
+  agreement and gaps do not exist as topics. Two rejected alternatives, kept
+  because the reasoning is what matters: corner values with a TRILINEAR zero set
+  (that interpolates the medium FIELD, not the boundary — the boundary is a
+  surface, so this is the wrong object); and 4 corner values with a BILINEAR
+  patch, which has no x² or y² term and therefore cannot represent the curvature
+  of a sphere or a lens AT ALL (their local form is z ≈ −(x²+y²)/2R), while its
+  one extra term d·xy produces e^{i k_z d·xy} and kills the closed form. Both
+  also coarsen the geometry to O(h²), which the LOD-on-geometry ban forbids
+  outright; a shared primitive does not coarsen it at all. Interpolated values
+  are needed only for a procedural medium with no primitive available (noise,
+  CSG blends) and only in the transport line, where quadrature is legal.
 - Solution basis: "potentials" (wavelet-like). 3D potential = tensor product of
   1D potentials; 1D: φ(x)=2−x² on [0,1], (x−2)² on (1,2], mirrored for x<0,
   zero outside [−2,2]. C¹ piecewise-quadratic, integer knots, φ'' piecewise

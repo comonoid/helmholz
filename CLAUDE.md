@@ -26,7 +26,15 @@
 ПРЕДСКАЗАННЫМ провалом; три подписи артефакта (число не меняется от параметра,
 которым его меняют / негативный контроль сел на пол метрики / ошибка нормирована
 на сокращённый результат); раздельный доклад холодного старта и установившегося
-кадра; октодерево, LOD, разрезы и оператор камеры как общая машинерия.
+кадра; октодерево, LOD, ГЕОМЕТРИЯ разреза и оператор камеры как общая машинерия.
+
+**«ГЕОМЕТРИЯ разреза», а не «разрезы» — уточнено 07-27, `PLAN_CUT.md`, Г6.** Общий у
+двух продуктов только выпуклый многогранник с топологией. Сам разрез у них разной
+физической природы: в волновой линии это место смены НЕСУЩЕЙ ФАЗОВОЙ ССЫЛКИ, и поле
+сшивается слабо через Нитше; в переносе это ГРАНИЧНОЕ УСЛОВИЕ (уравнение
+рендеринга), поле не сшивается вовсе — его связывает BRDF с Френелем, а развёртка на
+диэлектрической границе обрывается. Интегратор над общей геометрией у каждой линии
+свой, и сращивать их нельзя.
 
 **ПОЧЕМУ ЛИНИЙ ДВЕ** (измерено 07-26/27, разбор в `PLAN.md`): `ND ≈ W/ℓ_⊥` —
 число направлений в ячейке равно числу длин пространственной когерентности в ней.
@@ -47,9 +55,25 @@
   Staging: STAGE 1 = plain hierarchical (cubic) voxels, no boundary
   interpolation — then every operator integral is separable and reduces to a
   small precomputed table of 1D dyadic integrals (no quadrature anywhere).
-  STAGE 2 = planar cuts via cube clipping + tetrahedra + exact degree-6
-  cubature, swapped in behind the same integrate_cell() interface. Tree node
-  format carries an optional boundary-corner payload from day one.
+  STAGE 2 = planar cuts, swapped in behind the same integrate_cell() interface.
+  CORRECTION 07-27 (PLAN_CUT.md, Г2): the earlier wording here said Stage 2 does
+  "tetrahedra + exact degree-6 cubature". That is v1 text, written before the
+  CARRIER directive of 07-25 made the integrand OSCILLATORY, and it is now
+  wrong: src/cut2d.h measured that at W = 1e5 λ the integrand has 1e6 periods,
+  so "sampling is not an option in the assembly" (M14 audit R3) — and degree-6
+  cubature is sampling. The wave line's 3D cut is the divergence theorem applied
+  twice (polygon → polyhedron), giving closed-form face/edge integrals at a cost
+  independent of ω. THERE ARE NO TETRAHEDRA IN THE WAVE LINE. Tetrahedra are
+  correct for the TRANSPORT line, whose integrand is a real low-degree
+  polynomial — which is exactly why the shared layer stops at the polyhedron and
+  its topology, and each line brings its own integrator.
+  The boundary payload is CORNER VALUES, and it lives in a SIDE TABLE, not in
+  the node struct: 8 doubles per node would grow the tree 3.7x for the small
+  fraction of nodes that carry a boundary (PLAN_CUT.md, Г3/Г4). Note the zero
+  set of corner interpolation is CURVED (trilinear), while all the machinery is
+  planar — so the surface is reconstructed per cell as a plane through the
+  EDGE crossings, which are shared bitwise between neighbouring cells. A
+  per-cell least-squares plane would leave GAPS at cell faces.
 - Solution basis: "potentials" (wavelet-like). 3D potential = tensor product of
   1D potentials; 1D: φ(x)=2−x² on [0,1], (x−2)² on (1,2], mirrored for x<0,
   zero outside [−2,2]. C¹ piecewise-quadratic, integer knots, φ'' piecewise

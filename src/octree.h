@@ -36,6 +36,11 @@ int hz_oct_set_ball(hz_octree *t, const double c[3], double r, double complex k2
  * boundary records off an abstract int32 CELL index, and for this tree the cell
  * index is the node index. */
 int32_t hz_oct_leaf(const hz_octree *t, int x, int y, int z);
+/* То же плюс КОРОБКА листа. Нужна маршу по лучу (PLAN_TRANSPORT.md T5а): чтобы
+ * шагнуть в следующую ячейку без ε, надо знать грань выхода, а её задаёт коробка.
+ * Отдельной копии спуска не заводится намеренно — hz_oct_leaf вызывает эту же
+ * функцию, поэтому разойтись им негде. blo и bsize могут быть NULL. */
+int32_t hz_oct_leaf_box(const hz_octree *t, int x, int y, int z, int blo[3], int *bsize);
 double complex hz_oct_at(const hz_octree *t, int x, int y, int z);
 
 /* visit leaves intersecting [lo, hi): cb gets the CLIPPED box [blo, bhi).

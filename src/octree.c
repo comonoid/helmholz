@@ -148,7 +148,7 @@ int hz_oct_set_ball(hz_octree *t, const double c[3], double r, double complex k2
 
 /* --- queries ------------------------------------------------------------- */
 
-int32_t hz_oct_leaf(const hz_octree *t, int x, int y, int z) {
+int32_t hz_oct_leaf_box(const hz_octree *t, int x, int y, int z, int blo[3], int *bsize) {
   int size = 1 << t->log2size;
   if (x < 0 || y < 0 || z < 0 || x >= size || y >= size || z >= size) return -1;
   int32_t ni = 0;
@@ -170,7 +170,15 @@ int32_t hz_oct_leaf(const hz_octree *t, int x, int y, int z) {
     }
     ni = t->nodes[ni].child0 + idx;
   }
+  if (blo != NULL)
+    for (int a = 0; a < 3; a++)
+      blo[a] = lo[a];
+  if (bsize != NULL) *bsize = size;
   return ni;
+}
+
+int32_t hz_oct_leaf(const hz_octree *t, int x, int y, int z) {
+  return hz_oct_leaf_box(t, x, y, z, NULL, NULL);
 }
 
 double complex hz_oct_at(const hz_octree *t, int x, int y, int z) {

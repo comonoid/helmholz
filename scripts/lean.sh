@@ -18,7 +18,9 @@ cd "$HZ"
 if [ $# -gt 0 ]; then
   FILES=("$@")
 else
-  mapfile -t FILES < <(ls src/*.c src/*.h tools/*.c tests/*.c 2>/dev/null)
+  # src/transport/ — вторая линия (перенос); гейт качества общий для обеих.
+  mapfile -t FILES < <(ls src/*.c src/*.h src/transport/*.c src/transport/*.h \
+                          tools/*.c tests/*.c 2>/dev/null)
 fi
 [ ${#FILES[@]} -ge 1 ] || { echo "lean: no C sources found in src/"; exit 0; }
 

@@ -22,6 +22,7 @@
 #include "transport/cam3.h"
 #include "transport/cut3.h"
 #include "transport/dirs3.h"
+#include "transport/gather3.h"
 #include "transport/mesh3.h"
 #include "transport/ray3.h"
 #include "transport/sweep3.h"
@@ -45,6 +46,11 @@ int main(int argc, char **argv) {
   int H = argc > 2 ? atoi(argv[2]) : 480;
   int nmu = argc > 3 ? atoi(argv[3]) : 2;
   const char *out = argc > 4 ? argv[4] : "img/room_sphere.ppm";
+  /* ЗЕРКАЛЬНАЯ ДОЛЯ ШАРОВ. 0 — диффузные, как было. >0 — зеркала, и тогда
+   * диффузная доля обнуляется: складывать их без модели Френеля значило бы
+   * учесть энергию дважды. */
+  double spec = argc > 5 ? atof(argv[5]) : 0.0;
+  int maxbounce = argc > 6 ? atoi(argv[6]) : 8;
 
   hz_frame fr = {{0, 0, 0}, {1, 1, 1}};
   hz_octree t;
@@ -162,8 +168,17 @@ int main(int argc, char **argv) {
   double *frho = calloc((size_t)ftab.n, sizeof(double));
   double *femit = calloc((size_t)ftab.n, sizeof(double));
   if (frho == NULL || femit == NULL) return 1;
-  for (int32_t i = 0; i < ftab.n; i++)
-    frho[i] = 0.78; /* светлая диффузная сфера */
+  double *fspec = calloc((size_t)ftab.n, sizeof(double));
+  if (fspec == NULL) return 1;
+  for (int32_t i = 0; i < ftab.n; i++) {
+    /* К5: для РАЗВЁРТКИ зеркало есть ЧЁРНОЕ тело — отражённое направление в
+     * наборе ординат отсутствует, развёртка на такой границе обрывается, и
+     * зеркальная энергия из объёмного решения выпадает. Комната с зеркалами
+     * выходит темнее физической ровно на эту долю; это граница метода, а не
+     * недосмотр, и она записана в gather3.h. */
+    frho[i] = spec > 0.0 ? 0.0 : 0.78;
+    fspec[i] = spec;
+  }
 
   tr3_problem prob = {.m = &mesh,
                       .d = &dirs,
@@ -218,91 +233,30 @@ int main(int argc, char **argv) {
   }
 
   double t1 = now();
+  /* СБОР ВЫНЕСЕН В МОДУЛЬ (gather3.c): зеркало добавляет в него ЦИКЛ, а цикл
+   * надо фальсифицировать, чего внутри main было негде делать. При spec = 0
+   * результат обязан совпасть с прежним ПОБИТОВО — это перестановка кода, а не
+   * изменение расчёта, и это проверено. */
+  tr3_gather gg = {.sc = &scn,
+                   .m = &mesh,
+                   .cut = &cut,
+                   .bout = st.bout,
+                   .sout = st.sout,
+                   .facet_spec = spec > 0.0 ? fspec : NULL,
+                   .nfacet = ftab.n,
+                   .wallidx = wallidx,
+                   .nwall = NC,
+                   .maxbounce = maxbounce};
+  long nbtot = 0;
+  int nbmax = 0;
   for (int py = 0; py < H; py++)
     for (int px = 0; px < W; px++) {
       double o[3], d[3];
       tr3_camera_ray(&cam, px, py, o, d);
-      tr3_hit h;
-      tr3_march(&scn, o, d, -1.0, &h);
-      double val = 0.0;
-      int skip = 0;
-      if (h.hit) {
-        /* ИНДЕКС ЯЧЕЙКИ, А НЕ УЗЛА: марш возвращает индекс узла октодерева, а
-         * таблицы сетки и разреза живут по КОМПАКТНОМУ индексу ячейки. Перевод
-         * делает cellof, и без него поиск не находил ничего — сфера выходила
-         * чёрной при идеально круглом силуэте. */
-        int32_t mc = mesh.cellof[h.cell];
-        if (mc < 0) skip = 1;
-        /* ЭЛЕМЕНТ ИЩЕТСЯ ПО НОРМАЛИ, А НЕ ПО НОМЕРУ ФАСЕТА. В примитивном пути
-         * (К15) номер фасета не проставляется вовсе — попадание считает ПРИМИТИВ,
-         * и фасет к ответу отношения не имеет. Ближайший по нормали элемент и
-         * есть тот кусок поверхности, в который попал луч. */
-        double best = -2.0;
-        int32_t bi = -1;
-        if (skip)
-          bi = -1;
-        else
-          for (int32_t k = cut.sestart[mc]; k < cut.sestart[mc + 1]; k++) {
-            int32_t e = cut.selist[k];
-            double dp = cut.se[e].n[0] * h.n[0] + cut.se[e].n[1] * h.n[1] + cut.se[e].n[2] * h.n[2];
-            if (dp > best) {
-              best = dp;
-              bi = e;
-            }
-          }
-        if (bi >= 0) {
-          int32_t e = bi;
-          double sz = (double)mesh.csize[mc], b[4] = {1, 0, 0, 0};
-          for (int a = 0; a < 3; a++) {
-            double xu = (h.p[a] - fr.o[a]) / fr.u[a];
-            b[a + 1] = (xu - ((double)mesh.clo[mc][a] + 0.5 * sz)) / sz;
-          }
-          for (int i = 0; i < 4; i++)
-            val += st.sout[e * 4 + i] * b[i];
-        }
-      } else {
-        /* СТЕНКА: выход из куба, затем грань, накрывающая точку */
-        double tex = 1e300;
-        int wall = -1;
-        for (int a = 0; a < 3; a++) {
-          if (!(fabs(d[a]) > 0.0)) continue;
-          double lim = d[a] > 0.0 ? (double)NC : 0.0;
-          double tt = (lim - o[a]) / d[a];
-          if (tt > 0.0 && tt < tex) {
-            tex = tt;
-            wall = 2 * a + (d[a] > 0.0 ? 1 : 0);
-          }
-        }
-        if (wall >= 0) {
-          double hp[3];
-          for (int a = 0; a < 3; a++)
-            hp[a] = o[a] + tex * d[a];
-          int axis = wall / 2, u = (axis + 1) % 3, v = (axis + 2) % 3;
-          if (u > v) {
-            int s2 = u;
-            u = v;
-            v = s2;
-          }
-          int32_t iu = (int32_t)floor(hp[u]), iv = (int32_t)floor(hp[v]);
-          if (iu < 0) iu = 0;
-          if (iu >= NC) iu = NC - 1;
-          if (iv < 0) iv = 0;
-          if (iv >= NC) iv = NC - 1;
-          int32_t f = wallidx[((int32_t)wall * NC + iu) * NC + iv];
-          if (f >= 0) {
-            const tr3_face *ff = &mesh.f[f];
-            int32_t cc = ff->ca;
-            double sz = (double)mesh.csize[cc], b[4] = {1, 0, 0, 0};
-            for (int a = 0; a < 3; a++) {
-              double xu = (hp[a] - fr.o[a]) / fr.u[a];
-              b[a + 1] = (xu - ((double)mesh.clo[cc][a] + 0.5 * sz)) / sz;
-            }
-            for (int i = 0; i < 4; i++)
-              val += st.bout[f * 4 + i] * b[i];
-          }
-        }
-      }
-      buf[(size_t)py * (size_t)W + (size_t)px] = val > 0.0 ? val : 0.0;
+      int nb = 0;
+      buf[(size_t)py * (size_t)W + (size_t)px] = tr3_gather_ray(&gg, o, d, &nb);
+      nbtot += nb;
+      if (nb > nbmax) nbmax = nb;
     }
 
   double t_gather = now() - t1;
@@ -314,6 +268,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "не записалось: %s\n", out);
     return 1;
   }
+  if (spec > 0.0)
+    printf("ЗЕРКАЛА: доля %.2f, предел отскоков %d, отскоков всего %ld (до %d на луч)\n", spec,
+           maxbounce, nbtot, nbmax);
   printf("картинка: %s (%dx%d)\n", out, W, H);
   free(wallidx);
   free(solid);
@@ -324,6 +281,7 @@ int main(int argc, char **argv) {
   free(sig_t);
   free(sig_s);
   free(frho);
+  free(fspec);
   free(femit);
   tr3_dirs_free(&dirs);
   tr3_cut_free(&cut);

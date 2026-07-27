@@ -224,6 +224,7 @@ static void t_furnace(void) {
     tr3_stats st;
     int rc = tr3_sweep_solve(&p, 400, 1e-14, phi, &st);
     free(st.bout);
+    free(st.sout);
     double worst = 0.0, wslope = 0.0;
     for (int32_t c = 0; c < r.m.ncell; c++) {
       double e = fabs(phi[c * 4] - 4.0 * M_PI * lb) / (4.0 * M_PI * lb);
@@ -286,6 +287,7 @@ static void t_linear_field(void) {
     tr3_stats st;
     int rc = tr3_sweep_solve(&p, 4, 1e-14, phi, &st);
     free(st.bout);
+    free(st.sout);
     double wm = 0.0, ws = 0.0;
     for (int32_t c = 0; c < r.m.ncell; c++) {
       double s = (double)r.m.csize[c];
@@ -331,6 +333,7 @@ static void t_linear(void) {
   tr3_stats st;
   int rc = tr3_sweep_solve(&p, 4, 1e-14, phi, &st);
   free(st.bout);
+  free(st.sout);
   double worst = 0.0;
   for (int32_t c = 0; c < r.m.ncell; c++) {
     double e = fabs(phi[c * 4] - 4.0 * M_PI * 2.0) / (4.0 * M_PI * 2.0);
@@ -380,6 +383,7 @@ static void t_balance(void) {
     tr3_stats st;
     int rc = tr3_sweep_solve(&p, 2000, 1e-13, phi, &st);
     free(st.bout);
+    free(st.sout);
     double rel = fabs(st.balance) / (fabs(st.pin) + 1e-300);
     printf("  [C баланс%s] код %d, итераций %d: втекло %.6f, вытекло %.6f, поглощено %.2e, "
            "невязка/втекло %.2e\n",
@@ -441,7 +445,7 @@ static void t_cavity(void) {
     }
     for (int32_t f = 0; f < r.m.nf; f++) {
       if (r.m.f[f].cb >= 0) continue;
-      double e = fabs(st.bout[f] - exact) / exact;
+      double e = fabs(st.bout[f * 4] - exact) / exact;
       if (e > wb) wb = e;
     }
     printf("  [D полость%s] код %d, итераций %d: радианс отн. ошибка %.2e, "
@@ -451,6 +455,7 @@ static void t_cavity(void) {
     check(worst < 1e-10, "D: равновесие полости есть L_e/(1−ρ), однородно");
     check(wb < 1e-10, "и исходящий радианс стенок тот же");
     free(st.bout);
+    free(st.sout);
     free(phi);
     rig_free(&r);
   }
@@ -480,6 +485,7 @@ static void t_cavity(void) {
   }
   tr3_stats st2;
   tr3_sweep_solve(&p2, 200, 1e-12, phi2, &st2);
+  free(st2.sout);
   double got = phi2[0] / (4.0 * M_PI);
   printf("    [НК без 1/π] радианс %.4f против правильного %.4f\n", got, exact);
   check(fabs(got - exact) > 0.5 * exact, "негативный контроль: без 1/π ответ ОБЯЗАН уехать");
@@ -533,6 +539,7 @@ static void t_render(void) {
   if (buf == NULL) {
     check(0, "память");
     free(st.bout);
+    free(st.sout);
     free(phi);
     rig_free(&r);
     return;
@@ -580,7 +587,20 @@ static void t_render(void) {
         if (ff->cb >= 0 || (int)(~ff->cb) != wall) continue;
         if (hp[u] < (double)ff->lo[0] || hp[u] > (double)ff->hi[0]) continue;
         if (hp[v] < (double)ff->lo[1] || hp[v] > (double)ff->hi[1]) continue;
-        val = st.bout[f];
+        /* DG1 ПО ПОЛОЖЕНИЮ: радианс на грани линейный, и читать его надо В ТОЧКЕ
+         * попадания, а не константой на грань. Константа и давала квадраты. */
+        {
+          int32_t cc = ff->ca;
+          double sz = (double)r.m.csize[cc];
+          double bb[4] = {1.0, 0, 0, 0};
+          for (int a = 0; a < 3; a++) {
+            double xu = (hp[a] - r.m.fr.o[a]) / r.m.fr.u[a];
+            bb[a + 1] = (xu - ((double)r.m.clo[cc][a] + 0.5 * sz)) / sz;
+          }
+          val = 0.0;
+          for (int i = 0; i < 4; i++)
+            val += st.bout[f * 4 + i] * bb[i];
+        }
         break;
       }
       buf[py * W + px] = val;
@@ -597,8 +617,167 @@ static void t_render(void) {
   printf("    картинка записана: build/room.ppm\n");
   free(buf);
   free(st.bout);
+  free(st.sout);
   free(phi);
   rig_free(&r);
+}
+
+/* ------------------------- D2: разрезанные ячейки, флюидная геометрия */
+
+static void t_cut(void) {
+  const hz_frame fr = {{0, 0, 0}, {1, 1, 1}};
+  const int L = 4, N = 1 << L;
+  hz_octree t;
+  hz_oct_init(&t, L, 0.0);
+  for (int x = 0; x < N; x++)
+    for (int y = 0; y < N; y++)
+      for (int z = 0; z < N; z++) {
+        int lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
+        hz_oct_set_box(&t, lo, hi, 1.0);
+      }
+  hz_surftab stab;
+  hz_facettab ftab;
+  hz_cutmap cmap;
+  hz_surftab_init(&stab);
+  hz_facettab_init(&ftab);
+  hz_cutmap_init(&cmap);
+  double sc[3] = {8.3, 8.7, 7.6}, sr = 3.4;
+  hz_surf sp = {HZ_SURF_SPHERE, {sc[0], sc[1], sc[2], sr, 0, 0, 0}, 1, 0};
+  int32_t si = hz_surftab_add(&stab, &sp);
+  int32_t f0 = 0;
+  int32_t nfac = hz_surf_facet_sphere(&ftab, &fr, sc, sr, 1, HZ_FIT_MEAN_SAGITTA, si, &f0);
+  check(nfac > 0, "сфера фасетизирована");
+  /* Г45 В ДЕЙСТВИИ: ключ боковой таблицы обязан СТРОГО ВОЗРАСТАТЬ, а индексы
+   * узлов идут порядком ВЫДЕЛЕНИЯ, а не порядком (x,y,z). Первая редакция этого
+   * теста добавляла записи как попало и не смотрела на код возврата — половина
+   * молча отвергалась, тело выходило дырявым, и объём материала был 105 вместо
+   * 165. Ровно тот сценарий, про который Г45 и написана. */
+  typedef struct {
+    int32_t cell, f[HZ_P3_MAXH], nf;
+  } rec_t;
+  static rec_t rec[4096];
+  int nrec = 0;
+  for (int x = 0; x < N; x++)
+    for (int y = 0; y < N; y++)
+      for (int z = 0; z < N; z++) {
+        int32_t lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
+        int32_t sel[HZ_P3_MAXH];
+        int ns = hz_facets_for_box(&ftab, f0, nfac, lo, hi, sel, HZ_P3_MAXH);
+        if (ns <= 0) continue;
+        rec[nrec].cell = hz_oct_leaf(&t, x, y, z);
+        rec[nrec].nf = ns;
+        for (int j = 0; j < ns; j++)
+          rec[nrec].f[j] = sel[j];
+        nrec++;
+      }
+  for (int i = 1; i < nrec; i++) {
+    rec_t tmp = rec[i];
+    int j = i - 1;
+    while (j >= 0 && rec[j].cell > tmp.cell) {
+      rec[j + 1] = rec[j];
+      j--;
+    }
+    rec[j + 1] = tmp;
+  }
+  int nadd = 0;
+  for (int i = 0; i < nrec; i++)
+    if (hz_cutmap_add(&cmap, rec[i].cell, rec[i].f, rec[i].nf) == 0) nadd++;
+  check(nadd == nrec, "Г45: ВСЕ записи легли в боковую таблицу (ключи по возрастанию)");
+  tr3_mesh m;
+  check(tr3_mesh_build(&m, &t, &fr) == 0, "сетка");
+  uint8_t *solid = calloc((size_t)m.ncell, 1);
+  for (int x = 0; x < N; x++)
+    for (int y = 0; y < N; y++)
+      for (int z = 0; z < N; z++) {
+        int32_t lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
+        int32_t sel[HZ_P3_MAXH];
+        int ns = hz_facets_for_box(&ftab, f0, nfac, lo, hi, sel, HZ_P3_MAXH);
+        if (ns == 0) solid[m.cellof[hz_oct_leaf(&t, x, y, z)]] = 1; /* Г38: 0 = ПОЛНАЯ */
+      }
+  tr3_cut cu;
+  check(tr3_cut_build(&cu, &m, &ftab, &cmap, solid) == 0, "разрез");
+  check(cu.nbad == 0, "условие 1:1 у разрезанных ячеек соблюдено");
+
+  /* 1. ОБЪЁМ МАТЕРИАЛА: коробки минус флюид = объём шара, аналитически */
+  double vmat = 0.0;
+  for (int32_t c = 0; c < m.ncell; c++) {
+    double s = (double)m.csize[c];
+    vmat += s * s * s - cu.mvol[c][0][0];
+  }
+  free(solid);
+  double vex = 4.0 / 3.0 * M_PI * sr * sr * sr;
+  /* РЕШАЮЩАЯ СВЕРКА: материал считается НЕЗАВИСИМО, проверенным путём
+   * hz_poly3_cut (пункт 4), и сумма «флюид + материал = коробка» обязана
+   * держаться поячеечно. Если нет — виновата флюидная бухгалтерия, а не
+   * фасетизация. */
+  double vmat2 = 0.0, wcell = 0.0;
+  for (int32_t c = 0; c < m.ncell; c++) {
+    const hz_cutrec *rr = hz_cutmap_find(&cmap, m.node[c]);
+    double s = (double)m.csize[c];
+    if (rr == NULL) {
+      vmat2 += cu.solid[c] ? s * s * s : 0.0;
+      continue;
+    }
+    hz_hspace hh[HZ_P3_MAXH];
+    int32_t hd[HZ_P3_MAXH];
+    int nh = hz_cutmap_hspaces(&ftab, &cmap, rr, hh, hd, NULL, HZ_P3_MAXH);
+    int32_t lo2[3] = {m.clo[c][0], m.clo[c][1], m.clo[c][2]};
+    int32_t hi2[3] = {lo2[0] + m.csize[c], lo2[1] + m.csize[c], lo2[2] + m.csize[c]};
+    hz_poly3 pp;
+    double vm = 0.0;
+    if (hz_poly3_cut(&pp, lo2, hi2, hh, hd, nh) == HZ_P3_OK) vm = hz_poly3_volume(&pp, &fr);
+    vmat2 += vm;
+    double e = fabs(vm + cu.mvol[c][0][0] - s * s * s);
+    if (e > wcell) wcell = e;
+  }
+  printf("      материал независимым путём %.5f; max |флюид+материал−коробка| = %.3e\n", vmat2,
+         wcell);
+  check(wcell < 1e-12, "поячеечно: флюид и материал дополняют коробку ТОЧНО");
+  printf("  [D2] объём материала %.5f против шара %.5f (отн. %.3e), элементов %d\n", vmat, vex,
+         fabs(vmat - vex) / vex, cu.nse);
+  check(fabs(vmat - vex) / vex < 0.02, "флюид дополняет материал до шара (фасетизация k=1)");
+
+  /* 2. ЗАМКНУТОСТЬ ФЛЮИДНОЙ ОБЛАСТИ: Σ(внешняя нормаль × площадь) = 0.
+   * Это и есть проверка того, что ни одна грань не потеряна и ни одна не
+   * посчитана дважды — теорема о дивергенции для постоянного поля. */
+  double worst = 0.0;
+  int nchecked = 0;
+  for (int32_t c = 0; c < m.ncell; c++) {
+    if (cu.solid[c]) continue;
+    if (cu.sestart[c + 1] == cu.sestart[c]) continue; /* только разрезанные */
+    double acc[3] = {0, 0, 0};
+    for (int32_t k = m.fstart[c]; k < m.fstart[c + 1]; k++) {
+      int32_t f = m.flist[k];
+      int mine_is_a = m.f[f].ca == c;
+      double sgn;
+      if (m.f[f].cb < 0) {
+        int wall = (int)(~m.f[f].cb);
+        sgn = (wall & 1) ? 1.0 : -1.0;
+      } else {
+        sgn = mine_is_a ? 1.0 : -1.0;
+      }
+      double a = mine_is_a ? cu.ffm[f][0][0] : cu.ffmb[f][0][0];
+      acc[m.f[f].axis] += sgn * a;
+    }
+    for (int32_t k = cu.sestart[c]; k < cu.sestart[c + 1]; k++) {
+      const tr3_selem *se = &cu.se[cu.selist[k]];
+      for (int a = 0; a < 3; a++)
+        acc[a] += -se->n[a] * se->area; /* наружу ФЛЮИДА = −n */
+    }
+    double e = fabs(acc[0]) + fabs(acc[1]) + fabs(acc[2]);
+    if (e > worst) worst = e;
+    nchecked++;
+  }
+  printf("      замкнутость флюида: %d разрезанных ячеек, max |Σn·A| = %.3e\n", nchecked, worst);
+  check(nchecked > 50, "разрезанных ячеек достаточно");
+  check(worst < 1e-12, "D2: флюидная область ЗАМКНУТА — ни одна грань не потеряна");
+
+  tr3_cut_free(&cu);
+  tr3_mesh_free(&m);
+  hz_cutmap_free(&cmap);
+  hz_facettab_free(&ftab);
+  hz_surftab_free(&stab);
+  hz_oct_free(&t);
 }
 
 int main(void) {
@@ -624,6 +803,7 @@ int main(void) {
   t_linear_field();
   t_balance();
   t_cavity();
+  t_cut();
   t_render();
 
   printf("%s: %d/%d\n", g_fail ? "FAILURES" : "ok", g_total - g_fail, g_total);

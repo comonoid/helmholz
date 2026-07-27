@@ -101,63 +101,41 @@ static double corner_min(const double c[4]) {
 int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr3_stats *st) {
   const tr3_mesh *m = p->m;
   const tr3_dirs *d = p->d;
-  /* ВЛАДЕНИЕ ОБНУЛЯЕТСЯ ПЕРВОЙ СТРОКОЙ. Найдено аудитом: на путях раннего
-   * возврата (нехватка памяти, цикл обхода) bout освобождался внутри, а поле
-   * st->bout оставалось НЕИНИЦИАЛИЗИРОВАННЫМ — и вызывающий, освобождая его по
-   * заведённому порядку, освобождал мусор. Санитайзеры этого не показали:
-   * на зелёном прогоне ранние возвраты не случаются вовсе. */
+  const tr3_cut *cu = p->cut;
+  int32_t nc = m->ncell, nd = d->n, nse = cu != NULL ? cu->nse : 0;
+  /* ВЛАДЕНИЕ ОБНУЛЯЕТСЯ ПЕРВОЙ СТРОКОЙ (К30): на путях раннего возврата поля
+   * иначе остались бы неинициализированными, и вызывающий освободил бы мусор. */
   st->bout = NULL;
-  int32_t nc = m->ncell, nd = d->n;
+  st->sout = NULL;
+
   double *L = calloc((size_t)nc * 4, sizeof(double));
   double *phin = calloc((size_t)nc * 4, sizeof(double));
   int32_t *indeg = calloc((size_t)nc, sizeof(int32_t));
   int32_t *order = calloc((size_t)nc, sizeof(int32_t));
   int32_t *queue = calloc((size_t)nc, sizeof(int32_t));
-  double (*fm)[4][4] = calloc((size_t)m->nf, sizeof(double[4][4]));
-  double (*fmb)[4][4] = calloc((size_t)m->nf, sizeof(double[4][4]));
-  double (*fmx)[4][4] = calloc((size_t)m->nf, sizeof(double[4][4]));
-  double *farea = calloc((size_t)m->nf, sizeof(double));
-  double *bout = calloc((size_t)m->nf, sizeof(double));
-  double *binf = calloc((size_t)m->nf, sizeof(double));
-  if (L == NULL || phin == NULL || indeg == NULL || order == NULL || queue == NULL || fm == NULL ||
-      fmx == NULL || farea == NULL) {
+  double *bout = calloc((size_t)m->nf * 4, sizeof(double));
+  double *binf = calloc((size_t)m->nf * 4, sizeof(double));
+  double *sout = calloc((size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
+  double *sinf = calloc((size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
+  double *hs_se = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
+  if (L == NULL || phin == NULL || indeg == NULL || order == NULL || queue == NULL ||
+      bout == NULL || binf == NULL || sout == NULL || sinf == NULL || hs_se == NULL) {
     free(L);
     free(phin);
     free(indeg);
     free(order);
     free(queue);
-    free(fm);
-    free(fmb);
-    free(fmx);
-    free(farea);
     free(bout);
     free(binf);
+    free(sout);
+    free(sinf);
+    free(hs_se);
     return 1;
   }
 
-  /* Матрицы граней считаются ОДИН раз: они от направления не зависят. */
-  for (int32_t f = 0; f < m->nf; f++) {
-    double v[4][3];
-    tr3_face_corners(m, f, v);
-    farea[f] = tr3_face_area(m, f);
-    face_mass2(m, (const double (*)[4][3]) & v, m->f[f].ca, m->f[f].ca, fm[f]);
-    /* И ОТДЕЛЬНО матрица В БАЗИСЕ ЯЧЕЙКИ cb: у выточного члена стоит СВОЙ базис,
-     * а на стыке уровней он у соседей разный. Одна матрица на обе стороны была
-     * ошибкой, и на равномерной сетке она бы не проявилась вовсе. */
-    if (m->f[f].cb >= 0)
-      face_mass2(m, (const double (*)[4][3]) & v, m->f[f].cb, m->f[f].cb, fmb[f]);
-    face_mass2(m, (const double (*)[4][3]) & v, m->f[f].ca, m->f[f].cb, fmx[f]);
-  }
-
-  memset(phi, 0, (size_t)nc * 4 * sizeof(double));
-  /* ПОЛУСФЕРНЫЙ ПОТОК СЧИТАЕТСЯ ПО САМОМУ НАБОРУ, А НЕ БЕРЁТСЯ РАВНЫМ π.
-   * В континууме ∫_{ω·N>0}(ω·N)dω = π точно, а на дискретном наборе — нет: у
-   * боковых стенок под интегралом стоят sqrt(1−μ²) и cos φ, которые ни гауссова
-   * квадратура по μ, ни квадрантная по азимуту точно не берут. Делить на π
-   * значило бы терять энергию на каждом отражении: измерено 1.3%% на замкнутой
-   * полости, где точный ответ известен. Нормировка на СОБСТВЕННУЮ сумму делает
-   * диффузное отражение энергетически точным на любом наборе — дословно тот же
-   * приём, что p0 = 1/Σw для фазовой функции в T2. */
+  /* К29 ДЛЯ ПРОИЗВОЛЬНОЙ НОРМАЛИ. Полусферный поток на дискретном наборе не
+   * равен π (у наклонной поверхности тем более), и делить надо на СОБСТВЕННУЮ
+   * сумму набора — иначе каждое отражение теряет энергию. */
   double hsum[6];
   for (int wl = 0; wl < 6; wl++) {
     int ax = wl / 2;
@@ -168,36 +146,44 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       if (on > 0.0) hsum[wl] += d->w[mm] * on;
     }
   }
+  for (int32_t e = 0; e < nse; e++) {
+    double s = 0.0;
+    for (int mm = 0; mm < nd; mm++) {
+      double on =
+          d->ox[mm] * cu->se[e].n[0] + d->oy[mm] * cu->se[e].n[1] + d->oz[mm] * cu->se[e].n[2];
+      if (on < 0.0) s += d->w[mm] * (-on); /* приходящие НА поверхность */
+    }
+    hs_se[e] = s;
+  }
+
+  memset(phi, 0, (size_t)nc * 4 * sizeof(double));
   if (p->wall_rho != NULL)
     for (int32_t f = 0; f < m->nf; f++)
-      if (m->f[f].cb < 0) bout[f] = p->wall_emit != NULL ? p->wall_emit[(int)(~m->f[f].cb)] : 0.0;
-  st->nclip = 0;
-  int nclip_last = 0;
-  int it = 0;
+      if (m->f[f].cb < 0)
+        bout[f * 4] = p->wall_emit != NULL ? p->wall_emit[(int)(~m->f[f].cb)] : 0.0;
+  for (int32_t e = 0; e < nse; e++)
+    if (p->facet_emit != NULL && cu->se[e].facet < p->nfacet)
+      sout[e * 4] = p->facet_emit[cu->se[e].facet];
+
+  int nclip_last = 0, it = 0;
   double resid = 0.0;
   for (it = 0; it < maxit; it++) {
     memset(phin, 0, (size_t)nc * 4 * sizeof(double));
-    memset(binf, 0, (size_t)m->nf * sizeof(double));
-    /* СРЕЗКИ СЧИТАЮТСЯ И ЗА ПОСЛЕДНЮЮ ИТЕРАЦИЮ ОТДЕЛЬНО. Суммарное число мешает
-     * переходный процесс с установившимся, а вопрос К6 — активен ли ограничитель
-     * НА СОШЕДШЕМСЯ решении: если да, он портит константу, если нет, он только
-     * держал итерацию положительной. Одним числом эти два случая неразличимы. */
+    memset(binf, 0, (size_t)m->nf * 4 * sizeof(double));
+    memset(sinf, 0, (size_t)(nse > 0 ? nse : 1) * 4 * sizeof(double));
     nclip_last = 0;
     st->pin = st->pout = st->pabs = 0.0;
 
     for (int mm = 0; mm < nd; mm++) {
       double om[3] = {d->ox[mm], d->oy[mm], d->oz[mm]};
       /* --- топологический порядок для этого направления ---
-       * ПЕРЕСТРАИВАЕТСЯ КАЖДУЮ ИТЕРАЦИЮ, И ЭТО СОЗНАТЕЛЬНО. Порядок зависит
-       * только от направления, так что его можно было бы посчитать один раз —
-       * но хранить его пришлось бы для ВСЕХ ND направлений, то есть ND×ncell
-       * целых, а это ровно то, что запрещает Р1 («угловое поле транзиентно»).
-       * Цена пересборки O(ncell + nf) — тот же порядок, что у самого прохода,
-       * то есть постоянный множитель, а не лишняя асимптотика. */
+       * ПЕРЕСТРАИВАЕТСЯ КАЖДУЮ ИТЕРАЦИЮ, И ЭТО СОЗНАТЕЛЬНО: кэш стоил бы
+       * ND×ncell целых, а это ровно то, что запрещает Р1. Цена O(ncell+nf) —
+       * тот же порядок, что у самого прохода. */
       memset(indeg, 0, (size_t)nc * sizeof(int32_t));
       for (int32_t f = 0; f < m->nf; f++) {
         if (m->f[f].cb < 0) continue;
-        double on = om[m->f[f].axis]; /* нормаль ca->cb есть +axis */
+        double on = om[m->f[f].axis];
         if (on > 0.0)
           indeg[m->f[f].cb]++;
         else if (on < 0.0)
@@ -221,58 +207,67 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
           if (down >= 0 && --indeg[down] == 0) queue[qt++] = down;
         }
       }
-      if (no != nc) { /* цикл обхода — не считать молча */
+      if (no != nc) {
         free(L);
         free(phin);
         free(indeg);
         free(order);
         free(queue);
-        free(fm);
-        free(fmb);
-        free(fmx);
-        free(farea);
         free(bout);
         free(binf);
+        free(sout);
+        free(sinf);
+        free(hs_se);
         return 2;
       }
 
-      /* --- проход --- */
       for (int32_t oi = 0; oi < no; oi++) {
         int32_t c = order[oi];
+        if (cu != NULL && cu->solid[c]) { /* ячейка целиком в материале */
+          for (int j = 0; j < 4; j++)
+            L[c * 4 + j] = 0.0;
+          continue;
+        }
         double A[4][4], rhs[4];
         memset(A, 0, sizeof A);
         memset(rhs, 0, sizeof rhs);
         double s = (double)m->csize[c];
-        double vol = s * s * s * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
-        double M[4] = {vol, vol / 12.0, vol / 12.0, vol / 12.0};
-
-        /* объёмные члены: σ_t·∫b_i b_j и −∫ b_i (ω·∇b_j) */
-        for (int j = 0; j < 4; j++)
-          A[j][j] += p->sig_t[c] * M[j];
-        for (int j = 1; j < 4; j++) {
-          double g = om[j - 1] / (s * m->fr.u[j - 1]); /* (ω·∇b_j), постоянная */
-          /* −∫ b_i (ω·∇b_j) dV. Градиент постоянен, поэтому интеграл есть
-           * g_j·∫b_i dV, а ∫b_i dV равен НУЛЮ при i > 0 (ячейка симметрична
-           * относительно своего центра). Значит член связывает тестовую функцию
-           * ТОЛЬКО с постоянной модой, и лишний вклад при i == j был ошибкой. */
-          A[j][0] -= g * M[0];
+        double MM[4][4];
+        if (cu != NULL) {
+          memcpy(MM, cu->mvol[c], sizeof MM);
+        } else {
+          memset(MM, 0, sizeof MM);
+          double vol = s * s * s * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+          MM[0][0] = vol;
+          for (int k = 1; k < 4; k++)
+            MM[k][k] = vol / 12.0;
         }
-        /* источник: σ_s/(4π)·φ + ε */
+        for (int j = 0; j < 4; j++)
+          for (int i = 0; i < 4; i++)
+            A[j][i] += p->sig_t[c] * MM[j][i];
+        /* −∫ b_i (ω·∇b_j): градиент постоянен, поэтому член есть g_j·∫b_i dV, а
+         * ∫b_i dV на ФЛЮИДНОЙ области уже не ноль (симметрии нет) — берётся
+         * первая строка матрицы масс. */
+        for (int j = 1; j < 4; j++) {
+          double g = om[j - 1] / (s * m->fr.u[j - 1]);
+          for (int i = 0; i < 4; i++)
+            A[j][i] -= g * MM[0][i];
+        }
         for (int j = 0; j < 4; j++) {
-          double q = p->sig_s[c] / (4.0 * M_PI) * phi[c * 4 + j];
-          if (p->eps != NULL) q += p->eps[c * 4 + j];
-          if (j == 0) q += p->eps_dir[0] * om[0] + p->eps_dir[1] * om[1] + p->eps_dir[2] * om[2];
-          rhs[j] += q * M[j];
+          double q = 0.0;
+          for (int i = 0; i < 4; i++)
+            q += p->sig_s[c] / (4.0 * M_PI) * phi[c * 4 + i] * MM[j][i];
+          if (p->eps != NULL)
+            for (int i = 0; i < 4; i++)
+              q += p->eps[c * 4 + i] * MM[j][i];
+          if (j == 0)
+            q += (p->eps_dir[0] * om[0] + p->eps_dir[1] * om[1] + p->eps_dir[2] * om[2]) * MM[0][0];
+          rhs[j] += q;
         }
 
         for (int32_t k = m->fstart[c]; k < m->fstart[c + 1]; k++) {
           int32_t f = m->flist[k];
           int mine_is_a = m->f[f].ca == c;
-          /* ВНЕШНЯЯ НОРМАЛЬ ЯЧЕЙКИ. У внутренней грани её задаёт сторона: ca лежит
-           * со стороны меньших координат, значит у неё нормаль +axis. У ГРАНИЧНОЙ
-           * ячейка всегда записана в ca, и знак берётся из номера стенки —
-           * иначе минус-стенка получила бы нормаль плюсовой. Ровно это и поймала
-           * печь: решение уехало на 17%. */
           double sgn;
           if (m->f[f].cb < 0) {
             int wall = (int)(~m->f[f].cb);
@@ -282,86 +277,98 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
           }
           double on = om[m->f[f].axis] * sgn;
           if (!(fabs(on) > 0.0)) continue;
-          if (on > 0.0) { /* ВЫТОК: своя же функция, в СВОЁМ базисе */
-            const double (*fs)[4] = mine_is_a ? fm[f] : fmb[f];
+          const double (*fmine)[4] = cu != NULL ? (mine_is_a ? cu->ffm[f] : cu->ffmb[f]) : NULL;
+          double fbox[4][4];
+          if (cu == NULL) {
+            double v[4][3];
+            tr3_face_corners(m, f, v);
+            face_mass2(m, (const double (*)[4][3]) & v, c, c, fbox);
+            fmine = fbox;
+          }
+          if (on > 0.0) {
             for (int i = 0; i < 4; i++)
               for (int j = 0; j < 4; j++)
-                A[j][i] += on * fs[i][j];
-          } else { /* ВТОК: значение верхней по потоку ячейки */
+                A[j][i] += on * fmine[i][j];
+          } else {
             if (m->f[f].cb < 0) {
-              /* граница: предписанный влёт, линейный по положению */
-              double v[4][3];
-              tr3_face_corners(m, f, v);
-              double bl[4][4];
-              face_mass2(m, (const double (*)[4][3]) & v, c, -1, bl);
-              /* ∫ L_b b_j: L_b линейна, поэтому берём её значения в вершинах и
-               * пользуемся тем же тождеством через смешанную матрицу с b_0 */
-              for (int j = 0; j < 4; j++) {
-                double acc = 0.0;
-                for (int e = 1; e + 1 < 4; e++) {
-                  double tri[3][3];
-                  for (int q = 0; q < 3; q++)
-                    for (int a = 0; a < 3; a++)
-                      tri[q][a] = v[q == 0 ? 0 : (q == 1 ? e : e + 1)][a];
-                  double area = tr3_poly_face_area(tri, 3);
-                  double fv[3], bv[3][4];
-                  for (int q = 0; q < 3; q++) {
-                    if (p->wall_rho != NULL) {
-                      fv[q] = bout[f]; /* стенка светит СВОИМ исходящим радиансом */
-                    } else {
-                      fv[q] = p->binc0;
-                      for (int a = 0; a < 3; a++)
-                        fv[q] += p->binc[a] * (tri[q][a] - p->binx0[a]);
-                    }
-                    cell_basis(m, c, tri[q], bv[q]);
-                  }
-                  double s1 = 0.0, sf = 0.0, sg = 0.0;
-                  for (int q = 0; q < 3; q++) {
-                    s1 += fv[q] * bv[q][j];
-                    sf += fv[q];
-                    sg += bv[q][j];
-                  }
-                  acc += area * (s1 + sf * sg) / 12.0;
-                }
-                rhs[j] -= on * acc;
-                /* ВТЕКШАЯ МОЩНОСТЬ — из того же интеграла, что и правая часть,
-                 * а не из площади на константу: при линейном влёте второе
-                 * неверно, и баланс К13 померил бы не то. */
-                if (j == 0) st->pin += -on * d->w[mm] * acc;
+              double lb[4];
+              if (p->wall_rho != NULL) {
+                for (int i = 0; i < 4; i++)
+                  lb[i] = bout[f * 4 + i];
+              } else {
+                /* предписанный влёт, линейный по положению: раскладываем по
+                 * базису ЯЧЕЙКИ через значения в углах грани */
+                /* Разложение ЛИНЕЙНОГО влёта по базису ЯЧЕЙКИ. Центр берётся
+                 * ЯЧЕЙКИ, а не грани: базис b_i центрирован на ячейке, и подмена
+                 * центра сдвигает постоянную часть на binc·(центр грани − центр
+                 * ячейки) — то есть ровно на полклетки, что К12 и поймал. */
+                double cen[3];
+                for (int a = 0; a < 3; a++)
+                  cen[a] = m->fr.o[a] + m->fr.u[a] * ((double)m->clo[c][a] + 0.5 * s);
+                lb[0] = p->binc0;
+                for (int a = 0; a < 3; a++)
+                  lb[0] += p->binc[a] * (cen[a] - p->binx0[a]);
+                for (int a = 0; a < 3; a++)
+                  lb[a + 1] = p->binc[a] * s * m->fr.u[a];
               }
+              double accj[4] = {0, 0, 0, 0};
+              for (int j = 0; j < 4; j++)
+                for (int i = 0; i < 4; i++)
+                  accj[j] += lb[i] * fmine[i][j];
+              for (int j = 0; j < 4; j++)
+                rhs[j] -= on * accj[j];
+              st->pin += -on * d->w[mm] * accj[0];
             } else {
               int32_t up = mine_is_a ? m->f[f].cb : m->f[f].ca;
-              /* fmx[f] есть ∫ b^ca_i b^cb_j; нужна ∫ b^up_i b^my_j */
+              double fx[4][4];
+              if (cu != NULL) {
+                memcpy(fx, cu->ffmx[f], sizeof fx);
+              } else {
+                double v[4][3];
+                tr3_face_corners(m, f, v);
+                face_mass2(m, (const double (*)[4][3]) & v, m->f[f].ca, m->f[f].cb, fx);
+              }
               for (int j = 0; j < 4; j++) {
                 double acc = 0.0;
                 for (int i = 0; i < 4; i++)
-                  acc += L[up * 4 + i] * (mine_is_a ? fmx[f][j][i] : fmx[f][i][j]);
+                  acc += L[up * 4 + i] * (mine_is_a ? fx[j][i] : fx[i][j]);
                 rhs[j] -= on * acc;
               }
             }
           }
         }
 
-        /* СТРОКА БАЛАНСА СОХРАНЯЕТСЯ ДО РЕШЕНИЯ: ограничителю она нужна целой, а
-         * solve4 матрицу разрушает. Без неё пришлось бы либо считать систему
-         * дважды, либо срезать наклоны БЕЗ пересчёта среднего — а это ровно
-         * режим SLOPE, у которого в T2 измерена утечка 4.3e-3 против 5e-16. */
+        /* ПОВЕРХНОСТНЫЕ ЭЛЕМЕНТЫ: та же роль, что у граничной грани, но нормаль
+         * произвольная. ω·n > 0 — поверхность светит В ячейку (вток), < 0 — луч
+         * упирается в неё (выток, и он же облучённость поверхности). */
+        if (cu != NULL)
+          for (int32_t k = cu->sestart[c]; k < cu->sestart[c + 1]; k++) {
+            int32_t e = cu->selist[k];
+            const tr3_selem *se = &cu->se[e];
+            double on = om[0] * se->n[0] + om[1] * se->n[1] + om[2] * se->n[2];
+            if (!(fabs(on) > 0.0)) continue;
+            if (on < 0.0) { /* выток на поверхность */
+              for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++)
+                  A[j][i] += (-on) * se->m[i][j];
+            } else { /* вток с поверхности */
+              for (int j = 0; j < 4; j++) {
+                double acc = 0.0;
+                for (int i = 0; i < 4; i++)
+                  acc += sout[e * 4 + i] * se->m[i][j];
+                rhs[j] += on * acc;
+              }
+            }
+          }
+
         double a0row[4], rhs0 = rhs[0];
         for (int j = 0; j < 4; j++)
           a0row[j] = A[0][j];
         double cf[4];
-        if (solve4(A, rhs, cf) != 0) {
+        if (solve4(A, rhs, cf) != 0)
           for (int j = 0; j < 4; j++)
             cf[j] = 0.0;
-        }
-        /* ОГРАНИЧИТЕЛЬ ПОЛОЖИТЕЛЬНОСТИ (К14/К6): наклоны срезаются множителем α,
-         * а среднее ПЕРЕСЧИТЫВАЕТСЯ из строки баланса — иначе энергия течёт
-         * (в T2 измерено 4.3e-3 против 5e-16). α берётся замкнутой формой. */
         if (p->limiter && corner_min(cf) < 0.0 && fabs(a0row[0]) > 0.0) {
-          /* ЗАМКНУТАЯ ФОРМА (перенесена из T2): среднее есть АФФИННАЯ функция
-           * коэффициента срезки, поэтому положительность и баланс достигаются
-           * ОБА и за один шаг, а порога при этом не появляется — α берётся из
-           * уравнения. */
           double kk = 0.0;
           for (int j = 1; j < 4; j++)
             kk += a0row[j] * cf[j];
@@ -383,45 +390,98 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         }
         for (int j = 0; j < 4; j++)
           L[c * 4 + j] = cf[j];
+
+        /* облучённость поверхностных элементов — из того же выточного члена */
+        if (cu != NULL)
+          for (int32_t k = cu->sestart[c]; k < cu->sestart[c + 1]; k++) {
+            int32_t e = cu->selist[k];
+            const tr3_selem *se = &cu->se[e];
+            double on = om[0] * se->n[0] + om[1] * se->n[1] + om[2] * se->n[2];
+            if (on >= 0.0) continue;
+            for (int j = 0; j < 4; j++) {
+              double acc = 0.0;
+              for (int i = 0; i < 4; i++)
+                acc += cf[i] * se->m[i][j];
+              sinf[e * 4 + j] += (-on) * d->w[mm] * acc;
+            }
+          }
       }
 
-      /* вклад в скалярный поток и в баланс */
       for (int32_t c = 0; c < nc; c++)
         for (int j = 0; j < 4; j++)
           phin[c * 4 + j] += d->w[mm] * L[c * 4 + j];
+
       for (int32_t f = 0; f < m->nf; f++) {
         if (m->f[f].cb >= 0) continue;
-        /* внешняя нормаль граничной грани: +axis у «плюс»-стенки, −axis у «минус» */
         int wall = (int)(~m->f[f].cb);
         double on = om[m->f[f].axis] * ((wall & 1) ? 1.0 : -1.0);
-        if (on > 0.0) {
+        if (!(on > 0.0)) continue;
+        int32_t c = m->f[f].ca;
+        double fmm[4][4];
+        if (cu != NULL) {
+          memcpy(fmm, cu->ffm[f], sizeof fmm);
+        } else {
           double v[4][3];
           tr3_face_corners(m, f, v);
-          double bl[4][4];
-          face_mass2(m, (const double (*)[4][3]) & v, m->f[f].ca, -1, bl);
-          double acc = 0.0;
-          for (int i = 0; i < 4; i++)
-            acc += L[m->f[f].ca * 4 + i] * bl[i][0];
-          st->pout += on * d->w[mm] * acc;
-          /* ОБЛУЧЁННОСТЬ СТЕНКИ: то, что из ячейки вытекло, для стенки есть
-           * ВХОДЯЩЕЕ. E = ∫L|ω·n|dω, и делится потом на площадь. */
-          binf[f] += on * d->w[mm] * acc;
+          face_mass2(m, (const double (*)[4][3]) & v, c, c, fmm);
         }
+        double accj[4] = {0, 0, 0, 0};
+        for (int j = 0; j < 4; j++)
+          for (int i = 0; i < 4; i++)
+            accj[j] += L[c * 4 + i] * fmm[i][j];
+        st->pout += on * d->w[mm] * accj[0];
+        for (int j = 0; j < 4; j++)
+          binf[f * 4 + j] += on * d->w[mm] * accj[j];
       }
     }
 
-    /* СТЕНКИ: новый исходящий радианс из накопленной облучённости. Это и есть
-     * внешняя итерация «развёртка ↔ отражение», и она идёт в том же цикле, что
-     * и итерация по рассеянию — они сходятся вместе. */
-    if (p->wall_rho != NULL) {
+    /* --- стенки и поверхности: новый исходящий радианс, DG1 по положению --- */
+    if (p->wall_rho != NULL)
       for (int32_t f = 0; f < m->nf; f++) {
         if (m->f[f].cb >= 0) continue;
         int wall = (int)(~m->f[f].cb);
-        double e = farea[f] > 0.0 ? binf[f] / farea[f] : 0.0;
-        bout[f] =
-            (p->wall_emit != NULL ? p->wall_emit[wall] : 0.0) + p->wall_rho[wall] * e / hsum[wall];
+        double fmm[4][4], rr[4], ee[4];
+        if (cu != NULL) {
+          memcpy(fmm, cu->ffm[f], sizeof fmm);
+        } else {
+          double v[4][3];
+          tr3_face_corners(m, f, v);
+          face_mass2(m, (const double (*)[4][3]) & v, m->f[f].ca, m->f[f].ca, fmm);
+        }
+        if (!(fmm[0][0] > 0.0)) continue;
+        for (int j = 0; j < 4; j++)
+          rr[j] = binf[f * 4 + j];
+        /* проекция облучённости на DG1: решаем M·E = rhs */
+        if (solve4(fmm, rr, ee) != 0 || corner_min(ee) < 0.0) {
+          /* ПРОЕКЦИЯ НА DG1 ПАДАЕТ ДО ПОСТОЯННОЙ, ЕСЛИ ДАЁТ ОТРИЦАТЕЛЬНОЕ. На
+           * тонком осколке грани матрица масс почти вырождена, наклоны улетают, и
+           * итерация расходится — измерено на сцене со сферой. Критерий тот же,
+           * что у ограничителя (положительность), и порога в нём нет. */
+          ee[0] = binf[f * 4] / fmm[0][0];
+          ee[1] = ee[2] = ee[3] = 0.0;
+        }
+        for (int j = 0; j < 4; j++)
+          bout[f * 4 + j] = (hsum[wall] > 0.0 ? p->wall_rho[wall] * ee[j] / hsum[wall] : 0.0);
+        if (p->wall_emit != NULL) bout[f * 4] += p->wall_emit[wall];
       }
+    for (int32_t e = 0; e < nse; e++) {
+      const tr3_selem *se = &cu->se[e];
+      double rho = (p->facet_rho != NULL && se->facet < p->nfacet) ? p->facet_rho[se->facet] : 0.0;
+      double em = (p->facet_emit != NULL && se->facet < p->nfacet) ? p->facet_emit[se->facet] : 0.0;
+      double fmm[4][4], rr[4], ee[4];
+      memcpy(fmm, se->m, sizeof fmm);
+      for (int j = 0; j < 4; j++)
+        rr[j] = sinf[e * 4 + j];
+      if (!(fmm[0][0] > 0.0)) continue;
+      if (solve4(fmm, rr, ee) != 0 || corner_min(ee) < 0.0) {
+        ee[0] = sinf[e * 4] / fmm[0][0];
+        ee[1] = ee[2] = ee[3] = 0.0;
+      }
+      for (int j = 0; j < 4; j++)
+        sout[e * 4 + j] = (hs_se[e] > 0.0 ? rho * ee[j] / hs_se[e] : 0.0);
+      sout[e * 4] += em;
     }
+
     resid = 0.0;
     for (int32_t i = 0; i < nc * 4; i++) {
       double dd = fabs(phin[i] - phi[i]);
@@ -430,28 +490,28 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     }
     if (resid < tol) break;
   }
-  /* поглощено = ∫(σ_t − σ_s)·φ */
+
   st->pabs = 0.0;
   for (int32_t c = 0; c < nc; c++) {
-    double s = (double)m->csize[c];
-    double vol = s * s * s * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+    double vol = cu != NULL ? cu->mvol[c][0][0]
+                            : (double)m->csize[c] * (double)m->csize[c] * (double)m->csize[c] *
+                                  m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
     st->pabs += (p->sig_t[c] - p->sig_s[c]) * phi[c * 4] * vol;
   }
   st->balance = st->pin - st->pout - st->pabs;
   st->iters = it;
   st->resid = resid;
-  st->nclip = nclip_last; /* ИМЕННО последняя итерация: см. К6 выше */
-  st->bout = bout;        /* владение переходит вызывающему: сбор по пикселю читает это */
+  st->nclip = nclip_last;
+  st->bout = bout;
+  st->sout = sout;
 
   free(L);
   free(phin);
   free(indeg);
   free(order);
   free(queue);
-  free(fm);
-  free(fmb);
-  free(fmx);
-  free(farea);
   free(binf);
+  free(sinf);
+  free(hs_se);
   return 0;
 }

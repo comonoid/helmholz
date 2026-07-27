@@ -398,6 +398,11 @@ Every `.c`/`.h` written or edited goes through this sequence before it is
    float) before trusting GPU output.
 
 ## Build / run
+- **КАРТИНКИ ПИШУТСЯ В `img/`, А НЕ В `build/`.** `build` — только артефакты
+  сборки, и мусорить в нём нельзя: он чистится вместе с объектниками, и то, на
+  что смотрят глазами, там теряется. Всякий инструмент, выдающий изображение,
+  пишет в `img/` по умолчанию (`tools/render3.c` — так).
+
 - Compiler via nix: `nix-shell -p gcc --run 'gcc -O2 -o build/NAME src/NAME.c -lm'`.
 - **LANDMINE (07-25): nixpkgs openblas 0.3.33 LAPACKE zgelsd/zgelss SMASH THE
   STACK on rectangular complex matrices (m != n), both row- and col-major

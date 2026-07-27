@@ -22,12 +22,19 @@
 #ifndef TR_SWEEP3_H
 #define TR_SWEEP3_H
 
+#include "transport/cut3.h"
 #include "transport/dirs3.h"
 #include "transport/mesh3.h"
 
 typedef struct {
   const tr3_mesh *m;
   const tr3_dirs *d;
+  /* Геометрия разреза. NULL — развёртка по коробкам, как до стыка. */
+  const tr3_cut *cut;
+  /* Поверхности ВНУТРИ области: отражение и собственное излучение по ФАСЕТУ. */
+  const double *facet_rho;
+  const double *facet_emit;
+  int32_t nfacet;
   const double *sig_t; /* [ncell] */
   const double *sig_s; /* [ncell] */
   const double *eps;   /* [4·ncell] объёмное излучение, DG1, или NULL */
@@ -59,8 +66,14 @@ typedef struct {
 typedef struct {
   int iters;
   double resid;
-  /* [nf] исходящий радианс граничных граней — то, что читает сбор по пикселю */
+  /* [4·nf] исходящий радианс граничных граней, DG1 ПО ПОЛОЖЕНИЮ.
+   * ОДНО число на грань давало видимые квадраты на картинке: Р3 говорит, что у
+   * диффузной поверхности радианс не зависит от НАПРАВЛЕНИЯ, и это про угловую
+   * ось, а не про пространственную. По положению он меняется, и DG1 у нас уже
+   * есть — хранить его константой значило бы выбрасывать то, что посчитано. */
   double *bout;
+  /* [4·nse] то же на поверхностных элементах внутри области */
+  double *sout;
   double pin, pout, pabs, balance; /* энергетический баланс: втекло/вытекло/поглощено */
   int nclip;                       /* сколько раз сработал ограничитель */
 } tr3_stats;

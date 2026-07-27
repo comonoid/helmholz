@@ -47,8 +47,8 @@ void hz_facettab_free(hz_facettab *t) {
   t->n = t->cap = 0;
 }
 
-int32_t hz_facettab_add_plane(hz_facettab *t, const hz_frame *fr, const double n[3], double off,
-                              int32_t surf, double dmax) {
+int32_t hz_facettab_add_units(hz_facettab *t, const double n[3], double off, int32_t surf,
+                              double dmax) {
   if (t->n >= t->cap) {
     int32_t nc = t->cap * 2;
     hz_facet *nf = realloc(t->f, (size_t)nc * sizeof(hz_facet));
@@ -56,14 +56,19 @@ int32_t hz_facettab_add_plane(hz_facettab *t, const hz_frame *fr, const double n
     t->f = nf;
     t->cap = nc;
   }
-  hz_hspace h;
-  hz_frame_plane(fr, n, off, &h); /* перевод в единицы — ЗДЕСЬ и ОДИН РАЗ */
   hz_facet *f = &t->f[t->n];
-  memcpy(f->n, h.n, sizeof f->n);
-  f->off = h.off;
+  memcpy(f->n, n, sizeof f->n);
+  f->off = off;
   f->surf = surf;
   f->dmax = dmax;
   return t->n++;
+}
+
+int32_t hz_facettab_add_plane(hz_facettab *t, const hz_frame *fr, const double n[3], double off,
+                              int32_t surf, double dmax) {
+  hz_hspace h;
+  hz_frame_plane(fr, n, off, &h); /* перевод в единицы — ЗДЕСЬ и ОДИН РАЗ */
+  return hz_facettab_add_units(t, h.n, h.off, surf, dmax);
 }
 
 int hz_facet_error(const hz_facet *f, double k, double W, double *err) {

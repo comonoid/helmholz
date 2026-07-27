@@ -242,11 +242,12 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   double *sout = calloc((size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
   double *sinf = calloc((size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
   double *hs_se = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
+  double *hs_out = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   binfall = calloc((size_t)nth * (size_t)m->nf * 4, sizeof(double));
   sinfall = calloc((size_t)nth * (size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
   if (Lall == NULL || phinall == NULL || indegall == NULL || orderall == NULL || queueall == NULL ||
       phin == NULL || binfall == NULL || sinfall == NULL || bout == NULL || binf == NULL ||
-      sout == NULL || sinf == NULL || hs_se == NULL) {
+      sout == NULL || sinf == NULL || hs_se == NULL || hs_out == NULL) {
     free(Lall);
     free(phinall);
     free(indegall);
@@ -260,6 +261,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     free(sout);
     free(sinf);
     free(hs_se);
+    free(hs_out);
     return 1;
   }
 
@@ -277,13 +279,17 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     }
   }
   for (int32_t e = 0; e < nse; e++) {
-    double s = 0.0;
+    double s = 0.0, so = 0.0;
     for (int mm = 0; mm < nd; mm++) {
       double on =
           d->ox[mm] * cu->se[e].n[0] + d->oy[mm] * cu->se[e].n[1] + d->oz[mm] * cu->se[e].n[2];
-      if (on < 0.0) s += d->w[mm] * (-on); /* приходящие НА поверхность */
+      if (on < 0.0)
+        s += d->w[mm] * (-on); /* приходящие НА поверхность */
+      else
+        so += d->w[mm] * on; /* уходящие С поверхности — нужны балансу (К40) */
     }
     hs_se[e] = s;
+    hs_out[e] = so;
   }
 
   memset(phi, 0, (size_t)nc * 4 * sizeof(double));
@@ -591,6 +597,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       free(sout);
       free(sinf);
       free(hs_se);
+      free(hs_out);
       free(binfall);
       free(sinfall);
       return 2;
@@ -675,14 +682,70 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     if (resid < tol) break;
   }
 
+  /* ПОГЛОЩЕНИЕ БЕРЁТ ВСЕ ЧЕТЫРЕ МОМЕНТА, А НЕ ОДНО СРЕДНЕЕ (К48).
+   *
+   * В уравнении при тестовой функции `v = 1` член поглощения есть
+   * `∫(σ_t−σ_s)·L dV = (σ_t−σ_s)·Σ_i φ_i·∫b_i dV`, то есть `Σ_i φ_i·M[0][i]`.
+   * У КОРОБКИ `∫b_i dV = 0` при `i ≥ 1` по симметрии, и остаётся ровно
+   * `φ_0·объём` — так здесь и было написано. Но У РАЗРЕЗАННОЙ ЯЧЕЙКИ СИММЕТРИИ
+   * НЕТ, и `M[0][i]` при `i ≥ 1` не ноль (это уже отмечено выше, в члене
+   * переноса). Наклонные члены выбрасывались, и баланс терял 4.5e-9 от
+   * втекшего.
+   *
+   * Признак, по которому это нашлось: без ограничителя баланс был ХУЖЕ в 800
+   * раз (3.6e-6 против 4.5e-9). Ограничитель гасит наклоны, а выброшен был
+   * именно наклонный вклад — то есть «утечка» была пропорциональна тому,
+   * насколько разболтано поле. Ни геометрия (флюид на границе с твёрдой
+   * ячейкой — ноль), ни две полусферные суммы (совпадают до 4.4e-16) виноваты
+   * не были, и обе гипотезы проверены ЧИСЛОМ, а не рассуждением. */
   st->pabs = 0.0;
   for (int32_t c = 0; c < nc; c++) {
-    double vol = cu != NULL ? cu->mvol[c][0][0]
-                            : (double)m->csize[c] * (double)m->csize[c] * (double)m->csize[c] *
-                                  m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
-    st->pabs += (p->sig_t[c] - p->sig_s[c]) * phi[c * 4] * vol;
+    double sa = p->sig_t[c] - p->sig_s[c];
+    if (cu != NULL) {
+      for (int i = 0; i < 4; i++)
+        st->pabs += sa * phi[c * 4 + i] * cu->mvol[c][0][i];
+    } else {
+      double vol = (double)m->csize[c] * (double)m->csize[c] * (double)m->csize[c] * m->fr.u[0] *
+                   m->fr.u[1] * m->fr.u[2];
+      st->pabs += sa * phi[c * 4] * vol; /* у коробки ∫b_i = 0 при i ≥ 1 */
+    }
   }
-  st->balance = st->pin - st->pout - st->pabs;
+
+  /* ПОВЕРХНОСТИ ВНУТРИ ОБЛАСТИ — ТОЖЕ СТАТЬЯ БАЛАНСА (К40).
+   *
+   * Прежде баланс считался как `pin − pout − pabs`, и в сцене БЕЗ разреза это
+   * было точное дискретное тождество (измерено 1.5e-14). Но как только внутри
+   * появилась поверхность, она стала брать энергию себе, а в тождестве её не
+   * было: невязка выходила `1.66e2` при пропускной способности `1.0e4`, и она
+   * была ЗАКОННОЙ — сфера с ρ = 0.78 поглощает 22% того, что на неё падает.
+   *
+   * ЧЕМ ЭТО БЫЛО ПЛОХО: проверка, у которой законная невязка составляет
+   * полтора процента, не отличит от неё ошибку схемы в полтора процента. То
+   * есть главный инвариант метода (К13: тождество верно на ЛЮБОЙ итерации, а
+   * не только после сходимости) в разрезанной сцене НЕ ПРОВЕРЯЛ НИЧЕГО. Это
+   * третья подпись артефакта в чистом виде — метрика, нечувствительная к той
+   * ошибке, которую она якобы стережёт.
+   *
+   * Теперь считаются обе стороны отдельно: `psin` — мощность, УШЕДШАЯ из
+   * объёма в поверхности, `psout` — мощность, отданная поверхностями обратно
+   * (отражение плюс собственное излучение). Тождество:
+   *
+   *     pin + psout = pout + pabs + psin
+   *
+   * `psin` берётся из того же накопителя `sinf`, которым считается облучённость,
+   * поэтому это не независимая оценка, а ровно та величина, что вошла в схему.
+   * `psout` — интеграл хранимого исходящего радианса по элементу, умноженный на
+   * СОБСТВЕННУЮ полусферную сумму набора (К29): нормировка из континуума здесь
+   * потеряла бы энергию ровно так же, как теряла её в отражении. */
+  st->psin = st->psout = 0.0;
+  for (int32_t e = 0; e < nse; e++) {
+    st->psin += sinf[e * 4];
+    double io = 0.0; /* ∫ L_out dA = Σ_i sout_i · ∫b_i dA */
+    for (int i = 0; i < 4; i++)
+      io += sout[e * 4 + i] * cu->se[e].m[i][0];
+    st->psout += hs_out[e] * io;
+  }
+  st->balance = st->pin + st->psout - st->pout - st->pabs - st->psin;
   st->iters = it;
   st->resid = resid;
   st->nclip = nclip_last;
@@ -699,6 +762,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   free(binf);
   free(sinf);
   free(hs_se);
+  free(hs_out);
   free(binfall);
   free(sinfall);
   return 0;

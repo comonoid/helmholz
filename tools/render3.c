@@ -258,8 +258,11 @@ int main(int argc, char **argv) {
   printf("развёртка (ХОЛОДНЫЙ СТАРТ): код %d, итераций %d, невязка %.2e, срезок %d, %.2f с "
          "(%.2f мс на итерацию)\n",
          rc, st.iters, st.resid, st.nclip, t_sweep, 1e3 * t_sweep / (double)(st.iters + 1));
-  printf("баланс: втекло %.4f, вытекло %.4f, поглощено %.4f, невязка %.2e\n", st.pin, st.pout,
-         st.pabs, st.balance);
+  printf("баланс: втекло %.4f, вытекло %.4f, поглощено средой %.4f, ушло в поверхности %.4f, "
+         "отдано ими %.4f\n",
+         st.pin, st.pout, st.pabs, st.psin, st.psout);
+  printf("        невязка %.3e, она же на втекшее %.3e\n", st.balance,
+         st.pin > 0.0 ? fabs(st.balance) / st.pin : 0.0);
   if (rc != 0) return 1;
 
   /* --- сбор по пикселю --- */

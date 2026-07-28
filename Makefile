@@ -271,8 +271,8 @@ build/test_gather3: tests/test_gather3.c src/transport/gather3.c src/transport/g
 	  src/transport/mesh3.c src/transport/cut3.c src/transport/tet3.c src/transport/ray3.c \
 	  src/transport/cam3.c src/cut/poly3.c src/cut/surf.c src/octree.c -lm'
 
-build/lod3: tools/lod3.c src/octree.c | build
-	$(RUN) 'gcc $(CFLAGS) -o $@ tools/lod3.c src/octree.c -lm'
+build/lod3: tools/lod3.c src/transport/ray3.c src/cut/surf.c src/cut/poly3.c src/octree.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/lod3.c src/transport/ray3.c src/cut/surf.c src/cut/poly3.c src/octree.c -lm'
 
 # СРАВНЕНИЕ ДВУХ БУФЕРОВ РАДИАНСА (PFM), оснастка замеров К65 и К68.
 # Метрика берётся на РАДИАНСЕ, а не на картинке: К19 измерила, что тон-маппинг

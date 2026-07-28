@@ -23,6 +23,8 @@
  */
 
 #include "octree.h"
+#include "transport/ray3.h"
+#include <string.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -124,6 +126,57 @@ static long count_lod(int log2size, const double eye[3], double eps, int minsize
   return n;
 }
 
+/* ---------------- К52: СКОЛЬКО ЯЧЕЕК ВДОЛЬ ЛУЧА, И ЭТО РАЗНЫЕ ЗАКОНЫ ------
+ *
+ * План обосновывал формулу «A только вместе» тем, что LOD без проекции
+ * превращает марш из 23 ячеек в 7500, и число это выведено как
+ * `ln(R_max/R_min)/ε`. Но такой счёт предполагает, что ячейками заполнен ВЕСЬ
+ * ОБЪЁМ, а К49 измерила обратное: закон ПОВЕРХНОСТНЫЙ, и держится он на
+ * СХЛОПЫВАНИИ ПУСТОТЫ. Луч большую часть пути идёт по пустым КРУПНЫМ узлам.
+ *
+ * Здесь марш идёт по НАСТОЯЩЕМУ маршу (`tr3_march` без геометрии), а не по
+ * переписанному обходу: переписанный проверял бы себя. Считаются два дерева при
+ * ОДНОМ `ε` — со схлопнутой пустотой и заполняющее объём, — и вся разница между
+ * ними есть цена схлопывания. */
+static void ray_steps(const hz_octree *t, int world, const double eye[3], int nray, double *med,
+                      double *mx, double *mean) {
+  hz_frame fr = {{0, 0, 0}, {1, 1, 1}};
+  tr3_scene sc;
+  memset(&sc, 0, sizeof sc);
+  sc.tree = t;
+  sc.fr = fr;
+  int *hist = calloc((size_t)nray, sizeof(int));
+  if (hist == NULL) return;
+  long sum = 0;
+  int worst = 0, nn = 0;
+  /* ДЕТЕРМИНИРОВАННЫЙ веер направлений: спираль Фибоначчи по сфере. Случайности
+   * здесь не нужно, а воспроизводимость нужна. */
+  const double ga = 2.39996322972865332;
+  for (int i = 0; i < nray; i++) {
+    double z = 1.0 - 2.0 * ((double)i + 0.5) / (double)nray;
+    double r = sqrt(1.0 - z * z), a = ga * (double)i;
+    double d[3] = {r * cos(a), r * sin(a), z};
+    tr3_hit h;
+    if (tr3_march(&sc, eye, d, -1.0, &h) != 0) continue;
+    hist[nn++] = h.nsteps;
+    sum += h.nsteps;
+    if (h.nsteps > worst) worst = h.nsteps;
+  }
+  (void)world;
+  for (int i = 1; i < nn; i++) { /* сортировка вставками: nray мал */
+    int v = hist[i], j = i - 1;
+    while (j >= 0 && hist[j] > v) {
+      hist[j + 1] = hist[j];
+      j--;
+    }
+    hist[j + 1] = v;
+  }
+  *med = nn > 0 ? (double)hist[nn / 2] : 0.0;
+  *mx = (double)worst;
+  *mean = nn > 0 ? (double)sum / (double)nn : 0.0;
+  free(hist);
+}
+
 int main(void) {
   printf("=== ПРЕДСКАЗАНИЯ (до единого результата) ===\n");
   printf("  П1 число элементов ∝ 1/ε²: вдвое мельче пиксель -> ВЧЕТВЕРО больше\n");
@@ -131,6 +184,10 @@ int main(void) {
   printf("  П3 выигрыш против равномерной сетки того же шага — многие порядки\n");
   printf("  ПРИЗНАК АРТЕФАКТА: если число НЕ меняется при смене ε — правило не\n");
   printf("  применяется вовсе\n");
+  printf("  П5 ячеек ВДОЛЬ ЛУЧА при схлопнутой пустоте — ДЕСЯТКИ, и растут\n");
+  printf("     логарифмически с размером сцены\n");
+  printf("  П6 у дерева, дробящего ВЕСЬ ОБЪЁМ, — ТЫСЯЧИ, порядка ln(Rmax/Rmin)/ε;\n");
+  printf("     значит 7500 из плана принадлежит ОБЪЁМНОМУ закону (К52)\n");
   printf("=== РЕЗУЛЬТАТЫ ===\n");
 
   /* П1: ЗАВИСИМОСТЬ ОТ ε ПРИ ФИКСИРОВАННОЙ СЦЕНЕ */
@@ -196,6 +253,39 @@ int main(void) {
                (double)n / (double)pv);
       printf("\n");
       pv = n;
+    }
+  }
+
+  /* [П5/П6] К52: СКОЛЬКО ЯЧЕЕК ВДОЛЬ ЛУЧА У ДВУХ ЗАКОНОВ ПРИ ОДНОМ `ε`. */
+  printf("\n  [П5/П6] ячеек ВДОЛЬ ЛУЧА, 4096 лучей из камеры (К52):\n");
+  {
+    const int LG = 9, WORLD = 1 << LG;
+    double sc[3] = {(double)WORLD * 0.5, (double)WORLD * 0.5, (double)WORLD * 0.5};
+    double sr = (double)WORLD * 0.15;
+    double e3[3] = {(double)WORLD * 0.5, 8.0, (double)WORLD * 0.5};
+    for (int k = 0; k < 3; k++) {
+      double eps = 0.1 / (double)(1 << k);
+      double md, mx, mn;
+      hz_octree t1;
+      if (hz_oct_init(&t1, LG, 0.0)) break;
+      long n1 = 0;
+      int lo[3] = {0, 0, 0};
+      lod_surf_rec(&t1, lo, WORLD, e3, eps, 1, WORLD, sc, sr, &n1);
+      ray_steps(&t1, WORLD, e3, 4096, &md, &mx, &mn);
+      printf("     ε = %.4f  ПУСТОТА СХЛОПНУТА: ячеек %8ld, вдоль луча медиана %.0f, "
+             "среднее %.1f, макс %.0f\n",
+             eps, n1, md, mn, mx);
+      hz_oct_free(&t1);
+
+      hz_octree t2;
+      if (hz_oct_init(&t2, LG, 0.0)) break;
+      long n2 = 0;
+      lod_rec(&t2, lo, WORLD, e3, eps, 1, &n2);
+      ray_steps(&t2, WORLD, e3, 4096, &md, &mx, &mn);
+      printf("     ε = %.4f  ВЕСЬ ОБЪЁМ:       ячеек %8ld, вдоль луча медиана %.0f, "
+             "среднее %.1f, макс %.0f\n",
+             eps, n2, md, mn, mx);
+      hz_oct_free(&t2);
     }
   }
   return 0;

@@ -23,6 +23,7 @@
 #include "transport/cut3.h"
 #include "transport/dirs3.h"
 #include "transport/gather3.h"
+#include "transport/krylov3.h"
 #include "transport/mesh3.h"
 #include "transport/ray3.h"
 #include "transport/sweep3.h"
@@ -127,6 +128,8 @@ int main(int argc, char **argv) {
   int maxit = argc > 12 ? atoi(argv[12]) : 4000;
   /* К76: возмущение света для опыта «тёплый старт против холодного»; 0 — не ставить */
   double warmdelta = argc > 13 ? atof(argv[13]) : 0.0;
+  /* ЭТАП B: сравнить Крылов с рядом Неймана на этой сцене; 0 — не ставить */
+  int krylov = argc > 14 ? atoi(argv[14]) : 0;
   if (log2n < 1 || log2n > 8) {
     fprintf(stderr, "log2n вне [1,8]\n");
     return 1;
@@ -322,6 +325,71 @@ int main(int argc, char **argv) {
            mesh.ncell);
   }
   if (rc != 0) return 1;
+
+  /* --- ЭТАП B: КРЫЛОВ ПРОТИВ РЯДА НЕЙМАНА, НА ТОЙ ЖЕ СЦЕНЕ ---
+   *
+   * Единица сравнения — ПРОХОДЫ РАЗВЁРТКИ, а не итерации метода: BiCGStab
+   * делает два прохода на итерацию, и считать итерации значило бы сравнивать
+   * разное.
+   *
+   * СРАВНЕНИЕ ИДЁТ С РЯДОМ НЕЙМАНА БЕЗ ОГРАНИЧИТЕЛЯ, и это не поблажка, а
+   * требование: Крылову нужен ЛИНЕЙНЫЙ оператор, поэтому ограничитель у него
+   * выключен, а К65 измерила, что с ним и без него неподвижные точки РАЗНЫЕ
+   * (0.2% в среднем, 6.8% в худшем пикселе). Сравнивать с ограниченным рядом
+   * значило бы приписать методу чужую разницу. */
+  if (krylov) {
+    double *phi_n = calloc((size_t)mesh.ncell * 4, sizeof(double));
+    double *phi_k = calloc((size_t)mesh.ncell * 4, sizeof(double));
+    double *bk = calloc((size_t)mesh.nf * 4, sizeof(double));
+    double *sk = calloc((size_t)(cut.nse > 0 ? cut.nse : 1) * 4, sizeof(double));
+    if (phi_n == NULL || phi_k == NULL || bk == NULL || sk == NULL) return 1;
+
+    tr3_problem pn = prob;
+    pn.limiter = 0;
+    tr3_stats stn;
+    double t0n = now();
+    int rcn = tr3_sweep_solve(&pn, maxit, 1e-9, phi_n, &stn);
+    double tn = now() - t0n;
+
+    tr3_kstats stk;
+    double t0k = now();
+    int rck = tr3_krylov_solve(&prob, 200, 1e-9, phi_k, bk, sk, &stk);
+    double tk = now() - t0k;
+
+    double dmax = 0.0, pmax = 0.0, dbm = 0.0, bmax = 0.0;
+    for (int32_t i = 0; i < mesh.ncell * 4; i++) {
+      double d = fabs(phi_n[i] - phi_k[i]);
+      if (d > dmax) dmax = d;
+      if (fabs(phi_n[i]) > pmax) pmax = fabs(phi_n[i]);
+    }
+    for (int32_t i = 0; i < mesh.nf * 4; i++) {
+      double d = fabs(stn.bout[i] - bk[i]);
+      if (d > dbm) dbm = d;
+      if (fabs(stn.bout[i]) > bmax) bmax = fabs(stn.bout[i]);
+    }
+    printf("ЭТАП B, КРЫЛОВ ПРОТИВ РЯДА НЕЙМАНА (оба БЕЗ ограничителя):\n");
+    printf("     НЕЙМАН:  код %d, ПРОХОДОВ %d, невязка %.2e, застой %d, %.2f с\n", rcn, stn.iters,
+           stn.resid, stn.stalled, tn);
+    printf("     КРЫЛОВ:  код %d, ПРОХОДОВ %ld (итераций %d), невязка %.2e, %s, %.2f с  (×%.2f)\n",
+           rck, stk.npass, stk.iters, stk.resid, stk.why, tk, tk > 0.0 ? tn / tk : 0.0);
+    /* ПРОВЕРКА ПРИБОРА ПЕРЕД СПОРОМ О ЧИСЛАХ: сошедшийся ответ ряда Неймана
+     * обязан давать под тем же оператором НУЛЕВУЮ невязку. Если не даёт —
+     * неверен оператор или правая часть, и сравнивать проходы бессмысленно. */
+    double relN = -1.0, relK = -1.0;
+    tr3_krylov_residual(&prob, phi_n, stn.bout, stn.sout, &relN);
+    tr3_krylov_residual(&prob, phi_k, bk, sk, &relK);
+    printf("     ПРИБОР: невязка ответа НЕЙМАНА под оператором Крылова %.3e; ответа Крылова %.3e\n",
+           relN, relK);
+    printf("     СОВПАДЕНИЕ ОТВЕТОВ: max|Δφ| %.3e при |φ|max %.3e; "
+           "max|Δbout| %.3e при |bout|max %.3e\n",
+           dmax, pmax, dbm, bmax);
+    free(stn.bout);
+    free(stn.sout);
+    free(phi_n);
+    free(phi_k);
+    free(bk);
+    free(sk);
+  }
 
   /* --- К76: ТЁПЛЫЙ СТАРТ ПРОТИВ ХОЛОДНОГО ПРИ ДВИЖУЩЕМСЯ СВЕТЕ ---
    *

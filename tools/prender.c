@@ -745,6 +745,38 @@ int main(int argc, char **argv) {
              100.0 * (double)mst.nrej_rad / (double)(mst.npair ? mst.npair : 1),
              (long long)mst.nrej_geom, (long long)mst.nrej_mtl, (long long)mst.nrej_overlap,
              mst.dmax_worst);
+      /* ГДЕ ИМЕННО СЛИЯНИЕ ПРОИСХОДИТ — в тёмном или в светлом. Критерий
+       * АБСОЛЮТЕН (`|ΔE| < ltol·⟨E⟩`), значит в ярких местах, где градиенты
+       * велики по абсолютной величине, он обязан запрещать чаще. Проверяется
+       * это не рассуждением, а долей слитых по яркостным корзинам. */
+      {
+        int32_t cnt[4] = {0, 0, 0, 0}, mrg[4] = {0, 0, 0, 0};
+        int32_t *gs = calloc((size_t)sq.nseg, sizeof *gs);
+        if (gs != NULL) {
+          for (int32_t k = 0; k < F.ps.np && k < sgf.nseg; k++)
+            if (F.ps.p[k].ntri > 0) gs[sq.label[F.ps.tri[F.ps.p[k].t0]]]++;
+          double em = 0.0, aa = 0.0;
+          for (int32_t k = 0; k < sgf.nseg; k++) {
+            em += fabs(F.t.E[(size_t)k * 3]) * F.ps.p[k].area;
+            aa += F.ps.p[k].area;
+          }
+          em = (aa > 0.0) ? em / aa : 1.0;
+          for (int32_t k = 0; k < F.ps.np && k < sgf.nseg; k++) {
+            if (F.ps.p[k].ntri <= 0) continue;
+            double r = fabs(F.t.E[(size_t)k * 3]) / (em > 0.0 ? em : 1.0);
+            int bin = (r < 0.1) ? 0 : ((r < 0.5) ? 1 : ((r < 2.0) ? 2 : 3));
+            cnt[bin]++;
+            if (gs[sq.label[F.ps.tri[F.ps.p[k].t0]]] > 1) mrg[bin]++;
+          }
+          printf("         слито по яркости E/⟨E⟩:  <0.1: %5.1f%% (%d)   0.1–0.5: %5.1f%% (%d)"
+                 "   0.5–2: %5.1f%% (%d)   >2: %5.1f%% (%d)\n",
+                 cnt[0] ? 100.0 * mrg[0] / cnt[0] : 0.0, cnt[0],
+                 cnt[1] ? 100.0 * mrg[1] / cnt[1] : 0.0, cnt[1],
+                 cnt[2] ? 100.0 * mrg[2] / cnt[2] : 0.0, cnt[2],
+                 cnt[3] ? 100.0 * mrg[3] / cnt[3] : 0.0, cnt[3]);
+          free(gs);
+        }
+      }
       fflush(stdout);
       hz_seg_free(&sq);
     }

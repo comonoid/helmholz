@@ -13,6 +13,8 @@
 #define PCUT_MAXW 8
 /* Кусков на треугольник — страховка от вырожденных наборов плоскостей. */
 #define PCUT_MAXFRAG 64
+/* Вершин у треугольника, отсечённого коробкой: 3 + 6 = 9; берём с запасом. */
+#define HZ_GRID_MAXV 16
 
 void hz_wedges_free(hz_wedges *ws) {
   free(ws->w);
@@ -575,9 +577,78 @@ int hz_cut_apply(hz_objmesh *mo, hz_pseglist *so, const hz_objmesh *mi, const hz
   return 0;
 }
 
-/* --- дробление регулярной сеткой ПЛОСКОСТЯМИ (разбор — в `pcut.h`) --------- */
 
-#define PCUT_GRIDFRAG 8192
+/* --- дробление регулярной сеткой ПЛОСКОСТЯМИ (разбор — в `pcut.h`) ---------
+ *
+ * ОБХОД ИДЁТ ПО ЯЧЕЙКАМ, А НЕ ПО ПЛОСКОСТЯМ, и это не стилистика.
+ * Первая редакция резала треугольник плоскостями по очереди, накапливая куски:
+ * после прохода по x их ~N, после y ~N², и стена 8 м при шаге 5 см давала
+ * 160×160 = 25 600 кусков при потолке 8 192. Куски МОЛЧА ТЕРЯЛИСЬ, и вместе с
+ * ними площадь — замерено: `213 → 139 → 107` м² при шаге `0.4 → 0.1 → 0.05` м,
+ * `555 135` потерянных кусков. Поднимать потолок бессмысленно: он растёт как
+ * квадрат.
+ *
+ * Здесь треугольник ОТСЕКАЕТСЯ ПО КОРОБКЕ каждой ячейки, которую задевает его
+ * габарит. Кусок получается сразу окончательным, промежуточного взрыва нет
+ * вовсе, а общее число кусков ограничено `площадь/L²` — тем же, чем и число
+ * ячеек. Потолок не нужен и убран.
+ *
+ * ТОЧКА ПЕРЕСЕЧЕНИЯ СЧИТАЕТСЯ ОТ ЛЕКСИКОГРАФИЧЕСКИ МЕНЬШЕГО КОНЦА РЕБРА. Два
+ * треугольника, делящие ребро, обязаны дать ПОБИТОВО одну точку, иначе сварка
+ * их не сольёт и в крае появится щель — которую теорема Грина тут же поймает. */
+
+/* Отсечение выпуклого многоугольника полупространством `x[a] <= off` (sgn = +1)
+ * либо `x[a] >= off` (sgn = −1). Нормали несёт с собой. */
+static int clip_half(double p[][3], double nr[][3], int n, int a, double off, int sgn) {
+  double q[HZ_GRID_MAXV][3], qn[HZ_GRID_MAXV][3];
+  int m = 0;
+  for (int i = 0; i < n; i++) {
+    const double *A = p[i], *B = p[(i + 1) % n];
+    const double *NA = nr[i], *NB = nr[(i + 1) % n];
+    double da = sgn * (A[a] - off), db = sgn * (B[a] - off);
+    if (da <= 0.0) {
+      if (m >= HZ_GRID_MAXV) return 0;
+      for (int c = 0; c < 3; c++) {
+        q[m][c] = A[c];
+        qn[m][c] = NA[c];
+      }
+      m++;
+    }
+    if ((da <= 0.0) != (db <= 0.0)) {
+      /* канонический конец: лексикографически меньший */
+      const double *P = A, *Q = B;
+      const double *PN = NA, *QN = NB;
+      int swap = 0;
+      for (int c = 0; c < 3; c++) {
+        if (A[c] < B[c]) break;
+        if (A[c] > B[c]) {
+          swap = 1;
+          break;
+        }
+      }
+      if (swap) {
+        P = B;
+        Q = A;
+        PN = NB;
+        QN = NA;
+      }
+      double dp = P[a] - off, dq = Q[a] - off;
+      double s = dp / (dp - dq);
+      if (m >= HZ_GRID_MAXV) return 0;
+      for (int c = 0; c < 3; c++) {
+        q[m][c] = P[c] + s * (Q[c] - P[c]);
+        qn[m][c] = PN[c] + s * (QN[c] - PN[c]);
+      }
+      m++;
+    }
+  }
+  for (int i = 0; i < m; i++)
+    for (int c = 0; c < 3; c++) {
+      p[i][c] = q[i][c];
+      nr[i][c] = qn[i][c];
+    }
+  return m;
+}
 
 int hz_cut_grid(hz_objmesh *mo, hz_pseglist *so, const hz_objmesh *mi, const hz_pseglist *si,
                 double L, int64_t *nover) {
@@ -594,128 +665,112 @@ int hz_cut_grid(hz_objmesh *mo, hz_pseglist *so, const hz_objmesh *mi, const hz_
   mo->vn = malloc((size_t)cap * 9 * sizeof *mo->vn);
   int32_t *lab = malloc((size_t)cap * sizeof *lab);
   int64_t *cellid = malloc((size_t)cap * sizeof *cellid);
-  frag *cur = malloc(PCUT_GRIDFRAG * sizeof *cur), *nxt = malloc(PCUT_GRIDFRAG * sizeof *nxt);
   if (mo->f == NULL || mo->fn == NULL || mo->fm == NULL || mo->v == NULL || mo->vn == NULL ||
-      lab == NULL || cellid == NULL || cur == NULL || nxt == NULL) {
+      lab == NULL || cellid == NULL) {
     free(lab);
     free(cellid);
-    free(cur);
-    free(nxt);
     hz_obj_free(mo);
     return 2;
   }
 
-  const int32_t nx = (int32_t)((mi->hi[0] - mi->lo[0]) / L) + 2;
-  const int32_t ny = (int32_t)((mi->hi[1] - mi->lo[1]) / L) + 2;
+  const int64_t nx = (int64_t)((mi->hi[0] - mi->lo[0]) / L) + 2;
+  const int64_t ny = (int64_t)((mi->hi[1] - mi->lo[1]) / L) + 2;
   int64_t nt = 0;
 
   for (int32_t t = 0; t < mi->nt; t++) {
-    int nc = 1;
-    hz_obj_tri(mi, t, cur[0].p);
-    cur[0].has_n = 0;
+    double tp[3][3], tn[3][3];
+    hz_obj_tri(mi, t, tp);
+    int has_n = 0;
     for (int i = 0; i < 3; i++) {
       int32_t ni = (mi->vn != NULL) ? mi->fn[(size_t)t * 3 + (size_t)i] : -1;
       for (int a = 0; a < 3; a++)
-        cur[0].nrm[i][a] = (ni >= 0) ? mi->vn[(size_t)ni * 3 + (size_t)a] : 0.0;
-      if (ni >= 0) cur[0].has_n = 1;
+        tn[i][a] = (ni >= 0) ? mi->vn[(size_t)ni * 3 + (size_t)a] : 0.0;
+      if (ni >= 0) has_n = 1;
     }
-    /* Режем по каждой оси всеми плоскостями сетки, попавшими в габарит. */
-    for (int a = 0; a < 3 && nc > 0; a++) {
-      double lo = 1e300, hi = -1e300;
-      for (int c = 0; c < nc; c++)
-        for (int i = 0; i < 3; i++) {
-          if (cur[c].p[i][a] < lo) lo = cur[c].p[i][a];
-          if (cur[c].p[i][a] > hi) hi = cur[c].p[i][a];
-        }
-      int64_t k0 = (int64_t)floor((lo - mi->lo[a]) / L) + 1;
-      int64_t k1 = (int64_t)floor((hi - mi->lo[a]) / L);
-      double n[3] = {0.0, 0.0, 0.0};
-      n[a] = 1.0;
-      for (int64_t k = k0; k <= k1; k++) {
-        double off = mi->lo[a] + (double)k * L;
-        int nn2 = 0;
-        for (int c = 0; c < nc; c++) {
-          frag out[3];
-          int so2[3];
-          int kk = split_frag(&cur[c], n, off, out, so2);
-          for (int q = 0; q < kk; q++) {
-            if (nn2 >= PCUT_GRIDFRAG) {
-              if (nover != NULL) (*nover)++;
-              continue;
+    int64_t c0[3], c1[3];
+    for (int a = 0; a < 3; a++) {
+      double lo = tp[0][a], hi = tp[0][a];
+      for (int i = 1; i < 3; i++) {
+        if (tp[i][a] < lo) lo = tp[i][a];
+        if (tp[i][a] > hi) hi = tp[i][a];
+      }
+      c0[a] = (int64_t)floor((lo - mi->lo[a]) / L);
+      c1[a] = (int64_t)floor((hi - mi->lo[a]) / L);
+    }
+    for (int64_t iz = c0[2]; iz <= c1[2]; iz++)
+      for (int64_t iy = c0[1]; iy <= c1[1]; iy++)
+        for (int64_t ix = c0[0]; ix <= c1[0]; ix++) {
+          double p[HZ_GRID_MAXV][3], nr[HZ_GRID_MAXV][3];
+          for (int i = 0; i < 3; i++)
+            for (int a = 0; a < 3; a++) {
+              p[i][a] = tp[i][a];
+              nr[i][a] = tn[i][a];
             }
-            nxt[nn2++] = out[q];
+          int n = 3;
+          const int64_t ic[3] = {ix, iy, iz};
+          for (int a = 0; a < 3 && n >= 3; a++) {
+            n = clip_half(p, nr, n, a, mi->lo[a] + (double)(ic[a] + 1) * L, 1);
+            if (n >= 3) n = clip_half(p, nr, n, a, mi->lo[a] + (double)ic[a] * L, -1);
+          }
+          if (n < 3) continue;
+          /* веер: кусок выпуклый по построению (треугольник ∩ коробка) */
+          for (int k = 1; k + 1 < n; k++) {
+            if (nt >= cap) {
+              int64_t nc2 = cap * 2;
+              void *q;
+              int bad = 0;
+              if ((q = realloc(mo->v, (size_t)nc2 * 9 * sizeof *mo->v)) != NULL)
+                mo->v = q;
+              else
+                bad = 1;
+              if ((q = realloc(mo->vn, (size_t)nc2 * 9 * sizeof *mo->vn)) != NULL)
+                mo->vn = q;
+              else
+                bad = 1;
+              if ((q = realloc(mo->f, (size_t)nc2 * 3 * sizeof *mo->f)) != NULL)
+                mo->f = q;
+              else
+                bad = 1;
+              if ((q = realloc(mo->fn, (size_t)nc2 * 3 * sizeof *mo->fn)) != NULL)
+                mo->fn = q;
+              else
+                bad = 1;
+              if ((q = realloc(mo->fm, (size_t)nc2 * sizeof *mo->fm)) != NULL)
+                mo->fm = q;
+              else
+                bad = 1;
+              if ((q = realloc(lab, (size_t)nc2 * sizeof *lab)) != NULL)
+                lab = q;
+              else
+                bad = 1;
+              if ((q = realloc(cellid, (size_t)nc2 * sizeof *cellid)) != NULL)
+                cellid = q;
+              else
+                bad = 1;
+              if (bad) {
+                free(lab);
+                free(cellid);
+                hz_obj_free(mo);
+                return 2;
+              }
+              cap = nc2;
+            }
+            const int idx[3] = {0, k, k + 1};
+            for (int i = 0; i < 3; i++) {
+              for (int a = 0; a < 3; a++) {
+                mo->v[(size_t)(nt * 3 + i) * 3 + (size_t)a] = p[idx[i]][a];
+                mo->vn[(size_t)(nt * 3 + i) * 3 + (size_t)a] = nr[idx[i]][a];
+              }
+              mo->f[(size_t)nt * 3 + (size_t)i] = (int32_t)(nt * 3 + i);
+              mo->fn[(size_t)nt * 3 + (size_t)i] = has_n ? (int32_t)(nt * 3 + i) : -1;
+            }
+            mo->fm[nt] = mi->fm[t];
+            lab[nt] = si->label[t];
+            cellid[nt] = (iz * ny + iy) * nx + ix;
+            nt++;
           }
         }
-        memcpy(cur, nxt, (size_t)nn2 * sizeof *cur);
-        nc = nn2;
-      }
-    }
-    for (int c = 0; c < nc; c++) {
-      if (nt >= cap) {
-        int64_t nc2 = cap * 2;
-        void *q;
-        int bad = 0;
-        if ((q = realloc(mo->v, (size_t)nc2 * 9 * sizeof *mo->v)) != NULL)
-          mo->v = q;
-        else
-          bad = 1;
-        if ((q = realloc(mo->vn, (size_t)nc2 * 9 * sizeof *mo->vn)) != NULL)
-          mo->vn = q;
-        else
-          bad = 1;
-        if ((q = realloc(mo->f, (size_t)nc2 * 3 * sizeof *mo->f)) != NULL)
-          mo->f = q;
-        else
-          bad = 1;
-        if ((q = realloc(mo->fn, (size_t)nc2 * 3 * sizeof *mo->fn)) != NULL)
-          mo->fn = q;
-        else
-          bad = 1;
-        if ((q = realloc(mo->fm, (size_t)nc2 * sizeof *mo->fm)) != NULL)
-          mo->fm = q;
-        else
-          bad = 1;
-        if ((q = realloc(lab, (size_t)nc2 * sizeof *lab)) != NULL)
-          lab = q;
-        else
-          bad = 1;
-        if ((q = realloc(cellid, (size_t)nc2 * sizeof *cellid)) != NULL)
-          cellid = q;
-        else
-          bad = 1;
-        if (bad) {
-          free(lab);
-          free(cellid);
-          free(cur);
-          free(nxt);
-          hz_obj_free(mo);
-          return 2;
-        }
-        cap = nc2;
-      }
-      double cc[3] = {0.0, 0.0, 0.0};
-      for (int i = 0; i < 3; i++)
-        for (int a = 0; a < 3; a++)
-          cc[a] += cur[c].p[i][a] / 3.0;
-      int64_t ix = (int64_t)((cc[0] - mi->lo[0]) / L);
-      int64_t iy = (int64_t)((cc[1] - mi->lo[1]) / L);
-      int64_t iz = (int64_t)((cc[2] - mi->lo[2]) / L);
-      for (int i = 0; i < 3; i++) {
-        for (int a = 0; a < 3; a++) {
-          mo->v[(size_t)(nt * 3 + i) * 3 + (size_t)a] = cur[c].p[i][a];
-          mo->vn[(size_t)(nt * 3 + i) * 3 + (size_t)a] = cur[c].nrm[i][a];
-        }
-        mo->f[(size_t)nt * 3 + (size_t)i] = (int32_t)(nt * 3 + i);
-        mo->fn[(size_t)nt * 3 + (size_t)i] = cur[c].has_n ? (int32_t)(nt * 3 + i) : -1;
-      }
-      mo->fm[nt] = mi->fm[t];
-      lab[nt] = si->label[t];
-      cellid[nt] = (iz * ny + iy) * nx + ix;
-      nt++;
-    }
   }
-  free(cur);
-  free(nxt);
   mo->nt = (int32_t)nt;
   mo->nv = (int32_t)(nt * 3);
   mo->nvn = (int32_t)(nt * 3);
@@ -733,8 +788,7 @@ int hz_cut_grid(hz_objmesh *mo, hz_pseglist *so, const hz_objmesh *mi, const hz_
     mo->hi[a] = mi->hi[a];
   }
 
-  /* Метка = (участок, ячейка). Ключей много, поэтому ХЕШ, а не плотный массив:
-   * плотный был бы nseg × ncell и на мелкой сетке не поместился бы. */
+  /* Метка = (участок, ячейка). Ключей много, поэтому ХЕШ, а не плотный массив. */
   so->label = malloc((size_t)nt * sizeof *so->label);
   so->seg = malloc((size_t)nt * sizeof *so->seg);
   int64_t hn = 4;

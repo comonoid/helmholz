@@ -219,6 +219,16 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
           se.facet = ref >= 0 ? ref : ~ref;
           se.area = poly_mass2(m, vw, (int)nv, c, c, se.m);
           if (!(se.area > 0.0)) continue;
+          /* вершины — проекционному сбору; переполнение ПОМЕЧАЕТСЯ, а не режется */
+          if (nv <= TR3_SE_MAXV) {
+            se.nv = nv;
+            for (int32_t e = 0; e < nv; e++)
+              for (int a = 0; a < 3; a++)
+                se.v[e][a] = vw[e][a];
+          } else {
+            se.nv = 0;
+            cu->nsebig++;
+          }
           /* НУЛЕВОЙ ВЕКТОР матрицы масс — прямо из уравнения плоскости (К39).
            * Не вычисляется численно и не угадывается: он ЗАДАН геометрией. */
           se.nul[0] = -h[src].off;

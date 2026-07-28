@@ -25,6 +25,7 @@
 #include "transport/gather3.h"
 #include "transport/krylov3.h"
 #include "transport/mesh3.h"
+#include "transport/raster3.h"
 #include "transport/ray3.h"
 #include "transport/sweep3.h"
 #include <math.h>
@@ -222,6 +223,11 @@ int main(int argc, char **argv) {
    * `ρ → 1` встаёт (С1, К37); Крылов на печи держал шесть проходов при любой
    * толщине. Проверяется это только свипом по альбедо. */
   double albs = argc > 16 ? atof(argv[16]) : 1.0;
+  /* ЭТАП A, ШАГ 2: сверить ПРОЕКЦИОННЫЙ сбор с маршем НА ТОЙ ЖЕ СЕТКЕ (К53) */
+  int raster = argc > 23 ? atoi(argv[23]) : 0;
+  /* К59: уровень фасетизации сфер параметром. Ошибка силуэта у проекции обязана
+   * ПАДАТЬ с ним — иначе растеризуется не то, что думаем. */
+  int fsub = argc > 24 ? atoi(argv[24]) : 2;
   /* ЭТАП A, ШАГ 1: угловой размер пикселя для правила `L = εR`; 0 — равномерная
    * сетка, как прежде. Разделять A надвое стало можно после К52. */
   double lodeps = argc > 21 ? atof(argv[21]) : 0.0;
@@ -261,7 +267,7 @@ int main(int argc, char **argv) {
     hz_surf sp = {HZ_SURF_SPHERE, {sc[b][0], sc[b][1], sc[b][2], sr[b], 0, 0, 0}, 1, 0};
     int32_t si = hz_surftab_add(&stab, &sp);
     f0[b] = 0;
-    nfac[b] = hz_surf_facet_sphere(&ftab, &fr, sc[b], sr[b], 2, HZ_FIT_MEAN_SAGITTA, si, &f0[b]);
+    nfac[b] = hz_surf_facet_sphere(&ftab, &fr, sc[b], sr[b], fsub, HZ_FIT_MEAN_SAGITTA, si, &f0[b]);
     if (nfac[b] <= 0) return 1;
   }
 
@@ -826,6 +832,51 @@ int main(int argc, char **argv) {
    * числа; по PPM нельзя ничего (К19: та же ошибка после тон-маппинга доходит
    * до 255 уровней из 255). PPM пишется рядом и только для глаз.
    * Имя PFM получается заменой расширения у заданного пути. */
+  /* --- ЭТАП A, ШАГ 2: ПРОЕКЦИЯ ПРОТИВ МАРША НА ОДНОЙ И ТОЙ ЖЕ СЕТКЕ (К53) ---
+   *
+   * Сетка, хранимое поле и камера — одни и те же; меняется РОВНО СБОР. Это и
+   * есть изолирующая проверка, которую формула «A только вместе» запрещала, а
+   * К52 разрешила, показав, что марш под LOD не дорожает. */
+  if (raster) {
+    double *rb = calloc((size_t)W * (size_t)H * (size_t)TR3_MAXCH, sizeof(double));
+    if (rb == NULL) return 1;
+    tr3_raster rr = {.m = &mesh, .cut = &cut, .bout = boutc, .sout = soutc, .nch = nch};
+    tr3_rstats rs;
+    double tr0 = now();
+    if (tr3_raster_render(&rr, &cam, rb, &rs)) return 1;
+    double t_ras = now() - tr0;
+    printf("ЭТАП A ШАГ 2, ПРОЕКЦИЯ: элементов %ld, пропущено %ld, пикселей %ld, ПУСТЫХ %ld, "
+           "%.3f с (%.0f нс на пиксель)\n",
+           rs.nelem, rs.nskip, rs.npix, rs.nempty, t_ras,
+           1e9 * t_ras / (double)((size_t)W * (size_t)H));
+    double dmax2 = 0.0, dsum = 0.0, vmax = 0.0;
+    long nin = 0;
+    for (size_t i = 0; i < (size_t)W * (size_t)H; i++) {
+      double a = buf[i], b2 = rb[i];
+      if (fabs(a) > vmax) vmax = fabs(a);
+      double e = fabs(a - b2);
+      dsum += e;
+      nin++;
+      if (e > dmax2) dmax2 = e;
+    }
+    printf("     ПРОТИВ МАРША: |Δ| сред %.3e, макс %.3e при |L|max %.3e\n",
+           nin > 0 ? dsum / (double)nin : 0.0, dmax2, vmax);
+    {
+      char rp[512];
+      size_t ln2 = strlen(out);
+      if (ln2 + 6 < sizeof rp) {
+        memcpy(rp, out, ln2 + 1);
+        char *dt = strrchr(rp, (int)0x2E);
+        size_t ex = dt != NULL ? (size_t)(dt - rp) : ln2;
+        memcpy(rp + ex, "_r.pfm", 7);
+        const double *pg2 = nch > 1 ? rb + (size_t)W * (size_t)H : rb;
+        const double *pb2 = nch > 2 ? rb + (size_t)2 * (size_t)W * (size_t)H : rb;
+        hz_pfm_write(rp, rb, pg2, pb2, W, H);
+      }
+    }
+    free(rb);
+  }
+
   char pfm[512];
   size_t ln = strlen(out);
   if (ln + 5 < sizeof pfm) {

@@ -89,34 +89,45 @@ static int rec_cmp(const void *a, const void *b) {
  * Дробится узел, только если в нём ЕСТЬ поверхность (стенка куба либо шар) и он
  * крупнее `εR` в БЛИЖНЕЙ своей точке. Ближняя, а не центр: правило есть потолок
  * на размер элемента, и нарушать его хоть где-то внутри узла нельзя. */
-static int box_has_surface(const int lo[3], int size, int world, const double sc[2][3],
-                           const double sr[2], double u) {
+/* Возврат: 0 — поверхности нет, 1 — стенка куба, 2 — ФАСЕТЫ тела.
+ *
+ * Тело спрашивается ТЕМ ЖЕ `hz_facets_for_box`, которым потом строится боковая
+ * таблица (К95). Спрашивать аналитический ПРИМИТИВ нельзя: фасеты торчат наружу
+ * него на `dmax`, и тогда критерий дробления и таблица говорят о РАЗНЫХ телах —
+ * коробка чуть снаружи сферы не дробится, но фасеты получает. */
+static int box_has_surface(const int lo[3], int size, int world, const hz_facettab *ft,
+                           const int32_t *f0, const int32_t *nfac, int nb) {
+  int wall = 0;
   for (int a = 0; a < 3; a++)
-    if (lo[a] == 0 || lo[a] + size == world) return 1;
-  for (int b = 0; b < 2; b++) {
-    double dmin2 = 0.0, dmax2 = 0.0;
-    for (int a = 0; a < 3; a++) {
-      double l = (double)lo[a] * u, h = (double)(lo[a] + size) * u;
-      double dl = sc[b][a] - l, dh = h - sc[b][a];
-      double far = dl > dh ? dl : dh;
-      dmax2 += far * far;
-      double nr = 0.0;
-      if (sc[b][a] < l)
-        nr = l - sc[b][a];
-      else if (sc[b][a] > h)
-        nr = sc[b][a] - h;
-      dmin2 += nr * nr;
-    }
-    if (dmin2 <= sr[b] * sr[b] && dmax2 >= sr[b] * sr[b]) return 1;
-  }
-  return 0;
+    if (lo[a] == 0 || lo[a] + size == world) wall = 1;
+  int32_t blo[3] = {lo[0], lo[1], lo[2]};
+  int32_t bhi[3] = {lo[0] + size, lo[1] + size, lo[2] + size};
+  int32_t sel[HZ_P3_MAXH];
+  for (int b = 0; b < nb; b++)
+    if (hz_facets_for_box(ft, f0[b], nfac[b], blo, bhi, sel, HZ_P3_MAXH) != HZ_BOX_OUTSIDE)
+      return 2;
+  return wall;
 }
 
 static void lod_build(hz_octree *t, const int lo[3], int size, int world, double u,
-                      const double eye[3], double eps, const double sc[2][3], const double sr[2]) {
+                      const double eye[3], double eps, const hz_facettab *ft, const int32_t *f0,
+                      const int32_t *nfac, int nb, int cutfine) {
   int hi[3] = {lo[0] + size, lo[1] + size, lo[2] + size};
-  if (!box_has_surface(lo, size, world, sc, sr, u)) {
+  int kind = box_has_surface(lo, size, world, ft, f0, nfac, nb);
+  if (kind == 0) {
     hz_oct_set_box(t, lo, hi, 1.0);
+    return;
+  }
+  /* РАЗДЕЛИТЕЛЬ К94: при `cutfine` РАЗРЕЗАННЫЕ ячейки дробятся до предела, то
+   * есть перепада уровней у них не остаётся вовсе. Если картинка при этом
+   * становится верной — причина в условии 1:1, и это ПОКАЗАНО, а не выведено. */
+  if (kind == 2 && cutfine && size > 1) {
+    int h3 = size / 2;
+    for (int k = 0; k < 8; k++) {
+      int c[3] = {lo[0] + ((k & 1) ? h3 : 0), lo[1] + ((k & 2) ? h3 : 0),
+                  lo[2] + ((k & 4) ? h3 : 0)};
+      lod_build(t, c, h3, world, u, eye, eps, ft, f0, nfac, nb, cutfine);
+    }
     return;
   }
   double near2 = 0.0;
@@ -135,7 +146,7 @@ static void lod_build(hz_octree *t, const int lo[3], int size, int world, double
   int h2 = size / 2;
   for (int k = 0; k < 8; k++) {
     int c[3] = {lo[0] + ((k & 1) ? h2 : 0), lo[1] + ((k & 2) ? h2 : 0), lo[2] + ((k & 4) ? h2 : 0)};
-    lod_build(t, c, h2, world, u, eye, eps, sc, sr);
+    lod_build(t, c, h2, world, u, eye, eps, ft, f0, nfac, nb, cutfine);
   }
 }
 
@@ -214,6 +225,8 @@ int main(int argc, char **argv) {
   /* ЭТАП A, ШАГ 1: угловой размер пикселя для правила `L = εR`; 0 — равномерная
    * сетка, как прежде. Разделять A надвое стало можно после К52. */
   double lodeps = argc > 21 ? atof(argv[21]) : 0.0;
+  /* К94: дробить РАЗРЕЗАННЫЕ ячейки до предела — разделитель причины */
+  int cutfine = argc > 22 ? atoi(argv[22]) : 0;
   if (log2n < 1 || log2n > 8) {
     fprintf(stderr, "log2n вне [1,8]\n");
     return 1;
@@ -224,28 +237,14 @@ int main(int argc, char **argv) {
   hz_frame fr = {{0, 0, 0}, {ROOM / nc, ROOM / nc, ROOM / nc}};
   hz_octree t;
   if (hz_oct_init(&t, log2n, 0.0)) return 1;
-  /* РАВНОМЕРНОЕ дробление либо LOD по `L = εR` (этап A, шаг 1).
-   * При равномерном условие 1:1 у разрезанных ячеек (cut3) выполняется само;
-   * при LOD оно ПРЕДСКАЗАННО нарушается (К54), и это замеряется, а не
-   * обходится. */
-  if (lodeps > 0.0) {
-    double lsc[2][3] = {{5.6, 9.2, 4.2}, {10.9, 7.4, 3.1}};
-    double lsr[2] = {3.0, 1.9};
-    double leye[3] = {8.0, 0.6, 7.2};
-    int z0[3] = {0, 0, 0};
-    lod_build(&t, z0, nc, nc, ROOM / nc, leye, lodeps, lsc, lsr);
-  } else {
-    for (int x = 0; x < nc; x++)
-      for (int y = 0; y < nc; y++)
-        for (int z = 0; z < nc; z++) {
-          int lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
-          hz_oct_set_box(&t, lo, hi, 1.0);
-        }
-  }
 
-  stage_add("октодерево", 0);
-
-  /* сфера как АНАЛИТИЧЕСКИЙ примитив плюс её фасеты для разреза */
+  /* ФАСЕТИЗАЦИЯ ИДЁТ ПЕРЕД ДЕРЕВОМ, И ЭТО НЕ ПЕРЕСТАНОВКА РАДИ УДОБСТВА — К95.
+   * Критерий дробления обязан спрашивать ТО ЖЕ ТЕЛО, что и боковая таблица.
+   * Прежде он проверял аналитическую СФЕРУ, а таблица — ФАСЕТЫ, которые торчат
+   * наружу примитива на `dmax`: коробка чуть снаружи сферы не дробилась, но
+   * фасеты получала, становилась КРУПНОЙ разрезанной ячейкой рядом с мелкими и
+   * ломала условие 1:1. Это дословно К21 («один индекс обслуживает два разных
+   * тела»), только на другом конце. */
   hz_surftab stab;
   hz_facettab ftab;
   hz_cutmap cmap;
@@ -267,6 +266,23 @@ int main(int argc, char **argv) {
   }
 
   stage_add("фасетизация примитивов", 0);
+
+  /* РАВНОМЕРНОЕ дробление либо LOD по `L = εR` (этап A, шаг 1). Критерий
+   * «есть ли здесь поверхность» спрашивает ТОТ ЖЕ `hz_facets_for_box`, что и
+   * боковая таблица (К95) — иначе тела расходятся и условие 1:1 ломается. */
+  if (lodeps > 0.0) {
+    double leye[3] = {8.0, 0.6, 7.2};
+    int z0[3] = {0, 0, 0};
+    lod_build(&t, z0, nc, nc, ROOM / nc, leye, lodeps, &ftab, f0, nfac, NB, cutfine);
+  } else {
+    for (int x = 0; x < nc; x++)
+      for (int y = 0; y < nc; y++)
+        for (int z = 0; z < nc; z++) {
+          int lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
+          hz_oct_set_box(&t, lo, hi, 1.0);
+        }
+  }
+  stage_add("октодерево", 0);
 
   /* боковая таблица: ключи ОБЯЗАНЫ идти по возрастанию (Г45) */
   rec_t *recs = calloc((size_t)nc * (size_t)nc * (size_t)nc, sizeof(rec_t));
@@ -500,6 +516,35 @@ int main(int argc, char **argv) {
          st.pin, st.pout, st.pabs, st.psin, st.psout);
   printf("        невязка %.3e, она же на втекшее %.3e\n", st.balance,
          st.pin > 0.0 ? fabs(st.balance) / st.pin : 0.0);
+  /* РАЗДЕЛИТЕЛЬ «ВРЁТ РЕШЕНИЕ ИЛИ ВРЁТ СБОР» (К94). Печатается максимум
+   * ХРАНИМОГО радианса в углах граней и на поверхностных элементах. Если он
+   * разумен, а картинка показывает больше — виноват СБОР, а не развёртка, и
+   * искать надо в чтении DG1, а не в схеме. */
+  {
+    double bmax = 0.0, smax = 0.0;
+    for (int32_t f = 0; f < mesh.nf; f++) {
+      if (mesh.f[f].cb >= 0) continue;
+      int32_t cc = mesh.f[f].ca;
+      double s = (double)mesh.csize[cc];
+      (void)s;
+      for (int k = 0; k < 8; k++) {
+        double v = st.bout[f * 4];
+        for (int a = 0; a < 3; a++)
+          v += ((k >> a) & 1 ? 0.5 : -0.5) * st.bout[f * 4 + 1 + a];
+        if (v > bmax) bmax = v;
+      }
+    }
+    for (int32_t e = 0; e < cut.nse; e++)
+      for (int k = 0; k < 8; k++) {
+        double v = st.sout[e * 4];
+        for (int a = 0; a < 3; a++)
+          v += ((k >> a) & 1 ? 0.5 : -0.5) * st.sout[e * 4 + 1 + a];
+        if (v > smax) smax = v;
+      }
+    printf("К94: max ХРАНИМОГО в углах — стенки %.4f, поверхности %.4f "
+           "(излучение стенки %.2f)\n",
+           bmax, smax, we[5]);
+  }
   /* К65: САМА ВЕЛИЧИНА, РАДИ КОТОРОЙ ОГРАНИЧИТЕЛЬ СТОИТ. Картинка её не видит:
    * она читает хранимое на ПОВЕРХНОСТЯХ, а ограничитель следит за полем в
    * ОБЪЁМЕ. Печатается минимум φ по углам ячеек — то самое, что уходит в минус

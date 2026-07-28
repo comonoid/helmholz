@@ -73,6 +73,15 @@ typedef struct {
 int hz_obj_load(hz_objmesh *m, const char *path, double scale);
 void hz_obj_free(hz_objmesh *m);
 
+/* РАЗБОР ОТДЕЛЁН ОТ ЧТЕНИЯ ФАЙЛА, и это не удобство, а условие проверяемости.
+ * У CBMC нет тела ни для `fread`, ни для `FILE*`, поэтому «CBMC на
+ * hz_obj_load» недостижимо как задача (тот же довод, что в
+ * `tests/cbmc_octree.c`). Здесь вход — NUL-терминированный буфер в памяти, и
+ * ровно эту половину гоняет `tests/cbmc_sceneobj.c`.
+ * `objpath` может быть NULL: тогда строки `mtllib` пропускаются, и разбор не
+ * трогает файловую систему вовсе. */
+int hz_obj_parse(hz_objmesh *m, const char *buf, double scale, const char *objpath);
+
 /* Площадь треугольника t и его вершины. Отдельно, потому что нужны всем
  * потребителям, а раскладка `f`/`v` — здесь. */
 void hz_obj_tri(const hz_objmesh *m, int32_t t, double p[3][3]);

@@ -7,6 +7,7 @@
  */
 
 #include "poly_seg.h"
+#include "polygon.h"
 #include "scene_obj.h"
 #include <math.h>
 #include <stdio.h>
@@ -29,7 +30,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "usage: %s FILE.obj SCALE [delta ...]\n", argv[0]);
     return 2;
   }
-  double scale = atof(argv[2]);
+  double scale = strtod(argv[2], NULL);
   double t0 = now_s();
   hz_objmesh m;
   int rc = hz_obj_load(&m, argv[1], scale);
@@ -79,7 +80,7 @@ int main(int argc, char **argv) {
            "межур.пар   канд/тр    время, с\n");
     double d0 = 0.0, n0 = 0.0, d1 = 0.0, n1 = 0.0;
     for (int i = 3; i < argc; i++) {
-      double delta = atof(argv[i]);
+      double delta = strtod(argv[i], NULL);
       hz_pseglist s;
       double ta = now_s();
       int src = hz_seg_planar(&s, &m, delta);
@@ -88,12 +89,50 @@ int main(int argc, char **argv) {
         fprintf(stderr, "hz_seg_planar(%g): rc=%d\n", delta, src);
         continue;
       }
+      /* ИНВАРИАНТЫ РАЗБИЕНИЯ. Без них число участков — просто число: разметка,
+       * потерявшая треугольники, дала бы участков МЕНЬШЕ и выглядела бы лучше. */
+      int64_t sumtri = 0;
+      double sumarea = 0.0;
+      int bad = 0;
+      for (int32_t k = 0; k < s.nseg; k++) {
+        sumtri += s.seg[k].ntri;
+        sumarea += s.seg[k].area;
+      }
+      for (int32_t t = 0; t < m.nt; t++)
+        if (s.label[t] < 0 || s.label[t] >= s.nseg) bad++;
+      if (bad != 0 || sumtri != m.nt || fabs(sumarea - area) > 1e-6 * area) {
+        printf("  !! РАЗБИЕНИЕ НЕВЕРНО при δ=%g: вне диапазона %d, Σтр %lld против %d, "
+               "Σплощадь %.6f против %.6f\n",
+               delta, bad, (long long)sumtri, m.nt, sumarea, area);
+        hz_seg_free(&s);
+        continue;
+      }
       double worst = 0.0;
       for (int32_t k = 0; k < s.nseg; k++)
         if (s.seg[k].dmax / delta > worst) worst = s.seg[k].dmax / delta;
-      printf("  %9.4g   %9d   %10.1f   %10.4f  %5lld  %6lld  %9lld  %8.1f  %10.2f\n", delta,
-             s.nseg, (double)m.nt / (double)s.nseg, worst, (long long)s.nrounds,
-             (long long)s.nreleased, (long long)s.ncross, (double)s.ncand / (double)m.nt, tb - ta);
+      /* Сборка полигонов гоняется здесь же: на масштабной сцене надо знать не
+       * только СКОЛЬКО участков, но и во что обходится край. */
+      hz_polyset ps;
+      double tc = now_s();
+      int prc = hz_poly_build(&ps, &m, &s);
+      double td = now_s();
+      printf("  %9.4g   %9d   %10.1f   %10.4f  %5lld  %6lld  %9lld  %8.1f  %10.2f\n", delta, s.nseg,
+             (double)m.nt / (double)s.nseg, worst, (long long)s.nrounds, (long long)s.nreleased,
+             (long long)s.ncross, (double)s.ncand / (double)m.nt, tb - ta);
+      if (prc == 0) {
+        int32_t noloop = 0;
+        for (int32_t k = 0; k < ps.np; k++)
+          if (ps.p[k].nloop == 0) noloop++;
+        printf("             край: %.2f с, петель %d, вершин края %d (%.1f на полигон), "
+               "без петли %d, не замкнулось %lld, развилок %lld;\n"
+               "             полурёбер без пары %.3f%%, полигонов на шве материалов %lld\n",
+               td - tc, ps.nloopall, ps.nbv, (double)ps.nbv / (double)ps.np, noloop,
+               (long long)ps.nopen, (long long)ps.nfork,
+               100.0 * (double)ps.nhe_open / (double)ps.nhe, (long long)ps.nmixed);
+        hz_poly_free(&ps);
+      } else {
+        printf("             край: сборка полигонов не прошла (rc=%d)\n", prc);
+      }
       if (n0 <= 0.0) {
         d0 = delta;
         n0 = s.nseg;

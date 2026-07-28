@@ -95,6 +95,23 @@ build/test_gather3: tests/test_gather3.c src/transport/gather3.c src/transport/g
 build/lod3: tools/lod3.c src/transport/ray3.c src/cut/surf.c src/cut/poly3.c src/octree.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/lod3.c src/transport/ray3.c src/cut/surf.c src/cut/poly3.c src/octree.c -lm'
 
+# ---- ПОЛИГОНАЛЬНАЯ МОДЕЛЬ ПОЛЯ (PLAN_ELEMENTS.md) ----
+# Ш1: свип по δ на скачанных сценах. Не входит в `make test` — нужны assets/,
+# которых в git нет; запускается руками.
+build/segstat: tools/segstat.c src/scene_obj.c src/poly_seg.c src/polygon.c \
+               src/cut/surf.c src/cut/poly3.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/segstat.c src/scene_obj.c src/poly_seg.c \
+	  src/polygon.c src/cut/surf.c src/cut/poly3.c -lm'
+
+# Ш2: приёмка импорта. Сама СНИМАЕТСЯ, если сцены нет (печатает SKIP), поэтому
+# в `make test` входить может.
+build/test_polygon: tests/test_polygon.c src/scene_obj.c src/poly_seg.c src/polygon.c \
+                    src/cut/surf.c src/cut/poly3.c src/transport/cam3.c src/transport/ray3.c \
+                    src/octree.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_polygon.c src/scene_obj.c src/poly_seg.c \
+	  src/polygon.c src/cut/surf.c src/cut/poly3.c src/transport/cam3.c \
+	  src/transport/ray3.c src/octree.c -lm'
+
 # СРАВНЕНИЕ ДВУХ БУФЕРОВ РАДИАНСА (PFM), оснастка замеров К65 и К68.
 # Метрика берётся на РАДИАНСЕ, а не на картинке: К19 измерила, что тон-маппинг
 # ошибку съедает. Кромки (К20) докладываются ОТДЕЛЬНО, а не подмешиваются в
@@ -117,7 +134,7 @@ build/render3: tools/render3.c src/transport/gather3.c src/transport/krylov3.c s
 test: check-fp build/test_octree build/test_octfmt build/test_poly3 build/test_surf \
       build/test_facet build/test_qef build/test_dc build/test_dcwalk \
       build/test_sweep build/test_rte2d build/test_ray3 build/test_scat1d build/test_tet3 \
-      build/test_sweep3 build/test_gather3
+      build/test_sweep3 build/test_gather3 build/test_polygon
 	./build/test_octree
 	./build/test_octfmt
 	./build/test_poly3
@@ -133,6 +150,7 @@ test: check-fp build/test_octree build/test_octfmt build/test_poly3 build/test_s
 	./build/test_tet3
 	./build/test_sweep3
 	./build/test_gather3
+	./build/test_polygon
 
 check:
 	scripts/ccheck.sh src/octree.c src/image.c \
@@ -147,7 +165,8 @@ check:
 	  src/transport/dirs3.c src/transport/mesh3.c src/transport/sweep3.c tests/test_sweep3.c \
 	  src/transport/gather3.c tests/test_gather3.c \
 	  src/transport/krylov3.c src/transport/raster3.c src/transport/cut3.c \
-	  tools/lod3.c tools/pfmdiff.c tools/render3.c
+	  src/scene_obj.c src/poly_seg.c src/polygon.c tests/test_polygon.c tests/cbmc_sceneobj.c \
+	  tools/lod3.c tools/pfmdiff.c tools/render3.c tools/segstat.c
 
 # Г31: СТРАЖ КОНФИГУРАЦИИ СБОРКИ, А НЕ ЧИСЕЛ. Побитовое совпадение выходов ядра
 # контракцию НЕ ловит — измерено: с 18 fma-инструкциями внутри test_poly3

@@ -239,9 +239,9 @@ void hz_seg_free(hz_pseglist *s) {
 /* --- рабочее состояние: одна структура, чтобы освобождение было одним местом -- */
 
 typedef struct {
-  double *bb;  /* 6*nt */
-  double *gn;  /* 3*nt */
-  double *ar;  /* nt   */
+  double *bb; /* 6*nt */
+  double *gn; /* 3*nt */
+  double *ar; /* nt   */
   seg_key *ord;
   int32_t *queue;
   int32_t *rank;

@@ -8,8 +8,12 @@
 
 /* --- лексика --------------------------------------------------------------- */
 
-static int is_sp(char c) { return c == ' ' || c == '\t' || c == '\r'; }
-static int is_eol(char c) { return c == '\n' || c == '\0'; }
+static int is_sp(char c) {
+  return c == ' ' || c == '\t' || c == '\r';
+}
+static int is_eol(char c) {
+  return c == '\n' || c == '\0';
+}
 
 static const char *skip_sp(const char *p) {
   while (is_sp(*p))
@@ -128,7 +132,10 @@ static char *slurp(const char *path, size_t *len) {
     fclose(fp);
     return NULL;
   }
-  rewind(fp);
+  if (fseek(fp, 0, SEEK_SET) != 0) {
+    fclose(fp);
+    return NULL;
+  }
   char *buf = malloc((size_t)sz + 1);
   if (buf == NULL) {
     fclose(fp);
@@ -236,10 +243,20 @@ double hz_obj_tri_area(const hz_objmesh *m, int32_t t) {
 }
 
 int hz_obj_load(hz_objmesh *m, const char *path, double scale) {
-  memset(m, 0, sizeof *m);
   size_t len = 0;
   char *buf = slurp(path, &len);
-  if (buf == NULL) return 1;
+  if (buf == NULL) {
+    memset(m, 0, sizeof *m);
+    return 1;
+  }
+  int rc = hz_obj_parse(m, buf, scale, path);
+  free(buf);
+  return rc;
+}
+
+int hz_obj_parse(hz_objmesh *m, const char *buf, double scale, const char *objpath) {
+  memset(m, 0, sizeof *m);
+  if (buf == NULL) return 3;
 
   /* --- проход 1: счёт. Растущих массивов нет ровно поэтому. --- */
   int64_t nv = 0, nvn = 0, ntri = 0, nquad = 0;
@@ -258,7 +275,7 @@ int hz_obj_load(hz_objmesh *m, const char *path, double scale) {
     }
   }
   if (nv > 2000000000LL || ntri > 700000000LL) {
-    free(buf);
+
     return 3;
   }
 
@@ -269,13 +286,13 @@ int hz_obj_load(hz_objmesh *m, const char *path, double scale) {
   m->fm = malloc((size_t)(ntri > 0 ? ntri : 1) * sizeof *m->fm);
   if (m->v == NULL || m->f == NULL || m->fn == NULL || m->fm == NULL ||
       (nvn > 0 && m->vn == NULL)) {
-    free(buf);
+
     hz_obj_free(m);
     return 2;
   }
   /* Материал по умолчанию — индекс 0, поэтому fm валиден всегда (заголовок). */
   if (mtl_add(m, "__default", 9, 0.5) < 0) {
-    free(buf);
+
     hz_obj_free(m);
     return 2;
   }
@@ -306,7 +323,11 @@ int hz_obj_load(hz_objmesh *m, const char *path, double scale) {
       if (y > m->hi[1]) m->hi[1] = y;
       if (z > m->hi[2]) m->hi[2] = z;
       cv++;
-    } else if (q[0] == 'v' && q[1] == 'n' && is_sp(q[2])) {
+    } else if (q[0] == 'v' && q[1] == 'n' && is_sp(q[2]) && m->vn != NULL) {
+      /* `m->vn != NULL` недостижимо ложно — проход 1 считал `vn` тем же
+       * предикатом, — но проверка стоит явно: без неё запись в NULL прячется за
+       * согласованностью двух проходов, а это не то, на что стоит опираться в
+       * разборщике недоверенного входа. */
       char *e = NULL;
       double x = strtod(q + 2, &e);
       double y = strtod(e, &e);
@@ -325,7 +346,7 @@ int hz_obj_load(hz_objmesh *m, const char *path, double scale) {
     } else if (strncmp(q, "mtllib", 6) == 0 && is_sp(q[6])) {
       const char *s = skip_sp(q + 6);
       const char *e = skip_token(s);
-      mtl_load(m, path, s, (size_t)(e - s));
+      if (objpath != NULL) mtl_load(m, objpath, s, (size_t)(e - s));
     } else if (q[0] == 'f' && is_sp(q[1])) {
       /* Веер (0, i, i+1): грани входа плоские и выпуклые (заголовок). */
       int32_t first = -1, prev = -1, fnfirst = -1, fnprev = -1;
@@ -366,7 +387,7 @@ int hz_obj_load(hz_objmesh *m, const char *path, double scale) {
       }
     }
   }
-  free(buf);
+
   if (bad) {
     hz_obj_free(m);
     return 3;

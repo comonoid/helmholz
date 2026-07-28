@@ -82,34 +82,85 @@ int main(int argc, char **argv) {
       lo[a] = m.lo[a];
       hi[a] = m.hi[a];
     }
-    double hh = 0.01;
-    hz_pview v;
-    if (hz_pview_make(&v, w, lo, hi, hh) == 0) {
-      hz_span *sp = NULL;
-      int64_t nsp = 0, cap = 0;
-      hz_rstats rs;
-      if (hz_prast_spans(&sp, &nsp, &cap, &v, &ps, &rs) == 0) {
-        double cov = 0.0;
-        for (int64_t s = 0; s < nsp; s++) {
-          const hz_poly *P = &ps.p[sp[s].poly];
-          double nw = P->n[0] * v.w[0] + P->n[1] * v.w[1] + P->n[2] * v.w[2];
-          cov += (double)(sp[s].i1 - sp[s].i0 + 1) * hh * hh / fabs(nw);
+    /* НЕ ОДНА ТОЧКА, А ЗАКОН — и предсказание тут ПРОВАЛИЛОСЬ с пользой.
+     * Ожидался краевой эффект дискретизации `ΔS ≈ h·P/2`, то есть недобор,
+     * ЛИНЕЙНЫЙ по h. Замер дал недобор, ПОСТОЯННЫЙ по h (30.2 → 31.0 м² при
+     * изменении h в шестнадцать раз), а значит краевого эффекта нет вовсе:
+     * выборка по центру пикселя при полуоткрытых полосах несмещённа, полигон
+     * выигрывает на кромке ровно столько же, сколько теряет. Постоянный же
+     * недобор оказался ДВУМЯ разными вещами, и разделяет их таблица ниже. */
+    hz_span *sp = NULL;
+    int64_t cap = 0;
+    double per = 0.0;
+    for (int32_t k = 0; k < ps.np; k++) {
+      const hz_poly *P = &ps.p[k];
+      for (int32_t l = P->l0; l < P->l0 + P->nloop; l++) {
+        int32_t b = ps.loop[l], e = ps.loop[l + 1], nn = e - b;
+        for (int32_t q = 0; q < nn; q++) {
+          const double *A = ps.bv + (size_t)(b + q) * 2;
+          const double *B = ps.bv + (size_t)(b + (q + 1) % nn) * 2;
+          per += sqrt((B[0] - A[0]) * (B[0] - A[0]) + (B[1] - A[1]) * (B[1] - A[1]));
         }
-        printf("   подпись покрытия при h = %g: Σ h²/|n·ω| = %.2f м² против площади %.2f м² "
-               "(отн. %.4f); экран %d×%d, фрагментов %lld, полос %lld\n",
-               hh, cov, area, cov / area - 1.0, v.W, v.H, (long long)rs.nfrag,
-               (long long)rs.nspan);
       }
-      free(sp);
     }
+    printf("   периметр края всех полигонов: %.1f м\n", per);
+    /* ТРИ ПЛОЩАДИ, А НЕ ОДНА, и различать их обязательно.
+     *   mom[0]   — Σ ЗНАКОВЫХ проекций треугольников (кратность учитывается);
+     *   шнуровка — тот же интеграл, но взятый ПО КРАЮ. По теореме Грина обязан
+     *              совпасть с mom[0] ТОЧНО, если край извлечён верно: внутренние
+     *              рёбра сокращаются. Расхождение = дефект обхода края;
+     *   растр    — площадь МНОЖЕСТВА {оборот ≠ 0}. Меньше шнуровки ровно на
+     *              площадь двукратно покрытых мест, то есть на слипшиеся листы. */
+    double smom = 0.0, slace = 0.0, worst = 0.0;
+    int32_t nmulti = 0;
+    for (int32_t k = 0; k < ps.np; k++) {
+      const hz_poly *P = &ps.p[k];
+      double la = 0.0;
+      for (int32_t l = P->l0; l < P->l0 + P->nloop; l++) {
+        int32_t b = ps.loop[l], e = ps.loop[l + 1], nn = e - b;
+        for (int32_t q = 0; q < nn; q++) {
+          const double *A = ps.bv + (size_t)(b + q) * 2;
+          const double *B = ps.bv + (size_t)(b + (q + 1) % nn) * 2;
+          la += 0.5 * (A[0] * B[1] - B[0] * A[1]);
+        }
+      }
+      smom += P->mom[0];
+      slace += la;
+      double rel = fabs(la - P->mom[0]) / (fabs(P->mom[0]) > 0.0 ? fabs(P->mom[0]) : 1.0);
+      if (rel > 1e-9) {
+        nmulti++;
+        if (rel > worst) worst = rel;
+      }
+    }
+    printf("   Σ mom[0] = %.3f м², Σ шнуровка края = %.3f м² (расхождение %.3g отн.);\n"
+           "   полигонов с расхождением > 1e-9: %d, худшее %.3g\n",
+           smom, slace, fabs(slace - smom) / smom, nmulti, worst);
+    printf("   %-8s %10s %10s %10s %12s\n", "h, м", "Σh²/|n·ω|", "недобор", "недобор/h",
+           "ожид. P/2");
+    for (double hh = 0.04; hh > 0.0024; hh *= 0.5) {
+      hz_pview v;
+      if (hz_pview_make(&v, w, lo, hi, hh) != 0) continue;
+      int64_t nsp = 0;
+      hz_rstats rs;
+      if (hz_prast_spans(&sp, &nsp, &cap, &v, &ps, &rs) != 0) continue;
+      double cov = 0.0;
+      for (int64_t s = 0; s < nsp; s++) {
+        const hz_poly *P = &ps.p[sp[s].poly];
+        double nw = P->n[0] * v.w[0] + P->n[1] * v.w[1] + P->n[2] * v.w[2];
+        cov += (double)(sp[s].i1 - sp[s].i0 + 1) * hh * hh / fabs(nw);
+      }
+      printf("   %-8g %10.2f %10.2f %10.1f %12.1f\n", hh, cov, area - cov, (area - cov) / hh,
+             per / 2.0);
+    }
+    free(sp);
   }
 
   /* --- свип по шагу растра и раскладке --- */
   tr3_dirs d;
   if (tr3_dirs_product(&d, 2, 2) != 0) return 1; /* ND = 32 */
   printf("\n   ND = %d, один отскок\n", d.n);
-  printf("   %-6s %-6s %5s  %9s %9s %9s %9s %9s   %8s %8s %8s\n", "h, м", "раскл", "потк",
-         "полосы", "фрагм", "растр,с", "сорт,с", "редук,с", "всего,с", "ГБ/с", "нс/фр");
+  printf("   %-6s %-6s %5s  %9s %9s %9s %9s %9s   %8s %8s %8s\n", "h, м", "раскл", "потк", "полосы",
+         "фрагм", "растр,с", "сорт,с", "редук,с", "всего,с", "ГБ/с", "нс/фр");
 
   for (int i = 2; i < argc; i++) {
     double h = strtod(argv[i], NULL);
@@ -126,9 +177,8 @@ int main(int argc, char **argv) {
         }
         double tot = st.t_raster + st.t_sort + st.t_reduce;
         printf("   %-6g %-6s %5d  %9lld %9lld %9.3f %9.3f %9.3f   %8.3f %8.2f %8.1f\n", h,
-               lay ? "списк" : "пробг", nthr, (long long)st.nspan, (long long)st.nfrag,
-               st.t_raster, st.t_sort, st.t_reduce, tb - ta,
-               (double)st.nbytes / (tot > 0.0 ? tot : 1.0) / 1e9,
+               lay ? "списк" : "пробг", nthr, (long long)st.nspan, (long long)st.nfrag, st.t_raster,
+               st.t_sort, st.t_reduce, tb - ta, (double)st.nbytes / (tot > 0.0 ? tot : 1.0) / 1e9,
                1e9 * (tb - ta) * nthr / (double)(st.nfrag > 0 ? st.nfrag : 1));
         if (st.nover != 0)
           printf("        !! ёмкость A-буфера мала: %lld фрагментов потеряно\n",

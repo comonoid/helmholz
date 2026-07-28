@@ -73,17 +73,17 @@ double hz_ptrans_lout(const hz_ptrans *t, int32_t k, double u, double v);
 typedef struct {
   double t_raster, t_sort, t_reduce, t_solve;
   int64_t nfrag, nspan, npair, nover, nbytes;
-  int64_t nclip;   /* сколько полигонов тронул ограничитель */
-  double phi_in;   /* Σ ∫E dA — принято */
-  double phi_out;  /* Σ π∫L_out dA — испущено */
-  double dE;       /* Σ |ΔE| / Σ |E| — изменение за отскок, для остановки */
+  int64_t nclip;  /* сколько полигонов тронул ограничитель */
+  double phi_in;  /* Σ ∫E dA — принято */
+  double phi_out; /* Σ π∫L_out dA — испущено */
+  double dE;      /* Σ |ΔE| / Σ |E| — изменение за отскок, для остановки */
 } hz_pstats;
 
 /* ОДИН ОТСКОК: обход всех ординат, накопление, решение, ограничитель.
  * `h` — шаг растра, м. `nthr` — потоков (по направлениям); 0 = сколько дал OpenMP.
  * `Lsky` — радианс фона, приходящий из пустоты по каждому направлению. */
-int hz_psweep_bounce(hz_ptrans *t, const tr3_dirs *d, double h, int nthr, double Lsky,
-                     int layout, hz_pstats *st);
+int hz_psweep_bounce(hz_ptrans *t, const tr3_dirs *d, double h, int nthr, double Lsky, int layout,
+                     hz_pstats *st);
 
 /* ПРЯМОЙ СВЕТ от удалённого источника: один проход по направлению `w`,
  * `Eperp` — облучённость площадки, ПЕРПЕНДИКУЛЯРНОЙ пучку. Кладётся в `acc`,
@@ -92,8 +92,8 @@ int hz_psweep_direct(hz_ptrans *t, const double w[3], double Eperp, double h, hz
 
 /* Раздельные части отскока — нужны, когда прямой свет идёт вместе с развёрткой. */
 void hz_psweep_zero(hz_ptrans *t);
-int hz_psweep_gather(hz_ptrans *t, const tr3_dirs *d, double h, int nthr, double Lsky,
-                     int layout, hz_pstats *st);
+int hz_psweep_gather(hz_ptrans *t, const tr3_dirs *d, double h, int nthr, double Lsky, int layout,
+                     hz_pstats *st);
 void hz_psweep_solve(hz_ptrans *t, hz_pstats *st);
 
 #endif

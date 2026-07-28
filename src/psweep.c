@@ -95,11 +95,14 @@ static int solve3s(double A[3][3], double b[3]) {
  *
  * `*pk` / `*pu` / `*pv` — предыдущий фрагмент вдоль луча; на входе первого
  * фрагмента `*pk < 0`. */
-static inline void frag_step(const hz_ptrans *t, const hz_pview *v, double wq, double h2,
-                             double Lsky, double *acc, const double r[3], int32_t k, double depth,
-                             int32_t *pk, double *pu, double *pv, int64_t *npair) {
+static inline void frag_step(const hz_ptrans *t, const hz_pview *v, const double *nwt, double wq,
+                             double h2, double Lsky, double *acc, const double r[3], int32_t k,
+                             double depth, int32_t *pk, double *pu, double *pv, int64_t *npair) {
   const hz_poly *P = &t->ps->p[k];
-  double nw = P->n[0] * v->w[0] + P->n[1] * v->w[1] + P->n[2] * v->w[2];
+  /* `n·ω` НЕ пересчитывается на фрагмент: оно зависит только от (полигон,
+   * направление), а фрагментов на полигон — сотни. Таблица на направление
+   * стоит `np` умножений против `nfrag` штук по шесть. */
+  double nw = nwt[k];
   double q[3];
   for (int a = 0; a < 3; a++)
     q[a] = r[a] + depth * v->w[a] - P->org[a];
@@ -111,11 +114,9 @@ static inline void frag_step(const hz_ptrans *t, const hz_pview *v, double wq, d
     if (*pk < 0) {
       L = Lsky; /* выше по лучу пусто: фон */
     } else {
-      const hz_poly *Q = &t->ps->p[*pk];
-      double nwp = Q->n[0] * v->w[0] + Q->n[1] * v->w[1] + Q->n[2] * v->w[2];
       /* Излучает вдоль ω только лицевая сторона; изнанка ЗАСЛОНЯЕТ, и это и
        * есть тень — вычисленная, а не взятая из таблицы видимости. */
-      L = (nwp > 0.0) ? hz_ptrans_lout(t, *pk, *pu, *pv) : 0.0;
+      L = (nwt[*pk] > 0.0) ? hz_ptrans_lout(t, *pk, *pu, *pv) : 0.0;
     }
     if (L > 0.0) {
       double c = wq * h2 * L;
@@ -132,38 +133,50 @@ static inline void frag_step(const hz_ptrans *t, const hz_pview *v, double wq, d
 
 /* --- редукция, раскладка СПЛОШНЫХ ПРОБЕГОВ ---------------------------------- */
 
-static void reduce_fbuf(const hz_ptrans *t, const hz_pview *v, const hz_fbuf *fb, double wq,
-                        double Lsky, double *acc, hz_pstats *st) {
+/* Начало луча идёт ПРИРАЩЕНИЕМ вдоль строки, а не пересчётом на пиксель: заодно
+ * из внутреннего цикла уходит целочисленное деление `px % W`. */
+static void reduce_fbuf(const hz_ptrans *t, const hz_pview *v, const double *nwt, const hz_fbuf *fb,
+                        double wq, double Lsky, double *acc, hz_pstats *st) {
   const double h2 = v->h * v->h;
-  const int64_t npix = (int64_t)fb->W * fb->H;
-  for (int64_t px = 0; px < npix; px++) {
-    int32_t b = fb->start[px], e = fb->start[px + 1];
-    if (b == e) continue;
+  for (int32_t j = 0; j < fb->H; j++) {
     double r[3];
-    hz_pview_origin(v, (int32_t)(px % fb->W), (int32_t)(px / fb->W), r);
-    int32_t pk = -1;
-    double pu = 0.0, pv = 0.0;
-    for (int32_t f = b; f < e; f++)
-      frag_step(t, v, wq, h2, Lsky, acc, r, fb->poly[f], fb->depth[f], &pk, &pu, &pv, &st->npair);
+    hz_pview_origin(v, 0, j, r);
+    int64_t base = (int64_t)j * fb->W;
+    for (int32_t i = 0; i < fb->W; i++) {
+      int32_t b = fb->start[base + i], e = fb->start[base + i + 1];
+      if (b != e) {
+        int32_t pk = -1;
+        double pu = 0.0, pv = 0.0;
+        for (int32_t f = b; f < e; f++)
+          frag_step(t, v, nwt, wq, h2, Lsky, acc, r, fb->poly[f], fb->depth[f], &pk, &pu, &pv,
+                    &st->npair);
+      }
+      for (int a = 0; a < 3; a++)
+        r[a] += v->h * v->ea[a];
+    }
   }
 }
 
 /* --- редукция, раскладка ОДНОСВЯЗНЫХ СПИСКОВ -------------------------------- */
 
-static void reduce_abuf(const hz_ptrans *t, const hz_pview *v, const hz_abuf *ab, double wq,
-                        double Lsky, double *acc, hz_pstats *st) {
+static void reduce_abuf(const hz_ptrans *t, const hz_pview *v, const double *nwt, const hz_abuf *ab,
+                        double wq, double Lsky, double *acc, hz_pstats *st) {
   const double h2 = v->h * v->h;
-  const int64_t npix = (int64_t)ab->W * ab->H;
-  for (int64_t px = 0; px < npix; px++) {
-    int32_t f = ab->head[px];
-    if (f < 0) continue;
+  for (int32_t j = 0; j < ab->H; j++) {
     double r[3];
-    hz_pview_origin(v, (int32_t)(px % ab->W), (int32_t)(px / ab->W), r);
-    int32_t pk = -1;
-    double pu = 0.0, pv = 0.0;
-    while (f >= 0) {
-      frag_step(t, v, wq, h2, Lsky, acc, r, ab->poly[f], ab->depth[f], &pk, &pu, &pv, &st->npair);
-      f = ab->next[f];
+    hz_pview_origin(v, 0, j, r);
+    int64_t base = (int64_t)j * ab->W;
+    for (int32_t i = 0; i < ab->W; i++) {
+      int32_t f = ab->head[base + i];
+      int32_t pk = -1;
+      double pu = 0.0, pv = 0.0;
+      while (f >= 0) {
+        frag_step(t, v, nwt, wq, h2, Lsky, acc, r, ab->poly[f], ab->depth[f], &pk, &pu, &pv,
+                  &st->npair);
+        f = ab->next[f];
+      }
+      for (int a = 0; a < 3; a++)
+        r[a] += v->h * v->ea[a];
     }
   }
 }
@@ -172,6 +185,7 @@ static void reduce_abuf(const hz_ptrans *t, const hz_pview *v, const hz_abuf *ab
 
 typedef struct {
   hz_span *sp;
+  double *nwt; /* n·ω на полигон: считается раз на направление */
   int64_t nsp, cap;
   hz_fbuf fb;
   hz_abuf ab;
@@ -202,6 +216,10 @@ static void scene_box(const hz_polyset *ps, double lo[3], double hi[3]) {
 static int gather_dir(const hz_ptrans *t, const hz_pview *v, pw_thread *w, double wq, double Lsky,
                       int layout) {
   hz_rstats rs;
+  for (int32_t k = 0; k < t->np; k++) {
+    const double *n = t->ps->p[k].n;
+    w->nwt[k] = n[0] * v->w[0] + n[1] * v->w[1] + n[2] * v->w[2];
+  }
   double t0 = now_s();
   if (hz_prast_spans(&w->sp, &w->nsp, &w->cap, v, t->ps, &rs) != 0) return 2;
   double t1 = now_s();
@@ -221,9 +239,9 @@ static int gather_dir(const hz_ptrans *t, const hz_pview *v, pw_thread *w, doubl
     hz_fbuf_sort(&w->fb);
   double t3 = now_s();
   if (layout == HZ_LAYOUT_LIST)
-    reduce_abuf(t, v, &w->ab, wq, Lsky, w->acc, &w->st);
+    reduce_abuf(t, v, w->nwt, &w->ab, wq, Lsky, w->acc, &w->st);
   else
-    reduce_fbuf(t, v, &w->fb, wq, Lsky, w->acc, &w->st);
+    reduce_fbuf(t, v, w->nwt, &w->fb, wq, Lsky, w->acc, &w->st);
   double t4 = now_s();
 
   w->st.t_raster += (t1 - t0) + (t2 - t1);
@@ -231,13 +249,22 @@ static int gather_dir(const hz_ptrans *t, const hz_pview *v, pw_thread *w, doubl
   w->st.t_reduce += t4 - t3;
   w->st.nfrag += rs.nfrag;
   w->st.nspan += rs.nspan;
-  /* Трафик: запись фрагмента (poly + depth) и чтение его же редукцией, плюс
-   * список у списочной раскладки. Полигонные чтения сюда НЕ входят — они
-   * когерентны и считать их байтами значило бы приписать схеме трафик, которого
-   * кэш не производит. */
-  int64_t per = (int64_t)(sizeof(int32_t) + sizeof(double)) * 2;
+  /* ТРАФИК — МОДЕЛЬ ОБЯЗАТЕЛЬНОГО, а не показание счётчика железа, и это
+   * оговаривается. Считается то, что схема НЕ МОЖЕТ не тронуть:
+   *   полосы          — запись при заливке и чтение при раскладке;
+   *   фрагменты       — запись раскладкой и чтение редукцией (poly + depth),
+   *                     плюс два int32 списка у списочной раскладки;
+   *   попиксельные    — очистка, счётный проход, префиксные суммы, сдвиг назад
+   *                     и чтение редукцией: пять проходов по W·H.
+   * Полигонные чтения НЕ входят: их рабочий набор (сотни килобайт) сидит в
+   * кэше, и записать их байтами значило бы приписать схеме трафик, которого
+   * память не видит. */
+  const int64_t FR = (int64_t)(sizeof(int32_t) + sizeof(double));
+  int64_t per = FR * 2;
   if (layout == HZ_LAYOUT_LIST) per += (int64_t)sizeof(int32_t) * 2;
-  w->st.nbytes += rs.nfrag * per;
+  int64_t npix = (int64_t)v->W * v->H;
+  w->st.nbytes += rs.nfrag * per + rs.nspan * (int64_t)sizeof(hz_span) * 2 +
+                  npix * (int64_t)sizeof(int32_t) * 5;
   return 0;
 }
 
@@ -282,6 +309,8 @@ int hz_psweep_gather(hz_ptrans *t, const tr3_dirs *d, double h, int nthr, double
   if (w == NULL) return 2;
   for (int i = 0; i < nt; i++) {
     w[i].acc = calloc((size_t)t->np * 3, sizeof *w[i].acc);
+    w[i].nwt = calloc((size_t)t->np, sizeof *w[i].nwt);
+    if (w[i].nwt == NULL) rc = 2;
     if (w[i].acc == NULL) rc = 2;
     if (layout == HZ_LAYOUT_LIST) {
       if (hz_abuf_init(&w[i].ab, maxpix, cap) != 0) rc = 2;
@@ -317,6 +346,7 @@ int hz_psweep_gather(hz_ptrans *t, const tr3_dirs *d, double h, int nthr, double
   }
   for (int i = 0; i < nt; i++) {
     free(w[i].acc);
+    free(w[i].nwt);
     free(w[i].sp);
     hz_fbuf_free(&w[i].fb);
     hz_abuf_free(&w[i].ab);

@@ -67,9 +67,21 @@ typedef struct {
   int dir;
 } pe_cross;
 
-static int cmp_cross(const void *pa, const void *pb) {
-  const pe_cross *a = pa, *b = pb;
-  return (a->x < b->x) ? -1 : ((a->x > b->x) ? 1 : 0);
+/* ВСТАВКАМИ, А НЕ `qsort`, И ЭТО ЗАМЕР, А НЕ ВКУС. Пересечений в строке
+ * единицы (у выпуклого края — ровно два), а `qsort` платит вызовом через
+ * указатель на каждое сравнение. В первом прогоне Ш3 на этом стояло около
+ * двух третей времени растеризации: 960 тысяч вызовов `qsort` на отскок при
+ * средней длине списка 4. Вставки на такой длине оптимальны и без вызовов. */
+static void sort_cross(pe_cross *c, int32_t n) {
+  for (int32_t i = 1; i < n; i++) {
+    pe_cross v = c[i];
+    int32_t j = i - 1;
+    while (j >= 0 && c[j].x > v.x) {
+      c[j + 1] = c[j];
+      j--;
+    }
+    c[j + 1] = v;
+  }
 }
 
 int hz_prast_spans(hz_span **spp, int64_t *nsp, int64_t *cap, const hz_pview *v,
@@ -84,11 +96,28 @@ int hz_prast_spans(hz_span **spp, int64_t *nsp, int64_t *cap, const hz_pview *v,
         (ps->p[k].nloop > 0) ? ps->loop[ps->p[k].l0 + ps->p[k].nloop] - ps->loop[ps->p[k].l0] : 0;
     if (e > maxe) maxe = e;
   }
+  /* ТАБЛИЦА РЁБЕР ПО СТРОКАМ, а не перебор всех рёбер на каждой строке.
+   * Наивная заливка стоит `O(рёбра × строки)` и штрафует ИМЕННО крупный
+   * полигон — то есть ровно то, ради чего вся модель и затевалась. Замерено на
+   * зале при h = 2 см: 333 полигона (по 6.8 м периметра) растеризуются ДОЛЬШЕ,
+   * чем 7 244 (по 0.75 м), — 0.205 с против 0.126 при том, что фрагментов у
+   * первых МЕНЬШЕ. Таблица убирает этот член: `O(рёбра + Σ активных)`. */
   pe_scr *ed = malloc((size_t)maxe * sizeof *ed);
   pe_cross *cr = malloc((size_t)maxe * sizeof *cr);
-  if (ed == NULL || cr == NULL) {
+  int32_t *elo = malloc((size_t)maxe * sizeof *elo);
+  int32_t *ehi = malloc((size_t)maxe * sizeof *ehi);
+  int32_t *ebkt = malloc((size_t)maxe * sizeof *ebkt);
+  int32_t *act = malloc((size_t)maxe * sizeof *act);
+  int32_t *bcnt = calloc((size_t)H + 2, sizeof *bcnt);
+  if (ed == NULL || cr == NULL || elo == NULL || ehi == NULL || ebkt == NULL || act == NULL ||
+      bcnt == NULL) {
     free(ed);
     free(cr);
+    free(elo);
+    free(ehi);
+    free(ebkt);
+    free(act);
+    free(bcnt);
     return 2;
   }
 
@@ -141,11 +170,46 @@ int hz_prast_spans(hz_span **spp, int64_t *nsp, int64_t *cap, const hz_pview *v,
     if (j0 < 0) j0 = 0;
     if (j1 > H - 1) j1 = H - 1;
 
+    /* Строчный диапазон ребра. Пересечение с центром строки `yc = j + 0.5`
+     * бывает ровно при `yc ∈ [min, max)` — то же полуоткрытое условие, что и
+     * ниже, только решённое относительно `j`. */
+    for (int32_t i = 0; i < ne; i++) {
+      double y0 = ed[i].b0, y1 = ed[i].b1;
+      double ymin = (y0 < y1) ? y0 : y1, ymax = (y0 < y1) ? y1 : y0;
+      int32_t a = (int32_t)ceil(ymin - 0.5), b = (int32_t)ceil(ymax - 0.5) - 1;
+      if (a < j0) a = j0;
+      if (b > j1) b = j1;
+      elo[i] = a;
+      ehi[i] = b;
+    }
+    const int32_t nr = j1 - j0 + 1;
+    for (int32_t r = 0; r <= nr; r++)
+      bcnt[r] = 0;
+    for (int32_t i = 0; i < ne; i++)
+      if (elo[i] <= ehi[i]) bcnt[elo[i] - j0 + 1]++;
+    for (int32_t r = 0; r < nr; r++)
+      bcnt[r + 1] += bcnt[r];
+    for (int32_t i = 0; i < ne; i++)
+      if (elo[i] <= ehi[i]) ebkt[bcnt[elo[i] - j0]++] = i;
+    for (int32_t r = nr; r > 0; r--)
+      bcnt[r] = bcnt[r - 1];
+    bcnt[0] = 0;
+
+    int32_t na = 0;
     for (int32_t j = j0; j <= j1; j++) {
       double yc = (double)j + 0.5;
-      int32_t nc = 0;
+      int32_t nc = 0, r = j - j0;
       st->nrow++;
-      for (int32_t i = 0; i < ne; i++) {
+      for (int32_t q = bcnt[r]; q < bcnt[r + 1]; q++)
+        act[na++] = ebkt[q];
+      for (int32_t q = 0; q < na;) {
+        if (ehi[act[q]] < j)
+          act[q] = act[--na];
+        else
+          q++;
+      }
+      for (int32_t q = 0; q < na; q++) {
+        int32_t i = act[q];
         double y0 = ed[i].b0, y1 = ed[i].b1;
         /* Полуоткрытое условие: вершина ровно на строке считается один раз. */
         if ((y0 <= yc) == (y1 <= yc)) continue;
@@ -156,7 +220,7 @@ int hz_prast_spans(hz_span **spp, int64_t *nsp, int64_t *cap, const hz_pview *v,
         nc++;
       }
       if (nc < 2) continue;
-      qsort(cr, (size_t)nc, sizeof *cr, cmp_cross);
+      sort_cross(cr, nc);
       int wind = 0;
       for (int32_t c = 0; c + 1 < nc; c++) {
         wind += cr[c].dir;
@@ -171,6 +235,11 @@ int hz_prast_spans(hz_span **spp, int64_t *nsp, int64_t *cap, const hz_pview *v,
           if (ns == NULL) {
             free(ed);
             free(cr);
+            free(elo);
+            free(ehi);
+            free(ebkt);
+            free(act);
+            free(bcnt);
             return 2;
           }
           *spp = ns;
@@ -191,6 +260,11 @@ int hz_prast_spans(hz_span **spp, int64_t *nsp, int64_t *cap, const hz_pview *v,
   }
   free(ed);
   free(cr);
+  free(elo);
+  free(ehi);
+  free(ebkt);
+  free(act);
+  free(bcnt);
   return 0;
 }
 

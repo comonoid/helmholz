@@ -174,6 +174,78 @@ int hz_poly_inside(const hz_polyset *ps, const hz_poly *p, double u, double v) {
   return wind != 0;
 }
 
+int hz_poly_add_quad(hz_polyset *ps, const double c[3], const double n[3], const double eu[3],
+                     double hu, double hv, int32_t mtl) {
+  if (!(hu > 0.0) || !(hv > 0.0)) return 1;
+  hz_poly *np = realloc(ps->p, (size_t)(ps->np + 1) * sizeof *np);
+  if (np == NULL) return 2;
+  ps->p = np;
+  int32_t *nl = realloc(ps->loop, (size_t)(ps->nloopall + 2) * sizeof *nl);
+  if (nl == NULL) return 2;
+  ps->loop = nl;
+  double *nb = realloc(ps->bv, (size_t)(ps->nbv + 4) * 2 * sizeof *nb);
+  if (nb == NULL) return 2;
+  ps->bv = nb;
+
+  hz_poly *P = &ps->p[ps->np];
+  memset(P, 0, sizeof *P);
+  double nn = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  if (!(nn > 0.0)) return 1;
+  for (int a = 0; a < 3; a++) {
+    P->n[a] = n[a] / nn;
+    P->org[a] = c[a];
+  }
+  double d = eu[0] * P->n[0] + eu[1] * P->n[1] + eu[2] * P->n[2];
+  for (int a = 0; a < 3; a++)
+    P->eu[a] = eu[a] - d * P->n[a];
+  double un = sqrt(P->eu[0] * P->eu[0] + P->eu[1] * P->eu[1] + P->eu[2] * P->eu[2]);
+  if (!(un > 0.0)) return 1;
+  for (int a = 0; a < 3; a++)
+    P->eu[a] /= un;
+  P->ev[0] = P->n[1] * P->eu[2] - P->n[2] * P->eu[1];
+  P->ev[1] = P->n[2] * P->eu[0] - P->n[0] * P->eu[2];
+  P->ev[2] = P->n[0] * P->eu[1] - P->n[1] * P->eu[0];
+  P->off = P->n[0] * c[0] + P->n[1] * c[1] + P->n[2] * c[2];
+  P->area = 4.0 * hu * hv;
+  P->dmax = 0.0; /* здесь ноль ЧЕСТЕН: прямоугольник плоский точно */
+  P->mtl = mtl;
+  P->seg = -1;
+  P->t0 = 0;
+  P->ntri = 0;
+  P->mom[0] = 4.0 * hu * hv;
+  P->mom[1] = 0.0;
+  P->mom[2] = 0.0;
+  P->mom[3] = P->mom[0] * hu * hu / 3.0;
+  P->mom[4] = 0.0;
+  P->mom[5] = P->mom[0] * hv * hv / 3.0;
+  for (int a = 0; a < 3; a++) {
+    P->n0[a] = P->n[a];
+    P->nu[a] = 0.0;
+    P->nv[a] = 0.0;
+  }
+  P->uvlo[0] = -hu;
+  P->uvhi[0] = hu;
+  P->uvlo[1] = -hv;
+  P->uvhi[1] = hv;
+
+  const hz_frame idf = {{0.0, 0.0, 0.0}, {1.0, 1.0, 1.0}};
+  P->facet = hz_facettab_add_plane(&ps->ft, &idf, P->n, P->off, -1, 0.0);
+  if (P->facet < 0) return 2;
+
+  const double q[4][2] = {{-hu, -hv}, {hu, -hv}, {hu, hv}, {-hu, hv}};
+  for (int i = 0; i < 4; i++) {
+    ps->bv[(size_t)(ps->nbv + i) * 2 + 0] = q[i][0];
+    ps->bv[(size_t)(ps->nbv + i) * 2 + 1] = q[i][1];
+  }
+  P->l0 = ps->nloopall;
+  P->nloop = 1;
+  ps->nbv += 4;
+  ps->nloopall++;
+  ps->loop[ps->nloopall] = ps->nbv;
+  ps->np++;
+  return 0;
+}
+
 void hz_poly_free(hz_polyset *ps) {
   free(ps->p);
   free(ps->loop);

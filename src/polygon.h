@@ -88,6 +88,17 @@ typedef struct {
 int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg);
 void hz_poly_free(hz_polyset *ps);
 
+/* ПРЯМОУГОЛЬНЫЙ ПОЛИГОН, ДОБАВЛЕННЫЙ К НАБОРУ. Нужен источникам: §2 задаёт
+ * восемь потолочных светильников, а в скачанной сцене источников НЕТ вовсе, и
+ * §1.7 говорит прямо — «источник есть полигон с заданным L_e, отдельной
+ * машинерии нет». Значит светильник обязан войти в набор тем же объектом, что
+ * и стена, а не отдельным типом.
+ * Моменты берутся ЗАМКНУТОЙ ФОРМОЙ (для прямоугольника ∫u² = A·hu²/3), а не
+ * через треугольники: у такого полигона исходных треугольников нет, `ntri = 0`.
+ * `hu`, `hv` — ПОЛУразмеры вдоль eu и ev = n × eu. */
+int hz_poly_add_quad(hz_polyset *ps, const double c[3], const double n[3], const double eu[3],
+                     double hu, double hv, int32_t mtl);
+
 /* Мировая точка по местным (u,v). */
 void hz_poly_world(const hz_poly *p, double u, double v, double x[3]);
 

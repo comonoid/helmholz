@@ -53,9 +53,12 @@ typedef struct {
 } rig;
 
 /* Сцена: два шара в кубе 16³, как в render3, но БЕЗ развёртки. */
-static int rig_init(rig *r, int fac_level) {
+static int rig_init(rig *r, int fac_level, double s) {
   memset(r, 0, sizeof *r);
-  r->fr = (hz_frame){{0, 0, 0}, {1, 1, 1}};
+  /* МАСШТАБ КАДРА `s`: единица дерева есть `s` мировых единиц, и вся мировая
+   * геометрия множится на `s` вместе с ним. Тогда сцена ПОДОБНА исходной, а
+   * радианс подобием не меняется вовсе — отсюда инвариант К80. */
+  r->fr = (hz_frame){{0, 0, 0}, {s, s, s}};
   if (hz_oct_init(&r->t, LOG2N, 0.0)) return 1;
   for (int x = 0; x < NC; x++)
     for (int y = 0; y < NC; y++)
@@ -66,6 +69,11 @@ static int rig_init(rig *r, int fac_level) {
   if (hz_surftab_init(&r->stab) || hz_facettab_init(&r->ftab) || hz_cutmap_init(&r->cmap)) return 1;
   double sc[NB][3] = {{5.6, 9.2, 4.2}, {10.9, 7.4, 3.1}};
   double sr[NB] = {3.0, 1.9};
+  for (int b = 0; b < NB; b++) {
+    for (int a = 0; a < 3; a++)
+      sc[b][a] *= s;
+    sr[b] *= s;
+  }
   memcpy(r->sc, sc, sizeof sc);
   memcpy(r->sr, sr, sizeof sr);
   int32_t f0[NB], nfac[NB];
@@ -178,6 +186,120 @@ static void rig_uniform(rig *r, double L) {
   }
 }
 
+/* РАЗНЫЕ радиансы у СТЕНОК, и это лечение К44 дословно. В однородном поле
+ * неверно выбранная граница даёт то же самое число, и проверка пуста; когда у
+ * каждой стенки свой радианс, промах по стенке виден как ошибка O(1). */
+static void rig_walls(rig *r, const double wl[6], double inner) {
+  for (int32_t f = 0; f < r->m.nf; f++) {
+    const tr3_face *ff = &r->m.f[f];
+    double v = ff->cb < 0 ? wl[~ff->cb] : inner;
+    r->bout[f * 4] = v;
+    r->bout[f * 4 + 1] = r->bout[f * 4 + 2] = r->bout[f * 4 + 3] = 0.0;
+  }
+  for (int32_t e = 0; e < r->cut.nse; e++) {
+    r->sout[e * 4] = inner;
+    r->sout[e * 4 + 1] = r->sout[e * 4 + 2] = r->sout[e * 4 + 3] = 0.0;
+  }
+}
+
+/* ------------------------------- К80: КАРТИНКА НЕ ЗАВИСИТ ОТ ЕДИНИЦ ------- */
+
+/* Сцена, увеличенная вместе с кадром, ПОДОБНА исходной, а радианс подобием не
+ * меняется. Значит два прогона — `u = 1` и `u = 2` при мировой геометрии,
+ * умноженной на 2, — обязаны дать ОДНУ И ТУ ЖЕ картинку.
+ *
+ * Зачем это заведено. `wall_face` считала выход луча из куба МИРОВЫМИ
+ * координатами, сравнивая их с числом ячеек, и брала от них `floor`. При
+ * единичном кадре это верно случайно, и весь проект работал на единичном кадре.
+ * Ошибка вылезла на свипе по размеру ячейки (К68), где кадр обязан меняться,
+ * чтобы комната оставалась той же.
+ *
+ * СТЕНКАМ РАЗДАЮТСЯ РАЗНЫЕ РАДИАНСЫ (К44), иначе промах по стенке невидим. */
+static void t_frame_units(void) {
+  rig a, b;
+  if (rig_init(&a, 1, 1.0) || rig_init(&b, 1, 2.0)) {
+    check(0, "оснастка К80");
+    rig_free(&a);
+    rig_free(&b);
+    return;
+  }
+  const double wl[6] = {0.11, 0.27, 0.43, 0.61, 0.79, 0.97};
+  const double wlp[6] = {0.97, 0.79, 0.61, 0.43, 0.27, 0.11}; /* перестановка */
+  const double inner = 0.5;
+  rig_walls(&a, wl, inner);
+  rig_walls(&b, wl, inner);
+
+  tr3_scene sa = {.tree = &a.t, .fr = a.fr, .st = &a.stab, .ft = &a.ftab, .cm = &a.cmap};
+  tr3_scene sb = {.tree = &b.t, .fr = b.fr, .st = &b.stab, .ft = &b.ftab, .cm = &b.cmap};
+  tr3_gather ga = {.sc = &sa,
+                   .m = &a.m,
+                   .cut = &a.cut,
+                   .bout = a.bout,
+                   .sout = a.sout,
+                   .wallidx = a.wallidx,
+                   .nwall = NC};
+  tr3_gather gb = {.sc = &sb,
+                   .m = &b.m,
+                   .cut = &b.cut,
+                   .bout = b.bout,
+                   .sout = b.sout,
+                   .wallidx = b.wallidx,
+                   .nwall = NC};
+
+  const int W = 96, H = 72;
+  double eye[3] = {8.0, 0.6, 7.2}, at[3] = {8.2, 9.5, 3.6}, up[3] = {0, 0, 1};
+  double eye2[3], at2[3];
+  for (int k = 0; k < 3; k++) {
+    eye2[k] = 2.0 * eye[k];
+    at2[k] = 2.0 * at[k];
+  }
+  tr3_camera ca, cb;
+  check(tr3_camera_look(&ca, eye, at, up, 1.3, W, H) == 0, "камера, u = 1");
+  check(tr3_camera_look(&cb, eye2, at2, up, 1.3, W, H) == 0, "камера, u = 2");
+
+  double worst = 0.0, worst_perm = 0.0;
+  int npix = 0, nwallhit = 0;
+  for (int py = 0; py < H; py++)
+    for (int px = 0; px < W; px++) {
+      double o1[3], d1[3], o2[3], d2[3];
+      tr3_camera_ray(&ca, px, py, o1, d1);
+      tr3_camera_ray(&cb, px, py, o2, d2);
+      double va = tr3_gather_ray(&ga, o1, d1, NULL);
+      double vb = tr3_gather_ray(&gb, o2, d2, NULL);
+      double den = fabs(va) > 0.0 ? fabs(va) : 1.0;
+      double e = fabs(va - vb) / den;
+      if (e > worst) worst = e;
+      npix++;
+      /* попал ли луч в СТЕНКУ (а не в шар) — только там К80 и работает */
+      tr3_hit h;
+      tr3_march(&sa, o1, d1, -1.0, &h);
+      if (!h.hit) nwallhit++;
+    }
+  printf("  [К80] пикселей %d, из них в СТЕНКУ %d; max отн. расхождение u=1 против u=2: %.3e\n",
+         npix, nwallhit, worst);
+  check(nwallhit > 500, "лучей, доходящих до стенки, достаточно — иначе проверка пуста");
+  check(worst < 1e-13, "К80: картинка НЕ ЗАВИСИТ от выбора единиц дерева");
+
+  /* НЕГАТИВНЫЙ КОНТРОЛЬ: та же пара, но у второй сцены радиансы стенок
+   * ПЕРЕСТАВЛЕНЫ. Если метрика к выбору стенки слепа, расхождение останется
+   * нулевым — и тогда проверка выше не проверяет ничего (К44). */
+  rig_walls(&b, wlp, inner);
+  for (int py = 0; py < H; py++)
+    for (int px = 0; px < W; px++) {
+      double o1[3], d1[3], o2[3], d2[3];
+      tr3_camera_ray(&ca, px, py, o1, d1);
+      tr3_camera_ray(&cb, px, py, o2, d2);
+      double va = tr3_gather_ray(&ga, o1, d1, NULL);
+      double vb = tr3_gather_ray(&gb, o2, d2, NULL);
+      double e = fabs(va - vb);
+      if (e > worst_perm) worst_perm = e;
+    }
+  printf("  [К80] негативный контроль (радиансы стенок переставлены): max |Δ| %.3e\n", worst_perm);
+  check(worst_perm > 0.1, "негативный контроль: промах по СТЕНКЕ обязан быть виден");
+  rig_free(&a);
+  rig_free(&b);
+}
+
 int main(void) {
   printf("=== ПРЕДСКАЗАНИЯ (до единого результата) ===\n");
   printf("  Ф1 ПЕЧЬ ДЛЯ ЗЕРКАЛ: в ОДНОРОДНОМ поле зеркало с ρ=1 НЕВИДИМО —\n");
@@ -190,10 +312,18 @@ int main(void) {
   printf("  НК1 отражать по нормали ФАСЕТА вместо примитива ⇒ Ф1 ОБЯЗАН\n");
   printf("      сломаться, и тем сильнее, чем грубее фасетизация\n");
   printf("  НК2 не умножать на ρ на отскоке ⇒ Ф3 обязан дать 1.0 вместо 0.9^k\n");
+  printf("  К80: картинка НЕ зависит от выбора единиц дерева (сцена, увеличенная\n");
+  printf("     вместе с кадром, ПОДОБНА исходной) — отн. расхождение ≤1e-13;\n");
+  printf("     негативный контроль: переставить радиансы стенок ⇒ |Δ| > 0.1\n");
+  printf("  К80: картинка НЕ зависит от выбора единиц дерева (подобная сцена)\n");
+  printf("     — отн. расхождение <= 1e-13; негативный контроль: переставить\n");
+  printf("     радиансы стенок ==> |D| > 0.1\n");
   printf("=== РЕЗУЛЬТАТЫ ===\n");
 
+  t_frame_units();
+
   rig r;
-  if (rig_init(&r, 2)) {
+  if (rig_init(&r, 2, 1.0)) {
     check(0, "оснастка");
     rig_free(&r);
     printf("FAILURES\n");
@@ -447,7 +577,7 @@ int main(void) {
     double prev_mean = 0.0;
     for (int lev = 1; lev <= 3; lev++) {
       rig r2;
-      if (rig_init(&r2, lev)) {
+      if (rig_init(&r2, lev, 1.0)) {
         rig_free(&r2);
         continue;
       }

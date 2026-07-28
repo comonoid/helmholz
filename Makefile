@@ -104,7 +104,7 @@ check:
 	  tests/test_octfmt.c src/cut/poly3.c tests/test_poly3.c src/cut/surf.c tests/test_surf.c tests/test_facet.c src/cut/qef.c tests/test_qef.c src/cut/dc.c tests/test_dc.c tests/test_dcwalk.c \
 	  tests/test_asm3d.c tests/test_solver3d.c tests/test_mg3d.c tools/render.c \
 	  tools/carrier1d.c tools/fdtd.c src/carrier.c tools/carrier_scale.c tools/carrier_proj.c \
-  tests/test_carrier.c tests/test_carrier_op.c tools/carrier_term.c tools/scene2d.c tools/carrier_shell.c tools/carrier_angle.c tools/carrier_cascade.c tools/carrier_solve.c tools/carrier_iter.c tools/carrier_incr.c src/carrier2d.c tests/test_carrier2d.c src/cut2d.c tests/test_cut2d.c tools/carrier_cut2d.c src/bessel.c tests/test_bessel.c src/mie2d.c tests/test_mie2d.c src/dtn2d.c tests/test_dtn2d.c tools/slab2d.c src/nitsche2d.c tests/test_nitsche2d.c tools/slab2d.c tools/tdg2d.c tools/slice2d.c src/transport/sweep.c tests/test_sweep.c src/transport/quad.c src/transport/rte2d.c tests/test_rte2d.c src/transport/ray3.c src/transport/cam3.c tests/test_ray3.c src/transport/scat1d.c tests/test_scat1d.c src/transport/tet3.c tests/test_tet3.c src/transport/dirs3.c src/transport/mesh3.c src/transport/sweep3.c tests/test_sweep3.c src/transport/gather3.c tests/test_gather3.c tools/lod3.c
+  tests/test_carrier.c tests/test_carrier_op.c tools/carrier_term.c tools/scene2d.c tools/carrier_shell.c tools/carrier_angle.c tools/carrier_cascade.c tools/carrier_solve.c tools/carrier_iter.c tools/carrier_incr.c src/carrier2d.c tests/test_carrier2d.c src/cut2d.c tests/test_cut2d.c tools/carrier_cut2d.c src/bessel.c tests/test_bessel.c src/mie2d.c tests/test_mie2d.c src/dtn2d.c tests/test_dtn2d.c tools/slab2d.c src/nitsche2d.c tests/test_nitsche2d.c tools/slab2d.c tools/tdg2d.c tools/slice2d.c src/transport/sweep.c tests/test_sweep.c src/transport/quad.c src/transport/rte2d.c tests/test_rte2d.c src/transport/ray3.c src/transport/cam3.c tests/test_ray3.c src/transport/scat1d.c tests/test_scat1d.c src/transport/tet3.c tests/test_tet3.c src/transport/dirs3.c src/transport/mesh3.c src/transport/sweep3.c tests/test_sweep3.c src/transport/gather3.c tests/test_gather3.c tools/lod3.c tools/pfmdiff.c
 
 .PHONY: all test test-slow check check-fp
 
@@ -273,6 +273,13 @@ build/test_gather3: tests/test_gather3.c src/transport/gather3.c src/transport/g
 
 build/lod3: tools/lod3.c src/octree.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/lod3.c src/octree.c -lm'
+
+# СРАВНЕНИЕ ДВУХ БУФЕРОВ РАДИАНСА (PFM), оснастка замеров К65 и К68.
+# Метрика берётся на РАДИАНСЕ, а не на картинке: К19 измерила, что тон-маппинг
+# ошибку съедает. Кромки (К20) докладываются ОТДЕЛЬНО, а не подмешиваются в
+# среднее — на силуэте расхождение равно всей яркости при любой схеме.
+build/pfmdiff: tools/pfmdiff.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pfmdiff.c -lm'
 
 # ПОЛНОЦЕННЫЙ РЕНДЕР линии переноса. Картинки пишутся в img/, а НЕ в build/:
 # build — только артефакты сборки, и мусорить в нём нельзя.

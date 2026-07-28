@@ -140,7 +140,8 @@ static int scene_build(scene *s, int ksub) {
   s->sigma = calloc((size_t)s->tree.n, sizeof(double));
   if (s->sigma == NULL) return 1;
   s->sc.tree = &s->tree;
-  s->sc.sigma = NULL; /* вакуум по умолчанию */
+  s->sc.sigma = NULL;       /* вакуум по умолчанию */
+  s->sc.nsigma = s->tree.n; /* К28: длина заявляется рядом с массивом */
   s->sc.st = &s->st;
   s->sc.ft = &s->ft;
   s->sc.cm = &s->cm;
@@ -317,6 +318,7 @@ static void t_march_chord(void) {
     hz_frame fr = {{0, 0, 0}, {1.0, 1.0, aniso ? 4.0 : 1.0}};
     sc.fr = fr;
     sc.sigma = sig;
+    sc.nsigma = t.n;
     double o[3] = {-5.0, 3.3, (aniso ? 4.0 : 1.0) * 2.0};
     double at[3] = {40.0, 21.7, (aniso ? 4.0 : 1.0) * 29.0};
     double d[3];
@@ -440,6 +442,7 @@ static void t_tau_vs_boolean(void) {
       for (int z = 9; z < 14; z++)
         s.sigma[hz_oct_leaf(&s.tree, x, y, z)] = 0.2;
   s.sc.sigma = s.sigma;
+  s.sc.nsigma = s.tree.n;
 
   double o[3] = {16.0, 16.0, 30.0}, d[3] = {0, 0, -1};
   tr3_hit h;
@@ -664,6 +667,43 @@ static void t_image(int ksub, int *nbad_out, double *mean_out) {
 
 /* -------------------------------------------------------------------------- */
 
+/* ------------------------------------------------- К28: ДЛИНА `sigma` ----- */
+
+/* Прежде `sigma` объявлялась как `[tree->n]` и читалась как `sigma[ni]`, а
+ * длина нигде не сверялась: во всех строителях массив выделялся последним, и
+ * это держалось на ПОРЯДКЕ ВЫЗОВОВ, то есть на соглашении. Если дерево дорастёт
+ * после выделения (`hz_oct_set_box` умеет добавлять узлы), чтение уедет за
+ * границу МОЛЧА — санитайзер поймал бы это только на прогоне, где такой порядок
+ * действительно случился.
+ *
+ * ПРОВЕРКА ДВУСТОРОННЯЯ, И ВТОРАЯ ПОЛОВИНА ОБЯЗАТЕЛЬНА: без неё «отвергнуто»
+ * удовлетворяется реализацией `return TR3_MARCH_ESIGMA;` на любом входе. */
+static void t_sigma_len(void) {
+  scene s;
+  if (scene_build(&s, 1)) {
+    check(0, "сцена");
+    return;
+  }
+  s.sc.sigma = s.sigma;
+  s.sc.nsigma = s.tree.n;
+
+  double o[3] = {2.0, 2.0, 30.0}, d[3] = {0, 0, -1};
+  tr3_hit h;
+  check(tr3_march(&s.sc, o, d, -1.0, &h) == 0, "К28: годная длина — марш выполняется");
+
+  /* ровно ОДНО поле испорчено, всё остальное то же самое */
+  s.sc.nsigma = s.tree.n - 1;
+  int rc = tr3_march(&s.sc, o, d, -1.0, &h);
+  printf("  [К28] nsigma = n−1 -> код %d (ожидался %d)\n", rc, TR3_MARCH_ESIGMA);
+  check(rc == TR3_MARCH_ESIGMA, "К28: короткий массив ОТВЕРГНУТ, а не прочитан за границей");
+
+  /* и вакуум по-прежнему законен без всякой длины */
+  s.sc.sigma = NULL;
+  s.sc.nsigma = 0;
+  check(tr3_march(&s.sc, o, d, -1.0, &h) == 0, "К28: sigma = NULL длины не требует");
+  scene_free(&s);
+}
+
 int main(void) {
   printf("=== ПРЕДСКАЗАНИЯ (до единого результата) ===\n");
   printf("  1 марш: τ равна длине куска луча в слое до 1e-13, в том числе на\n");
@@ -677,8 +717,10 @@ int main(void) {
   printf("  булева видимость вместо exp(−τ) -> разница O(1) (К16/С4)\n");
   printf("  теневой марш выключен -> тень на плоскости ОБЯЗАНА пропасть\n");
   printf("  К19: та же ошибка после тон-маппинга становится неразличимой\n");
+  printf("  К28: nsigma короче дерева -> марш ОТВЕРГНУТ кодом, а не читает за границей\n");
   printf("=== РЕЗУЛЬТАТЫ ===\n");
 
+  t_sigma_len();
   t_two_primitives();
   t_march_chord();
   t_hit();

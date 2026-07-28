@@ -38,8 +38,13 @@ static double now(void) {
   return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
-#define LOG2N 4
-#define NC (1 << LOG2N)
+/* РАЗМЕР КОМНАТЫ В МИРЕ — ФИКСИРОВАН, а число ячеек параметр (К68).
+ * Свип по размеру элемента обязан менять ТОЛЬКО сетку: если менять `log2n` не
+ * трогая кадр, вырастет сама комната, и сравнивались бы РАЗНЫЕ сцены. Поэтому
+ * единица дерева есть `ROOM / nc`, и мир остаётся тем же при любом `log2n`.
+ * Уровень фасетизации сфер тоже держится постоянным — иначе за один свип
+ * менялись бы две вещи сразу, и это ровно ошибка К53. */
+#define ROOM 16.0
 
 /* УЧЁТ ХОЛОДНОГО СТАРТА ПО ЭТАПАМ, И ЭТО ТРЕБОВАНИЕ, А НЕ УДОБСТВО.
  * Прежде «холодным стартом» звалась ОДНА развёртка, а вся расстановка сцены —
@@ -97,17 +102,29 @@ int main(int argc, char **argv) {
   int nframe = argc > 7 ? atoi(argv[7]) : 1;
   /* ОГРАНЁННОЕ ТЕЛО: примитив выключен, тело есть многогранник (см. ray3.h) */
   int facet_only = argc > 8 ? atoi(argv[8]) : 0;
+  /* К68: РАЗМЕР ЭЛЕМЕНТА — ПАРАМЕТР, А НЕ КОНСТАНТА. Мир при этом не меняется
+   * (см. ROOM выше), поэтому свип по `log2n` меряет ровно сетку. */
+  int log2n = argc > 9 ? atoi(argv[9]) : 4;
+  /* К65: ограничитель положительности параметром — надо измерить, активен ли он
+   * на СХОДИМОСТИ рендерной сцены и меняет ли ответ. От этого зависит, нужен ли
+   * Крылову внешний нелинейный цикл (этап B плана перехода). */
+  int limiter = argc > 10 ? atoi(argv[10]) : 1;
+  if (log2n < 1 || log2n > 8) {
+    fprintf(stderr, "log2n вне [1,8]\n");
+    return 1;
+  }
+  const int nc = 1 << log2n;
 
   stage_mark();
-  hz_frame fr = {{0, 0, 0}, {1, 1, 1}};
+  hz_frame fr = {{0, 0, 0}, {ROOM / nc, ROOM / nc, ROOM / nc}};
   hz_octree t;
-  if (hz_oct_init(&t, LOG2N, 0.0)) return 1;
+  if (hz_oct_init(&t, log2n, 0.0)) return 1;
   /* РАВНОМЕРНОЕ дробление: условие 1:1 у разрезанных ячеек (cut3) требует, чтобы
    * грань сетки совпадала с гранью коробки. Градуированную сетку у поверхности
    * пришлось бы ещё и обрезать прямоугольником — это отдельная работа. */
-  for (int x = 0; x < NC; x++)
-    for (int y = 0; y < NC; y++)
-      for (int z = 0; z < NC; z++) {
+  for (int x = 0; x < nc; x++)
+    for (int y = 0; y < nc; y++)
+      for (int z = 0; z < nc; z++) {
         int lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
         hz_oct_set_box(&t, lo, hi, 1.0);
       }
@@ -141,12 +158,12 @@ int main(int argc, char **argv) {
   typedef struct {
     int32_t cell, f[HZ_P3_MAXH], nf;
   } rec_t;
-  rec_t *recs = calloc((size_t)NC * NC * NC, sizeof(rec_t));
+  rec_t *recs = calloc((size_t)nc * (size_t)nc * (size_t)nc, sizeof(rec_t));
   if (recs == NULL) return 1;
   int nrec = 0, nboth = 0;
-  for (int x = 0; x < NC; x++)
-    for (int y = 0; y < NC; y++)
-      for (int z = 0; z < NC; z++) {
+  for (int x = 0; x < nc; x++)
+    for (int y = 0; y < nc; y++)
+      for (int z = 0; z < nc; z++) {
         int32_t lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
         int32_t sel[HZ_P3_MAXH];
         int used = -1, ns = 0;
@@ -192,9 +209,9 @@ int main(int argc, char **argv) {
   /* Г38: маска полных ячеек строится ОТДЕЛЬНО — в боковой таблице их нет */
   uint8_t *solid = calloc((size_t)mesh.ncell, 1);
   if (solid == NULL) return 1;
-  for (int x = 0; x < NC; x++)
-    for (int y = 0; y < NC; y++)
-      for (int z = 0; z < NC; z++) {
+  for (int x = 0; x < nc; x++)
+    for (int y = 0; y < nc; y++)
+      for (int z = 0; z < nc; z++) {
         int32_t lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
         int32_t sel[HZ_P3_MAXH];
         for (int b = 0; b < NB; b++)
@@ -247,7 +264,7 @@ int main(int argc, char **argv) {
                       .sig_s = sig_s,
                       .wall_rho = wr,
                       .wall_emit = we,
-                      .limiter = 1};
+                      .limiter = limiter};
   double *phi = calloc((size_t)mesh.ncell * 4, sizeof(double));
   if (phi == NULL) return 1;
   tr3_stats st;
@@ -267,6 +284,29 @@ int main(int argc, char **argv) {
          st.pin, st.pout, st.pabs, st.psin, st.psout);
   printf("        невязка %.3e, она же на втекшее %.3e\n", st.balance,
          st.pin > 0.0 ? fabs(st.balance) / st.pin : 0.0);
+  /* К65: САМА ВЕЛИЧИНА, РАДИ КОТОРОЙ ОГРАНИЧИТЕЛЬ СТОИТ. Картинка её не видит:
+   * она читает хранимое на ПОВЕРХНОСТЯХ, а ограничитель следит за полем в
+   * ОБЪЁМЕ. Печатается минимум φ по углам ячеек — то самое, что уходит в минус
+   * около границы тени, — и минимум хранимого. Без этих двух чисел вопрос
+   * «нужен ли Крылову внешний нелинейный цикл» решается на глаз. */
+  {
+    double phimin = 1e300;
+    int nneg = 0;
+    for (int32_t c = 0; c < mesh.ncell; c++) {
+      for (int k = 0; k < 8; k++) {
+        double v = phi[4 * c];
+        for (int a = 0; a < 3; a++)
+          v += ((k >> a) & 1 ? 0.5 : -0.5) * phi[4 * c + 1 + a];
+        if (v < phimin) phimin = v;
+        if (v < 0.0) {
+          nneg++;
+          break;
+        }
+      }
+    }
+    printf("К65: min φ по углам ячеек %.6e, ячеек с отрицательным углом %d из %d\n", phimin, nneg,
+           mesh.ncell);
+  }
   if (rc != 0) return 1;
 
   /* --- сбор по пикселю --- */
@@ -287,9 +327,9 @@ int main(int argc, char **argv) {
    * перебором всех 13056 граней на КАЖДЫЙ пиксель — это 2.7e10 сравнений на
    * кадр, и сбор стоил 3930 нс на луч при разумных 100-200. Грани лежат на
    * ЦЕЛОЧИСЛЕННОЙ сетке, поэтому индекс прямой: (стенка, u, v) -> грань. */
-  int32_t *wallidx = calloc((size_t)6 * NC * NC, sizeof(int32_t));
+  int32_t *wallidx = calloc((size_t)6 * (size_t)nc * (size_t)nc, sizeof(int32_t));
   if (wallidx == NULL) return 1;
-  for (int32_t i = 0; i < 6 * NC * NC; i++)
+  for (int32_t i = 0; i < 6 * (int32_t)nc * (int32_t)nc; i++)
     wallidx[i] = -1;
   for (int32_t f = 0; f < mesh.nf; f++) {
     const tr3_face *ff = &mesh.f[f];
@@ -297,7 +337,7 @@ int main(int argc, char **argv) {
     int wl = (int)(~ff->cb);
     for (int32_t a = ff->lo[0]; a < ff->hi[0]; a++)
       for (int32_t b = ff->lo[1]; b < ff->hi[1]; b++)
-        wallidx[((int32_t)wl * NC + a) * NC + b] = f;
+        wallidx[((int32_t)wl * nc + a) * nc + b] = f;
   }
 
   stage_add("индекс граничных граней", 0);
@@ -314,7 +354,7 @@ int main(int argc, char **argv) {
                    .facet_spec = spec > 0.0 ? fspec : NULL,
                    .nfacet = ftab.n,
                    .wallidx = wallidx,
-                   .nwall = NC,
+                   .nwall = nc,
                    .maxbounce = maxbounce};
   long nbtot = 0;
   int nbmax = 0;

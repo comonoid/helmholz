@@ -65,6 +65,18 @@ typedef struct {
   int per_frame; /* 1 — повторяется при движении камеры */
 } stage;
 
+/* Запись боковой таблицы: ячейка и её веер фасетов. Вынесена на уровень файла
+ * ради компаратора `qsort` — вставками сортировка была `O(n^2)` и на мелкой
+ * сетке съедала десятки минут ПЕРЕД развёрткой. */
+typedef struct {
+  int32_t cell, f[HZ_P3_MAXH], nf;
+} rec_t;
+
+static int rec_cmp(const void *a, const void *b) {
+  const rec_t *x = a, *y = b;
+  return x->cell < y->cell ? -1 : (x->cell > y->cell ? 1 : 0);
+}
+
 #define NSTAGE 12
 static stage g_st[NSTAGE];
 static int g_ns = 0;
@@ -155,9 +167,6 @@ int main(int argc, char **argv) {
   stage_add("фасетизация примитивов", 0);
 
   /* боковая таблица: ключи ОБЯЗАНЫ идти по возрастанию (Г45) */
-  typedef struct {
-    int32_t cell, f[HZ_P3_MAXH], nf;
-  } rec_t;
   rec_t *recs = calloc((size_t)nc * (size_t)nc * (size_t)nc, sizeof(rec_t));
   if (recs == NULL) return 1;
   int nrec = 0, nboth = 0;
@@ -188,15 +197,13 @@ int main(int argc, char **argv) {
           recs[nrec].f[j] = sel[j];
         nrec++;
       }
-  for (int i = 1; i < nrec; i++) { /* сортировка вставками по ключу */
-    rec_t tmp = recs[i];
-    int j = i - 1;
-    while (j >= 0 && recs[j].cell > tmp.cell) {
-      recs[j + 1] = recs[j];
-      j--;
-    }
-    recs[j + 1] = tmp;
-  }
+  /* СОРТИРОВКА `qsort`, А НЕ ВСТАВКАМИ, И ЭТО НЕ УКРАШЕНИЕ.
+   * Вставками было `O(n^2)` при записи в 392 байта. На сетке 16^3 записей около
+   * тысячи, и это не мешало; на 64^3 их десятки тысяч, и построитель сцены
+   * вставал на десятки минут ПЕРЕД развёрткой — то есть свип по размеру ячейки
+   * (К68) упирался в оснастку, а не в схему. Ключи различны (одна запись на
+   * ячейку), поэтому порядок совпадает с прежним, а не просто похож. */
+  qsort(recs, (size_t)nrec, sizeof(rec_t), rec_cmp);
   for (int i = 0; i < nrec; i++)
     if (hz_cutmap_add(&cmap, recs[i].cell, recs[i].f, recs[i].nf) != 0) return 1;
   free(recs);

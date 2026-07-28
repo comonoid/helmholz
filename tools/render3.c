@@ -78,6 +78,67 @@ static int rec_cmp(const void *a, const void *b) {
   return x->cell < y->cell ? -1 : (x->cell > y->cell ? 1 : 0);
 }
 
+/* ЭТАП A, ШАГ 1: ДЕРЕВО ПО ПРАВИЛУ `L = εR` СО СХЛОПЫВАНИЕМ ПУСТОТЫ.
+ *
+ * Разделять этап A надвое стало можно после того, как К52 закрыта замером:
+ * при схлопнутой пустоте число ячеек ВДОЛЬ ЛУЧА почти не растёт (`18 → 21 → 22`
+ * при учетверении `ε`), тогда как «`23 → 7500`» принадлежало ОБЪЁМНОМУ закону.
+ * Значит LOD можно ставить при СТАРОМ, маршевом сборе — и тогда сбор остаётся
+ * эталоном, а меняется ровно одна вещь.
+ *
+ * Дробится узел, только если в нём ЕСТЬ поверхность (стенка куба либо шар) и он
+ * крупнее `εR` в БЛИЖНЕЙ своей точке. Ближняя, а не центр: правило есть потолок
+ * на размер элемента, и нарушать его хоть где-то внутри узла нельзя. */
+static int box_has_surface(const int lo[3], int size, int world, const double sc[2][3],
+                           const double sr[2], double u) {
+  for (int a = 0; a < 3; a++)
+    if (lo[a] == 0 || lo[a] + size == world) return 1;
+  for (int b = 0; b < 2; b++) {
+    double dmin2 = 0.0, dmax2 = 0.0;
+    for (int a = 0; a < 3; a++) {
+      double l = (double)lo[a] * u, h = (double)(lo[a] + size) * u;
+      double dl = sc[b][a] - l, dh = h - sc[b][a];
+      double far = dl > dh ? dl : dh;
+      dmax2 += far * far;
+      double nr = 0.0;
+      if (sc[b][a] < l)
+        nr = l - sc[b][a];
+      else if (sc[b][a] > h)
+        nr = sc[b][a] - h;
+      dmin2 += nr * nr;
+    }
+    if (dmin2 <= sr[b] * sr[b] && dmax2 >= sr[b] * sr[b]) return 1;
+  }
+  return 0;
+}
+
+static void lod_build(hz_octree *t, const int lo[3], int size, int world, double u,
+                      const double eye[3], double eps, const double sc[2][3], const double sr[2]) {
+  int hi[3] = {lo[0] + size, lo[1] + size, lo[2] + size};
+  if (!box_has_surface(lo, size, world, sc, sr, u)) {
+    hz_oct_set_box(t, lo, hi, 1.0);
+    return;
+  }
+  double near2 = 0.0;
+  for (int a = 0; a < 3; a++) {
+    double l = (double)lo[a] * u, h = (double)hi[a] * u, dd = 0.0;
+    if (eye[a] < l)
+      dd = l - eye[a];
+    else if (eye[a] > h)
+      dd = eye[a] - h;
+    near2 += dd * dd;
+  }
+  if (size <= 1 || (double)size * u <= eps * sqrt(near2)) {
+    hz_oct_set_box(t, lo, hi, 1.0);
+    return;
+  }
+  int h2 = size / 2;
+  for (int k = 0; k < 8; k++) {
+    int c[3] = {lo[0] + ((k & 1) ? h2 : 0), lo[1] + ((k & 2) ? h2 : 0), lo[2] + ((k & 4) ? h2 : 0)};
+    lod_build(t, c, h2, world, u, eye, eps, sc, sr);
+  }
+}
+
 #define NSTAGE 12
 static stage g_st[NSTAGE];
 static int g_ns = 0;
@@ -150,6 +211,9 @@ int main(int argc, char **argv) {
    * `ρ → 1` встаёт (С1, К37); Крылов на печи держал шесть проходов при любой
    * толщине. Проверяется это только свипом по альбедо. */
   double albs = argc > 16 ? atof(argv[16]) : 1.0;
+  /* ЭТАП A, ШАГ 1: угловой размер пикселя для правила `L = εR`; 0 — равномерная
+   * сетка, как прежде. Разделять A надвое стало можно после К52. */
+  double lodeps = argc > 21 ? atof(argv[21]) : 0.0;
   if (log2n < 1 || log2n > 8) {
     fprintf(stderr, "log2n вне [1,8]\n");
     return 1;
@@ -160,15 +224,24 @@ int main(int argc, char **argv) {
   hz_frame fr = {{0, 0, 0}, {ROOM / nc, ROOM / nc, ROOM / nc}};
   hz_octree t;
   if (hz_oct_init(&t, log2n, 0.0)) return 1;
-  /* РАВНОМЕРНОЕ дробление: условие 1:1 у разрезанных ячеек (cut3) требует, чтобы
-   * грань сетки совпадала с гранью коробки. Градуированную сетку у поверхности
-   * пришлось бы ещё и обрезать прямоугольником — это отдельная работа. */
-  for (int x = 0; x < nc; x++)
-    for (int y = 0; y < nc; y++)
-      for (int z = 0; z < nc; z++) {
-        int lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
-        hz_oct_set_box(&t, lo, hi, 1.0);
-      }
+  /* РАВНОМЕРНОЕ дробление либо LOD по `L = εR` (этап A, шаг 1).
+   * При равномерном условие 1:1 у разрезанных ячеек (cut3) выполняется само;
+   * при LOD оно ПРЕДСКАЗАННО нарушается (К54), и это замеряется, а не
+   * обходится. */
+  if (lodeps > 0.0) {
+    double lsc[2][3] = {{5.6, 9.2, 4.2}, {10.9, 7.4, 3.1}};
+    double lsr[2] = {3.0, 1.9};
+    double leye[3] = {8.0, 0.6, 7.2};
+    int z0[3] = {0, 0, 0};
+    lod_build(&t, z0, nc, nc, ROOM / nc, leye, lodeps, lsc, lsr);
+  } else {
+    for (int x = 0; x < nc; x++)
+      for (int y = 0; y < nc; y++)
+        for (int z = 0; z < nc; z++) {
+          int lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
+          hz_oct_set_box(&t, lo, hi, 1.0);
+        }
+  }
 
   stage_add("октодерево", 0);
 
@@ -199,33 +272,66 @@ int main(int argc, char **argv) {
   rec_t *recs = calloc((size_t)nc * (size_t)nc * (size_t)nc, sizeof(rec_t));
   if (recs == NULL) return 1;
   int nrec = 0, nboth = 0;
-  for (int x = 0; x < nc; x++)
-    for (int y = 0; y < nc; y++)
-      for (int z = 0; z < nc; z++) {
-        int32_t lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
-        int32_t sel[HZ_P3_MAXH];
-        int used = -1, ns = 0;
-        for (int b = 0; b < NB; b++) {
-          int32_t s2[HZ_P3_MAXH];
-          int k2 = hz_facets_for_box(&ftab, f0[b], nfac[b], lo, hi, s2, HZ_P3_MAXH);
-          if (k2 <= 0) continue;
-          if (used >= 0) {
-            nboth++;
-            continue;
-          }
-          used = b;
-          ns = k2;
-          for (int j = 0; j < k2; j++)
-            sel[j] = s2[j];
+  /* ОБХОД ИДЁТ ПО ЛИСТЬЯМ, А НЕ ПО ЕДИНИЧНЫМ ЯЧЕЙКАМ — К93.
+   *
+   * Прежде здесь стоял тройной цикл по `x, y, z` с шагом единица, и это молча
+   * предполагало РАВНОМЕРНОЕ дерево. На градуированном несколько единичных
+   * позиций дают ОДИН лист, ключ в боковой таблице повторяется, и
+   * `hz_cutmap_add` возвращает 2 (Г45) — а `render3` на это отвечал `return 1`
+   * БЕЗ ЕДИНОГО СЛОВА на выход. То есть построитель сцены был равномерным по
+   * построению, и обнаружилось это только на первом же LOD-дереве.
+   *
+   * Отбор фасетов при этом ведётся по КОРОБКЕ ЛИСТА, а не по единичной ячейке:
+   * у крупного листа она крупная, и `hz_facets_for_box` обязан видеть именно её. */
+  {
+    int32_t stack[64][4]; /* lo[3] и size; глубина дерева заведомо меньше */
+    int sp = 0;
+    stack[sp][0] = stack[sp][1] = stack[sp][2] = 0;
+    stack[sp][3] = nc;
+    sp = 1;
+    while (sp > 0) {
+      sp--;
+      int32_t blo[3] = {stack[sp][0], stack[sp][1], stack[sp][2]};
+      int32_t bsz = stack[sp][3];
+      int32_t rlo[3], rsz = 1;
+      int32_t ni = hz_oct_leaf_box(&t, blo[0], blo[1], blo[2], rlo, &rsz);
+      if (ni < 0) continue;
+      if (rsz < bsz) { /* лист мельче — спускаемся */
+        int32_t h2 = bsz / 2;
+        for (int k = 0; k < 8; k++) {
+          stack[sp][0] = blo[0] + ((k & 1) ? h2 : 0);
+          stack[sp][1] = blo[1] + ((k & 2) ? h2 : 0);
+          stack[sp][2] = blo[2] + ((k & 4) ? h2 : 0);
+          stack[sp][3] = h2;
+          sp++;
         }
-        if (ns <= 0) continue;
-        int32_t ni = hz_oct_leaf(&t, x, y, z);
-        recs[nrec].cell = ni;
-        recs[nrec].nf = ns;
-        for (int j = 0; j < ns; j++)
-          recs[nrec].f[j] = sel[j];
-        nrec++;
+        continue;
       }
+      int32_t lo[3] = {rlo[0], rlo[1], rlo[2]};
+      int32_t hi[3] = {rlo[0] + rsz, rlo[1] + rsz, rlo[2] + rsz};
+      int32_t sel[HZ_P3_MAXH];
+      int used = -1, ns = 0;
+      for (int b = 0; b < NB; b++) {
+        int32_t s2[HZ_P3_MAXH];
+        int k2 = hz_facets_for_box(&ftab, f0[b], nfac[b], lo, hi, s2, HZ_P3_MAXH);
+        if (k2 <= 0) continue;
+        if (used >= 0) {
+          nboth++;
+          continue;
+        }
+        used = b;
+        ns = k2;
+        for (int j = 0; j < k2; j++)
+          sel[j] = s2[j];
+      }
+      if (ns <= 0) continue;
+      recs[nrec].cell = ni;
+      recs[nrec].nf = ns;
+      for (int j = 0; j < ns; j++)
+        recs[nrec].f[j] = sel[j];
+      nrec++;
+    }
+  }
   /* СОРТИРОВКА `qsort`, А НЕ ВСТАВКАМИ, И ЭТО НЕ УКРАШЕНИЕ.
    * Вставками было `O(n^2)` при записи в 392 байта. На сетке 16^3 записей около
    * тысячи, и это не мешало; на 64^3 их десятки тысяч, и построитель сцены
@@ -234,7 +340,14 @@ int main(int argc, char **argv) {
    * ячейку), поэтому порядок совпадает с прежним, а не просто похож. */
   qsort(recs, (size_t)nrec, sizeof(rec_t), rec_cmp);
   for (int i = 0; i < nrec; i++)
-    if (hz_cutmap_add(&cmap, recs[i].cell, recs[i].f, recs[i].nf) != 0) return 1;
+    if (hz_cutmap_add(&cmap, recs[i].cell, recs[i].f, recs[i].nf) != 0) {
+      /* К93: МОЛЧА УМИРАТЬ НЕЛЬЗЯ. Прежде здесь стоял голый `return 1`, и
+       * прогон завершался без единого слова — а причина (повторный ключ на
+       * градуированном дереве) видна только отсюда. */
+      fprintf(stderr, "боковая таблица отвергла запись %d (ячейка %d): ключи не возрастают\n", i,
+              recs[i].cell);
+      return 1;
+    }
   free(recs);
 
   stage_add("боковая таблица (отбор фасетов по ячейкам)", 0);
@@ -242,18 +355,18 @@ int main(int argc, char **argv) {
   tr3_mesh mesh;
   if (tr3_mesh_build(&mesh, &t, &fr)) return 1;
   stage_add("сетка ГРАНЕЙ над деревом", 0);
-  /* Г38: маска полных ячеек строится ОТДЕЛЬНО — в боковой таблице их нет */
+  /* Г38: маска полных ячеек строится ОТДЕЛЬНО — в боковой таблице их нет.
+   * Обход тоже по ЛИСТЬЯМ (К93): на градуированном дереве единичные ячейки
+   * дают один и тот же лист, и коробка отбора обязана быть коробкой ЛИСТА. */
   uint8_t *solid = calloc((size_t)mesh.ncell, 1);
   if (solid == NULL) return 1;
-  for (int x = 0; x < nc; x++)
-    for (int y = 0; y < nc; y++)
-      for (int z = 0; z < nc; z++) {
-        int32_t lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
-        int32_t sel[HZ_P3_MAXH];
-        for (int b = 0; b < NB; b++)
-          if (hz_facets_for_box(&ftab, f0[b], nfac[b], lo, hi, sel, HZ_P3_MAXH) == 0)
-            solid[mesh.cellof[hz_oct_leaf(&t, x, y, z)]] = 1;
-      }
+  for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+    int32_t lo[3] = {mesh.clo[ci][0], mesh.clo[ci][1], mesh.clo[ci][2]};
+    int32_t hi[3] = {lo[0] + mesh.csize[ci], lo[1] + mesh.csize[ci], lo[2] + mesh.csize[ci]};
+    int32_t sel[HZ_P3_MAXH];
+    for (int b = 0; b < NB; b++)
+      if (hz_facets_for_box(&ftab, f0[b], nfac[b], lo, hi, sel, HZ_P3_MAXH) == 0) solid[ci] = 1;
+  }
   stage_add("маска полных ячеек (Г38)", 0);
   tr3_cut cut;
   if (tr3_cut_build(&cut, &mesh, &ftab, &cmap, solid)) return 1;

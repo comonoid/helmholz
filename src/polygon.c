@@ -415,6 +415,16 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
     P->seg = r;
     P->t0 = w.poff[r];
     P->ntri = w.poff[r + 1] - w.poff[r];
+    /* ПУСТОЙ УЧАСТОК ЗАКОНЕН, и его надо пропустить ЯВНО. Сегментация Ш1
+     * пустых не выдаёт, поэтому до огрубления (Ш7) этой ветки не бывало; там
+     * же группа может остаться без треугольников, и тогда `tri[t0]` — чтение
+     * за концом массива (у последнего участка `t0 == nt`). */
+    if (P->ntri <= 0) {
+      P->nloop = 0;
+      P->l0 = ps->nloopall;
+      P->facet = -1;
+      continue;
+    }
     P->dmax = sg->seg[r].dmax;
     P->area = sg->seg[r].area;
     for (int a = 0; a < 3; a++)

@@ -29,6 +29,7 @@
 
 #include "image.h"
 #include "pcut.h"
+#include "pmerge.h"
 #include "pdirect.h"
 #include "poly_seg.h"
 #include "polygon.h"
@@ -45,7 +46,9 @@
 #include <string.h>
 #include <time.h>
 
-#define NVIS_REF 6 /* проб видимости на источник в ЭТАЛОНЕ (6×6 = 36) */
+/* Проб видимости в ЭТАЛОНЕ. Переменная, а не константа: у ОГРУБЛЁННОЙ сцены
+ * полигоны крупные, сетка лучей отсекает плохо, и эталон дорожает в разы. */
+static int NVIS_REF = 6;
 /* Проб видимости в ПРОВЕРЯЕМОМ прогоне. Параметр, а не константа, и это
  * вынужденно: при 2×2 = 4 пробах полутень квантуется на пять ступеней, то есть
  * площадной источник §2 ведёт себя как четыре точечных. Тогда выигрыш разрезов
@@ -56,8 +59,8 @@ static int NVIS_RUN = 2;
  * 36 лучей), и на 1024² один прогон занимает минуты, а их в свипе двадцать.
  * Для КАРТИНКИ НА ГЛАЗ это не годится, и картинка пишется отдельно в полном
  * разрешении §2; для ХВОСТА распределения 262 тысячи точек достаточно. */
-#define IMGW 512
-#define IMGH 512
+static int IMGW = 512;
+static int IMGH = 512;
 
 static double now_s(void) {
   struct timespec ts;
@@ -306,6 +309,27 @@ static int scene_build(scene *S, const hz_objmesh *base, double delta, int nsrc,
     S->sg = sg0;
     memset(&S->m, 0, sizeof S->m);
   }
+  return 0;
+}
+
+/* Сцена из ГОТОВОЙ разметки: нужна огрублению, которое сперва решает задачу на
+ * мелком представлении, а потом строит из него грубое. */
+static int scene_from(scene *S, const hz_objmesh *m, const hz_pseglist *sg, const double lo[3],
+                      const double hi[3], int nsrc) {
+  memset(S, 0, sizeof *S);
+  if (hz_poly_build(&S->ps, m, sg) != 0) return 1;
+  if (add_lamps(&S->ps, lo, hi, S->src, nsrc, 0.0) != 0) return 1;
+  S->nsrc = nsrc;
+  if (hz_ptrans_init(&S->t, &S->ps, m) != 0) return 1;
+  S->srcLe = calloc((size_t)S->ps.np, sizeof *S->srcLe);
+  S->Edir = calloc((size_t)S->ps.np * 3, sizeof *S->Edir);
+  if (S->srcLe == NULL || S->Edir == NULL) return 1;
+  for (int i = 0; i < nsrc; i++) {
+    S->srcLe[S->src[i]] = HZ_CFG_LAMP_LE;
+    S->t.rho[S->src[i]] = 0.0;
+    S->t.Le[S->src[i]] = 0.0;
+  }
+  if (hz_pray_build(&S->g, &S->ps, 4.0) != 0) return 1;
   return 0;
 }
 
@@ -667,6 +691,78 @@ int main(int argc, char **argv) {
       if (one(&base, &cam, &d, delta, h, 8, 4, &cfg0, 0.0, lab, im, &s, NULL, NULL, L) != 0)
         return 1;
     }
+    tr3_dirs_free(&d);
+    hz_obj_free(&base);
+    return 0;
+  }
+
+  /* --- Ш7: ОГРУБЛЕНИЕ. Решаем на мелком, огрубляем по решённому полю. --- */
+  if (argc > 6 && argv[6][0] == 0x63) {
+    /* Эталон удешевлён ВЧЕТВЕРО по пикселям и ВПЯТЕРО по пробам: у огрублённой
+     * сцены он иначе дороже самого решения, а хвост распределения 65 тысяч
+     * точек держат. */
+    NVIS_REF = 4;
+    IMGW = 256;
+    IMGH = 256;
+    if (tr3_camera_look(&cam, eye, at, up, HZ_CFG_FOV_DEG * M_PI / 180.0, IMGW, IMGH) != 0)
+      return 1;
+    hz_pseglist sgf;
+    if (hz_seg_planar(&sgf, &base, delta) != 0) return 1;
+    scene F;
+    if (scene_from(&F, &base, &sgf, base.lo, base.hi, 8) != 0) return 1;
+    if (solve(&F, &d, h, 1e-4) != 0) return 1;
+    imgstat s0;
+    if (render(&F, &cam, &s0, NULL, NULL) != 0) return 1;
+    printf("   %-34s %7d %9.3e %9.3e %8.2f%% %8.2f%%\n", "исходное (мелкое)", F.ps.np, s0.p50,
+           s0.p99, s0.frac1, s0.frac10);
+    fflush(stdout);
+
+    const int32_t tg[3] = {700, 450, 250};
+    for (int mode = 0; mode < 3; mode++)
+      for (int i = 0; i < 3; i++) {
+        hz_mergecfg mc;
+        memset(&mc, 0, sizeof mc);
+        /* Допуск ОГРУБЛЕНИЯ, и он обязан быть БОЛЬШЕ допуска сегментации: при
+         * равном сегментация Ш1 уже максимальна, и сливать нечего — замерено,
+         * 10 пар из 4 689. Здесь берётся из argv[3]. */
+        mc.delta = eps;
+        mc.ltol = 0.05;
+        mc.rtol = 0.05;
+        mc.target = tg[i];
+        /* mode 0 — полная конъюнкция; 1 — ТОЛЬКО геометрия (проверка довода
+         * плана: одна геометрия сливает то, что разделено полем); 2 —
+         * НЕГАТИВНЫЙ КОНТРОЛЬ по случайной метрике. */
+        mc.use_geom = 1;
+        mc.use_rad = (mode == 0);
+        mc.use_mtl = (mode == 0);
+        mc.use_overlap = (mode == 0);
+        mc.random = (mode == 2);
+        hz_pseglist sgc;
+        hz_mergestat ms;
+        if (hz_merge(&sgc, &base, &sgf, &F.ps, F.t.E, F.t.rho, &mc, &ms) != 0) return 1;
+        scene C;
+        if (scene_from(&C, &base, &sgc, base.lo, base.hi, 8) != 0) return 1;
+        if (solve(&C, &d, h, 1e-4) != 0) return 1;
+        imgstat sc;
+        char im[64];
+        snprintf(im, sizeof im, "img/sh7_m%d_t%d.ppm", mode, tg[i]);
+        if (render(&C, &cam, &sc, im, NULL) != 0) return 1;
+        const char *nm =
+            (mode == 0) ? "конъюнкция" : ((mode == 1) ? "ТОЛЬКО геометрия" : "СЛУЧАЙНО");
+        printf("   %-18s цель %4d: %7d %9.3e %9.3e %8.2f%% %8.2f%%  dmax %9.3e (%.2f δ)\n", nm,
+               tg[i], C.ps.np, sc.p50, sc.p99, sc.frac1, sc.frac10, ms.dmax_worst,
+               ms.dmax_worst / delta);
+        if (mode == 0)
+          printf("        пар %lld, слито %lld; отсеяно: геометрия %lld, поле %lld, "
+                 "материал %lld, ПЕРЕКРЫТИЕ %lld\n",
+                 (long long)ms.npair, (long long)ms.nmerged, (long long)ms.nrej_geom,
+                 (long long)ms.nrej_rad, (long long)ms.nrej_mtl, (long long)ms.nrej_overlap);
+        fflush(stdout);
+        scene_free(&C);
+        hz_seg_free(&sgc);
+      }
+    scene_free(&F);
+    hz_seg_free(&sgf);
     tr3_dirs_free(&d);
     hz_obj_free(&base);
     return 0;

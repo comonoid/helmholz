@@ -99,6 +99,10 @@ void hz_poly_free(hz_polyset *ps);
 int hz_poly_add_quad(hz_polyset *ps, const double c[3], const double n[3], const double eu[3],
                      double hu, double hv, int32_t mtl);
 
+/* Пустой набор — начало для сцены, СОБРАННОЙ, а не импортированной (печь Ш4).
+ * Заводит таблицу фасетов; дальше только `hz_poly_add_quad`. */
+int hz_poly_init_empty(hz_polyset *ps);
+
 /* Мировая точка по местным (u,v). */
 void hz_poly_world(const hz_poly *p, double u, double v, double x[3]);
 

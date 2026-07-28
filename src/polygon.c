@@ -174,6 +174,15 @@ int hz_poly_inside(const hz_polyset *ps, const hz_poly *p, double u, double v) {
   return wind != 0;
 }
 
+int hz_poly_init_empty(hz_polyset *ps) {
+  memset(ps, 0, sizeof *ps);
+  if (hz_facettab_init(&ps->ft) != 0) return 2;
+  ps->loop = malloc(sizeof *ps->loop);
+  if (ps->loop == NULL) return 2;
+  ps->loop[0] = 0;
+  return 0;
+}
+
 int hz_poly_add_quad(hz_polyset *ps, const double c[3], const double n[3], const double eu[3],
                      double hu, double hv, int32_t mtl) {
   if (!(hu > 0.0) || !(hv > 0.0)) return 1;

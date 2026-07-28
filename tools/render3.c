@@ -125,6 +125,8 @@ int main(int argc, char **argv) {
   int trace = argc > 11 ? atoi(argv[11]) : 0;
   /* предел итераций развёртки: диагностический прогон не обязан ждать сходимости */
   int maxit = argc > 12 ? atoi(argv[12]) : 4000;
+  /* К76: возмущение света для опыта «тёплый старт против холодного»; 0 — не ставить */
+  double warmdelta = argc > 13 ? atof(argv[13]) : 0.0;
   if (log2n < 1 || log2n > 8) {
     fprintf(stderr, "log2n вне [1,8]\n");
     return 1;
@@ -320,6 +322,65 @@ int main(int argc, char **argv) {
            mesh.ncell);
   }
   if (rc != 0) return 1;
+
+  /* --- К76: ТЁПЛЫЙ СТАРТ ПРОТИВ ХОЛОДНОГО ПРИ ДВИЖУЩЕМСЯ СВЕТЕ ---
+   *
+   * Свет меняется на `warmdelta`, и та же задача решается ДВАЖДЫ: от нуля и от
+   * поля предыдущего кадра (включая `bout`/`sout` — без них тёплый старт на
+   * сцене с отражением тёплым не является).
+   *
+   * ПРЕДСКАЗАНИЕ ЗАПИСАНО ДО ПРОГОНА и выведено, а не угадано: число итераций
+   * есть `ln(tol/e₀)/ln(ρ)`, тёплый старт уменьшает ТОЛЬКО `e₀`. При `ρ = 0.63`,
+   * `tol = 1e-9` и `φ ≈ 16` возмущение `δ` даёт `e₀ ≈ δ·φ`, то есть экономию
+   * `ln(37/(δ·16))/ln(1/0.63)` итераций: около 7 при `δ = 0.1`, 12 при 0.01 и
+   * 17 при 0.001. Ждать `×20` неоткуда.
+   *
+   * НЕГАТИВНЫЙ КОНТРОЛЬ ВСТРОЕН: оба решения обязаны СОВПАСТЬ. Если тёплое
+   * отличается от холодного больше допуска, тёплый старт меняет ОТВЕТ, а не
+   * только путь к нему, и тогда он незаконен. */
+  if (warmdelta > 0.0) {
+    double we2[6];
+    for (int i = 0; i < 6; i++)
+      we2[i] = we[i] * (1.0 + warmdelta);
+    double *phi_c = calloc((size_t)mesh.ncell * 4, sizeof(double));
+    double *phi_w = calloc((size_t)mesh.ncell * 4, sizeof(double));
+    if (phi_c == NULL || phi_w == NULL) return 1;
+    memcpy(phi_w, phi, (size_t)mesh.ncell * 4 * sizeof(double));
+
+    tr3_problem p2 = prob;
+    p2.wall_emit = we2;
+    tr3_stats sc_st, sw_st;
+    double t1 = now();
+    int rc1 = tr3_sweep_solve(&p2, maxit, 1e-9, phi_c, &sc_st);
+    double tc = now() - t1;
+
+    p2.warm_start = 1;
+    p2.bout_in = st.bout;
+    p2.sout_in = st.sout;
+    t1 = now();
+    int rc2 = tr3_sweep_solve(&p2, maxit, 1e-9, phi_w, &sw_st);
+    double tw = now() - t1;
+
+    double dmax = 0.0, pmax = 0.0;
+    for (int32_t i = 0; i < mesh.ncell * 4; i++) {
+      double d = fabs(phi_c[i] - phi_w[i]);
+      if (d > dmax) dmax = d;
+      if (fabs(phi_c[i]) > pmax) pmax = fabs(phi_c[i]);
+    }
+    printf("К76 ТЁПЛЫЙ СТАРТ, возмущение света %.4g:\n", warmdelta);
+    printf("     ХОЛОДНЫЙ: код %d, итераций %d, невязка %.2e, застой %d, %.2f с\n", rc1,
+           sc_st.iters, sc_st.resid, sc_st.stalled, tc);
+    printf("     ТЁПЛЫЙ:   код %d, итераций %d, невязка %.2e, застой %d, %.2f с  (×%.2f)\n", rc2,
+           sw_st.iters, sw_st.resid, sw_st.stalled, tw, tc > 0.0 ? tc / tw : 0.0);
+    printf("     СОВПАДЕНИЕ ОТВЕТОВ (негативный контроль): max|Δφ| %.3e при |φ|max %.3e\n", dmax,
+           pmax);
+    free(sc_st.bout);
+    free(sc_st.sout);
+    free(sw_st.bout);
+    free(sw_st.sout);
+    free(phi_c);
+    free(phi_w);
+  }
 
   /* --- сбор по пикселю --- */
   tr3_scene scn = {.tree = &t,

@@ -243,11 +243,15 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   double *sinf = calloc((size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
   double *hs_se = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   double *hs_out = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
+  /* предыдущее ПОВЕРХНОСТНОЕ состояние — для невязки по всему состоянию (К84) */
+  double *bprev = calloc((size_t)m->nf * 4, sizeof(double));
+  double *sprev = calloc((size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
   binfall = calloc((size_t)nth * (size_t)m->nf * 4, sizeof(double));
   sinfall = calloc((size_t)nth * (size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
   if (Lall == NULL || phinall == NULL || indegall == NULL || orderall == NULL || queueall == NULL ||
       phin == NULL || binfall == NULL || sinfall == NULL || bout == NULL || binf == NULL ||
-      sout == NULL || sinf == NULL || hs_se == NULL || hs_out == NULL) {
+      sout == NULL || sinf == NULL || hs_se == NULL || hs_out == NULL || bprev == NULL ||
+      sprev == NULL) {
     free(Lall);
     free(phinall);
     free(indegall);
@@ -262,6 +266,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     free(sinf);
     free(hs_se);
     free(hs_out);
+    free(bprev);
+    free(sprev);
     return 1;
   }
 
@@ -296,13 +302,22 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
    * применение ОПЕРАТОРА к заданному вектору, а не итерация от нуля (см.
    * `sweep3.h`). Ограничение про `bout`/`sout` там же. */
   if (!p->warm_start) memset(phi, 0, (size_t)nc * 4 * sizeof(double));
-  if (p->wall_rho != NULL)
+  /* К76: ПОВЕРХНОСТНОЕ СОСТОЯНИЕ ТОЖЕ МОЖЕТ ПРИЙТИ ИЗВНЕ. Без него «тёплый
+   * старт» на сцене с отражением тёплым не является: `bout`/`sout` есть вторая
+   * половина состояния итерации, и заводить их из одного излучения значит
+   * начинать отражённую часть с нуля. */
+  if (p->bout_in != NULL)
+    memcpy(bout, p->bout_in, (size_t)m->nf * 4 * sizeof(double));
+  else if (p->wall_rho != NULL)
     for (int32_t f = 0; f < m->nf; f++)
       if (m->f[f].cb < 0)
         bout[f * 4] = p->wall_emit != NULL ? p->wall_emit[(int)(~m->f[f].cb)] : 0.0;
-  for (int32_t e = 0; e < nse; e++)
-    if (p->facet_emit != NULL && cu->se[e].facet < p->nfacet)
-      sout[e * 4] = p->facet_emit[cu->se[e].facet];
+  if (p->sout_in != NULL && nse > 0)
+    memcpy(sout, p->sout_in, (size_t)nse * 4 * sizeof(double));
+  else
+    for (int32_t e = 0; e < nse; e++)
+      if (p->facet_emit != NULL && cu->se[e].facet < p->nfacet)
+        sout[e * 4] = p->facet_emit[cu->se[e].facet];
 
   int nclip_last = 0, it = 0, nfb = 0;
   double resid = 0.0;
@@ -605,6 +620,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       free(sinf);
       free(hs_se);
       free(hs_out);
+      free(bprev);
+      free(sprev);
       free(binfall);
       free(sinfall);
       return 2;
@@ -680,11 +697,38 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       sout[e * 4] += em;
     }
 
+    /* НЕВЯЗКА МЕРИТ ВСЁ СОСТОЯНИЕ ИТЕРАЦИИ, А НЕ ТОЛЬКО `φ` — К84.
+     *
+     * Состояние здесь есть тройка `(φ, bout, sout)`, и обновляются они ПО
+     * ОЧЕРЕДИ: развёртка считает `φ` по СТАРЫМ поверхностям, и лишь потом
+     * поверхности пересчитываются. Значит изменение, вошедшее через поверхности,
+     * доходит до `φ` только на СЛЕДУЮЩЕЙ итерации, и критерий, глядящий на одно
+     * `φ`, объявляет сходимость раньше времени.
+     *
+     * Поймано негативным контролем К76: при тёплом старте с изменённым светом
+     * развёртка останавливалась на НУЛЕВОЙ итерации и возвращала СТАРОЕ решение
+     * (`max|Δφ| = 5.04` при `|φ| = 55`, строго пропорционально возмущению), то
+     * есть давала ложное ускорение `×47`. Без встроенной проверки «оба ответа
+     * обязаны совпасть» это выглядело бы как блестящий результат.
+     *
+     * И ВТОРОЙ ДОВОД, СИЛЬНЕЕ ПЕРВОГО: КАРТИНКА ДЕЛАЕТСЯ ИЗ `bout`/`sout`, а не
+     * из `φ`. Критерий, который на них не смотрит, не измеряет то, ради чего
+     * решение и считается. */
     resid = 0.0;
     for (int32_t i = 0; i < nc * 4; i++) {
       double dd = fabs(phin[i] - phi[i]);
       if (dd > resid) resid = dd;
       phi[i] = phin[i];
+    }
+    for (int32_t i = 0; i < m->nf * 4; i++) {
+      double dd = fabs(bout[i] - bprev[i]);
+      if (dd > resid) resid = dd;
+      bprev[i] = bout[i];
+    }
+    for (int32_t i = 0; i < nse * 4; i++) {
+      double dd = fabs(sout[i] - sprev[i]);
+      if (dd > resid) resid = dd;
+      sprev[i] = sout[i];
     }
     /* ИСТОРИЯ НЕВЯЗКИ ПЕЧАТАЕТСЯ ПО ТРЕБОВАНИЮ, И ЭТО НЕ ОТЛАДКА (К38).
      *
@@ -813,6 +857,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   free(sinf);
   free(hs_se);
   free(hs_out);
+  free(bprev);
+  free(sprev);
   free(binfall);
   free(sinfall);
   return 0;

@@ -127,28 +127,56 @@ int tr3_march(const tr3_scene *sc, const double o[3], const double d[3], double 
      * Первая редакция уточняла примитивом лишь ТОЧКУ, оставив решение фасетам, —
      * и силуэт с кромкой тени уезжали на O(dmax), то есть на несколько пикселей
      * при k = 1. Это измерено, а не предположено. */
-    int32_t psurf = -1;
+    /* ВСЕ РАЗЛИЧНЫЕ ПРИМИТИВЫ ВЕЕРА, А НЕ ПЕРВЫЙ (К27).
+     *
+     * Прежде бралcя первый же фасет с `surf ≥ 0`, и на этом перебор кончался.
+     * Если в веере ячейки встречались ДВА разных тела — две сферы, сфера и
+     * цилиндр, — второе не проверялось вовсе, и луч проходил сквозь него. Тест
+     * T5а этот случай не просто не покрывал, а ОБХОДИЛ проверкой `both == 0`.
+     *
+     * Берётся БЛИЖАЙШЕЕ попадание, а не первое найденное: на стыке двух тел
+     * порядок фасетов в веере произволен, и «первое» дало бы то дальнее тело,
+     * то ближнее в зависимости от того, как лёг отбор. */
+    int32_t plist[HZ_P3_MAXH];
+    int np = 0;
     if (!sc->facet_only) /* facet_only: тело есть МНОГОГРАННИК, примитива нет */
-      for (int j = 0; j < nh && psurf < 0; j++) {
+      for (int j = 0; j < nh; j++) {
         int32_t fi = hid[j] >= 0 ? hid[j] : ~hid[j];
-        if (sc->ft->f[fi].surf >= 0) psurf = sc->ft->f[fi].surf;
+        int32_t sf = sc->ft->f[fi].surf;
+        if (sf < 0) continue;
+        int seen = 0;
+        for (int q = 0; q < np && !seen; q++)
+          if (plist[q] == sf) seen = 1;
+        if (!seen) plist[np++] = sf;
       }
-    if (psurf >= 0 && sc->st != NULL && psurf < sc->st->n) {
-      double tp, np[3];
-      if (sphere_hit(&sc->st->s[psurf], o, d, t, texit, &tp, np)) {
+    if (np > 0 && sc->st != NULL) {
+      double bt = 0.0, bn[3] = {0, 0, 0};
+      int32_t bs = -1;
+      for (int q = 0; q < np; q++) {
+        if (plist[q] >= sc->st->n) continue;
+        double tp, npv[3];
+        if (!sphere_hit(&sc->st->s[plist[q]], o, d, t, texit, &tp, npv)) continue;
+        if (bs < 0 || tp < bt) {
+          bt = tp;
+          bs = plist[q];
+          for (int a = 0; a < 3; a++)
+            bn[a] = npv[a];
+        }
+      }
+      if (bs >= 0) {
         h->hit = 1;
         h->refined = 1;
-        h->t = tp;
+        h->t = bt;
         h->cell = ni;
-        h->surf = psurf;
+        h->surf = bs;
         for (int a = 0; a < 3; a++) {
-          h->n[a] = np[a];
-          h->p[a] = o[a] + tp * d[a];
+          h->n[a] = bn[a];
+          h->p[a] = o[a] + bt * d[a];
         }
-        h->tau += (sc->sigma != NULL ? sc->sigma[ni] : 0.0) * (tp - t);
+        h->tau += (sc->sigma != NULL ? sc->sigma[ni] : 0.0) * (bt - t);
         return 0;
       }
-      nh = 0; /* примитив эту ячейку не задел — поверхности здесь нет */
+      nh = 0; /* ни один примитив эту ячейку не задел — поверхности здесь нет */
     }
     if (nh > 0) {
       double lo_t = t, hi_t = texit;

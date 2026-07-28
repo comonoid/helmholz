@@ -155,6 +155,144 @@ static void scene_free(scene *s) {
   free(s->sigma);
 }
 
+/* --------------------------------- К27: ДВА ПРИМИТИВА В ОДНОЙ ЯЧЕЙКЕ ------ */
+
+/* Прежде марш брал ПЕРВЫЙ фасет с `surf ≥ 0` и на этом останавливался: второе
+ * тело в веере не проверялось вовсе, и луч проходил сквозь него. Тест T5а этот
+ * случай не просто не покрывал, а ОБХОДИЛ проверкой `both == 0` — то есть
+ * утверждал, что такой ячейки не бывает, вместо того чтобы её разобрать.
+ *
+ * Здесь строится сцена, где такие ячейки ЕСТЬ по построению: две БЛИЗКИЕ сферы,
+ * фасеты обеих кладутся в один веер. Эталон аналитический — пересечение луча со
+ * сферой в замкнутой форме, посчитанное независимо от марша. */
+static void t_two_primitives(void) {
+  hz_octree t;
+  hz_surftab st;
+  hz_facettab ft;
+  hz_cutmap cm;
+  const hz_frame fr = {{0, 0, 0}, {1, 1, 1}};
+  if (hz_oct_init(&t, LOG2N, 0.0)) {
+    check(0, "дерево");
+    return;
+  }
+  if (hz_surftab_init(&st) || hz_facettab_init(&ft) || hz_cutmap_init(&cm)) {
+    check(0, "таблицы");
+    return;
+  }
+  /* ТЕЛА ПЕРЕСЕКАЮТСЯ, а не касаются: центры на 6.0 при радиусах 5 и 4. При
+   * КАСАНИИ двухтельных ячеек всего восемь, и в них первым в веере случайно
+   * всегда оказывалось верное тело — негативный контроль не срабатывал, то есть
+   * проверка К27 не проверяла ничего. При пересечении таких ячеек много, и
+   * ближнее тело в них то одно, то другое. */
+  double c0[3] = {14.0, 16.0, 16.0}, r0 = 5.0;
+  double c1[3] = {20.0, 16.0, 16.0}, r1 = 4.0;
+  hz_surf s0 = {HZ_SURF_SPHERE, {c0[0], c0[1], c0[2], r0, 0, 0, 0}, 1, 0};
+  hz_surf s1 = {HZ_SURF_SPHERE, {c1[0], c1[1], c1[2], r1, 0, 0, 0}, 1, 0};
+  int32_t i0 = hz_surftab_add(&st, &s0), i1 = hz_surftab_add(&st, &s1);
+  int32_t f0 = 0, f1 = 0;
+  int32_t n0 = hz_surf_facet_sphere(&ft, &fr, c0, r0, 2, HZ_FIT_MEAN_SAGITTA, i0, &f0);
+  int32_t n1 = hz_surf_facet_sphere(&ft, &fr, c1, r1, 2, HZ_FIT_MEAN_SAGITTA, i1, &f1);
+  check(n0 > 0 && n1 > 0, "обе сферы фасетизованы");
+  hz_oct_set_ball(&t, c0, r0, 1.0);
+  hz_oct_set_ball(&t, c1, r1, 1.0);
+
+  /* веер ячейки = фасеты ОБОИХ тел */
+  static cellrec rec[200000];
+  int nrec = 0, nboth = 0;
+  for (int x = 0; x < NCUBE; x++)
+    for (int y = 0; y < NCUBE; y++)
+      for (int z = 0; z < NCUBE; z++) {
+        int blo[3] = {x, y, z}, bsz = 1;
+        int32_t ni = hz_oct_leaf_box(&t, x, y, z, blo, &bsz);
+        if (ni < 0 || blo[0] != x || blo[1] != y || blo[2] != z || bsz != 1) continue;
+        int32_t lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1}, sel[HZ_P3_MAXH];
+        int k0 = hz_facets_for_box(&ft, f0, n0, lo, hi, sel, HZ_P3_MAXH);
+        cellrec *r = &rec[nrec];
+        r->cell = ni;
+        r->nf = 0;
+        for (int j = 0; j < k0; j++)
+          r->f[r->nf++] = sel[j];
+        int k1 = hz_facets_for_box(&ft, f1, n1, lo, hi, sel, HZ_P3_MAXH);
+        for (int j = 0; j < k1 && r->nf < HZ_P3_MAXH; j++)
+          r->f[r->nf++] = sel[j];
+        if (k0 > 0 && k1 > 0) nboth++;
+        if (r->nf > 0) nrec++;
+      }
+  qsort(rec, (size_t)nrec, sizeof(cellrec), cell_cmp);
+  int nadd = 0;
+  for (int i = 0; i < nrec; i++)
+    if (hz_cutmap_add(&cm, rec[i].cell, rec[i].f, rec[i].nf) == 0) nadd++;
+  printf("  [К27] ячеек с ДВУМЯ телами в веере: %d (нужно > 0, иначе тест ничего не проверяет)\n",
+         nboth);
+  check(nboth > 0, "К27: случай ДВУХ тел в ячейке действительно встречается");
+  check(nadd == nrec, "Г45: все записи легли");
+
+  tr3_scene sc = {.tree = &t, .fr = fr, .sigma = NULL, .st = &st, .ft = &ft, .cm = &cm};
+  /* Лучи вдоль оси x сквозь ОБА тела, с обеих сторон. Эталон — ближайший корень
+   * уравнения сферы, посчитанный здесь же и независимо. */
+  /* ЛУЧИ ОБЯЗАНЫ ВХОДИТЬ В ГЕОМЕТРИЮ ИМЕННО ЧЕРЕЗ СТЫК, иначе проверка пуста.
+   * Первая редакция пускала лучи вдоль оси x, и они попадали в тела ЗАДОЛГО до
+   * ячеек с двумя телами — негативный контроль (прежнее поведение «первый из
+   * веера») тест НЕ ВАЛИЛ, то есть проверка не проверяла ничего. Здесь лучи
+   * падают СВЕРХУ на окрестность точки касания (18, 16, 16), и первая же
+   * встреченная ими ячейка с геометрией — как раз двухтельная. */
+  double wt = 0.0, wn = 0.0;
+  int nhit = 0, wrong_body = 0, nmiss = 0;
+  for (int ix = 0; ix <= 40; ix++)
+    for (int iy = 0; iy <= 20; iy++) {
+      double o[3] = {14.0 + 0.25 * (double)ix, 13.0 + 0.3 * (double)iy, 31.0};
+      double d[3] = {0, 0, -1};
+      double best = 1e300;
+      int bs = -1;
+      for (int b = 0; b < 2; b++) {
+        const double *cc = b ? c1 : c0;
+        double rr = b ? r1 : r0, m[3];
+        for (int a = 0; a < 3; a++)
+          m[a] = o[a] - cc[a];
+        double bb = m[0] * d[0] + m[1] * d[1] + m[2] * d[2];
+        double c2 = m[0] * m[0] + m[1] * m[1] + m[2] * m[2] - rr * rr;
+        double disc = bb * bb - c2;
+        if (disc < 0.0) continue;
+        double tt = -bb - sqrt(disc);
+        if (tt > 0.0 && tt < best) {
+          best = tt;
+          bs = b;
+        }
+      }
+      if (bs < 0) continue;
+      tr3_hit h;
+      tr3_march(&sc, o, d, -1.0, &h);
+      if (!h.hit) {
+        nmiss++;
+        continue;
+      }
+      if (fabs(h.t - best) > wt) wt = fabs(h.t - best);
+      const double *cc = bs ? c1 : c0;
+      double rr = bs ? r1 : r0, e = 0.0;
+      for (int a = 0; a < 3; a++)
+        e += fabs(h.n[a] - (h.p[a] - cc[a]) / rr);
+      if (e > wn) wn = e;
+      if (h.surf != (bs ? i1 : i0)) wrong_body++;
+      nhit++;
+    }
+  printf("  [К27] лучей с попаданием %d, промахов %d; max |t − аналитика| = %.3e, "
+         "max ошибка нормали = %.3e, попаданий не в то тело: %d\n",
+         nhit, nmiss, wt, wn, wrong_body);
+  check(nhit > 300, "лучей, входящих через окрестность стыка, достаточно");
+  /* Промахи здесь — это К21 (скользящий луч теряется, потому что веер
+   * индексирует ФАСЕТНОЕ тело, а примитив торчит наружу на dmax), а не К27.
+   * Разные находки, и мерить их одной проверкой нельзя. */
+  check(nmiss * 50 < nhit, "К21: скользящих потерь немного (это НЕ про К27)");
+  check(wt < 1e-12, "К27: попадание в БЛИЖНЕЕ тело совпадает с аналитическим");
+  check(wn < 1e-12, "и нормаль радиальна ИМЕННО ему");
+  check(wrong_body == 0, "ни одного попадания не в то тело");
+
+  hz_cutmap_free(&cm);
+  hz_facettab_free(&ft);
+  hz_surftab_free(&st);
+  hz_oct_free(&t);
+}
+
 /* ------------------------------------------- 1. марш: хорда и закон Бугера */
 
 static void t_march_chord(void) {
@@ -541,6 +679,7 @@ int main(void) {
   printf("  К19: та же ошибка после тон-маппинга становится неразличимой\n");
   printf("=== РЕЗУЛЬТАТЫ ===\n");
 
+  t_two_primitives();
   t_march_chord();
   t_hit();
   t_tau_vs_boolean();

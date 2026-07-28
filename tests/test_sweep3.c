@@ -197,6 +197,7 @@ static void rig_free(rig *r) {
 static void t_furnace(void) {
   const hz_frame fr = {{0, 0, 0}, {1.0, 1.0, 2.0}};
   const double lb = 1.7;
+  (void)lb;
   for (int graded = 0; graded < 2; graded++) {
     rig r;
     if (rig_init(&r, 3, graded, 2, &fr)) {
@@ -1099,6 +1100,292 @@ static void t_cut(void) {
   hz_oct_free(&t);
 }
 
+/* ------------------------- КРЫЛОВСКОЕ УСКОРЕНИЕ ИТЕРАЦИИ ПО РАССЕЯНИЮ ------ */
+
+/* ИТЕРАЦИЯ ПО РАССЕЯНИЮ ЕСТЬ РЯД НЕЙМАНА — САМЫЙ МЕДЛЕННЫЙ СПОСОБ РЕШИТЬ
+ * `(I − T)φ = b`. Он просто складывает порядки рассеяния, и его скорость равна
+ * альбедо: `‖φⁿ − φ‖ ~ ρⁿ`. Крыловский метод на том же операторе идёт по `√κ`
+ * вместо `κ`, где `κ = 1/(1−ρ)`, и выигрыш тем больше, чем ближе альбедо к
+ * единице — то есть ровно там, где С1 и предупреждал про сотни итераций.
+ *
+ * ОПЕРАТОР СТРОИТСЯ ИЗ САМОЙ РАЗВЁРТКИ, а не выписывается заново:
+ *
+ *     S(φ) — один проход развёртки (при `warm_start`, maxit = 1)
+ *     b = S(0)                       — вклад предписанного влёта
+ *     T·v = S(v) − b                 — линейная часть
+ *     A·v = v − T·v = v − S(v) + b
+ *
+ * Одно умножение на `A` есть ОДИН проход развёртки, поэтому честное сравнение
+ * идёт по ЧИСЛУ ПРОХОДОВ, а не по числу итераций метода: BiCGStab делает два
+ * прохода на итерацию.
+ *
+ * ЛОВУШКА, НАЗВАННАЯ ДО КОДА: Крылову нужен ЛИНЕЙНЫЙ оператор, а в проходе
+ * сидит ограничитель положительности. Крыловские векторы физическим радиансом
+ * не являются, у них есть отрицательные компоненты, и ограничитель на них
+ * сработает — оператор перестанет быть линейным. Поэтому опыт ставится с
+ * ВЫКЛЮЧЕННЫМ ограничителем, и законно это ровно на печи: там на сошедшемся
+ * решении `nclip = 0` (измерено, К31), значит выключение ответа не меняет.
+ * Отражающих границ и поверхностных элементов в печи нет, других нелинейностей
+ * не остаётся. Для сцен с отражением так делать НЕЛЬЗЯ — там ограничитель
+ * активен и на сходимости (458 срезок в рендере), и нужен другой ход. */
+
+typedef struct {
+  tr3_problem p;
+  double *work;
+  long npass;
+  int32_t n;
+} krylov_op;
+
+/* v_out = A·v = v − S(v) + b. Разрушает `work`. */
+static void kr_apply(krylov_op *k, const double *v, const double *b, double *out) {
+  tr3_stats st;
+  memcpy(k->work, v, (size_t)k->n * sizeof(double));
+  if (tr3_sweep_solve(&k->p, 1, 0.0, k->work, &st) != 0) return;
+  k->npass++;
+  free(st.bout);
+  free(st.sout);
+  for (int32_t i = 0; i < k->n; i++)
+    out[i] = v[i] - k->work[i] + b[i];
+}
+
+static double kr_dot(const double *a, const double *b, int32_t n) {
+  double s = 0.0;
+  for (int32_t i = 0; i < n; i++)
+    s += a[i] * b[i];
+  return s;
+}
+
+static double kr_nrm(const double *a, int32_t n) {
+  double m = 0.0;
+  for (int32_t i = 0; i < n; i++)
+    if (fabs(a[i]) > m) m = fabs(a[i]);
+  return m;
+}
+
+static void t_krylov(void) {
+  const hz_frame fr = {{0, 0, 0}, {1.0, 1.0, 2.0}};
+  const double lb = 1.7;
+  (void)lb;
+  /* альбедо РОВНО 1 — тот самый случай, ради которого С1 заводил разгон */
+  /* СВИП ПО ОПТИЧЕСКОЙ ТОЛЩИНЕ ЯЧЕЙКИ, потому что от неё всё и зависит.
+   * При `σ_t·h ~ 1` свободный пробег равен ячейке, рассеянный свет почти не
+   * уходит из неё, оператор рассеяния ПОЧТИ ДИАГОНАЛЕН, спектр сжат — и Крылов
+   * сносит его за один шаг. Это измерено: на случайном векторе `cos(v, A·v)`
+   * вышел `0.997`. Такой режим ускорение ЗАВЫШАЕТ, и мерить только на нём
+   * нельзя. В нашем рендере `σ_t·h = 0.015` — другой конец шкалы. */
+  const double sigh[7] = {0.05, 0.8, 4.0, 0.8, 0.05, 0.8, 4.0};
+  for (int cs = 0; cs < 7; cs++) {
+    rig r;
+    if (rig_init(&r, 3, 0, 2, &fr)) {
+      check(0, "оснастка");
+      rig_free(&r);
+      return;
+    }
+    /* cs = 0 — НЕОДНОРОДНАЯ среда при альбедо 1. Однородную печь для замера
+     * УСКОРЕНИЯ брать нельзя: у неё точное решение однородно, оно почти
+     * параллельно правой части, и BiCGStab сходится за один шаг по причине,
+     * не имеющей отношения к скорости метода. Это тот же урок, что К12 и К44 —
+     * эталон с однородным решением проверяет только однородные степени свободы.
+     * cs = 1 — НЕГАТИВНЫЙ КОНТРОЛЬ без рассеяния. */
+    double alb = cs == 3 ? 0.0 : 1.0; /* cs = 3 — НК; cs = 4 — СЛУЧАЙНАЯ правая часть */
+    for (int32_t c = 0; c < r.m.ncell; c++) {
+      /* σ меняется по ячейкам в 6 раз — решение заведомо неоднородно */
+      double f = 0.3 + 1.7 * (double)((c * 37) % 11) / 10.0;
+      r.sig_t[c] = sigh[cs] * f;
+      r.sig_s[c] = sigh[cs] * f * alb;
+    }
+    /* ИСТОЧНИК ОБЯЗАН ВОЗБУЖДАТЬ МНОГО МОД, иначе замер вырожден.
+     * Первая редакция брала ОДНОРОДНЫЙ влёт на границе, и незатенённое поле от
+     * него оказалось почти точно ОСНОВНОЙ МОДОЙ оператора рассеяния: измерено
+     * `cos(b, A·b) = 1.000000` и `T·b = 0.524·b`. Крылов такую задачу решает за
+     * один шаг тождественно, и ускорение на ней измерить нельзя.
+     * Здесь источник ЛОКАЛЬНЫЙ — светится одна ячейка из восьми по каждой оси,
+     * и в правой части оказывается широкий спектр мод. */
+    for (int32_t c = 0; c < r.m.ncell; c++)
+      r.eps[c * 4] = ((r.m.clo[c][0] + r.m.clo[c][1] * 3 + r.m.clo[c][2] * 7) % 8 == 0) ? 5.0 : 0.0;
+    int32_t n = r.m.ncell * 4;
+    tr3_problem base = {
+        .m = &r.m, .d = &r.d, .sig_t = r.sig_t, .sig_s = r.sig_s, .eps = r.eps, .limiter = 0};
+
+    /* --- эталон: обычная итерация по рассеянию --- */
+    double *ref = calloc((size_t)n, sizeof(double));
+    tr3_stats st0;
+    tr3_sweep_solve(&base, 2000, 1e-12, ref, &st0);
+    free(st0.bout);
+    free(st0.sout);
+    int passes_ref = st0.iters + 1;
+
+    /* --- крыловский путь --- */
+    krylov_op k = {.p = base, .work = calloc((size_t)n, sizeof(double)), .npass = 0, .n = n};
+    k.p.warm_start = 1;
+    double *b = calloc((size_t)n, sizeof(double));
+    double *x = calloc((size_t)n, sizeof(double));
+    double *rr = calloc((size_t)n, sizeof(double));
+    double *rh = calloc((size_t)n, sizeof(double));
+    double *pv = calloc((size_t)n, sizeof(double));
+    double *vv = calloc((size_t)n, sizeof(double));
+    double *ss = calloc((size_t)n, sizeof(double));
+    double *tt = calloc((size_t)n, sizeof(double));
+    if (k.work == NULL || b == NULL || x == NULL || rr == NULL || rh == NULL || pv == NULL ||
+        vv == NULL || ss == NULL || tt == NULL) {
+      check(0, "память");
+      rig_free(&r);
+      return;
+    }
+    /* b = S(0): один проход от нулевого поля */
+    memset(k.work, 0, (size_t)n * sizeof(double));
+    {
+      tr3_stats st1;
+      tr3_sweep_solve(&k.p, 1, 0.0, k.work, &st1);
+      k.npass++;
+      free(st1.bout);
+      free(st1.sout);
+      memcpy(b, k.work, (size_t)n * sizeof(double));
+    }
+    /* РЕШАЮЩИЙ ОПЫТ: правая часть СЛУЧАЙНАЯ, оператор ТОТ ЖЕ.
+     * `boff` — аффинный сдвиг внутри оператора, его подменять нельзя; подменяем
+     * только правую часть системы. Если и на случайной метод сходится за шаг —
+     * дело в операторе; если берёт много — значит быстрая сходимость была
+     * свойством ЭТОЙ правой части, и цитировать ускорение по ней нельзя. */
+    double *rhs = calloc((size_t)n, sizeof(double));
+    if (rhs == NULL) {
+      check(0, "память");
+      rig_free(&r);
+      return;
+    }
+    if (cs >= 4) {
+      uint32_t sd = 777u;
+      for (int32_t i = 0; i < n; i++) {
+        sd = sd * 1664525u + 1013904223u;
+        rhs[i] = (double)(sd >> 8) / 8388608.0 - 1.0;
+      }
+    } else {
+      memcpy(rhs, b, (size_t)n * sizeof(double));
+    }
+    /* BiCGStab по A·x = rhs, старт с нуля: r = rhs */
+    memcpy(rr, rhs, (size_t)n * sizeof(double));
+    memcpy(rh, rr, (size_t)n * sizeof(double));
+    double rho = 1.0, alpha = 1.0, omega = 1.0, bn = kr_nrm(rhs, n);
+    const char *why = "предел итераций";
+    int it = 0, maxit = 400;
+    for (; it < maxit; it++) {
+      if (kr_nrm(rr, n) <= 1e-12 * bn) {
+        why = "сошлось";
+        break;
+      }
+      double rho1 = kr_dot(rh, rr, n);
+      if (!(fabs(rho1) > 0.0)) {
+        why = "обрыв: rho = 0";
+        break;
+      }
+      if (it == 0) {
+        memcpy(pv, rr, (size_t)n * sizeof(double));
+      } else {
+        double beta = (rho1 / rho) * (alpha / omega);
+        for (int32_t i = 0; i < n; i++)
+          pv[i] = rr[i] + beta * (pv[i] - omega * vv[i]);
+      }
+      kr_apply(&k, pv, b, vv);
+      if (it == 0) {
+        /* ДИАГНОЗ ОПЕРАТОРА, А НЕ ЗАДАЧИ: если `A·v ∥ v` и для СЛУЧАЙНОГО `v`,
+         * значит оператор построен неверно и вырожден в кратный единичному. */
+        double *rv = calloc((size_t)n, sizeof(double)), *av = calloc((size_t)n, sizeof(double));
+        if (rv != NULL && av != NULL) {
+          uint32_t sd = 12345u;
+          for (int32_t i = 0; i < n; i++) {
+            sd = sd * 1664525u + 1013904223u;
+            rv[i] = (double)(sd >> 8) / 8388608.0 - 1.0;
+          }
+          kr_apply(&k, rv, b, av);
+          k.npass--; /* диагностический проход в счёт не идёт */
+          printf(
+              "        [диагноз] на b: ‖A·b‖/‖b‖ = %.4f, cos = %.6f;  на СЛУЧАЙНОМ: cos = %.6f\n",
+              kr_nrm(vv, n) / kr_nrm(b, n),
+              kr_dot(b, vv, n) / (sqrt(kr_dot(b, b, n)) * sqrt(kr_dot(vv, vv, n))),
+              kr_dot(rv, av, n) / (sqrt(kr_dot(rv, rv, n)) * sqrt(kr_dot(av, av, n))));
+        }
+        free(rv);
+        free(av);
+      }
+      double den = kr_dot(rh, vv, n);
+      if (!(fabs(den) > 0.0)) {
+        why = "обрыв: (r0,v) = 0";
+        break;
+      }
+      alpha = rho1 / den;
+      for (int32_t i = 0; i < n; i++)
+        ss[i] = rr[i] - alpha * vv[i];
+      if (it == 0)
+        printf("        [диагноз2] после 1 шага: ‖s‖/‖b‖ = %.3e, α = %.6f\n", kr_nrm(ss, n) / bn,
+               alpha);
+      if (kr_nrm(ss, n) <= 1e-12 * bn) {
+        for (int32_t i = 0; i < n; i++)
+          x[i] += alpha * pv[i];
+        /* НАСТОЯЩАЯ невязка на этой ветке есть `s`, а не старое `r`: шаг сделан
+         * половинный, и `r` ещё не обновлена. Печатать старое `r` — врать. */
+        memcpy(rr, ss, (size_t)n * sizeof(double));
+        why = "сошлось на половинном шаге";
+        break;
+      }
+      kr_apply(&k, ss, b, tt);
+      double tsq = kr_dot(tt, tt, n);
+      if (!(tsq > 0.0)) {
+        why = "обрыв: (t,t) = 0";
+        break;
+      }
+      omega = kr_dot(tt, ss, n) / tsq;
+      for (int32_t i = 0; i < n; i++) {
+        x[i] += alpha * pv[i] + omega * ss[i];
+        rr[i] = ss[i] - omega * tt[i];
+      }
+      rho = rho1;
+      if (!(fabs(omega) > 0.0)) {
+        why = "обрыв: omega = 0";
+        break;
+      }
+    }
+    /* сверка с эталоном */
+    double worst = 0.0, scale = kr_nrm(ref, n);
+    if (!(scale > 0.0)) scale = 1.0;
+    for (int32_t i = 0; i < n; i++) {
+      double e = fabs(x[i] - ref[i]) / scale;
+      if (e > worst) worst = e;
+    }
+    if (cs >= 4) {
+      printf("  [КРЫЛОВ, СЛУЧАЙНАЯ правая часть] σ_t·h = %.2f: ряд Неймана %4d, BiCGStab %3ld "
+             "проходов; невязка %.2e; останов: %s\n",
+             sigh[cs], passes_ref, k.npass, kr_nrm(rr, n) / bn, why);
+      check(k.npass > 4, "РЕШАЮЩИЙ ОПЫТ: на общей правой части метод обязан взять БОЛЬШЕ шагов");
+      check(k.npass < 40, "и всё же ЦЕНА ОСТАЁТСЯ ОГРАНИЧЕННОЙ при любой толщине");
+    } else
+      printf("  [КРЫЛОВ] σ_t·h = %.2f, альбедо %.0f: ряд Неймана %4d проходов, BiCGStab %3ld "
+             "(×%.1f); расхождение %.2e\n",
+             sigh[cs], alb, passes_ref, k.npass, (double)passes_ref / (double)k.npass, worst);
+    if (cs < 3) {
+      check(worst < 1e-9, "КРЫЛОВ: ответ тот же, что у итерации по рассеянию");
+      check(k.npass < passes_ref, "КРЫЛОВ: проходов МЕНЬШЕ, чем у ряда Неймана");
+    } else if (cs == 3) {
+      /* НЕГАТИВНЫЙ КОНТРОЛЬ: без рассеяния T = 0, и обе схемы обязаны решить
+       * задачу за ОДИН проход. Если Крылов возьмёт больше — ошибка в постановке
+       * оператора, а не в скорости. */
+      check(k.npass <= 3, "НК: при σ_s = 0 оператор тождественный, проходов должно быть ~1");
+      check(worst < 1e-12, "НК: и ответ совпадает точно");
+    }
+    free(k.work);
+    free(b);
+    free(rhs);
+    free(x);
+    free(rr);
+    free(rh);
+    free(pv);
+    free(vv);
+    free(ss);
+    free(tt);
+    free(ref);
+    rig_free(&r);
+  }
+}
+
 /* --------------- ЗАМКНУТ ЛИ НАБОР ОРДИНАТ ОТНОСИТЕЛЬНО ЗЕРКАЛЬНОГО ОТРАЖЕНИЯ */
 
 /* ОТ ЭТОГО ЗАВИСИТ, МОЖЕТ ЛИ ЗЕРКАЛО ИДТИ ЧЕРЕЗ РАЗВЁРТКУ ВОВСЕ.
@@ -1267,6 +1554,7 @@ int main(void) {
   t_balance();
   t_cavity();
   t_cut();
+  t_krylov();
   t_mirror_closure();
   t_pfm();
   t_render();

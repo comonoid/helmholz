@@ -292,7 +292,10 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     hs_out[e] = so;
   }
 
-  memset(phi, 0, (size_t)nc * 4 * sizeof(double));
+  /* ПРИ `warm_start` ВХОДНОЕ ПОЛЕ СОХРАНЯЕТСЯ — тогда один проход есть
+   * применение ОПЕРАТОРА к заданному вектору, а не итерация от нуля (см.
+   * `sweep3.h`). Ограничение про `bout`/`sout` там же. */
+  if (!p->warm_start) memset(phi, 0, (size_t)nc * 4 * sizeof(double));
   if (p->wall_rho != NULL)
     for (int32_t f = 0; f < m->nf; f++)
       if (m->f[f].cb < 0)

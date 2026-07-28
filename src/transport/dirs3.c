@@ -11,7 +11,9 @@ void tr3_dirs_free(tr3_dirs *d) {
   free(d->oy);
   free(d->oz);
   free(d->w);
+  free(d->mir);
   d->ox = d->oy = d->oz = d->w = NULL;
+  d->mir = NULL;
   d->n = 0;
 }
 
@@ -63,6 +65,37 @@ int tr3_dirs_product(tr3_dirs *d, int nmu, int nphi) {
     for (int i = 0; i < nphi; i++) {
       ph[q * nphi + i] = 0.5 * (b - a) * gx[i] + 0.5 * (a + b);
       wph[q * nphi + i] = 0.5 * (b - a) * gw[i];
+    }
+  }
+
+  /* ЗЕРКАЛЬНАЯ ПЕРЕСТАНОВКА — ПО ИНДЕКСАМ, А НЕ ПОИСКОМ (см. `dirs3.h`).
+   * Индекс направления есть `i*np + j`, где `i` — узел по μ, `j` — по азимуту;
+   * обе квадратуры симметричны, поэтому отражение переставляет узлы, а не
+   * порождает новые. */
+  d->mir = calloc((size_t)3 * (size_t)n, sizeof(int));
+  if (d->mir == NULL) {
+    tr3_dirs_free(d);
+    free(gx);
+    free(gw);
+    free(mu);
+    free(wmu);
+    free(ph);
+    free(wph);
+    return 1;
+  }
+  for (int i = 0; i < nm; i++) {
+    int h = i / nmu, ii = i % nmu;
+    int iz = (1 - h) * nmu + (nmu - 1 - ii); /* μ → −μ */
+    for (int j = 0; j < np; j++) {
+      int q = j / nphi, jj = j % nphi;
+      static const int qx[4] = {1, 0, 3, 2}; /* φ → π − φ */
+      static const int qy[4] = {3, 2, 1, 0}; /* φ → −φ     */
+      int jx = qx[q] * nphi + (nphi - 1 - jj);
+      int jy = qy[q] * nphi + (nphi - 1 - jj);
+      int m = i * np + j;
+      d->mir[0 * n + m] = i * np + jx; /* нормаль вдоль x */
+      d->mir[1 * n + m] = i * np + jy; /* нормаль вдоль y */
+      d->mir[2 * n + m] = iz * np + j; /* нормаль вдоль z */
     }
   }
 

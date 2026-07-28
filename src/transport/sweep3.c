@@ -243,6 +243,23 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   double *sinf = calloc((size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
   double *hs_se = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   double *hs_out = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
+  /* ЭТАП C: ЗЕРКАЛЬНЫЕ ГРАНИ. Индекс `mfid[f]` есть номер грани среди
+   * зеркальных или −1; хранимое на них НАПРАВЛЕННОЕ, `nmf · nd · 4`. Память
+   * платится только за зеркальные грани, а не за все. */
+  int32_t *mfid = calloc((size_t)m->nf, sizeof(int32_t));
+  int32_t nmf = 0;
+  if (mfid != NULL) {
+    for (int32_t f = 0; f < m->nf; f++) {
+      mfid[f] = -1;
+      if (m->f[f].cb >= 0) continue;
+      int wl = (int)(~m->f[f].cb);
+      if (p->wall_spec != NULL && p->wall_spec[wl] > 0.0) mfid[f] = nmf++;
+    }
+  }
+  double *mspec = calloc((size_t)(nmf > 0 ? nmf : 1) * (size_t)nd * 4, sizeof(double));
+  double *mspin = calloc((size_t)(nmf > 0 ? nmf : 1) * (size_t)nd * 4, sizeof(double));
+  double *mprev = calloc((size_t)(nmf > 0 ? nmf : 1) * (size_t)nd * 4, sizeof(double));
+
   /* предыдущее ПОВЕРХНОСТНОЕ состояние — для невязки по всему состоянию (К84) */
   double *bprev = calloc((size_t)m->nf * 4, sizeof(double));
   double *sprev = calloc((size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
@@ -268,6 +285,10 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     free(hs_out);
     free(bprev);
     free(sprev);
+    free(mfid);
+    free(mspec);
+    free(mspin);
+    free(mprev);
     return 1;
   }
 
@@ -329,6 +350,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     memset(phin, 0, (size_t)nc * 4 * sizeof(double));
     memset(binf, 0, (size_t)m->nf * 4 * sizeof(double));
     memset(sinf, 0, (size_t)(nse > 0 ? nse : 1) * 4 * sizeof(double));
+    if (nmf > 0) memset(mspin, 0, (size_t)nmf * (size_t)nd * 4 * sizeof(double));
     memset(phinall, 0, (size_t)nth * (size_t)nc * 4 * sizeof(double));
     memset(binfall, 0, (size_t)nth * (size_t)m->nf * 4 * sizeof(double));
     memset(sinfall, 0, (size_t)nth * (size_t)(nse > 0 ? nse : 1) * 4 * sizeof(double));
@@ -460,7 +482,14 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
           } else {
             if (m->f[f].cb < 0) {
               double lb[4];
-              if (p->wall_rho != NULL) {
+              /* ЭТАП C: у ЗЕРКАЛЬНОЙ грани влёт зависит от ОРДИНАТЫ — хранимое
+               * там направленное, и берётся оно по индексу `mm` напрямую.
+               * Перестановка уже применена при записи, поэтому здесь никакого
+               * поиска нет: чтение по тому же `mm`, что и всё остальное. */
+              if (mfid != NULL && mfid[f] >= 0) {
+                for (int i = 0; i < 4; i++)
+                  lb[i] = mspec[((size_t)mfid[f] * (size_t)nd + (size_t)mm) * 4 + (size_t)i];
+              } else if (p->wall_rho != NULL) {
                 for (int i = 0; i < 4; i++)
                   lb[i] = bout[f * 4 + i];
               } else {
@@ -603,6 +632,11 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         pout_acc += on * d->w[mm] * accj[0];
         for (int j = 0; j < 4; j++)
           binft[f * 4 + j] += on * d->w[mm] * accj[j];
+        /* ЭТАП C: у зеркальной грани копится момент ПО ОРДИНАТЕ, без веса —
+         * зеркало не интегрирует по полусфере, оно переставляет направление. */
+        if (mfid != NULL && mfid[f] >= 0)
+          for (int j = 0; j < 4; j++)
+            mspin[((size_t)mfid[f] * (size_t)nd + (size_t)mm) * 4 + (size_t)j] += accj[j];
       }
     }
 
@@ -622,6 +656,10 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       free(hs_out);
       free(bprev);
       free(sprev);
+      free(mfid);
+      free(mspec);
+      free(mspin);
+      free(mprev);
       free(binfall);
       free(sinfall);
       return 2;
@@ -684,6 +722,52 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
           bout[f * 4 + j] = (hsum[wall] > 0.0 ? p->wall_rho[wall] * ee[j] / hsum[wall] : 0.0);
         if (p->wall_emit != NULL) bout[f * 4] += p->wall_emit[wall];
       }
+
+    /* ЭТАП C: ЗЕРКАЛЬНЫЕ ГРАНИ — СВЯЗЬ `m → m′` ТОЧНОЙ ПЕРЕСТАНОВКОЙ.
+     *
+     * Радианс, пришедший на грань по ординате `mm`, уходит с неё по ординате
+     * `mir`, и никакой свёртки по полусфере здесь нет: зеркало не усредняет, а
+     * переставляет. Интерполировать между ординатами запрещает К3, и она здесь
+     * не нужна — набор замкнут относительно осевых плоскостей ТОЧНО.
+     *
+     * Проекция моментов на DG1 берётся та же, что у ламбертовой грани, вместе с
+     * разделением К86: вырождение элемента — геометрия, положительность —
+     * переключатель. */
+    if (nmf > 0)
+      for (int32_t f = 0; f < m->nf; f++) {
+        if (mfid[f] < 0) continue;
+        int wall = (int)(~m->f[f].cb);
+        int ax = (int)m->f[f].axis;
+        double fmmb[4][4];
+        const double (*fmm)[4];
+        if (cu != NULL) {
+          fmm = cu->ffm[f];
+        } else {
+          double v[4][3];
+          tr3_face_corners(m, f, v);
+          face_mass2(m, (const double (*)[4][3]) & v, m->f[f].ca, m->f[f].ca, fmmb);
+          fmm = fmmb;
+        }
+        if (!(fmm[0][0] > 0.0)) continue;
+        double nul[4];
+        tr3_face_null(m, f, m->f[f].ca, nul);
+        for (int mm2 = 0; mm2 < nd; mm2++) {
+          double on2 = (d->ox[mm2] * (ax == 0) + d->oy[mm2] * (ax == 1) + d->oz[mm2] * (ax == 2)) *
+                       ((wall & 1) ? 1.0 : -1.0);
+          if (!(on2 > 0.0)) continue; /* только УХОДЯЩИЕ от ячейки в стенку */
+          double rr2[4], ee2[4];
+          for (int j = 0; j < 4; j++)
+            rr2[j] = mspin[((size_t)mfid[f] * (size_t)nd + (size_t)mm2) * 4 + (size_t)j];
+          if (tr3_project_plane(fmm, rr2, nul, ee2) != 0 || (p->limiter && corner_min(ee2) < 0.0)) {
+            ee2[0] = rr2[0] / fmm[0][0];
+            ee2[1] = ee2[2] = ee2[3] = 0.0;
+          }
+          int mr = d->mir[(size_t)ax * (size_t)nd + (size_t)mm2];
+          for (int j = 0; j < 4; j++)
+            mspec[((size_t)mfid[f] * (size_t)nd + (size_t)mr) * 4 + (size_t)j] =
+                p->wall_spec[wall] * ee2[j];
+        }
+      }
     for (int32_t e = 0; e < nse; e++) {
       const tr3_selem *se = &cu->se[e];
       double rho = (p->facet_rho != NULL && se->facet < p->nfacet) ? p->facet_rho[se->facet] : 0.0;
@@ -738,6 +822,13 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       double dd = fabs(sout[i] - sprev[i]);
       if (dd > resid) resid = dd;
       sprev[i] = sout[i];
+    }
+    /* ЗЕРКАЛЬНОЕ хранимое — тоже часть состояния (К84), и без него критерий
+     * объявил бы сходимость, пока зеркала ещё не установились. */
+    for (int32_t i = 0; i < nmf * nd * 4; i++) {
+      double dd = fabs(mspec[i] - mprev[i]);
+      if (dd > resid) resid = dd;
+      mprev[i] = mspec[i];
     }
     /* ИСТОРИЯ НЕВЯЗКИ ПЕЧАТАЕТСЯ ПО ТРЕБОВАНИЮ, И ЭТО НЕ ОТЛАДКА (К38).
      *
@@ -848,7 +939,33 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       io += sout[e * 4 + i] * cu->se[e].m[i][0];
     st->psout += hs_out[e] * io;
   }
-  st->balance = st->pin + st->psout - st->pout - st->pabs - st->psin;
+  /* К91: ОБЪЁМНЫЙ ИСТОЧНИК В ТОЖДЕСТВЕ ОТСУТСТВОВАЛ.
+   *
+   * Тождество читалось `pin + psout = pout + pabs + psin` и было верно ровно до
+   * тех пор, пока `ε = 0`. Ни один тест с объёмным источником баланс не
+   * проверял, поэтому дыра держалась с шага C: в задаче с `ε` невязка выходила
+   * равной ВСЕЙ излучённой мощности (измерено: `1.14e+01` от втекшего), и это
+   * читалось бы как ошибка схемы.
+   *
+   * Излучённая мощность есть `∫∫ ε dΩ dV`. Изотропная часть даёт `4π·∫ε dV`, а
+   * НАПРАВЛЕННАЯ `eps_dir·ω` при интегрировании по сфере даёт ноль — поэтому в
+   * тождество она не входит вовсе, и это надо назвать, а не молча опустить.
+   * Объёмный интеграл берётся ВСЕМИ ЧЕТЫРЬМЯ моментами, а не одним средним:
+   * у РАЗРЕЗАННОЙ ячейки `∫b_i dV ≠ 0` при `i ≥ 1`. Это дословно К48, и то, что
+   * та же поправка понадобилась второй раз, — довод считать её правилом. */
+  st->pemit = 0.0;
+  if (p->eps != NULL)
+    for (int32_t c = 0; c < nc; c++) {
+      if (cu != NULL) {
+        for (int i = 0; i < 4; i++)
+          st->pemit += 4.0 * M_PI * p->eps[c * 4 + i] * cu->mvol[c][0][i];
+      } else {
+        double vol = (double)m->csize[c] * (double)m->csize[c] * (double)m->csize[c] * m->fr.u[0] *
+                     m->fr.u[1] * m->fr.u[2];
+        st->pemit += 4.0 * M_PI * p->eps[c * 4] * vol;
+      }
+    }
+  st->balance = st->pin + st->psout + st->pemit - st->pout - st->pabs - st->psin;
   st->iters = it;
   st->resid = resid;
   st->nclip = nclip_last;
@@ -868,6 +985,10 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   free(hs_out);
   free(bprev);
   free(sprev);
+  free(mfid);
+  free(mspec);
+  free(mspin);
+  free(mprev);
   free(binfall);
   free(sinfall);
   return 0;

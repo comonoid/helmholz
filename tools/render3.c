@@ -130,6 +130,15 @@ int main(int argc, char **argv) {
   double warmdelta = argc > 13 ? atof(argv[13]) : 0.0;
   /* ЭТАП B: сравнить Крылов с рядом Неймана на этой сцене; 0 — не ставить */
   int krylov = argc > 14 ? atoi(argv[14]) : 0;
+  /* ЭТАП E: число спектральных каналов, 1 или 3 */
+  int nch = argc > 17 ? atoi(argv[17]) : 1;
+  /* фальсификатор №1: три ОДИНАКОВЫХ канала */
+  int chsame = argc > 18 ? atoi(argv[18]) : 0;
+  /* фальсификатор №2: канал без источников; -1 — нет такого */
+  int chdark = argc > 19 ? atoi(argv[19]) : -1;
+  /* фальсификатор №3: канал, излучение которого УДВОЕНО; -1 — нет такого.
+   * Задача линейна по источнику, поэтому ответ обязан удвоиться ТОЧНО. */
+  int chdbl = argc > 20 ? atoi(argv[20]) : -1;
   /* ДОПУСК РЕШАТЕЛЯ — ПАРАМЕТР, А НЕ КОНСТАНТА. `1e-9` при `φ ≈ 50` есть `2e-11`
    * относительных, тогда как ошибка дискретизации на `16³` измерена в 3%
    * (К68). То есть система решается на девять порядков точнее, чем имеет смысл,
@@ -262,14 +271,43 @@ int main(int argc, char **argv) {
                        * ρⁿ и упирается ровно в то, ради чего С1 и заводил DSA */
     ;
   }
-  /* комната: потолок светит, пол и стены серые, одна стена красноватая по
-   * яркости (цвета нет — считается один спектральный канал) */
-  double wr[6] = {0.72, 0.35, 0.72, 0.72, 0.65, 0.05};
-  for (int i = 0; i < 6; i++) {
-    wr[i] *= albs;
-    if (wr[i] > 0.999) wr[i] = 0.999;
-  }
-  double we[6] = {0, 0, 0, 0, 0, 6.0};
+  /* КОМНАТА ПО КАНАЛАМ (этап E). Прежде считался ОДИН спектральный канал, и
+   * «красноватая стена» была красноватой только по яркости — а на картинке
+   * стояла ЛОЖНАЯ РАСКРАСКА скалярной величины палитрой.
+   *
+   * Каналы суть НЕЗАВИСИМЫЕ задачи переноса: развёртка гоняется по разу на
+   * канал со своими свойствами. Смешаться они не могут ПО ПОСТРОЕНИЮ — общего
+   * состояния у них нет вовсе, — и это довод в пользу такой раскладки, а не
+   * следствие лени.
+   *
+   * ПРИ `nch = 1` ВСЁ ОБЯЗАНО ОСТАТЬСЯ ПРЕЖНИМ ПОБИТОВО: нулевой канал несёт
+   * ровно те числа, что стояли здесь до правки. */
+  double wrc[TR3_MAXCH][6] = {{0.72, 0.35, 0.72, 0.72, 0.65, 0.05},
+                              {0.72, 0.20, 0.55, 0.72, 0.65, 0.05},
+                              {0.72, 0.18, 0.42, 0.72, 0.65, 0.05}};
+  double wec[TR3_MAXCH][6] = {{0, 0, 0, 0, 0, 6.0}, {0, 0, 0, 0, 0, 5.4}, {0, 0, 0, 0, 0, 4.5}};
+  /* ТРИ ОДИНАКОВЫХ КАНАЛА — режим фальсификатора №1: буферы обязаны совпасть с
+   * одноканальным прогоном ПОБИТОВО, иначе многоканальность что-то трогает. */
+  if (chsame)
+    for (int c = 1; c < TR3_MAXCH; c++)
+      for (int i = 0; i < 6; i++) {
+        wrc[c][i] = wrc[0][i];
+        wec[c][i] = wec[0][i];
+      }
+  /* КАНАЛ БЕЗ ИСТОЧНИКОВ — режим фальсификатора №2: обязан выйти РОВНО нулём. */
+  if (chdark >= 0 && chdark < TR3_MAXCH)
+    for (int i = 0; i < 6; i++)
+      wec[chdark][i] = 0.0;
+  if (chdbl >= 0 && chdbl < TR3_MAXCH)
+    for (int i = 0; i < 6; i++)
+      wec[chdbl][i] *= 2.0;
+  for (int c = 0; c < TR3_MAXCH; c++)
+    for (int i = 0; i < 6; i++) {
+      wrc[c][i] *= albs;
+      if (wrc[c][i] > 0.999) wrc[c][i] = 0.999;
+    }
+  double *wr = wrc[0];
+  double *we = wec[0];
   double *frho = calloc((size_t)ftab.n, sizeof(double));
   double *femit = calloc((size_t)ftab.n, sizeof(double));
   if (frho == NULL || femit == NULL) return 1;
@@ -300,17 +338,50 @@ int main(int argc, char **argv) {
   double *phi = calloc((size_t)mesh.ncell * 4, sizeof(double));
   if (phi == NULL) return 1;
   tr3_stats st;
+  memset(&st, 0, sizeof st);
   printf("ячеек %d, граней %d, поверхностных элементов %d, направлений %d, 1:1 нарушений %d, "
          "ячеек с ДВУМЯ телами %d (обязано быть 0)\n",
          mesh.ncell, mesh.nf, cut.nse, dirs.n, cut.nbad, nboth);
+  /* ХРАНИМОЕ ПО КАНАЛАМ, СПЛОШНЫМ МАССИВОМ [nch][4·nf] — та же раскладка, что
+   * ждёт сбор (gather3.h). Развёртка о каналах не знает вовсе: она вызывается
+   * по разу со своими свойствами, и это ровно то, что делает смешение
+   * невозможным по построению. */
+  double *boutc = calloc((size_t)nch * (size_t)mesh.nf * 4, sizeof(double));
+  double *soutc = calloc((size_t)nch * (size_t)(cut.nse > 0 ? cut.nse : 1) * 4, sizeof(double));
+  if (boutc == NULL || soutc == NULL) return 1;
   stage_mark();
-  double t0 = now();
-  int rc = tr3_sweep_solve(&prob, maxit, stol, phi, &st);
-  double t_sweep = now() - t0;
+  int rc = 0;
+  double t_sweep = 0.0;
+  memset(&st, 0, sizeof st);
+  for (int ch = 0; ch < nch; ch++) {
+    tr3_problem pc = prob;
+    pc.wall_rho = wrc[ch];
+    pc.wall_emit = wec[ch];
+    tr3_stats sc2;
+    double tc0 = now();
+    int rcc = tr3_sweep_solve(&pc, maxit, stol, phi, &sc2);
+    t_sweep += now() - tc0;
+    if (rcc != 0) rc = rcc;
+    memcpy(boutc + (size_t)ch * (size_t)mesh.nf * 4, sc2.bout,
+           (size_t)mesh.nf * 4 * sizeof(double));
+    if (cut.nse > 0)
+      memcpy(soutc + (size_t)ch * (size_t)cut.nse * 4, sc2.sout,
+             (size_t)cut.nse * 4 * sizeof(double));
+    if (ch + 1 == nch) {
+      st = sc2; /* последний канал: баланс и статистика докладываются по нему */
+    } else {
+      free(sc2.bout);
+      free(sc2.sout);
+    }
+    if (nch > 1)
+      printf("  канал %d: итераций %d, невязка %.2e, баланс на втекшее %.3e\n", ch, sc2.iters,
+             sc2.resid, sc2.pin > 0.0 ? fabs(sc2.balance) / sc2.pin : 0.0);
+  }
   stage_add("РАЗВЁРТКА (итерация по рассеянию)", 0);
-  printf("развёртка (ХОЛОДНЫЙ СТАРТ): код %d, итераций %d, невязка %.2e, срезок %d, %.2f с "
-         "(%.2f мс на итерацию)\n",
-         rc, st.iters, st.resid, st.nclip, t_sweep, 1e3 * t_sweep / (double)(st.iters + 1));
+  printf("развёртка (ХОЛОДНЫЙ СТАРТ, каналов %d): код %d, итераций %d, невязка %.2e, срезок %d, "
+         "%.2f с (%.2f мс на итерацию)\n",
+         nch, rc, st.iters, st.resid, st.nclip, t_sweep,
+         1e3 * t_sweep / (double)(st.iters + 1) / (double)nch);
   printf("баланс: втекло %.4f, вытекло %.4f, поглощено средой %.4f, ушло в поверхности %.4f, "
          "отдано ими %.4f\n",
          st.pin, st.pout, st.pabs, st.psin, st.psout);
@@ -476,7 +547,9 @@ int main(int argc, char **argv) {
   tr3_camera cam;
   double eye[3] = {8.0, 0.6, 7.2}, at[3] = {8.2, 9.5, 3.6}, up[3] = {0, 0, 1};
   if (tr3_camera_look(&cam, eye, at, up, 1.3, W, H)) return 1;
-  double *buf = calloc((size_t)W * (size_t)H, sizeof(double));
+  /* ТРИ БУФЕРА, А НЕ ОДИН: `buf` есть нулевой канал, и одноканальный путь
+   * пользуется им как прежде. */
+  double *buf = calloc((size_t)W * (size_t)H * (size_t)TR3_MAXCH, sizeof(double));
   if (buf == NULL) return 1;
 
   /* ИНДЕКС ГРАНИЧНЫХ ГРАНЕЙ ПО СЕТКЕ. Первая редакция искала грань ЛИНЕЙНЫМ
@@ -505,8 +578,9 @@ int main(int argc, char **argv) {
   tr3_gather gg = {.sc = &scn,
                    .m = &mesh,
                    .cut = &cut,
-                   .bout = st.bout,
-                   .sout = st.sout,
+                   .bout = boutc,
+                   .sout = soutc,
+                   .nch = nch,
                    .facet_spec = spec > 0.0 ? fspec : NULL,
                    .nfacet = ftab.n,
                    .wallidx = wallidx,
@@ -542,7 +616,10 @@ int main(int argc, char **argv) {
         double o[3], d[3];
         tr3_camera_ray(&cam, px, py, o, d);
         int nb = 0;
-        buf[(size_t)py * (size_t)W + (size_t)px] = tr3_gather_ray(&gg, o, d, &nb);
+        double px3[TR3_MAXCH] = {0, 0, 0};
+        tr3_gather_ray(&gg, o, d, &nb, px3);
+        for (int ch = 0; ch < nch; ch++)
+          buf[(size_t)ch * (size_t)W * (size_t)H + (size_t)py * (size_t)W + (size_t)px] = px3[ch];
         nbtot += nb;
         if (nb > nbmax) nbmax = nb;
       }
@@ -599,7 +676,11 @@ int main(int argc, char **argv) {
     size_t ext = dot != NULL ? (size_t)(dot - pfm) : ln;
     memcpy(pfm + ext, ".pfm", 5);
     /* R = G = B: спектральный канал ОДИН, и файл об этом не врёт */
-    if (hz_pfm_write(pfm, buf, buf, buf, W, H) != 0) {
+    /* НАСТОЯЩИЙ RGB, если каналов три; при одном — `R = G = B`, и файл об этом
+     * не врёт (формат взят трёхканальным сознательно, см. доклад 07-27). */
+    const double *pg = nch > 1 ? buf + (size_t)W * (size_t)H : buf;
+    const double *pb = nch > 2 ? buf + (size_t)2 * (size_t)W * (size_t)H : buf;
+    if (hz_pfm_write(pfm, buf, pg, pb, W, H) != 0) {
       fprintf(stderr, "не записалось: %s\n", pfm);
       return 1;
     }

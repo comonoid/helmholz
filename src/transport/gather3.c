@@ -91,8 +91,17 @@ static int32_t wall_face(const tr3_gather *g, const double o[3], const double d[
   return g->wallidx[((int32_t)wall * g->nwall + iu) * g->nwall + iv];
 }
 
-double tr3_gather_ray(const tr3_gather *g, const double o[3], const double d[3], int *nbounce) {
-  double p[3], dir[3], thr = 1.0, val = 0.0;
+double tr3_gather_ray(const tr3_gather *g, const double o[3], const double d[3], int *nbounce,
+                      double *out) {
+  /* ОДИН МАРШ НА ВСЕ КАНАЛЫ (этап E): геометрия у них общая, различаются только
+   * ЗНАЧЕНИЯ хранимого. Марш есть почти вся цена кадра, поэтому звать сбор по
+   * разу на канал значило бы утроить кадр там, где честная цена — проценты. */
+  const int nch = g->nch > 0 ? g->nch : 1;
+  const int32_t nse4 = (g->cut != NULL && g->cut->nse > 0 ? g->cut->nse : 1) * 4;
+  double p[3], dir[3], thr = 1.0;
+  double val[TR3_MAXCH];
+  for (int c = 0; c < nch; c++)
+    val[c] = 0.0;
   memcpy(p, o, sizeof p);
   memcpy(dir, d, sizeof dir);
   int nb = 0;
@@ -102,7 +111,10 @@ double tr3_gather_ray(const tr3_gather *g, const double o[3], const double d[3],
     if (!h.hit) { /* ушёл в стенку куба */
       double hp[3];
       int32_t f = wall_face(g, p, dir, hp);
-      if (f >= 0) val += thr * dg1_at(g->m, g->m->f[f].ca, g->bout + (size_t)f * 4, hp);
+      if (f >= 0)
+        for (int c = 0; c < nch; c++)
+          val[c] += thr * dg1_at(g->m, g->m->f[f].ca,
+                                 g->bout + (size_t)c * (size_t)g->m->nf * 4 + (size_t)f * 4, hp);
       break;
     }
     int32_t mc = g->m->cellof[h.cell];
@@ -125,9 +137,14 @@ double tr3_gather_ray(const tr3_gather *g, const double o[3], const double d[3],
       nb++;
       continue;
     }
-    val += thr * dg1_at(g->m, mc, g->sout + (size_t)e * 4, h.p);
+    for (int c = 0; c < nch; c++)
+      val[c] += thr * dg1_at(g->m, mc, g->sout + (size_t)c * (size_t)nse4 + (size_t)e * 4, h.p);
     break;
   }
   if (nbounce != NULL) *nbounce = nb;
-  return val > 0.0 ? val : 0.0;
+  for (int c = 0; c < nch; c++) {
+    if (!(val[c] > 0.0)) val[c] = 0.0;
+    if (out != NULL) out[c] = val[c];
+  }
+  return val[0];
 }

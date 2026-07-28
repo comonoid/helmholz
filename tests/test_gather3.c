@@ -264,8 +264,8 @@ static void t_frame_units(void) {
       double o1[3], d1[3], o2[3], d2[3];
       tr3_camera_ray(&ca, px, py, o1, d1);
       tr3_camera_ray(&cb, px, py, o2, d2);
-      double va = tr3_gather_ray(&ga, o1, d1, NULL);
-      double vb = tr3_gather_ray(&gb, o2, d2, NULL);
+      double va = tr3_gather_ray(&ga, o1, d1, NULL, NULL);
+      double vb = tr3_gather_ray(&gb, o2, d2, NULL, NULL);
       double den = fabs(va) > 0.0 ? fabs(va) : 1.0;
       double e = fabs(va - vb) / den;
       if (e > worst) worst = e;
@@ -289,8 +289,8 @@ static void t_frame_units(void) {
       double o1[3], d1[3], o2[3], d2[3];
       tr3_camera_ray(&ca, px, py, o1, d1);
       tr3_camera_ray(&cb, px, py, o2, d2);
-      double va = tr3_gather_ray(&ga, o1, d1, NULL);
-      double vb = tr3_gather_ray(&gb, o2, d2, NULL);
+      double va = tr3_gather_ray(&ga, o1, d1, NULL, NULL);
+      double vb = tr3_gather_ray(&gb, o2, d2, NULL, NULL);
       double e = fabs(va - vb);
       if (e > worst_perm) worst_perm = e;
     }
@@ -363,7 +363,7 @@ int main(void) {
       double o[3], d[3];
       tr3_camera_ray(&cam, px, py, o, d);
       int nb = 0;
-      double v = tr3_gather_ray(&gg, o, d, &nb);
+      double v = tr3_gather_ray(&gg, o, d, &nb, NULL);
       if (nb > 0) {
         nhit++;
         nbsum += nb;
@@ -475,7 +475,7 @@ int main(void) {
         double o[3], d[3];
         tr3_camera_ray(&cam, px, py, o, d);
         int nb = 0;
-        double v = tr3_gather_ray(&gg, o, d, &nb);
+        double v = tr3_gather_ray(&gg, o, d, &nb, NULL);
         if (nb == 0) continue;
         double want = L;
         for (int k = 0; k < nb; k++)
@@ -498,7 +498,7 @@ int main(void) {
         double o[3], d[3];
         tr3_camera_ray(&cam, px, py, o, d);
         int nb = 0;
-        double v = tr3_gather_ray(&gg, o, d, &nb);
+        double v = tr3_gather_ray(&gg, o, d, &nb, NULL);
         if (nb == 1) {
           got = v;
           found = 1;
@@ -522,7 +522,7 @@ int main(void) {
         double o[3], d[3];
         tr3_camera_ray(&cam, px, py, o, d);
         int nb = 0;
-        tr3_gather_ray(&gg, o, d, &nb);
+        tr3_gather_ray(&gg, o, d, &nb, NULL);
         if (nb > 0) nhit4++;
         if (nb >= gg.maxbounce) nstuck++;
       }
@@ -547,7 +547,7 @@ int main(void) {
         for (int px = 0; px < W; px++) {
           double o[3], d[3];
           tr3_camera_ray(&cam, px, py, o, d);
-          sum += tr3_gather_ray(&gg, o, d, NULL);
+          sum += tr3_gather_ray(&gg, o, d, NULL, NULL);
         }
       printf("        предел %2d: %.9f  (изменение %.3e)\n", mb, sum,
              prev > 0.0 ? fabs(sum - prev) / prev : 0.0);
@@ -616,7 +616,7 @@ int main(void) {
         for (int px = 0; px < W; px += 2) {
           double o[3], d[3];
           tr3_camera_ray(&cam, px, py, o, d);
-          double v = tr3_gather_ray(&g2, o, d, NULL);
+          double v = tr3_gather_ray(&g2, o, d, NULL, NULL);
           /* тот же луч, но первое отражение — по нормали ФАСЕТА */
           tr3_hit h;
           tr3_march(&s2, o, d, -1.0, &h);
@@ -639,7 +639,7 @@ int main(void) {
             o2[a] = h.p[a];
             d2[a] = d[a] - 2.0 * dn * nf[a];
           }
-          double v2 = tr3_gather_ray(&g2, o2, d2, NULL);
+          double v2 = tr3_gather_ray(&g2, o2, d2, NULL, NULL);
           double e2 = fabs(v2 - v);
           if (e2 > wdiff) wdiff = e2;
           sdiff += e2;

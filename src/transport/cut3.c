@@ -269,25 +269,81 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
           if (bf < 0 || bf > 5) continue;
           int axis = bf / 2;
           int32_t pos = m->clo[c][axis] + ((bf & 1) ? m->csize[c] : 0);
+          /* УСЛОВИЕ 1:1 СНЯТО — К96: СТОРОНА КОРОБКИ МОЖЕТ БЫТЬ РАЗБИТА НА
+           * НЕСКОЛЬКО ГРАНЕЙ, И ФЛЮИД ОБРЕЗАЕТСЯ ПО КАЖДОЙ.
+           *
+           * Прежде здесь стоял `break` на ПЕРВОЙ подходящей грани: весь флюидный
+           * многоугольник стороны сваливался в неё одну, а остальные подграни
+           * получали ноль. На равномерной сетке подгрань ровно одна, и дефект не
+           * проявлялся ВОВСЕ; на градуированной он ломал поток, и `cut3` честно
+           * считал такие ячейки в `nbad`, но не исправлял.
+           *
+           * Обрезка — Сазерленд—Ходжмен по четырём полуплоскостям прямоугольника
+           * грани, в ДВУХ поперечных координатах (третья постоянна на грани).
+           * Многоугольник флюида выпуклый, прямоугольник выпуклый, значит
+           * пересечение выпукло и алгоритма достаточно. Порога здесь нет:
+           * стороны прямоугольника — целые координаты сетки, и сравнение идёт с
+           * ними, а не с подобранным числом. */
+          int ua = (axis + 1) % 3, wa = (axis + 2) % 3;
+          if (ua > wa) {
+            int tt = ua;
+            ua = wa;
+            wa = tt;
+          }
           for (int32_t k = m->fstart[c]; k < m->fstart[c + 1]; k++) {
             int32_t fi = m->flist[k];
             if (m->f[fi].axis != axis || m->f[fi].pos != pos) continue;
+            /* прямоугольник грани в МИРЕ по двум поперечным осям */
+            double rlo[2] = {m->fr.o[ua] + m->fr.u[ua] * (double)m->f[fi].lo[0],
+                             m->fr.o[wa] + m->fr.u[wa] * (double)m->f[fi].lo[1]};
+            double rhi[2] = {m->fr.o[ua] + m->fr.u[ua] * (double)m->f[fi].hi[0],
+                             m->fr.o[wa] + m->fr.u[wa] * (double)m->f[fi].hi[1]};
+            double cp[2][64][3];
+            int cur = 0, ncp = (int)nv;
+            for (int e = 0; e < ncp; e++)
+              for (int a = 0; a < 3; a++)
+                cp[0][e][a] = vw[e][a];
+            for (int side = 0; side < 4 && ncp >= 3; side++) {
+              int ax = (side < 2) ? ua : wa;
+              double lim = (side & 1) ? rhi[side < 2 ? 0 : 1] : rlo[side < 2 ? 0 : 1];
+              double sgn = (side & 1) ? -1.0 : 1.0; /* внутри: sgn*(x−lim) ≥ 0 */
+              int nxt = 0, oth = 1 - cur;
+              for (int e = 0; e < ncp; e++) {
+                const double *A = cp[cur][e], *B = cp[cur][(e + 1) % ncp];
+                double da = sgn * (A[ax] - lim), db = sgn * (B[ax] - lim);
+                if (da >= 0.0 && nxt < 64) {
+                  for (int a = 0; a < 3; a++)
+                    cp[oth][nxt][a] = A[a];
+                  nxt++;
+                }
+                if ((da > 0.0 && db < 0.0) || (da < 0.0 && db > 0.0)) {
+                  double tt = da / (da - db);
+                  if (nxt < 64) {
+                    for (int a = 0; a < 3; a++)
+                      cp[oth][nxt][a] = A[a] + tt * (B[a] - A[a]);
+                    nxt++;
+                  }
+                }
+              }
+              cur = oth;
+              ncp = nxt;
+            }
+            if (ncp < 3) continue;
             double t1[4][4];
-            cu->farea[fi] += poly_mass2(m, vw, (int)nv, m->f[fi].ca, m->f[fi].ca, t1);
+            cu->farea[fi] += poly_mass2(m, cp[cur], ncp, m->f[fi].ca, m->f[fi].ca, t1);
             for (int i = 0; i < 4; i++)
               for (int j = 0; j < 4; j++)
                 cu->ffm[fi][i][j] += t1[i][j];
-            poly_mass2(m, vw, (int)nv, m->f[fi].ca, m->f[fi].cb, t1);
+            poly_mass2(m, cp[cur], ncp, m->f[fi].ca, m->f[fi].cb, t1);
             for (int i = 0; i < 4; i++)
               for (int j = 0; j < 4; j++)
                 cu->ffmx[fi][i][j] += t1[i][j];
             if (m->f[fi].cb >= 0) {
-              poly_mass2(m, vw, (int)nv, m->f[fi].cb, m->f[fi].cb, t1);
+              poly_mass2(m, cp[cur], ncp, m->f[fi].cb, m->f[fi].cb, t1);
               for (int i = 0; i < 4; i++)
                 for (int j = 0; j < 4; j++)
                   cu->ffmb[fi][i][j] += t1[i][j];
             }
-            break;
           }
         }
       }

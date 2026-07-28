@@ -121,6 +121,10 @@ int main(int argc, char **argv) {
    * на СХОДИМОСТИ рендерной сцены и меняет ли ответ. От этого зависит, нужен ли
    * Крылову внешний нелинейный цикл (этап B плана перехода). */
   int limiter = argc > 10 ? atoi(argv[10]) : 1;
+  /* К38: печатать историю невязки каждые `trace` итераций; 0 — молчать */
+  int trace = argc > 11 ? atoi(argv[11]) : 0;
+  /* предел итераций развёртки: диагностический прогон не обязан ждать сходимости */
+  int maxit = argc > 12 ? atoi(argv[12]) : 4000;
   if (log2n < 1 || log2n > 8) {
     fprintf(stderr, "log2n вне [1,8]\n");
     return 1;
@@ -271,7 +275,8 @@ int main(int argc, char **argv) {
                       .sig_s = sig_s,
                       .wall_rho = wr,
                       .wall_emit = we,
-                      .limiter = limiter};
+                      .limiter = limiter,
+                      .trace = trace};
   double *phi = calloc((size_t)mesh.ncell * 4, sizeof(double));
   if (phi == NULL) return 1;
   tr3_stats st;
@@ -280,7 +285,7 @@ int main(int argc, char **argv) {
          mesh.ncell, mesh.nf, cut.nse, dirs.n, cut.nbad, nboth);
   stage_mark();
   double t0 = now();
-  int rc = tr3_sweep_solve(&prob, 4000, 1e-9, phi, &st);
+  int rc = tr3_sweep_solve(&prob, maxit, 1e-9, phi, &st);
   double t_sweep = now() - t0;
   stage_add("РАЗВЁРТКА (итерация по рассеянию)", 0);
   printf("развёртка (ХОЛОДНЫЙ СТАРТ): код %d, итераций %d, невязка %.2e, срезок %d, %.2f с "

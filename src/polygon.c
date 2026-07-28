@@ -174,6 +174,30 @@ int hz_poly_inside(const hz_polyset *ps, const hz_poly *p, double u, double v) {
   return wind != 0;
 }
 
+int hz_poly_weld(const hz_objmesh *m, int32_t *wid, int32_t *nw, double *wpos) {
+  hz_ht wt;
+  if (ht_init(&wt, m->nv) != 0) {
+    ht_free(&wt);
+    return 2;
+  }
+  int32_t n = 0;
+  for (int32_t i = 0; i < m->nv; i++) {
+    const double *p = m->v + (size_t)i * 3;
+    int64_t sl = ht_slot(&wt, pos_key(p), 1);
+    if (wt.val[sl] == 0) {
+      wt.val[sl] = n + 1;
+      if (wpos != NULL)
+        for (int a = 0; a < 3; a++)
+          wpos[(size_t)n * 3 + (size_t)a] = p[a];
+      n++;
+    }
+    wid[i] = wt.val[sl] - 1;
+  }
+  ht_free(&wt);
+  *nw = n;
+  return 0;
+}
+
 int hz_poly_init_empty(hz_polyset *ps) {
   memset(ps, 0, sizeof *ps);
   if (hz_facettab_init(&ps->ft) != 0) return 2;
@@ -306,26 +330,12 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
 
   /* --- 1. сварка вершин по положению --- */
   {
-    hz_ht wt;
-    if (ht_init(&wt, m->nv) != 0) {
-      ht_free(&wt);
+    int32_t nwv = 0;
+    if (hz_poly_weld(m, w.wid, &nwv, w.wpos) != 0) {
       pb_free(&w);
       return 2;
     }
-    int32_t nw = 0;
-    for (int32_t i = 0; i < m->nv; i++) {
-      const double *p = m->v + (size_t)i * 3;
-      int64_t sl = ht_slot(&wt, pos_key(p), 1);
-      if (wt.val[sl] == 0) {
-        wt.val[sl] = nw + 1;
-        for (int a = 0; a < 3; a++)
-          w.wpos[(size_t)nw * 3 + (size_t)a] = p[a];
-        nw++;
-      }
-      w.wid[i] = wt.val[sl] - 1;
-    }
-    ht_free(&wt);
-    ps->nweld = nw;
+    ps->nweld = nwv;
   }
   const int64_t nw = ps->nweld;
 

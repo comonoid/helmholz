@@ -103,6 +103,14 @@ int hz_poly_add_quad(hz_polyset *ps, const double c[3], const double n[3], const
  * Заводит таблицу фасетов; дальше только `hz_poly_add_quad`. */
 int hz_poly_init_empty(hz_polyset *ps);
 
+/* СВАРКА ВЕРШИН ПО ПОЛОЖЕНИЮ — вынесена наружу, потому что нужна не только
+ * краю: силуэтные рёбра (Ш6) определяются по ПАРНОСТИ полурёбер, а парность
+ * без сварки меряет нарезку меша, а не геометрию (у зала 3 603 связные
+ * компоненты при 4.77% полурёбер без пары).
+ * `wid` — массив на `m->nv`; `*nw` получает число сварных вершин;
+ * `wpos` (может быть NULL) — `3*m->nv` координат сварных вершин. */
+int hz_poly_weld(const hz_objmesh *m, int32_t *wid, int32_t *nw, double *wpos);
+
 /* Мировая точка по местным (u,v). */
 void hz_poly_world(const hz_poly *p, double u, double v, double x[3]);
 

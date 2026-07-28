@@ -96,7 +96,17 @@ int main(int argc, char **argv) {
     double *rc = malloc((size_t)ps.np * sizeof *rc);
     double *rl = malloc((size_t)ps.np * sizeof *rl);
     double *ar = malloc((size_t)ps.np * sizeof *ar);
-    if (rc == NULL || rl == NULL || ar == NULL) return 1;
+    if (rc == NULL || rl == NULL || ar == NULL) {
+      free(rc);
+      free(rl);
+      free(ar);
+      return 1;
+    }
+    /* Заполняются оба массива целиком в цикле ниже; ноль здесь — чтобы
+     * анализатору была видна инициализация, а не только вера в цикл. */
+    memset(rc, 0, (size_t)ps.np * sizeof *rc);
+    memset(rl, 0, (size_t)ps.np * sizeof *rl);
+    memset(ar, 0, (size_t)ps.np * sizeof *ar);
     int32_t nmix = 0;
     double amix = 0.0, atot = 0.0;
 
@@ -165,9 +175,17 @@ int main(int argc, char **argv) {
       rl[k] = (sw > 0.0) ? sqrt(s2l / sw) : 0.0;
     }
     double *sc = malloc((size_t)ps.np * sizeof *sc);
+    double *sl = malloc((size_t)ps.np * sizeof *sl);
+    if (sc == NULL || sl == NULL) {
+      free(sc);
+      free(sl);
+      free(rc);
+      free(rl);
+      free(ar);
+      return 1;
+    }
     memcpy(sc, rc, (size_t)ps.np * sizeof *sc);
     qsort(sc, (size_t)ps.np, sizeof *sc, cmp_d);
-    double *sl = malloc((size_t)ps.np * sizeof *sl);
     memcpy(sl, rl, (size_t)ps.np * sizeof *sl);
     qsort(sl, (size_t)ps.np, sizeof *sl, cmp_d);
     printf("   %-7g %8d %9d %8.2f%% %11.3e %11.3e %11.3e %11.3e\n", d, ps.np, nmix,

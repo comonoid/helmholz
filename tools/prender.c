@@ -717,6 +717,38 @@ int main(int argc, char **argv) {
            s0.p99, s0.frac1, s0.frac10);
     fflush(stdout);
 
+    /* СВИП ПО ДОПУСКУ ПОЛЯ, без решения и кадра. Вопрос «почему поле отвергает
+     * 91% кандидатов» — это вопрос про ПОРОГ, и отвечать на него надо порогом,
+     * а не картинкой: `ltol` нормирован на СРЕДНЮЮ по сцене облучённость, то
+     * есть мягок в тени и жёсток у светильника, где `E` меняется на порядок за
+     * десятки сантиметров. `ltol = 1e9` выключает член вовсе. */
+    printf("\n   свип по допуску поля (только отбор, без решения):\n");
+    for (int q = 0; q < 5; q++) {
+      double lt = (double[]){0.01, 0.05, 0.2, 1.0, 1e9}[q];
+      hz_mergecfg mq;
+      memset(&mq, 0, sizeof mq);
+      mq.delta = eps;
+      mq.ltol = lt;
+      mq.rtol = 0.05;
+      mq.target = 1;
+      mq.use_geom = 1;
+      mq.use_rad = 1;
+      mq.use_mtl = 1;
+      mq.use_overlap = 1;
+      hz_pseglist sq;
+      hz_mergestat mst;
+      if (hz_merge(&sq, &base, &sgf, &F.ps, F.t.E, F.t.rho, &mq, &mst) != 0) return 1;
+      printf("      ltol %8.3g: пар %6lld, слито %5lld, участков %4d -> %4d; "
+             "отсев поля %6lld (%.1f%%), геом %5lld, мат %4lld, перекр %4lld; dmax %.3f м\n",
+             lt, (long long)mst.npair, (long long)mst.nmerged, mst.nseg_in, mst.nseg_out,
+             (long long)mst.nrej_rad,
+             100.0 * (double)mst.nrej_rad / (double)(mst.npair ? mst.npair : 1),
+             (long long)mst.nrej_geom, (long long)mst.nrej_mtl, (long long)mst.nrej_overlap,
+             mst.dmax_worst);
+      fflush(stdout);
+      hz_seg_free(&sq);
+    }
+
     const int32_t tg[3] = {700, 450, 250};
     for (int mode = 0; mode < 3; mode++)
       for (int i = 0; i < 3; i++) {

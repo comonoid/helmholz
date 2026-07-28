@@ -574,3 +574,215 @@ int hz_cut_apply(hz_objmesh *mo, hz_pseglist *so, const hz_objmesh *mi, const hz
   free(wn);
   return 0;
 }
+
+/* --- дробление регулярной сеткой ПЛОСКОСТЯМИ (разбор — в `pcut.h`) --------- */
+
+#define PCUT_GRIDFRAG 8192
+
+int hz_cut_grid(hz_objmesh *mo, hz_pseglist *so, const hz_objmesh *mi, const hz_pseglist *si,
+                double L, int64_t *nover) {
+  memset(mo, 0, sizeof *mo);
+  memset(so, 0, sizeof *so);
+  if (!(L > 0.0)) return 1;
+  if (nover != NULL) *nover = 0;
+
+  int64_t cap = (int64_t)mi->nt * 2 + 4096;
+  mo->f = malloc((size_t)cap * 3 * sizeof *mo->f);
+  mo->fn = malloc((size_t)cap * 3 * sizeof *mo->fn);
+  mo->fm = malloc((size_t)cap * sizeof *mo->fm);
+  mo->v = malloc((size_t)cap * 9 * sizeof *mo->v);
+  mo->vn = malloc((size_t)cap * 9 * sizeof *mo->vn);
+  int32_t *lab = malloc((size_t)cap * sizeof *lab);
+  int64_t *cellid = malloc((size_t)cap * sizeof *cellid);
+  frag *cur = malloc(PCUT_GRIDFRAG * sizeof *cur), *nxt = malloc(PCUT_GRIDFRAG * sizeof *nxt);
+  if (mo->f == NULL || mo->fn == NULL || mo->fm == NULL || mo->v == NULL || mo->vn == NULL ||
+      lab == NULL || cellid == NULL || cur == NULL || nxt == NULL) {
+    free(lab);
+    free(cellid);
+    free(cur);
+    free(nxt);
+    hz_obj_free(mo);
+    return 2;
+  }
+
+  const int32_t nx = (int32_t)((mi->hi[0] - mi->lo[0]) / L) + 2;
+  const int32_t ny = (int32_t)((mi->hi[1] - mi->lo[1]) / L) + 2;
+  int64_t nt = 0;
+
+  for (int32_t t = 0; t < mi->nt; t++) {
+    int nc = 1;
+    hz_obj_tri(mi, t, cur[0].p);
+    cur[0].has_n = 0;
+    for (int i = 0; i < 3; i++) {
+      int32_t ni = (mi->vn != NULL) ? mi->fn[(size_t)t * 3 + (size_t)i] : -1;
+      for (int a = 0; a < 3; a++)
+        cur[0].nrm[i][a] = (ni >= 0) ? mi->vn[(size_t)ni * 3 + (size_t)a] : 0.0;
+      if (ni >= 0) cur[0].has_n = 1;
+    }
+    /* Режем по каждой оси всеми плоскостями сетки, попавшими в габарит. */
+    for (int a = 0; a < 3 && nc > 0; a++) {
+      double lo = 1e300, hi = -1e300;
+      for (int c = 0; c < nc; c++)
+        for (int i = 0; i < 3; i++) {
+          if (cur[c].p[i][a] < lo) lo = cur[c].p[i][a];
+          if (cur[c].p[i][a] > hi) hi = cur[c].p[i][a];
+        }
+      int64_t k0 = (int64_t)floor((lo - mi->lo[a]) / L) + 1;
+      int64_t k1 = (int64_t)floor((hi - mi->lo[a]) / L);
+      double n[3] = {0.0, 0.0, 0.0};
+      n[a] = 1.0;
+      for (int64_t k = k0; k <= k1; k++) {
+        double off = mi->lo[a] + (double)k * L;
+        int nn2 = 0;
+        for (int c = 0; c < nc; c++) {
+          frag out[3];
+          int so2[3];
+          int kk = split_frag(&cur[c], n, off, out, so2);
+          for (int q = 0; q < kk; q++) {
+            if (nn2 >= PCUT_GRIDFRAG) {
+              if (nover != NULL) (*nover)++;
+              continue;
+            }
+            nxt[nn2++] = out[q];
+          }
+        }
+        memcpy(cur, nxt, (size_t)nn2 * sizeof *cur);
+        nc = nn2;
+      }
+    }
+    for (int c = 0; c < nc; c++) {
+      if (nt >= cap) {
+        int64_t nc2 = cap * 2;
+        void *q;
+        int bad = 0;
+        if ((q = realloc(mo->v, (size_t)nc2 * 9 * sizeof *mo->v)) != NULL)
+          mo->v = q;
+        else
+          bad = 1;
+        if ((q = realloc(mo->vn, (size_t)nc2 * 9 * sizeof *mo->vn)) != NULL)
+          mo->vn = q;
+        else
+          bad = 1;
+        if ((q = realloc(mo->f, (size_t)nc2 * 3 * sizeof *mo->f)) != NULL)
+          mo->f = q;
+        else
+          bad = 1;
+        if ((q = realloc(mo->fn, (size_t)nc2 * 3 * sizeof *mo->fn)) != NULL)
+          mo->fn = q;
+        else
+          bad = 1;
+        if ((q = realloc(mo->fm, (size_t)nc2 * sizeof *mo->fm)) != NULL)
+          mo->fm = q;
+        else
+          bad = 1;
+        if ((q = realloc(lab, (size_t)nc2 * sizeof *lab)) != NULL)
+          lab = q;
+        else
+          bad = 1;
+        if ((q = realloc(cellid, (size_t)nc2 * sizeof *cellid)) != NULL)
+          cellid = q;
+        else
+          bad = 1;
+        if (bad) {
+          free(lab);
+          free(cellid);
+          free(cur);
+          free(nxt);
+          hz_obj_free(mo);
+          return 2;
+        }
+        cap = nc2;
+      }
+      double cc[3] = {0.0, 0.0, 0.0};
+      for (int i = 0; i < 3; i++)
+        for (int a = 0; a < 3; a++)
+          cc[a] += cur[c].p[i][a] / 3.0;
+      int64_t ix = (int64_t)((cc[0] - mi->lo[0]) / L);
+      int64_t iy = (int64_t)((cc[1] - mi->lo[1]) / L);
+      int64_t iz = (int64_t)((cc[2] - mi->lo[2]) / L);
+      for (int i = 0; i < 3; i++) {
+        for (int a = 0; a < 3; a++) {
+          mo->v[(size_t)(nt * 3 + i) * 3 + (size_t)a] = cur[c].p[i][a];
+          mo->vn[(size_t)(nt * 3 + i) * 3 + (size_t)a] = cur[c].nrm[i][a];
+        }
+        mo->f[(size_t)nt * 3 + (size_t)i] = (int32_t)(nt * 3 + i);
+        mo->fn[(size_t)nt * 3 + (size_t)i] = cur[c].has_n ? (int32_t)(nt * 3 + i) : -1;
+      }
+      mo->fm[nt] = mi->fm[t];
+      lab[nt] = si->label[t];
+      cellid[nt] = (iz * ny + iy) * nx + ix;
+      nt++;
+    }
+  }
+  free(cur);
+  free(nxt);
+  mo->nt = (int32_t)nt;
+  mo->nv = (int32_t)(nt * 3);
+  mo->nvn = (int32_t)(nt * 3);
+  mo->nmtl = mi->nmtl;
+  mo->mtl = malloc((size_t)mi->nmtl * sizeof *mo->mtl);
+  if (mo->mtl == NULL) {
+    free(lab);
+    free(cellid);
+    hz_obj_free(mo);
+    return 2;
+  }
+  memcpy(mo->mtl, mi->mtl, (size_t)mi->nmtl * sizeof *mo->mtl);
+  for (int a = 0; a < 3; a++) {
+    mo->lo[a] = mi->lo[a];
+    mo->hi[a] = mi->hi[a];
+  }
+
+  /* Метка = (участок, ячейка). Ключей много, поэтому ХЕШ, а не плотный массив:
+   * плотный был бы nseg × ncell и на мелкой сетке не поместился бы. */
+  so->label = malloc((size_t)nt * sizeof *so->label);
+  so->seg = malloc((size_t)nt * sizeof *so->seg);
+  int64_t hn = 4;
+  while (hn < 4 * nt)
+    hn *= 2;
+  uint64_t *hk = calloc((size_t)hn, sizeof *hk);
+  int32_t *hv = malloc((size_t)hn * sizeof *hv);
+  if (so->label == NULL || so->seg == NULL || hk == NULL || hv == NULL) {
+    free(hk);
+    free(hv);
+    free(lab);
+    free(cellid);
+    hz_obj_free(mo);
+    hz_seg_free(so);
+    return 2;
+  }
+  int32_t nn = 0;
+  for (int64_t i = 0; i < nt; i++) {
+    uint64_t key = ((uint64_t)lab[i] << 40) ^ (uint64_t)cellid[i];
+    uint64_t kk = key + 1, s = hmix(kk) & (uint64_t)(hn - 1);
+    while (hk[s] != 0 && hk[s] != kk)
+      s = (s + 1) & (uint64_t)(hn - 1);
+    if (hk[s] == 0) {
+      hk[s] = kk;
+      hv[s] = nn;
+      so->seg[nn] = si->seg[lab[i]];
+      so->seg[nn].area = 0.0;
+      so->seg[nn].ntri = 0;
+      so->seg[nn].dmax = 0.0;
+      nn++;
+    }
+    int32_t g = hv[s];
+    so->label[i] = g;
+    so->seg[g].ntri++;
+    so->seg[g].area += hz_obj_tri_area(mo, (int32_t)i);
+    double p[3][3];
+    hz_obj_tri(mo, (int32_t)i, p);
+    for (int j = 0; j < 3; j++) {
+      double dv = fabs(p[j][0] * so->seg[g].n[0] + p[j][1] * so->seg[g].n[1] +
+                       p[j][2] * so->seg[g].n[2] - so->seg[g].off);
+      if (dv > so->seg[g].dmax) so->seg[g].dmax = dv;
+    }
+  }
+  so->nseg = nn;
+  so->delta = si->delta;
+  free(hk);
+  free(hv);
+  free(lab);
+  free(cellid);
+  return 0;
+}

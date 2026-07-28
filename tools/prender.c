@@ -240,6 +240,14 @@ static int scene_build(scene *S, const hz_objmesh *base, double delta, int nsrc,
     ssrc = &scut;
     cut_made = 2;
     S->ncut = 0;
+  } else if (docut == 4) {
+    /* ЧИСТОЕ дробление ПЛОСКОСТЯМИ: край прямой, осколков нет. */
+    int64_t ov = 0;
+    if (hz_cut_grid(&mcut, &scut, base, &sg0, gridL, &ov) != 0) return 1;
+    msrc = &mcut;
+    ssrc = &scut;
+    cut_made = 1;
+    S->ncut = 0;
   } else if (docut == 3) {
     /* КОНТРОЛЬ LOD: шаг растёт с дальностью от глаза, L = εR. */
     double eye[3] = HZ_CFG_HALL_EYE;
@@ -646,9 +654,17 @@ int main(int argc, char **argv) {
     for (int i = 0; i < 4; i++) {
       double L = (double[]){0.20, 0.10, 0.05, 0.025}[i];
       char lab[64], im[64];
-      snprintf(lab, sizeof lab, "ДЕТАЛИЗАЦИЯ L = %.3f·R", L);
+      snprintf(lab, sizeof lab, "ЗУБЧАТОЕ L = %.3f·R", L);
       snprintf(im, sizeof im, "sh6_lod_%d", i);
       if (one(&base, &cam, &d, delta, h, 8, 3, &cfg0, 0.0, lab, im, &s, NULL, NULL, L) != 0)
+        return 1;
+    }
+    for (int i = 0; i < 4; i++) {
+      double L = (double[]){0.40, 0.20, 0.10, 0.05}[i];
+      char lab[64], im[64];
+      snprintf(lab, sizeof lab, "ПЛОСКОСТЯМИ, шаг %.2f м", L);
+      snprintf(im, sizeof im, "sh6_grid_%d", i);
+      if (one(&base, &cam, &d, delta, h, 8, 4, &cfg0, 0.0, lab, im, &s, NULL, NULL, L) != 0)
         return 1;
     }
     tr3_dirs_free(&d);

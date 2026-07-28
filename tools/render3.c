@@ -130,6 +130,17 @@ int main(int argc, char **argv) {
   double warmdelta = argc > 13 ? atof(argv[13]) : 0.0;
   /* ЭТАП B: сравнить Крылов с рядом Неймана на этой сцене; 0 — не ставить */
   int krylov = argc > 14 ? atoi(argv[14]) : 0;
+  /* ДОПУСК РЕШАТЕЛЯ — ПАРАМЕТР, А НЕ КОНСТАНТА. `1e-9` при `φ ≈ 50` есть `2e-11`
+   * относительных, тогда как ошибка дискретизации на `16³` измерена в 3%
+   * (К68). То есть система решается на девять порядков точнее, чем имеет смысл,
+   * и цена этого — итерации. Число назначено, а не выведено: тот же класс, что
+   * `ε` в К68. */
+  double stol = argc > 15 ? atof(argv[15]) : 1e-9;
+  /* МНОЖИТЕЛЬ АЛЬБЕДО СТЕНОК: настоящий довод этапа B не в множителе на этой
+   * сцене, а в НЕЧУВСТВИТЕЛЬНОСТИ к альбедо. Ряд Неймана идёт как `ρⁿ` и при
+   * `ρ → 1` встаёт (С1, К37); Крылов на печи держал шесть проходов при любой
+   * толщине. Проверяется это только свипом по альбедо. */
+  double albs = argc > 16 ? atof(argv[16]) : 1.0;
   if (log2n < 1 || log2n > 8) {
     fprintf(stderr, "log2n вне [1,8]\n");
     return 1;
@@ -254,6 +265,10 @@ int main(int argc, char **argv) {
   /* комната: потолок светит, пол и стены серые, одна стена красноватая по
    * яркости (цвета нет — считается один спектральный канал) */
   double wr[6] = {0.72, 0.35, 0.72, 0.72, 0.65, 0.05};
+  for (int i = 0; i < 6; i++) {
+    wr[i] *= albs;
+    if (wr[i] > 0.999) wr[i] = 0.999;
+  }
   double we[6] = {0, 0, 0, 0, 0, 6.0};
   double *frho = calloc((size_t)ftab.n, sizeof(double));
   double *femit = calloc((size_t)ftab.n, sizeof(double));
@@ -290,7 +305,7 @@ int main(int argc, char **argv) {
          mesh.ncell, mesh.nf, cut.nse, dirs.n, cut.nbad, nboth);
   stage_mark();
   double t0 = now();
-  int rc = tr3_sweep_solve(&prob, maxit, 1e-9, phi, &st);
+  int rc = tr3_sweep_solve(&prob, maxit, stol, phi, &st);
   double t_sweep = now() - t0;
   stage_add("РАЗВЁРТКА (итерация по рассеянию)", 0);
   printf("развёртка (ХОЛОДНЫЙ СТАРТ): код %d, итераций %d, невязка %.2e, срезок %d, %.2f с "
@@ -348,12 +363,12 @@ int main(int argc, char **argv) {
     pn.limiter = 0;
     tr3_stats stn;
     double t0n = now();
-    int rcn = tr3_sweep_solve(&pn, maxit, 1e-9, phi_n, &stn);
+    int rcn = tr3_sweep_solve(&pn, maxit, stol, phi_n, &stn);
     double tn = now() - t0n;
 
     tr3_kstats stk;
     double t0k = now();
-    int rck = tr3_krylov_solve(&prob, 200, 1e-9, phi_k, bk, sk, &stk);
+    int rck = tr3_krylov_solve(&prob, 200, stol, phi_k, bk, sk, &stk);
     double tk = now() - t0k;
 
     double dmax = 0.0, pmax = 0.0, dbm = 0.0, bmax = 0.0;

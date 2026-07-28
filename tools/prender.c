@@ -660,7 +660,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     for (int i = 0; i < 4; i++) {
-      double L = (double[]){0.40, 0.20, 0.10, 0.05}[i];
+      double L = (double[]){1.60, 1.20, 0.80, 0.60}[i];
       char lab[64], im[64];
       snprintf(lab, sizeof lab, "ПЛОСКОСТЯМИ, шаг %.2f м", L);
       snprintf(im, sizeof im, "sh6_grid_%d", i);

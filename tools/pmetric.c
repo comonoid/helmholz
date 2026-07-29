@@ -129,8 +129,9 @@ int main(int argc, char **argv) {
            (long long)vs.nvert_fixed, (long long)vs.nvert_l2out, (long long)vs.nvert_fail, vs.tmax);
     printf("   О17: отказов по смещению %lld, худшее принятое смещение %.4f м\n",
            (long long)vs.nvert_far, vs.dmax_move);
-    printf("   О17: отказов без улучшения %lld; предел смещения %.4f м\n",
-           (long long)vs.nvert_noimp, vmove * dcoarse);
+    printf("   О17: отказов без улучшения %lld; предел смещения %.4f м; худшее относительное "
+           "изменение площади после пересчёта моментов %.3e\n",
+           (long long)vs.nvert_noimp, vmove * dcoarse, vs.dmax_area);
     printf("   О17: t* по корзинам 10^k м (от 1e-6):");
     for (int i = 0; i < 12; i++)
       if (vs.t_hist[i] > 0)

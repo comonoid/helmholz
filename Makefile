@@ -183,6 +183,11 @@ build/ptex: tools/ptex.c $(PFULL) | build
 build/pcoarse: tools/pcoarse.c $(PFULL) | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pcoarse.c $(PFULL) -lm'
 
+# pmetric — метрика огрубления: две сцены через ОБЩИЙ набор лучей (§34, О20).
+# Стенд ЗАМЕРА: огрубитель не трогает.
+build/pmetric: tools/pmetric.c $(PFULL) | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pmetric.c $(PFULL) -lm'
+
 # pfit — запас минимаксной (чебышевской) плоскости против средневзвешенной (§23).
 # Стенд ЗАМЕРА: огрубитель не трогает, критерий не меняет.
 build/pfit: tools/pfit.c $(PFULL) | build

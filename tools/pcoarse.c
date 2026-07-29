@@ -43,6 +43,8 @@ static double now_s(void) {
  * строки. Конфигурации при этом остаются в коде, а не в командной строке (§2:
  * иначе числа разных прогонов несравнимы). */
 static double g_only = -1.0;
+static int g_notie = 0;
+static int g_rand = 0;
 
 static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps, double eps,
                 int32_t target, int random, int brute, double delta, int ov) {
@@ -60,6 +62,7 @@ static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps
   mc.use_overlap = ov && !random;
   mc.random = random;
   mc.brute = brute;
+  mc.notie = g_notie;
   hz_pseglist so;
   hz_mergestat st;
   double t0 = now_s();
@@ -77,6 +80,15 @@ static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps
          "(на пару-кандидата %.2f мкс)\n",
          st.t_grid, st.t_gate, st.t_merge, st.t_label,
          (st.ncand > 0) ? 1e6 * st.t_gate / (double)st.ncand : 0.0);
+  /* ПОТОКИ: СТЕННОЕ И ПРОЦЕССОРНОЕ ВРЕМЯ ПОРОЗНЬ (К79), плюс ПЕРЕКОС. Без
+   * отношения `CPU/стена` упор в память неотличим от упора в счёт, а без
+   * перекоса «процессорное время выросло» неотличимо от простоя на активном
+   * ожидании (А57): при `dynamic` ждущий поток тоже тратит процессорное время. */
+  printf("        потоки: %d, ворота стенные %.2f с, процессорные %.2f с (CPU/стена %.2f); "
+         "пар у самого нагруженного потока %lld при среднем %lld\n",
+         st.nthreads, st.t_gate, st.t_gate_cpu, (st.t_gate > 0.0) ? st.t_gate_cpu / st.t_gate : 0.0,
+         (long long)st.npair_thr_max,
+         (long long)(st.nthreads > 0 ? st.npair_list / st.nthreads : st.npair_list));
   /* РАЗБИВКА ВОРОТ. Без неё всякий довод о том, что в них дорого, есть
    * атрибуция по догадке: О6 намерил цену ЛИНЕЙНОЙ ПО КРАЮ (сжатие втрое
    * уронило ворота втрое), а это указывает на пробы неперекрытия, а не на
@@ -254,6 +266,10 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     if (strncmp(argv[i], "only=", 5) == 0) g_only = strtod(argv[i] + 5, NULL);
     if (strcmp(argv[i], "nohull") == 0) use_hull = 0;
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ О8: сравнение без доопределения по номерам. Ставить
+     * только на ГОРОДЕ — на зале совпадающих `err` 49 из 19 846 (А14). */
+    if (strcmp(argv[i], "notie") == 0) g_notie = 1;
+    if (strcmp(argv[i], "rand") == 0) g_rand = 1;
   }
   double delta = (argc > 2) ? strtod(argv[2], NULL) : (city ? 0.05 : 0.045);
   hz_objmesh m;
@@ -385,6 +401,22 @@ int main(int argc, char **argv) {
            now_s() - ta, (long long)es.nbv_in, (long long)es.nbv_out, (double)es.nbv_out / ps.np);
   }
 
+  /* РЕЖИМ СЛУЧАЙНОЙ МЕТРИКИ ОТДЕЛЬНЫМ КЛЮЧОМ (`rand`). Он есть НЕГАТИВНЫЙ
+   * КОНТРОЛЬ критерия (Ш7, приёмка О12 и О20), и до О8 его величина зависела от
+   * ПОРЯДКА ЭМИСЦИИ пар — то есть при потоках рассыпалась бы (А13). После
+   * замены ЛЦГ на хеш от `(a, b)` она есть функция ПАРЫ, и проверяется это
+   * прямо: слепок при 1 и 16 потоках обязан совпасть. В постоянную таблицу
+   * строка не ставится, чтобы не менять конфигурацию §2 задним числом. */
+  if (g_rand) {
+    if (city)
+      run(&m, &sg, &ps, 0.5, 150000, 1, 0, delta, 1);
+    else
+      run(&m, &sg, &ps, 0.3, 250, 1, 0, delta, 1);
+    hz_poly_free(&ps);
+    hz_seg_free(&sg);
+    hz_obj_free(&m);
+    return 0;
+  }
   if (city) {
     /* Допуски огрубления заданы масштабом города, а не залом: у Rungholt
      * сегментация при δ ≤ 0.2 м не аппроксимирует НИЧЕГО (Ш1: `max dmax = 0`

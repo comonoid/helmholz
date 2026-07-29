@@ -1,6 +1,7 @@
 /* Огрубление слиянием. Разбор и оговорки — в `pmerge.h`. */
 
 #include "pmerge.h"
+#include <omp.h>
 #include <time.h>
 #include <math.h>
 #include <stdint.h>
@@ -31,14 +32,43 @@ typedef struct {
  * оставляло равные пары на произвол `qsort`, а от их порядка зависит, какие
  * группы срастутся первыми. Тогда сеточный набор кандидатов и переборный,
  * СОВПАДАЯ как множества, давали бы разный выход, и проверку «сетка равна
- * перебору» нельзя было бы поставить вовсе. */
+ * перебору» нельзя было бы поставить вовсе.
+ *
+ * ЭТО ЖЕ И ЕСТЬ ДОВОД ПОБИТОВОСТИ ПРИ ПОТОКАХ (А12): раз порядок полный, а пары
+ * попарно различны, отсортированный массив однозначно определён МНОЖЕСТВОМ пар,
+ * и порядок, в котором потоки их выдали, безразличен. Нестабильность `qsort`
+ * при полном порядке ничего не меняет.
+ *
+ * ФЛАГ `pm_notie` — НЕГАТИВНЫЙ КОНТРОЛЬ, а не режим. Он снимает доопределение,
+ * и тогда выход ОБЯЗАН зависеть от порядка эмиссии, то есть от числа потоков.
+ * Переменная файловая, потому что `qsort` не передаёт контекста; ставится один
+ * раз в начале `hz_merge`, из одного потока, до всякой сортировки. */
+static int pm_notie = 0;
+
 static int cmp_pair(const void *x, const void *y) {
   const pm_pair *p = x, *q = y;
   if (p->err < q->err) return -1;
   if (p->err > q->err) return 1;
+  if (pm_notie) return 0;
   if (p->a != q->a) return (p->a < q->a) ? -1 : 1;
   if (p->b != q->b) return (p->b < q->b) ? -1 : 1;
   return 0;
+}
+
+/* ПЕРЕМЕШИВАНИЕ ДЛЯ НЕГАТИВНОГО КОНТРОЛЯ `random` — ФУНКЦИЯ ПАРЫ, А НЕ ПОРЯДКА
+ * ЭМИССИИ (А13). Был ЛЦГ, продвигаемый по мере выдачи пар: при потоках он
+ * рассыпается, а на этом контроле стоят Ш7, приёмка О12 и приёмка О20. Хеш от
+ * `(a, b)` делает величину воспроизводимой лучше, чем прежде, и от обхода
+ * независимой вовсе. Ступени те же, что у `mix64` в `src/polygon.c`, — качество
+ * перемешивания здесь не роскошь: пространственно связная «случайность»
+ * ослабила бы контроль, оставшись с виду тем же (А61). */
+static uint64_t pm_mix64(uint64_t k) {
+  k ^= k >> 33;
+  k *= 0xFF51AFD7ED558CCDULL;
+  k ^= k >> 33;
+  k *= 0xC4CEB9FE1A85EC53ULL;
+  k ^= k >> 33;
+  return k;
 }
 
 static int32_t uf_find(int32_t *p, int32_t x) {
@@ -354,6 +384,16 @@ static double pm_now(void) {
   return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
+/* ПРОЦЕССОРНОЕ ВРЕМЯ ВСЕГО ПРОЦЕССА — второй часовой механизм к стенному (К79).
+ * Отношение `CPU/стена` показывает, заняты потоки или ждут; сама по себе
+ * величина при активном ожидании OpenMP включает и простой (А57), поэтому
+ * читать её надо только в паре со стенным временем и с перекосом по потокам. */
+static double pm_cpu(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+  return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
 /* --- отбор кандидатов ---------------------------------------------------------
  * `pm_emit` — единственное место, где пара проверяется и попадает в список.
  * Едино для сетки и для переборного эталона: иначе «совпадение выходов» ничего
@@ -364,8 +404,29 @@ typedef struct {
   int64_t pn, pcap;
 } pm_plist;
 
+/* ПАМЯТЬ СПИСКОВ ПАР — ОБЩАЯ НА ВСЕ ПОТОКИ, И ПИК МЕРИТСЯ, А НЕ ОЦЕНИВАЕТСЯ.
+ * После О8 списков столько же, сколько потоков, и «сумма пиков по потокам» была
+ * бы МАЖОРАНТОЙ: удваиваются они не одновременно. Поэтому ведётся текущий объём
+ * (сумма ёмкостей) и его максимум; момент удвоения учитывается как «старый плюс
+ * новый», момент сцепки — как «все списки плюс итоговый массив». Величина
+ * измеренная, а не выведенная. */
+static int64_t pm_bytes_cur = 0, pm_bytes_max = 0;
+
+static void pm_bytes_add(int64_t d, int64_t transient) {
+  int64_t cur;
+#pragma omp atomic capture
+  {
+    pm_bytes_cur += d;
+    cur = pm_bytes_cur;
+  }
+#pragma omp critical(pm_bytes)
+  {
+    if (cur + transient > pm_bytes_max) pm_bytes_max = cur + transient;
+  }
+}
+
 static int pm_emit(pm_plist *L, const hz_polyset *ps, const double *bb, int32_t a, int32_t b,
-                   const hz_mergecfg *cfg, hz_mergestat *st, uint64_t *rnd) {
+                   const hz_mergecfg *cfg, hz_mergestat *st) {
   st->ncand++;
   const double *A = bb + (size_t)a * 6, *B = bb + (size_t)b * 6;
   for (int c = 0; c < 3; c++) {
@@ -380,9 +441,10 @@ static int pm_emit(pm_plist *L, const hz_polyset *ps, const double *bb, int32_t 
    * члены: ворота по оценке сверху и перекрытие. */
   if (cfg->random) {
     /* НЕГАТИВНЫЙ КОНТРОЛЬ: метрика СЛУЧАЙНАЯ. Ошибка обязана стать O(1);
-     * если не стала — критерий ничего не решает и мерили не его. */
-    *rnd = *rnd * 6364136223846793005ULL + 1442695040888963407ULL;
-    err = (double)(*rnd >> 11) / 9007199254740992.0;
+     * если не стала — критерий ничего не решает и мерили не его.
+     * Величина есть функция ПАРЫ (А13), см. `pm_mix64`. */
+    uint64_t h = pm_mix64(((uint64_t)(uint32_t)a << 32) | (uint64_t)(uint32_t)b);
+    err = (double)(h >> 11) / 9007199254740992.0;
   } else {
     if (cfg->use_geom) {
       /* МАЖОРАНТА ЗА O(1), И ТОЧНЫЙ РАСЧЁТ ТОЛЬКО ЕСЛИ ОНА НЕ ПРОПУСТИЛА.
@@ -417,8 +479,7 @@ static int pm_emit(pm_plist *L, const hz_polyset *ps, const double *bb, int32_t 
     /* ПИК ПАМЯТИ СИДИТ В САМОМ УДВОЕНИИ: `realloc` в худшем случае держит
      * СТАРЫЙ и НОВЫЙ массивы одновременно, то есть полтора итоговых размера.
      * Мерить надо этот момент, а не конечную длину списка (О10). */
-    int64_t pk = (L->pcap + nc) * (int64_t)sizeof *L->pl;
-    if (pk > st->bytes_pairs_peak) st->bytes_pairs_peak = pk;
+    pm_bytes_add((nc - L->pcap) * (int64_t)sizeof *L->pl, nc * (int64_t)sizeof *L->pl);
     pm_pair *q = realloc(L->pl, (size_t)nc * sizeof *q);
     if (q == NULL) return 2;
     L->pl = q;
@@ -458,23 +519,48 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
     }
   }
 
-  /* --- кандидаты --- */
-  pm_plist L;
-  L.pcap = 4096;
-  L.pn = 0;
-  L.pl = malloc((size_t)L.pcap * sizeof *L.pl);
-  if (L.pl == NULL) {
+  /* --- кандидаты ---
+   * СПИСОК У КАЖДОГО ПОТОКА СВОЙ, сцепка — в порядке номеров потоков (О8).
+   * Порядок сцепки на выход не влияет (А12): `cmp_pair` — полный порядок, пары
+   * попарно различны, значит отсортированный массив определён МНОЖЕСТВОМ пар.
+   * Проверяется это не рассуждением, а негативным контролем `cfg.notie`. */
+  const int nthr = (cfg->brute) ? 1 : omp_get_max_threads();
+  pm_plist *TL = calloc((size_t)(nthr > 0 ? nthr : 1), sizeof *TL);
+  hz_mergestat *TS = calloc((size_t)(nthr > 0 ? nthr : 1), sizeof *TS);
+  if (TL == NULL || TS == NULL) {
+    free(TL);
+    free(TS);
     free(bb);
     free(par);
     return 2;
   }
-  uint64_t rnd = 0x9E3779B97F4A7C15ULL;
+  pm_bytes_cur = 0;
+  pm_bytes_max = 0;
+  pm_notie = cfg->notie;
   int oom = 0;
+  for (int t = 0; t < nthr; t++) {
+    TL[t].pcap = 4096;
+    TL[t].pn = 0;
+    TL[t].pl = malloc((size_t)TL[t].pcap * sizeof *TL[t].pl);
+    if (TL[t].pl == NULL) oom = 1;
+    pm_bytes_add(TL[t].pcap * (int64_t)sizeof *TL[t].pl, 0);
+  }
+  st->nthreads = (int32_t)nthr;
   double tphase = pm_now();
+  double tcpu0 = pm_cpu();
+  if (oom) {
+    for (int t = 0; t < nthr; t++)
+      free(TL[t].pl);
+    free(TL);
+    free(TS);
+    free(bb);
+    free(par);
+    return 2;
+  }
   if (cfg->brute) {
     for (int32_t a = 0; a < np && !oom; a++)
       for (int32_t b = a + 1; b < np && !oom; b++)
-        if (pm_emit(&L, ps, bb, a, b, cfg, st, &rnd) != 0) oom = 1;
+        if (pm_emit(&TL[0], ps, bb, a, b, cfg, &TS[0]) != 0) oom = 1;
   } else {
     /* СЕТКА КАНДИДАТОВ. Коробка полигона расширяется на `δ/2` с каждой стороны,
      * поэтому две коробки, отстоящие меньше чем на `δ`, заведомо делят ячейку:
@@ -507,7 +593,10 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
     if (cr == NULL || start == NULL) {
       free(cr);
       free(start);
-      free(L.pl);
+      for (int t = 0; t < nthr; t++)
+        free(TL[t].pl);
+      free(TL);
+      free(TS);
       free(bb);
       free(par);
       return 2;
@@ -541,7 +630,10 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
     if (idx == NULL) {
       free(cr);
       free(start);
-      free(L.pl);
+      for (int t = 0; t < nthr; t++)
+        free(TL[t].pl);
+      free(TL);
+      free(TS);
       free(bb);
       free(par);
       return 2;
@@ -561,46 +653,100 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
 
     st->t_grid = pm_now() - tphase;
     tphase = pm_now();
-    for (int64_t z = 0; z < nc[2] && !oom; z++)
-      for (int64_t y = 0; y < nc[1] && !oom; y++)
-        for (int64_t x = 0; x < nc[0] && !oom; x++) {
-          int64_t c = (z * nc[1] + y) * nc[0] + x;
-          for (int32_t i = start[c]; i < start[c + 1] && !oom; i++)
-            for (int32_t j = i + 1; j < start[c + 1] && !oom; j++) {
-              int32_t a = idx[i], b = idx[j];
-              if (a > b) {
-                int32_t t = a;
-                a = b;
-                b = t;
-              }
-              /* ПАРА ВЫДАЁТСЯ ОДИН РАЗ — из ПЕРВОЙ общей ячейки. Иначе крупный
-               * полигон, лежащий в сотне ячеек, дал бы сотню одинаковых пар, и
-               * они прошли бы дорогие ворота по сто раз. */
-              int first = 1;
-              for (int cc = 0; cc < 3 && first; cc++) {
-                int32_t lo = cr[(size_t)a * 6 + (size_t)cc];
-                if (cr[(size_t)b * 6 + (size_t)cc] > lo) lo = cr[(size_t)b * 6 + (size_t)cc];
-                int64_t me = (cc == 0) ? x : ((cc == 1) ? y : z);
-                if (me != lo) first = 0;
-              }
-              if (!first) continue;
-              if (pm_emit(&L, ps, bb, a, b, cfg, st, &rnd) != 0) oom = 1;
-            }
+    tcpu0 = pm_cpu();
+    /* ЦИКЛ ПО ЯЧЕЙКАМ — ПАРАЛЛЕЛЬНЫЙ, `dynamic`: цена ячейки различается на
+     * порядки (у города медиана 4 треугольника при максимуме 695 364), и
+     * статическое деление дало бы перекос вместо ускорения. Гонок нет:
+     * пишет каждый поток только в СВОЙ список и СВОИ счётчики, а правило
+     * «пара выдаётся из ПЕРВОЙ общей ячейки» есть функция ПАРЫ, а не обхода
+     * (А59: ячейка-эмитент — покоординатный максимум нижних углов коробок).
+     * НЕХВАТКА ПАМЯТИ — ОТКАЗ ВСЕЙ ФУНКЦИИ, а не усечённый список (А60): из
+     * `omp for` не выйти по `break`, поэтому флаг проверяется в начале тела, а
+     * усечённый список означал бы ложно малое число слияний. */
+#pragma omp parallel for schedule(dynamic, 8)
+    for (int64_t c = 0; c < tot; c++) {
+      int oomlocal;
+#pragma omp atomic read
+      oomlocal = oom;
+      if (oomlocal) continue;
+      int th = omp_get_thread_num();
+      int64_t x = c % nc[0], y = (c / nc[0]) % nc[1], z = c / ((int64_t)nc[0] * nc[1]);
+      for (int32_t i = start[c]; i < start[c + 1]; i++)
+        for (int32_t j = i + 1; j < start[c + 1]; j++) {
+          int32_t a = idx[i], b = idx[j];
+          if (a > b) {
+            int32_t t = a;
+            a = b;
+            b = t;
+          }
+          /* ПАРА ВЫДАЁТСЯ ОДИН РАЗ — из ПЕРВОЙ общей ячейки. Иначе крупный
+           * полигон, лежащий в сотне ячеек, дал бы сотню одинаковых пар, и
+           * они прошли бы дорогие ворота по сто раз. */
+          int first = 1;
+          for (int cc = 0; cc < 3 && first; cc++) {
+            int32_t lo = cr[(size_t)a * 6 + (size_t)cc];
+            if (cr[(size_t)b * 6 + (size_t)cc] > lo) lo = cr[(size_t)b * 6 + (size_t)cc];
+            int64_t me = (cc == 0) ? x : ((cc == 1) ? y : z);
+            if (me != lo) first = 0;
+          }
+          if (!first) continue;
+          if (pm_emit(&TL[th], ps, bb, a, b, cfg, &TS[th]) != 0) {
+#pragma omp atomic write
+            oom = 1;
+          }
         }
+    }
     free(cr);
     free(start);
     free(idx);
   }
   st->t_gate = pm_now() - tphase;
+  st->t_gate_cpu = pm_cpu() - tcpu0;
   tphase = pm_now();
-  pm_pair *pl = L.pl;
-  int64_t pn = L.pn;
+  /* --- сцепка списков в порядке номеров потоков и редукция счётчиков --- */
+  int64_t pn = 0;
+  for (int t = 0; t < nthr; t++) {
+    pn += TL[t].pn;
+    if (TL[t].pn > st->npair_thr_max) st->npair_thr_max = TL[t].pn;
+    st->ncand += TS[t].ncand;
+    st->npair += TS[t].npair;
+    st->nrej_geom += TS[t].nrej_geom;
+    st->nrej_overlap += TS[t].nrej_overlap;
+    st->ngate_major += TS[t].ngate_major;
+    st->ngate_exact += TS[t].ngate_exact;
+    st->ngate_ov += TS[t].ngate_ov;
+    st->ngate_ovbox += TS[t].ngate_ovbox;
+    st->nwork_tri += TS[t].nwork_tri;
+    st->nwork_bv += TS[t].nwork_bv;
+  }
+  pm_pair *pl = malloc((size_t)(pn > 0 ? pn : 1) * sizeof *pl);
+  if (pl == NULL) oom = 1;
   if (oom) {
     free(pl);
+    for (int t = 0; t < nthr; t++)
+      free(TL[t].pl);
+    free(TL);
+    free(TS);
     free(bb);
     free(par);
     return 2;
   }
+  /* Сцепка — момент наибольшей памяти: живы и все списки потоков, и итоговый
+   * массив. Учитывается именно так, а не суммой пиков (та была бы мажорантой). */
+  pm_bytes_add(0, pn * (int64_t)sizeof *pl);
+  {
+    int64_t at = 0;
+    for (int t = 0; t < nthr; t++) {
+      memcpy(pl + at, TL[t].pl, (size_t)TL[t].pn * sizeof *pl);
+      at += TL[t].pn;
+      free(TL[t].pl);
+      TL[t].pl = NULL;
+    }
+  }
+  free(TL);
+  free(TS);
+  st->bytes_pairs_peak = pm_bytes_max;
+  st->npair_list = pn;
 
   /* --- слияние по возрастанию ошибки (Т2: приоритет — качество) ---
    * ГЕОМЕТРИЯ ПРОВЕРЯЕТСЯ ЗДЕСЬ, ПО ОБЪЕДИНЕНИЮ ГРУПП. Списки членов ведутся
@@ -609,7 +755,6 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
    * дальше и могут слиться с другими. */
   qsort(pl, (size_t)pn, sizeof *pl, cmp_pair);
   st->bytes_pairs = pn * (int64_t)sizeof *pl;
-  if (st->bytes_pairs > st->bytes_pairs_peak) st->bytes_pairs_peak = st->bytes_pairs;
   /* СОВПАДАЮЩИЕ ОШИБКИ — мера силы негативного контроля О8, а не статистика.
    * Порядок доопределён номерами именно на этот случай; если совпадений нет,
    * снятие доопределения ничего не изменит, и контроль окажется слепым, не

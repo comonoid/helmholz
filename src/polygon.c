@@ -198,6 +198,137 @@ int hz_poly_weld(const hz_objmesh *m, int32_t *wid, int32_t *nw, double *wpos) {
   return 0;
 }
 
+/* --- опорное множество (О7) ---------------------------------------------------
+ *
+ * Разбор и обе ветви — в `polygon.h` у поля `sup`. Здесь только устройство.
+ * Точка несёт и проекцию на раму полигона (для оболочки), и ИСХОДНУЮ мировую
+ * вершину: хранится в опорном множестве именно она, а не восстановленная из
+ * `(u,v)`, — иначе `dmax` считался бы по точке, снесённой на плоскость, то есть
+ * ровно по той ПРОЕКЦИИ, из-за которой измерение по краю и оказалось незаконным
+ * (А7). */
+typedef struct {
+  double u, v;
+  double x[3];
+} sup_pt;
+
+/* Порядок ПОЛНЫЙ и лексикографический: сперва проекция (её и требует монотонная
+ * цепь), потом координаты — тогда точные дубликаты стоят рядом при любом
+ * совпадении проекций. */
+static int cmp_sup(const void *a, const void *b) {
+  const sup_pt *p = a, *q = b;
+  if (p->u < q->u) return -1;
+  if (p->u > q->u) return 1;
+  if (p->v < q->v) return -1;
+  if (p->v > q->v) return 1;
+  for (int c = 0; c < 3; c++) {
+    if (p->x[c] < q->x[c]) return -1;
+    if (p->x[c] > q->x[c]) return 1;
+  }
+  return 0;
+}
+
+static int sup_same(const sup_pt *p, const sup_pt *q) {
+  for (int c = 0; c < 3; c++)
+    if (p->x[c] < q->x[c] || p->x[c] > q->x[c]) return 0;
+  return 1;
+}
+
+static double sup_cross(const sup_pt *o, const sup_pt *a, const sup_pt *b) {
+  return (a->u - o->u) * (b->v - o->v) - (a->v - o->v) * (b->u - o->u);
+}
+
+/* Точка внутри выпуклого многоугольника, заданного против часовой стрелки?
+ * Двоичный поиск по клину от `h[0]`: `O(log nh)` на точку, поэтому сторож (А48)
+ * стоит `O(n log nh)` на полигон и берётся один раз при импорте.
+ * Нестрогие сравнения намеренно: точка НА границе внутри. */
+static int sup_inside(const sup_pt *buf, const int32_t *h, int32_t nh, const sup_pt *p) {
+  if (nh < 3) return 1; /* вырожденная оболочка: цепь оставила все точки */
+  if (sup_cross(&buf[h[0]], &buf[h[1]], p) < 0.0) return 0;
+  if (sup_cross(&buf[h[0]], &buf[h[nh - 1]], p) > 0.0) return 0;
+  int32_t lo = 1, hi = nh - 1;
+  while (hi - lo > 1) {
+    int32_t mid = lo + (hi - lo) / 2;
+    if (sup_cross(&buf[h[0]], &buf[h[mid]], p) >= 0.0)
+      lo = mid;
+    else
+      hi = mid;
+  }
+  return sup_cross(&buf[h[lo]], &buf[h[lo + 1]], p) >= 0.0;
+}
+
+/* Опорное множество полигона: собрать вершины треугольников, отсортировать,
+ * различить, при плоскости ТОЧНО — свернуть до оболочки. Возвращает число
+ * оставленных точек, их номера — в `idx` (номера в отсортированном `buf`).
+ * `*planar` — по какой ветви пошло; `*nout` растёт на число точек, оказавшихся
+ * вне оболочки (сторож А48, обязан остаться нулём). */
+static int32_t sup_reduce(const hz_objmesh *m, const hz_polyset *ps, const hz_poly *P, sup_pt *buf,
+                          int32_t *idx, int use_hull, int *planar, int *hulled, int64_t *nout) {
+  int32_t n = 0;
+  int flat = 1;
+  *hulled = 0;
+  for (int32_t i = 0; i < P->ntri; i++) {
+    double p[3][3];
+    hz_obj_tri(m, ps->tri[P->t0 + i], p);
+    for (int k = 0; k < 3; k++) {
+      double q[3];
+      for (int a = 0; a < 3; a++)
+        q[a] = p[k][a] - P->org[a];
+      /* ПЛОСКОСТЬ ПРОВЕРЯЕТСЯ ЗДЕСЬ, А НЕ БЕРЁТСЯ ИЗ `P->dmax` (А44): `dmax`
+       * приходит от сегментатора и означает максимум по ЕГО множеству вершин и
+       * ЕГО плоскости. Ветвь (А) законна только при равенстве РОВНО нулю у
+       * каждой вершины, и это дешевле проверить, чем вывести. */
+      double d = p[k][0] * P->n[0] + p[k][1] * P->n[1] + p[k][2] * P->n[2] - P->off;
+      if (d < 0.0 || d > 0.0) flat = 0;
+      buf[n].u = q[0] * P->eu[0] + q[1] * P->eu[1] + q[2] * P->eu[2];
+      buf[n].v = q[0] * P->ev[0] + q[1] * P->ev[1] + q[2] * P->ev[2];
+      for (int a = 0; a < 3; a++)
+        buf[n].x[a] = p[k][a];
+      n++;
+    }
+  }
+  *planar = flat;
+  if (n <= 0) return 0;
+  qsort(buf, (size_t)n, sizeof *buf, cmp_sup);
+  int32_t nd = 0;
+  for (int32_t i = 0; i < n; i++) {
+    if (nd > 0 && sup_same(&buf[nd - 1], &buf[i])) continue;
+    buf[nd++] = buf[i];
+  }
+  for (int32_t i = 0; i < nd; i++)
+    idx[i] = i;
+  if (!use_hull || !flat || nd < 4) return nd;
+
+  /* МОНОТОННАЯ ЦЕПЬ. Точка выбрасывается только при СТРОГОМ знаке: тогда
+   * коллинеарные остаются, и результат есть НАДмножество оболочки. Для
+   * максимума это безопасно в ту сторону, в какую ошибаться можно, — лишняя
+   * точка максимум не портит, потерянная ЗАНИЖАЕТ его (А45, класс А8). */
+  int32_t nh = 0;
+  for (int32_t i = 0; i < nd; i++) {
+    while (nh >= 2 && sup_cross(&buf[idx[nh - 2]], &buf[idx[nh - 1]], &buf[i]) < 0.0)
+      nh--;
+    idx[nh++] = i;
+  }
+  int32_t lower = nh + 1;
+  for (int32_t i = nd - 2; i >= 0; i--) {
+    while (nh >= lower && sup_cross(&buf[idx[nh - 2]], &buf[idx[nh - 1]], &buf[i]) < 0.0)
+      nh--;
+    idx[nh++] = i;
+  }
+  nh--; /* последняя точка совпадает с первой */
+  if (nh >= nd) {
+    for (int32_t i = 0; i < nd; i++)
+      idx[i] = i;
+    return nd;
+  }
+  /* СТОРОЖ (А48): каждая точка обязана лежать внутри построенной оболочки.
+   * Проверка прямая и от слепка независимая — тот ловит лишь перевернувшиеся
+   * решения. Оболочка читается через `idx`, копии не заводится. */
+  for (int32_t i = 0; i < nd; i++)
+    if (!sup_inside(buf, idx, nh, &buf[i])) (*nout)++;
+  *hulled = 1;
+  return nh;
+}
+
 int hz_poly_init_empty(hz_polyset *ps) {
   memset(ps, 0, sizeof *ps);
   if (hz_facettab_init(&ps->ft) != 0) return 2;
@@ -282,6 +413,30 @@ int hz_poly_add_quad(hz_polyset *ps, const double c[3], const double n[3], const
   ps->nbv += 4;
   ps->nloopall++;
   ps->loop[ps->nloopall] = ps->nbv;
+
+  /* ОПОРНОЕ МНОЖЕСТВО СОБРАННОГО ПОЛИГОНА — ЕГО ЧЕТЫРЕ УГЛА, и ноль здесь был
+   * бы ложным. Треугольников у такого полигона нет (`ntri = 0`), поэтому
+   * «максимум по треугольникам» дал бы ноль при любой плоскости; четыре угла
+   * дают точный максимум, потому что прямоугольник плоский и его оболочка —
+   * ровно они. В огрубление такие полигоны сейчас не попадают (`hz_merge`
+   * берёт только полигоны из участков), но подразумеваемый ноль — это то, на
+   * чём проект уже сидел (Ш7, А4). */
+  {
+    double *nsp = realloc(ps->sup, (size_t)(ps->nsupall + 4) * 3 * sizeof *nsp);
+    if (nsp == NULL) return 2;
+    ps->sup = nsp;
+    if (ps->nsupall + 4 > INT32_MAX) return 2;
+    P->s0 = (int32_t)ps->nsupall;
+    P->nsup = 4;
+    for (int i = 0; i < 4; i++) {
+      double x[3];
+      hz_poly_world(P, q[i][0], q[i][1], x);
+      for (int a = 0; a < 3; a++)
+        ps->sup[(size_t)(ps->nsupall + i) * 3 + (size_t)a] = x[a];
+    }
+    ps->nsupall += 4;
+    ps->nsup_hull++;
+  }
   ps->np++;
   return 0;
 }
@@ -292,6 +447,7 @@ void hz_poly_free(hz_polyset *ps) {
   free(ps->bv);
   free(ps->bw);
   free(ps->tri);
+  free(ps->sup);
   hz_facettab_free(&ps->ft);
   memset(ps, 0, sizeof *ps);
 }
@@ -319,6 +475,10 @@ static void pb_free(pb_work *w) {
 }
 
 int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
+  return hz_poly_build_ex(ps, m, sg, 1);
+}
+
+int hz_poly_build_ex(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg, int use_hull) {
   memset(ps, 0, sizeof *ps);
   if (hz_facettab_init(&ps->ft) != 0) return 2;
   const int32_t nt = m->nt, nseg = sg->nseg;
@@ -398,8 +558,31 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
   w.used = malloc((size_t)maxe * sizeof *w.used);
   w.marea = calloc((size_t)(m->nmtl > 0 ? m->nmtl : 1), sizeof *w.marea);
   int32_t *lbuf = malloc(((size_t)(maxe > 0 ? maxe : 1) + 8) * sizeof *lbuf);
-  if (w.ed == NULL || w.bd == NULL || w.used == NULL || w.marea == NULL || lbuf == NULL) {
+  /* Буферы опорного множества — на самый большой участок, как и всё в этом
+   * блоке: `3·ntri` точек и столько же номеров. Заводятся один раз, а не на
+   * полигон, потому что у города максимум — 695 364 треугольника, и повторное
+   * выделение на каждый из 301 430 полигонов стоило бы дороже самой работы. */
+  sup_pt *sbuf = malloc((size_t)maxe * sizeof *sbuf);
+  int32_t *sidx = malloc((size_t)maxe * sizeof *sidx);
+  if (w.ed == NULL || w.bd == NULL || w.used == NULL || w.marea == NULL || lbuf == NULL ||
+      sbuf == NULL || sidx == NULL) {
     free(lbuf);
+    free(sbuf);
+    free(sidx);
+    pb_free(&w);
+    return 2;
+  }
+  /* Ёмкость опорного массива растёт удвоением от четверти числа треугольников.
+   * Верхняя граница ветви (Б) есть `3·nt` точек, то есть `482` МБ на городе, и
+   * выделять их сразу нельзя: при работающей ветви (А) выйдут единицы
+   * процентов от этого. Транзит удвоения здесь дёшев ровно потому, что итог
+   * мал; на списке пар (О10) он стоил `868` МБ, и там ход обратный. */
+  int64_t supcap = (int64_t)nt / 4 + 16;
+  ps->sup = malloc((size_t)supcap * 3 * sizeof *ps->sup);
+  if (ps->sup == NULL) {
+    free(lbuf);
+    free(sbuf);
+    free(sidx);
     pb_free(&w);
     return 2;
   }
@@ -410,6 +593,8 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
   int32_t bvcap = maxe, loopcap = nt + nseg + 1;
   if (ps->bv == NULL || ps->bw == NULL || ps->loop == NULL) {
     free(lbuf);
+    free(sbuf);
+    free(sidx);
     pb_free(&w);
     return 2;
   }
@@ -432,6 +617,12 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
       P->nloop = 0;
       P->l0 = ps->nloopall;
       P->facet = -1;
+      /* Опорных точек ноль, и это НЕ ложный ноль: точек у полигона нет вовсе,
+       * поэтому в максимум он не вносит ничего — ровно как сейчас, где у него
+       * нет треугольников. Счётчик есть, чтобы молчания не было. */
+      P->s0 = 0;
+      P->nsup = 0;
+      ps->nsup_empty++;
       continue;
     }
     P->dmax = sg->seg[r].dmax;
@@ -498,8 +689,53 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
     P->facet = hz_facettab_add_plane(&ps->ft, &idf, P->n, P->off, -1, P->dmax);
     if (P->facet < 0) {
       free(lbuf);
+      free(sbuf);
+      free(sidx);
       pb_free(&w);
       return 2;
+    }
+
+    /* --- опорное множество (О7) --- */
+    {
+      int planar = 0, hulled = 0;
+      int32_t ns = sup_reduce(m, ps, P, sbuf, sidx, use_hull, &planar, &hulled, &ps->nsup_out);
+      if (planar) ps->nsup_flat++;
+      if (hulled)
+        ps->nsup_hull++;
+      else
+        ps->nsup_full++;
+      if (ps->nsupall + ns > supcap) {
+        int64_t nc = supcap;
+        while (nc < ps->nsupall + ns)
+          nc *= 2;
+        double *nsp = realloc(ps->sup, (size_t)nc * 3 * sizeof *nsp);
+        if (nsp == NULL) {
+          free(lbuf);
+          free(sbuf);
+          free(sidx);
+          pb_free(&w);
+          return 2;
+        }
+        ps->sup = nsp;
+        supcap = nc;
+      }
+      /* ПЕРЕПОЛНЕНИЕ ИНДЕКСА — ОТКАЗ, А НЕ ЗАВОРОТ (А50). `s0` тридцатидвух-
+       * битный по образцу `t0` и `l0`, а точек в ветви (Б) до `3·nt`; на сцене
+       * в сотни миллионов треугольников это выйдет за `INT32_MAX` МОЛЧА.
+       * Порога здесь нет: граница ТИПА, а не выбранное число. */
+      if (ps->nsupall + ns > INT32_MAX) {
+        free(lbuf);
+        free(sbuf);
+        free(sidx);
+        pb_free(&w);
+        return 2;
+      }
+      P->s0 = (int32_t)ps->nsupall;
+      P->nsup = ns;
+      for (int32_t i = 0; i < ns; i++)
+        for (int a = 0; a < 3; a++)
+          ps->sup[(size_t)(ps->nsupall + i) * 3 + (size_t)a] = sbuf[sidx[i]].x[a];
+      ps->nsupall += ns;
     }
 
     /* моменты и поле нормалей — один проход по треугольникам */
@@ -686,6 +922,8 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
         double *nb2 = realloc(ps->bv, (size_t)nc * 2 * sizeof *ps->bv);
         if (nb2 == NULL) {
           free(lbuf);
+          free(sbuf);
+          free(sidx);
           pb_free(&w);
           return 2;
         }
@@ -693,6 +931,8 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
         int32_t *nw2 = realloc(ps->bw, (size_t)nc * sizeof *ps->bw);
         if (nw2 == NULL) {
           free(lbuf);
+          free(sbuf);
+          free(sidx);
           pb_free(&w);
           return 2;
         }
@@ -704,6 +944,8 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
         int32_t *nl = realloc(ps->loop, ((size_t)nc + 2) * sizeof *ps->loop);
         if (nl == NULL) {
           free(lbuf);
+          free(sbuf);
+          free(sidx);
           pb_free(&w);
           return 2;
         }
@@ -753,6 +995,8 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
   }
   ps->np = nseg;
   free(lbuf);
+  free(sbuf);
+  free(sidx);
   pb_free(&w);
   return 0;
 }

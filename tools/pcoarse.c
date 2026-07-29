@@ -175,10 +175,86 @@ static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps
   hz_seg_free(&so);
 }
 
+/* Сравнение по УБЫВАНИЮ `dmax`: негативному контролю нужны худшие полигоны. */
+static const hz_poly *g_p = NULL;
+static int cmp_dmax_desc(const void *x, const void *y) {
+  const hz_poly *a = &g_p[*(const int32_t *)x], *b = &g_p[*(const int32_t *)y];
+  if (a->dmax > b->dmax) return -1;
+  if (a->dmax < b->dmax) return 1;
+  return 0;
+}
+
+/* НЕГАТИВНЫЙ КОНТРОЛЬ О7 (§13): `dmax` группы ТРЕМЯ способами — по
+ * треугольникам, по опорному множеству и ПО КРАЮ.
+ *
+ * Первые два обязаны совпасть БИТ В БИТ: множество, по которому берётся
+ * максимум, меняется, а величина — нет. Третий обязан РАЗОЙТИСЬ на зале и
+ * совпасть на городе, и это следует из построения, а не из данных:
+ * `hz_poly_world` возвращает точку СТРОГО в плоскости полигона, поэтому у
+ * группы из одного полигона отклонение края от собственной плоскости равно нулю
+ * ТОЧНО, а отклонение треугольников равно `P->dmax`.
+ *
+ * ЧЕГО ЭТОТ КОНТРОЛЬ НЕ ПОКАЗЫВАЕТ (А49): группа здесь из ОДНОГО полигона,
+ * значит доказывается «край слеп к собственному прогибу», а не утверждение А7
+ * целиком — в группе из нескольких членов край `B` относительно плоскости `A`
+ * несёт настоящую информацию, и слепота там другой природы. */
+static void negcontrol(const hz_objmesh *m, const hz_polyset *ps, int ntop) {
+  int32_t *ord = malloc((size_t)ps->np * sizeof *ord);
+  if (ord == NULL) return;
+  for (int32_t k = 0; k < ps->np; k++)
+    ord[k] = k;
+  g_p = ps->p;
+  qsort(ord, (size_t)ps->np, sizeof *ord, cmp_dmax_desc);
+  double wtri = 0.0, whull = 0.0, wedge = 0.0, dth = 0.0, dte = 0.0;
+  int32_t nn = (ps->np < ntop) ? ps->np : ntop;
+  for (int32_t i = 0; i < nn; i++) {
+    const hz_poly *P = &ps->p[ord[i]];
+    double a = 0.0, b = 0.0, c = 0.0;
+    for (int32_t q = 0; q < P->ntri; q++) {
+      double p[3][3];
+      hz_obj_tri(m, ps->tri[P->t0 + q], p);
+      for (int j = 0; j < 3; j++) {
+        double d = fabs(p[j][0] * P->n[0] + p[j][1] * P->n[1] + p[j][2] * P->n[2] - P->off);
+        if (d > a) a = d;
+      }
+    }
+    for (int32_t q = 0; q < P->nsup; q++) {
+      const double *S = ps->sup + (size_t)(P->s0 + q) * 3;
+      double d = fabs(S[0] * P->n[0] + S[1] * P->n[1] + S[2] * P->n[2] - P->off);
+      if (d > b) b = d;
+    }
+    for (int32_t l = P->l0; l < P->l0 + P->nloop; l++)
+      for (int32_t e = ps->loop[l]; e < ps->loop[l + 1]; e++) {
+        double x[3];
+        hz_poly_world(P, ps->bv[(size_t)e * 2], ps->bv[(size_t)e * 2 + 1], x);
+        double d = fabs(x[0] * P->n[0] + x[1] * P->n[1] + x[2] * P->n[2] - P->off);
+        if (d > c) c = d;
+      }
+    if (a > wtri) wtri = a;
+    if (b > whull) whull = b;
+    if (c > wedge) wedge = c;
+    if (fabs(a - b) > dth) dth = fabs(a - b);
+    if (a - c > dte) dte = a - c;
+  }
+  printf("   НЕГАТИВНЫЙ КОНТРОЛЬ О7 (%d полигонов с наибольшим dmax): по треугольникам %.6f м, "
+         "по оболочке %.6f м, ПО КРАЮ %.6f м\n",
+         nn, wtri, whull, wedge);
+  printf("      расхождение треугольники/оболочка %.3e м (обязано быть 0), "
+         "треугольники/край %.6f м (обязано быть > 0 на ЗАЛЕ и 0 на городе)\n",
+         dth, dte);
+  free(ord);
+}
+
 int main(int argc, char **argv) {
   int city = (argc > 1 && strcmp(argv[1], "city") == 0);
-  for (int i = 1; i < argc; i++)
+  /* ЭТАЛОН БЕЗ ОБОЛОЧКИ (А45): опорное множество — все различные вершины.
+   * Слепок и `dmax_worst` обязаны совпасть с обычным прогоном; расхождение
+   * означает, что монотонная цепь теряет опорные точки. */
+  int use_hull = 1;
+  for (int i = 1; i < argc; i++) {
     if (strncmp(argv[i], "only=", 5) == 0) g_only = strtod(argv[i] + 5, NULL);
+    if (strcmp(argv[i], "nohull") == 0) use_hull = 0;
+  }
   double delta = (argc > 2) ? strtod(argv[2], NULL) : (city ? 0.05 : 0.045);
   hz_objmesh m;
   if (hz_obj_load(&m, city ? HZ_CFG_CITY_OBJ : HZ_CFG_HALL_OBJ,
@@ -191,10 +267,10 @@ int main(int argc, char **argv) {
   if (hz_seg_planar(&sg, &m, delta) != 0) return 1;
   double t1 = now_s();
   hz_polyset ps;
-  if (hz_poly_build(&ps, &m, &sg) != 0) return 1;
+  if (hz_poly_build_ex(&ps, &m, &sg, use_hull) != 0) return 1;
   double t2 = now_s();
-  printf("== огрубление: %s, δ сегментации %g м, треугольников %d, полигонов %d\n",
-         city ? "ГОРОД" : "зал", delta, m.nt, ps.np);
+  printf("== огрубление: %s, δ сегментации %g м, треугольников %d, полигонов %d%s\n",
+         city ? "ГОРОД" : "зал", delta, m.nt, ps.np, use_hull ? "" : "  [БЕЗ ОБОЛОЧКИ]");
   /* ПОЛИГОНЫ БЕЗ КРАЯ — не любопытство, а то, на чём села первая редакция
    * критерия: `hz_poly_build` отбрасывает петли короче трёх вершин, и такой
    * полигон не даёт НИ ОДНОЙ пробы при проверке по краю, оставаясь в группе
@@ -230,12 +306,68 @@ int main(int argc, char **argv) {
       for (int32_t k = ps.np - ps.np / 100; k < ps.np; k++)
         tail += h[k];
       printf("   треугольников на полигон: среднее %.1f, p50 %d, p99 %d, максимум %d; "
-             "на верхний 1%% полигонов приходится %.1f%% треугольников\n\n",
+             "на верхний 1%% полигонов приходится %.1f%% треугольников\n",
              (double)sum / ps.np, h[ps.np / 2], h[ps.np - ps.np / 100], h[ps.np - 1],
              100.0 * (double)tail / (double)sum);
       free(h);
     }
   }
+  /* РАЗМЕР ОПОРНОГО МНОЖЕСТВА — ВЫХОД О7. Сравнивать его надо с числом ВЕРШИН
+   * ТРЕУГОЛЬНИКОВ (`3·ntri`), потому что именно столько трогал прежний путь, а
+   * не с числом треугольников. Печатается тем же порядком величин, что и
+   * распределение выше, чтобы строки сличались глазами. */
+  {
+    int32_t *h = malloc((size_t)ps.np * sizeof *h);
+    if (h != NULL) {
+      int64_t sum = 0;
+      for (int32_t k = 0; k < ps.np; k++) {
+        h[k] = ps.p[k].nsup;
+        sum += ps.p[k].nsup;
+      }
+      qsort(h, (size_t)ps.np, sizeof *h, cmp_i32);
+      printf("   опорных точек на полигон: среднее %.1f, p50 %d, p99 %d, максимум %d; "
+             "всего %lld точек (%.1f МБ) против %d вершин треугольников — сжатие %.1f×\n",
+             (double)sum / ps.np, h[ps.np / 2], h[ps.np - ps.np / 100], h[ps.np - 1],
+             (long long)ps.nsupall, (double)ps.nsupall * 3 * (double)sizeof *ps.sup / 1048576.0,
+             3 * m.nt, (sum > 0) ? 3.0 * (double)m.nt / (double)sum : 0.0);
+      free(h);
+    }
+  }
+  /* `dmax` СЕГМЕНТАТОРА ПРОТИВ ТОЧНОГО — прямая проверка А44. Первый берётся из
+   * `sg->seg[r].dmax` и докладывается как «максимум отклонения»; второй считается
+   * здесь по опорному множеству и плоскости полигона, то есть по той же
+   * формуле, что критерий огрубления. Если они расходятся, «dmax = 0.0000» есть
+   * ЛОЖНЫЙ НОЛЬ, и все выводы вида «у Rungholt отклонения нет» держатся на
+   * округлении печати, а не на геометрии. */
+  {
+    double wd = 0.0, wrel = 0.0;
+    int32_t nz = 0;
+    for (int32_t k = 0; k < ps.np; k++) {
+      const hz_poly *P = &ps.p[k];
+      double e = 0.0;
+      for (int32_t q = 0; q < P->nsup; q++) {
+        const double *S = ps.sup + (size_t)(P->s0 + q) * 3;
+        double d = fabs(S[0] * P->n[0] + S[1] * P->n[1] + S[2] * P->n[2] - P->off);
+        if (d > e) e = d;
+      }
+      if (e > wd) wd = e;
+      if (fabs(e - P->dmax) > wrel) wrel = fabs(e - P->dmax);
+      if (e > 0.0 && !(P->dmax > 0.0)) nz++;
+    }
+    printf("   dmax: точный максимум по сцене %.3e м; худшее расхождение с dmax сегментации "
+           "%.3e м; полигонов с dmax = 0 при НЕнулевом точном %d\n",
+           wd, wrel, nz);
+  }
+  /* ВЕТВИ И СТОРОЖ. «Плоских точно» есть свойство ДАННЫХ (А44) и печатается
+   * отдельно от «оболочек построено»: у полигона из трёх различных вершин
+   * оболочка равна им же, и строить её незачем. Сторож обязан быть нулём. */
+  printf("   опорное множество: плоских ТОЧНО %lld (%.1f%%), оболочек построено %lld, "
+         "полным набором %lld, без треугольников %lld; ТОЧЕК ВНЕ ОБОЛОЧКИ %lld\n\n",
+         (long long)ps.nsup_flat, 100.0 * (double)ps.nsup_flat / (double)ps.np,
+         (long long)ps.nsup_hull, (long long)ps.nsup_full, (long long)ps.nsup_empty,
+         (long long)ps.nsup_out);
+  negcontrol(&m, &ps, 64);
+  printf("\n");
   printf("   %5s %8s %7s %8s %9s %6s %10s %9s %9s %8s %10s %8s\n", "δ огр", "цель", "отбор",
          "полиг", "dmax", "/δ", "кандидат", "пар", "слито", "ячеек", "вхожд", "с");
 

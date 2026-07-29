@@ -134,8 +134,14 @@ static void pbox(const hz_polyset *ps, const hz_objmesh *m, int32_t k, double lo
  * Треугольники — это и есть поверхность; край есть её проекция. Заодно критерий
  * и докладываемый `dmax` становятся ОДНОЙ величиной, а не двумя похожими, и
  * тогда «`dmax_worst < δ`» — проверяемый инвариант, а не пожелание. */
-static double group_plane(const hz_polyset *ps, const hz_objmesh *m, const int32_t *mem, int32_t nm,
-                          double n[3], double *off, int64_t *nwork) {
+/* О7: ХОДИМ ПО ОПОРНОМУ МНОЖЕСТВУ, А НЕ ПО ВСЕМ ТРЕУГОЛЬНИКАМ. Величина ТА ЖЕ —
+ * максимум аффинной функции достигается на вершине выпуклой оболочки, — а работа
+ * падает на столько, во сколько оболочка мельче набора (`polygon.h`, поле `sup`).
+ * Мажорантой это НЕ становится: подмены максимума чем-то другим здесь нет, в
+ * отличие от Г40/Г44. Треугольники сюда больше не приходят вовсе, поэтому и
+ * сетка (`m`) функции не нужна. */
+static double group_plane(const hz_polyset *ps, const int32_t *mem, int32_t nm, double n[3],
+                          double *off, int64_t *nwork) {
   double s = 0.0, ns[3] = {0, 0, 0}, org[3] = {0, 0, 0};
   for (int32_t i = 0; i < nm; i++) {
     const hz_poly *P = &ps->p[mem[i]];
@@ -177,14 +183,12 @@ static double group_plane(const hz_polyset *ps, const hz_objmesh *m, const int32
   double dmax = 0.0;
   for (int32_t i = 0; i < nm; i++) {
     const hz_poly *P = &ps->p[mem[i]];
-    if (nwork != NULL) *nwork += 3 * (int64_t)P->ntri;
-    for (int32_t q = 0; q < P->ntri; q++) {
-      double p[3][3];
-      hz_obj_tri(m, ps->tri[P->t0 + q], p);
-      for (int j = 0; j < 3; j++) {
-        double d = fabs(p[j][0] * n[0] + p[j][1] * n[1] + p[j][2] * n[2] - *off);
-        if (d > dmax) dmax = d;
-      }
+    if (nwork != NULL) *nwork += P->nsup;
+    const double *S = ps->sup + (size_t)P->s0 * 3;
+    for (int32_t q = 0; q < P->nsup; q++) {
+      double d = fabs(S[(size_t)q * 3] * n[0] + S[(size_t)q * 3 + 1] * n[1] +
+                      S[(size_t)q * 3 + 2] * n[2] - *off);
+      if (d > dmax) dmax = d;
     }
   }
   return dmax;
@@ -360,8 +364,8 @@ typedef struct {
   int64_t pn, pcap;
 } pm_plist;
 
-static int pm_emit(pm_plist *L, const hz_polyset *ps, const hz_objmesh *m, const double *bb,
-                   int32_t a, int32_t b, const hz_mergecfg *cfg, hz_mergestat *st, uint64_t *rnd) {
+static int pm_emit(pm_plist *L, const hz_polyset *ps, const double *bb, int32_t a, int32_t b,
+                   const hz_mergecfg *cfg, hz_mergestat *st, uint64_t *rnd) {
   st->ncand++;
   const double *A = bb + (size_t)a * 6, *B = bb + (size_t)b * 6;
   for (int c = 0; c < 3; c++) {
@@ -393,7 +397,7 @@ static int pm_emit(pm_plist *L, const hz_polyset *ps, const hz_objmesh *m, const
         int32_t mm[2] = {a, b};
         double gn[3], goff;
         st->ngate_exact++;
-        qg = group_plane(ps, m, mm, 2, gn, &goff, &st->nwork_tri);
+        qg = group_plane(ps, mm, 2, gn, &goff, &st->nwork_tri);
         if (qg > cfg->delta) {
           st->nrej_geom++;
           return 0;
@@ -470,7 +474,7 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
   if (cfg->brute) {
     for (int32_t a = 0; a < np && !oom; a++)
       for (int32_t b = a + 1; b < np && !oom; b++)
-        if (pm_emit(&L, ps, m, bb, a, b, cfg, st, &rnd) != 0) oom = 1;
+        if (pm_emit(&L, ps, bb, a, b, cfg, st, &rnd) != 0) oom = 1;
   } else {
     /* СЕТКА КАНДИДАТОВ. Коробка полигона расширяется на `δ/2` с каждой стороны,
      * поэтому две коробки, отстоящие меньше чем на `δ`, заведомо делят ячейку:
@@ -580,7 +584,7 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
                 if (me != lo) first = 0;
               }
               if (!first) continue;
-              if (pm_emit(&L, ps, m, bb, a, b, cfg, st, &rnd) != 0) oom = 1;
+              if (pm_emit(&L, ps, bb, a, b, cfg, st, &rnd) != 0) oom = 1;
             }
         }
     free(cr);
@@ -662,7 +666,7 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
     }
     if (cfg->use_geom && !cfg->random) {
       double n[3], off;
-      if (!(group_plane(ps, m, mem, nm, n, &off, NULL) < cfg->delta)) {
+      if (!(group_plane(ps, mem, nm, n, &off, NULL) < cfg->delta)) {
         st->nrej_geom++;
         continue;
       }

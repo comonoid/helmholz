@@ -79,6 +79,10 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "cone=", 5) == 0) conemax = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "loss=", 5) == 0) lossmax = strtod(argv[i] + 5, NULL);
     if (strcmp(argv[i], "vfit") == 0) vfit = 1;
+    /* УРОВЕНЬ ЛЕСТНИЦЫ ЗАДАЁТСЯ ДОПУСКОМ, А НЕ ЦЕЛЬЮ. С целью число полигонов на
+     * грубых уровнях упирается в неё, и «сколько полигонов на уровне» меряется
+     * не то: получается ответ про цель, а не про геометрию (А126). */
+    if (strcmp(argv[i], "notarget") == 0) target = 0;
     if (strncmp(argv[i], "vfit=", 5) == 0) {
       vfit = 1;
       vmove = strtod(argv[i] + 5, NULL);

@@ -69,7 +69,7 @@ int main(int argc, char **argv) {
   double dcoarse = city ? 2.0 : 0.3;
   int32_t target = city ? 20000 : 250;
   int simp = 0, random = 0;
-  double conemax = 0.0, lossmax = 0.0;
+  double conemax = 0.0, lossmax = 0.0, aspmax = 0.0;
   int vfit = 0;
   double vmove = 1.0; /* предел смещения вершины в долях допуска огрубления */
   for (int i = 1; i < argc; i++) {
@@ -78,6 +78,10 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "d=", 2) == 0) dcoarse = strtod(argv[i] + 2, NULL);
     if (strncmp(argv[i], "cone=", 5) == 0) conemax = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "loss=", 5) == 0) lossmax = strtod(argv[i] + 5, NULL);
+    /* §37/§38: ограничение ВЫТЯНУТОСТИ группы как критерий. До сих пор оно было
+     * только измерено распределением, но ни разу не применено — а это разные
+     * вещи (А129). */
+    if (strncmp(argv[i], "asp=", 4) == 0) aspmax = strtod(argv[i] + 4, NULL);
     if (strcmp(argv[i], "vfit") == 0) vfit = 1;
     /* УРОВЕНЬ ЛЕСТНИЦЫ ЗАДАЁТСЯ ДОПУСКОМ, А НЕ ЦЕЛЬЮ. С целью число полигонов на
      * грубых уровнях упирается в неё, и «сколько полигонов на уровне» меряется
@@ -111,6 +115,7 @@ int main(int argc, char **argv) {
   mc.random = random;
   mc.conemax = conemax;
   mc.lossmax = lossmax;
+  mc.aspmax = aspmax;
   hz_pseglist so;
   hz_mergestat st;
   double t0 = now_s();

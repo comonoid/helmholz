@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# night3.sh — ПОДГОТОВКА К LOD: пригодность уровней при камере §2 (§47).
+#
+# ЧТО МЕРИТСЯ. Срез камеры выбирает уровень по правилу `dmax < ε·R` (§27).
+# Значит первое, что надо знать про уровень, — распределение ПРОЕЦИРУЕМОЙ ошибки
+# его групп при данной камере, `dmax·|sin∠(n, v̂)| / (ε·R)`, и доля групп,
+# допустимых при одном пикселе. Отсюда читается, сколько элементов дал бы срез, и
+# читается БЕЗ DAG: дерево нужно для ПЕРЕКЛЮЧЕНИЯ между уровнями, а не для оценки
+# их пригодности.
+#
+# ЛЕСТНИЦА ШИРЕ, ЧЕМ В §45: у города до 32 м, потому что при камере §2 дальний
+# край Rungholt даёт пиксельный след 0.17 м, и грубые уровни там могут оказаться
+# допустимыми — а могут и нет. Это и надо увидеть.
+set -u
+cd "$(dirname "$0")/.."
+OUT=build/night3
+mkdir -p "$OUT"
+LOG="$OUT/log.txt"
+: > "$LOG"
+while pgrep -x pmetric > /dev/null; do sleep 60; done
+
+run() {
+  local name=$1
+  shift
+  [ -s "$OUT/$name.txt" ] && { echo "SKIP $name" >> "$LOG"; return; }
+  echo "=== $name : $* : $(date +%H:%M:%S)" >> "$LOG"
+  OMP_NUM_THREADS=16 timeout 7200 ./build/pmetric "$@" > "$OUT/$name.txt" 2>&1
+  echo "    выход $? : $(date +%H:%M:%S)" >> "$LOG"
+  grep -E "участков|LOD:|ПИКСЕЛЯХ" "$OUT/$name.txt" >> "$LOG" 2>/dev/null
+}
+
+for D in 0.25 0.5 1.0 2.0 4.0 8.0 16.0 32.0; do
+  run "city_lod${D}" city simp notarget d=$D vfit=0.25
+done
+for D in 0.045 0.09 0.18 0.36 0.72 1.44 2.88; do
+  run "hall_lod${D}" hall simp notarget d=$D vfit=0.25
+done
+echo "LOD-ЛЕСТНИЦА ЗАКОНЧЕНА $(date +%H:%M:%S)" >> "$LOG"

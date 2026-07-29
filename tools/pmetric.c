@@ -157,6 +157,58 @@ int main(int argc, char **argv) {
    * смещение поверхности в пиксели (§27). */
   const double eps_px = (HZ_CFG_FOV_DEG * M_PI / 180.0) / (double)H;
 
+  /* --- ПОДГОТОВКА К LOD: ПРОЕЦИРУЕМАЯ ОШИБКА ПО ГРУППАМ (§47) ---
+   * Срез камеры берёт уровень по правилу `dmax < ε·R` (§27), поэтому первое, что
+   * надо знать про уровень, — распределение проецируемой ошибки его групп при
+   * данной камере: `dmax·|sin∠(n, v̂)| / (ε·R)`. Отсюда читается, какая доля
+   * групп уровня ДОПУСТИМА на своём расстоянии, то есть сколько элементов дал бы
+   * срез. DAG для этого не нужен — нужен он для ПЕРЕКЛЮЧЕНИЯ между уровнями, а
+   * не для оценки их пригодности. */
+  {
+    const double *eye = city ? eyec : eyeh;
+    int64_t hist[12];
+    memset(hist, 0, sizeof hist);
+    int64_t ok1 = 0, tot = 0;
+    double wmax = 0.0;
+    for (int32_t g = 0; g < so.nseg; g++) {
+      if (so.seg[g].ntri <= 0) continue;
+      const hz_poly *P = &psc.p[g];
+      double d[3], R = 0.0;
+      for (int c = 0; c < 3; c++) {
+        d[c] = P->org[c] - eye[c];
+        R += d[c] * d[c];
+      }
+      R = sqrt(R);
+      if (!(R > 0.0)) continue;
+      double cs = 0.0;
+      for (int c = 0; c < 3; c++)
+        cs += P->n[c] * d[c] / R;
+      /* Синус угла между нормалью и направлением на камеру: смещение ВДОЛЬ луча
+       * экран почти не двигает, поперёк — двигает (§27, А106). */
+      if (cs > 1.0) cs = 1.0;
+      if (cs < -1.0) cs = -1.0;
+      double sn = sqrt(1.0 - cs * cs);
+      double px = so.seg[g].dmax * sn / (eps_px * R);
+      tot++;
+      if (px <= 1.0) ok1++;
+      if (px > wmax) wmax = px;
+      int bk = 0;
+      if (px > 0.0) {
+        double lg = log10(px) + 3.0;
+        bk = (int)lg;
+        if (bk < 0) bk = 0;
+        if (bk > 11) bk = 11;
+      }
+      hist[bk]++;
+    }
+    printf("   LOD: проецируемая ошибка групп при камере §2, %% по корзинам 10^k пикселя:");
+    for (int i = 0; i < 12; i++)
+      if (hist[i] > 0)
+        printf(" [1e%d] %.2f", i - 3, 100.0 * (double)hist[i] / (double)(tot ? tot : 1));
+    printf("\n   LOD: групп %lld, допустимы при 1 пикселе %lld (%.2f%%), худшая %.1f пикселя\n",
+           (long long)tot, (long long)ok1, 100.0 * (double)ok1 / (double)(tot ? tot : 1), wmax);
+  }
+
   int64_t nboth = 0, nlost = 0, ngain = 0, nnone = 0;
   double *dt = malloc((size_t)W * (size_t)H * sizeof *dt);
   double *dpx = malloc((size_t)W * (size_t)H * sizeof *dpx);

@@ -45,6 +45,7 @@ static double now_s(void) {
 static double g_only = -1.0;
 static int g_notie = 0;
 static int g_rand = 0;
+static int g_noexact = 0;
 
 static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps, double eps,
                 int32_t target, int random, int brute, double delta, int ov) {
@@ -63,6 +64,7 @@ static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps
   mc.random = random;
   mc.brute = brute;
   mc.notie = g_notie;
+  mc.noexact = g_noexact;
   hz_pseglist so;
   hz_mergestat st;
   double t0 = now_s();
@@ -89,6 +91,13 @@ static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps
          st.nthreads, st.t_gate, st.t_gate_cpu, (st.t_gate > 0.0) ? st.t_gate_cpu / st.t_gate : 0.0,
          (long long)st.npair_thr_max,
          (long long)(st.nthreads > 0 ? st.npair_list / st.nthreads : st.npair_list));
+  /* СЛИЯНИЕ ПОСЛЕ О9: доля точных пересчётов и РАБОТА, ими вызванная. Доля
+   * попыток зависит от истории слияний (А67), поэтому вывод делается по работе
+   * (А71), а не по ней. */
+  printf("        слияние: попыток %lld, проверок объединения %lld, тронуто членов %lld, опорных "
+         "точек %lld\n",
+         (long long)st.nmerge_try, (long long)st.nmerge_exact, (long long)st.nwork_merge_mem,
+         (long long)st.nwork_merge_sup);
   /* РАЗБИВКА ВОРОТ. Без неё всякий довод о том, что в них дорого, есть
    * атрибуция по догадке: О6 намерил цену ЛИНЕЙНОЙ ПО КРАЮ (сжатие втрое
    * уронило ворота втрое), а это указывает на пробы неперекрытия, а не на
@@ -270,6 +279,9 @@ int main(int argc, char **argv) {
      * только на ГОРОДЕ — на зале совпадающих `err` 49 из 19 846 (А14). */
     if (strcmp(argv[i], "notie") == 0) g_notie = 1;
     if (strcmp(argv[i], "rand") == 0) g_rand = 1;
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ О9: точный пересчёт отключён там, где граница его
+     * требует; инвариант dmax_worst <= δ обязан НАРУШИТЬСЯ на городе. */
+    if (strcmp(argv[i], "noexact") == 0) g_noexact = 1;
   }
   double delta = (argc > 2) ? strtod(argv[2], NULL) : (city ? 0.05 : 0.045);
   hz_objmesh m;

@@ -174,6 +174,13 @@ static void pbox(const hz_polyset *ps, const hz_objmesh *m, int32_t k, double lo
  * предел стал рабочей частью, и это надо чинить, а не терпеть. */
 #define PM_MMEXCH 64
 
+/* ПРЕДЕЛ ПОВОРОТОВ ОСИ КОНУСА (О21). Персептрон на сфере сходится при СТРОГОЙ
+ * отделимости; при касании (нормаль ровно перпендикулярна любой допустимой оси)
+ * он будет крутиться, и предел это ловит. Тридцать два — заведомо больше
+ * ожидаемого: старт берётся из `Σ A·n`, и предсказание §31 — ноль-один поворот.
+ * Упёрлись — ОТКАЗ и счётчик; в докладе это «вырожденный конус» (А101). */
+#define PM_CONEIT 32
+
 /* Состояние минимаксного решателя — замер, а не отладка (А89: сходимость этой
  * формы обмена НЕ доказана, значит её надо мерить). */
 static int pm_solve4(double A[4][4], double rhs[4], double x[4]) {
@@ -461,7 +468,8 @@ static int pm_minimax(const hz_polyset *ps, const int32_t *mem, int32_t nm, doub
  * отличие от Г40/Г44. Треугольники сюда больше не приходят вовсе, поэтому и
  * сетка (`m`) функции не нужна. */
 static double group_plane(const hz_polyset *ps, const int32_t *mem, int32_t nm, double n[3],
-                          double *off, int64_t *nwork, hz_mergestat *mmst, int quarter) {
+                          double *off, int64_t *nwork, hz_mergestat *mmst, int quarter,
+                          double conemax, double *pcone) {
   double s = 0.0, ns[3] = {0, 0, 0}, org[3] = {0, 0, 0};
   for (int32_t i = 0; i < nm; i++) {
     const hz_poly *P = &ps->p[mem[i]];
@@ -494,9 +502,66 @@ static double group_plane(const hz_polyset *ps, const int32_t *mem, int32_t nm, 
    * Встречные грани — это ДВЕ поверхности, а не одна, и сливать их нельзя ни
    * при каком допуске; кривая же поверхность, которую огрубление и должно
    * сливать, держит нормали в одной полусфере, и её ограничивает `dmax`. */
-  for (int32_t i = 0; i < nm; i++) {
-    const hz_poly *P = &ps->p[mem[i]];
-    if (!(P->n[0] * n[0] + P->n[1] * n[1] + P->n[2] * n[2] > 0.0)) return 1e300;
+  /* О21: КОНУС НОРМАЛЕЙ, А НЕ ПОЛУСФЕРА С ОСЬЮ ИЗ `Σ A·n`. Две причины, обе
+   * замеренные. (1) А77: при взаимно гасящихся нормалях `Σ A·n` есть ОСТАТОК
+   * ОКРУГЛЕНИЯ, и проверка держалась на удаче — город при δ = 8 м дал тогда
+   * `dmax_worst = 9.236` м. (2) А97: после О11 полусфера оказалась слишком
+   * слабым условием — сливались куски с нормалями `(0,−1,0)`, `(−1,0,0)`,
+   * `(0,0,−1)`, потому что оптимальная плоскость к ним подбирается.
+   * Ось ищется персептроном на сфере: старт — `Σ A·n`, затем поворот к худшему
+   * нарушителю, пока такие есть. Сходимость — при отделимости множества;
+   * упёрлись в предел — ОТКАЗ (fail closed, А101: это «вырожденный конус», а не
+   * «конуса нет»). Полураствор `θ = arccos(min n_i·ось)` — ОЦЕНКА СВЕРХУ
+   * наименьшего конуса, значит ограничение сверху ошибается в сторону отказа. */
+  {
+    double ax[3] = {n[0], n[1], n[2]};
+    int it = 0;
+    double mn = 0.0;
+    for (; it <= PM_CONEIT; it++) {
+      mn = 2.0;
+      int32_t iw = -1;
+      for (int32_t i = 0; i < nm; i++) {
+        const hz_poly *P = &ps->p[mem[i]];
+        double d = P->n[0] * ax[0] + P->n[1] * ax[1] + P->n[2] * ax[2];
+        if (d < mn) {
+          mn = d;
+          iw = i;
+        }
+      }
+      if (mn > 0.0 || iw < 0) break;
+      const hz_poly *W = &ps->p[mem[iw]];
+      for (int c = 0; c < 3; c++)
+        ax[c] += W->n[c];
+      double al = sqrt(ax[0] * ax[0] + ax[1] * ax[1] + ax[2] * ax[2]);
+      if (!(al > 0.0)) return 1e300;
+      for (int c = 0; c < 3; c++)
+        ax[c] /= al;
+      if (mmst != NULL) mmst->ncone_turn++;
+    }
+    if (!(mn > 0.0)) {
+      if (mmst != NULL) mmst->ncone_fail++;
+      return 1e300;
+    }
+    /* ПОЛУРАСТВОР ВОЗВРАЩАЕТСЯ НАРУЖУ, А В ГИСТОГРАММУ ПОПАДАЕТ ТОЛЬКО У
+     * ПРИНЯТЫХ СЛИЯНИЙ (А99). Первая редакция писала его прямо здесь — и
+     * histogram оказывалась по ВСЕМ проверяемым парам, включая отвергаемые
+     * воротами: на зале в корзину `85-90°` попало `36.8%`, что говорит о
+     * кандидатах, а не о том, что сливается. */
+    if (pcone != NULL)
+      *pcone = acos(mn < -1.0 ? -1.0 : (mn > 1.0 ? 1.0 : mn)) * 180.0 / 3.14159265358979323846;
+    /* ОГРАНИЧЕНИЕ ПОЛУРАСТВОРА — ПАРАМЕТР, а не константа в коде: значение
+     * выбирается ПОСЛЕ замера гистограммы и метрики О20, а не в этом шаге. */
+    if (conemax > 0.0) {
+      double th = acos(mn < -1.0 ? -1.0 : (mn > 1.0 ? 1.0 : mn)) * 180.0 / 3.14159265358979323846;
+      if (th > conemax) {
+        if (mmst != NULL) mmst->ncone_rej++;
+        return 1e300;
+      }
+    }
+    /* Ось конуса становится ориентацией группы: она отделима от всех нормалей
+     * членов по построению, тогда как `Σ A·n` этого не гарантирует. */
+    for (int c = 0; c < 3; c++)
+      n[c] = ax[c];
   }
   *off = n[0] * org[0] + n[1] * org[1] + n[2] * org[2];
 
@@ -782,7 +847,8 @@ static int pm_emit(pm_plist *L, const hz_polyset *ps, const double *bb, int32_t 
         int32_t mm[2] = {a, b};
         double gn[3], goff;
         st->ngate_exact++;
-        qg = group_plane(ps, mm, 2, gn, &goff, &st->nwork_tri, st, cfg->quarter);
+        qg =
+            group_plane(ps, mm, 2, gn, &goff, &st->nwork_tri, st, cfg->quarter, cfg->conemax, NULL);
         if (qg > cfg->delta) {
           st->nrej_geom++;
           return 0;
@@ -1195,11 +1261,20 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
     st->nmerge_exact++;
     st->nwork_merge_mem += nm;
     {
-      double n[3], off;
-      double q = group_plane(ps, mem, nm, n, &off, &st->nwork_merge_sup, st, cfg->quarter);
+      double n[3], off, cone = 0.0;
+      double q = group_plane(ps, mem, nm, n, &off, &st->nwork_merge_sup, st, cfg->quarter,
+                             cfg->conemax, &cone);
       if (cfg->use_geom && !cfg->random && !cfg->noexact && !(q < cfg->delta)) {
         st->nrej_geom++;
         continue;
+      }
+      /* Полураствор — в гистограмму ТОЛЬКО у принятого слияния (А99). */
+      if (q < 1e299) {
+        int bk = (int)(cone / 5.0);
+        if (bk < 0) bk = 0;
+        if (bk > 17) bk = 17;
+        st->cone_hist[bk]++;
+        if (cone > st->cone_max) st->cone_max = cone;
       }
       /* Плоскость объединения запоминается у БУДУЩЕГО корня (`ra`). */
       if (q < 1e299) {

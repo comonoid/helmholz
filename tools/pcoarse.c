@@ -47,6 +47,7 @@ static int g_notie = 0;
 static int g_rand = 0;
 static int g_noexact = 0;
 static int g_quarter = 0;
+static double g_conemax = 0.0;
 
 static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps, double eps,
                 int32_t target, int random, int brute, double delta, int ov) {
@@ -67,6 +68,7 @@ static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps
   mc.notie = g_notie;
   mc.noexact = g_noexact;
   mc.quarter = g_quarter;
+  mc.conemax = g_conemax;
   hz_pseglist so;
   hz_mergestat st;
   double t0 = now_s();
@@ -101,6 +103,21 @@ static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps
          (long long)st.nmm_call,
          (st.nmm_call > 0) ? (double)st.nmm_exch / (double)st.nmm_call : 0.0,
          (long long)st.nmm_exch_max, (long long)st.nmm_cap, (long long)st.nmm_under, st.mm_gmax);
+  /* КОНУС НОРМАЛЕЙ (О21): гистограмма полураствора ПО СЛИЯНИЯМ — числа, которого
+   * в проекте не было вовсе, а без него всякий порог есть угадывание. */
+  {
+    int64_t tot = 0;
+    for (int i = 0; i < 18; i++)
+      tot += st.cone_hist[i];
+    printf("        конус: полураствор по слияниям, %% в корзинах по 5°:");
+    for (int i = 0; i < 18; i++)
+      if (st.cone_hist[i] > 0)
+        printf(" [%d-%d°] %.2f", i * 5, i * 5 + 5,
+               100.0 * (double)st.cone_hist[i] / (double)(tot ? tot : 1));
+    printf("; максимум %.2f°, поворотов оси %lld, вырожденных %lld, отвергнуто порогом %lld\n",
+           st.cone_max, (long long)st.ncone_turn, (long long)st.ncone_fail,
+           (long long)st.ncone_rej);
+  }
   printf("        минимакс: откатов к средневзвешенной %lld (%.2f%%)\n", (long long)st.nmm_revert,
          (st.nmm_call > 0) ? 100.0 * (double)st.nmm_revert / (double)st.nmm_call : 0.0);
   /* СЛИЯНИЕ ПОСЛЕ О9: доля точных пересчётов и РАБОТА, ими вызванная. Доля
@@ -296,6 +313,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "noexact") == 0) g_noexact = 1;
     /* НЕГАТИВНЫЙ КОНТРОЛЬ О11: минимакс по четверти точек. */
     if (strcmp(argv[i], "quarter") == 0) g_quarter = 1;
+    /* О21: ограничение полураствора конуса нормалей, градусы. */
+    if (strncmp(argv[i], "cone=", 5) == 0) g_conemax = strtod(argv[i] + 5, NULL);
   }
   double delta = (argc > 2) ? strtod(argv[2], NULL) : (city ? 0.05 : 0.045);
   hz_objmesh m;

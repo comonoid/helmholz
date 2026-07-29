@@ -48,6 +48,7 @@ static int g_rand = 0;
 static int g_noexact = 0;
 static int g_quarter = 0;
 static double g_conemax = 0.0;
+static double g_lossmax = 0.0, g_aspmax = 0.0;
 
 static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps, double eps,
                 int32_t target, int random, int brute, double delta, int ov) {
@@ -69,6 +70,8 @@ static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps
   mc.noexact = g_noexact;
   mc.quarter = g_quarter;
   mc.conemax = g_conemax;
+  mc.lossmax = g_lossmax;
+  mc.aspmax = g_aspmax;
   hz_pseglist so;
   hz_mergestat st;
   double t0 = now_s();
@@ -117,6 +120,25 @@ static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps
     printf("; максимум %.2f°, поворотов оси %lld, вырожденных %lld, отвергнуто порогом %lld\n",
            st.cone_max, (long long)st.ncone_turn, (long long)st.ncone_fail,
            (long long)st.ncone_rej);
+  }
+  {
+    int64_t ta = 0, tl = 0;
+    for (int i = 0; i < 12; i++) {
+      ta += st.asp_hist[i];
+      tl += st.loss_hist[i];
+    }
+    printf("        форма (§38): вытянутость, %% по корзинам 2^k:");
+    for (int i = 0; i < 12; i++)
+      if (st.asp_hist[i] > 0)
+        printf(" [%d..%d] %.2f", 1 << i, 1 << (i + 1),
+               100.0 * (double)st.asp_hist[i] / (double)(ta ? ta : 1));
+    printf("; максимум %.1f\n", st.asp_max);
+    printf("        форма (§38): потеря площади худшим членом, %% по корзинам 0.25:");
+    for (int i = 0; i < 12; i++)
+      if (st.loss_hist[i] > 0)
+        printf(" [%.2f..%.2f] %.2f", 1.0 + 0.25 * i, 1.25 + 0.25 * i,
+               100.0 * (double)st.loss_hist[i] / (double)(tl ? tl : 1));
+    printf("; максимум %.2f\n", st.loss_max);
   }
   printf("        минимакс: откатов к средневзвешенной %lld (%.2f%%)\n", (long long)st.nmm_revert,
          (st.nmm_call > 0) ? 100.0 * (double)st.nmm_revert / (double)st.nmm_call : 0.0);
@@ -315,6 +337,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "quarter") == 0) g_quarter = 1;
     /* О21: ограничение полураствора конуса нормалей, градусы. */
     if (strncmp(argv[i], "cone=", 5) == 0) g_conemax = strtod(argv[i] + 5, NULL);
+    if (strncmp(argv[i], "loss=", 5) == 0) g_lossmax = strtod(argv[i] + 5, NULL);
+    if (strncmp(argv[i], "asp=", 4) == 0) g_aspmax = strtod(argv[i] + 4, NULL);
   }
   double delta = (argc > 2) ? strtod(argv[2], NULL) : (city ? 0.05 : 0.045);
   hz_objmesh m;

@@ -467,6 +467,98 @@ static int pm_minimax(const hz_polyset *ps, const int32_t *mem, int32_t nm, doub
  * Мажорантой это НЕ становится: подмены максимума чем-то другим здесь нет, в
  * отличие от Г40/Г44. Треугольники сюда больше не приходят вовсе, поэтому и
  * сетка (`m`) функции не нужна. */
+/* ВЫТЯНУТОСТЬ ГРУППЫ И ПОТЕРЯ ПЛОЩАДИ ПРИ УПЛОЩЕНИИ (§38) — ЗАМЕР.
+ *
+ * Обе величины считаются из УЖЕ ИМЕЮЩИХСЯ и не требуют ни персептрона, ни
+ * итераций.
+ *
+ * ВЫТЯНУТОСТЬ. Вторые моменты полигона `mom[3..5]` = `∫u²`, `∫uv`, `∫v²` в его
+ * СОБСТВЕННОЙ раме, точные и взвешенные площадью. Точка `x = org + u·eu + v·ev`
+ * в раме группы даёт `U = a0 + a1·u + a2·v`, `V = b0 + b1·u + b2·v`, поэтому
+ * `∫U²`, `∫UV`, `∫V²` объединения собираются из моментов членов сложением — то
+ * есть за `O(1)` на член (перенос Штейнера сидит в членах с `a0`, `b0`).
+ * Вытянутость — корень отношения собственных чисел центральной ковариации,
+ * замкнутая форма для `2×2`.
+ *
+ * ПОТЕРЯ ПЛОЩАДИ. Грань, стоящая под углом к общей плоскости, проецируется с
+ * множителем `|n_i·N|`, то есть теряет площадь в `1/|n_i·N|` раз. Берётся
+ * МАКСИМУМ по членам, а не среднее (§38): среднее прячет одну перпендикулярную
+ * грань в сотне компланарных — подмена того же класса, что Г40/Г44.
+ */
+static void pm_shape(const hz_polyset *ps, const int32_t *mem, int32_t nm, const double N[3],
+                     hz_mergestat *st, double *pasp, double *ploss) {
+  double eu[3], ev[3];
+  {
+    int ax = 0;
+    for (int a = 1; a < 3; a++)
+      if (fabs(N[a]) < fabs(N[ax])) ax = a;
+    double e0[3] = {0.0, 0.0, 0.0};
+    e0[ax] = 1.0;
+    double d = e0[0] * N[0] + e0[1] * N[1] + e0[2] * N[2];
+    for (int a = 0; a < 3; a++)
+      eu[a] = e0[a] - d * N[a];
+    double en = sqrt(eu[0] * eu[0] + eu[1] * eu[1] + eu[2] * eu[2]);
+    if (!(en > 0.0)) return;
+    for (int a = 0; a < 3; a++)
+      eu[a] /= en;
+    ev[0] = N[1] * eu[2] - N[2] * eu[1];
+    ev[1] = N[2] * eu[0] - N[0] * eu[2];
+    ev[2] = N[0] * eu[1] - N[1] * eu[0];
+  }
+  double M0 = 0.0, MU = 0.0, MV = 0.0, MUU = 0.0, MUV = 0.0, MVV = 0.0, worst = 1.0;
+  for (int32_t i = 0; i < nm; i++) {
+    const hz_poly *P = &ps->p[mem[i]];
+    double c = fabs(P->n[0] * N[0] + P->n[1] * N[1] + P->n[2] * N[2]);
+    double loss = (c > 0.0) ? 1.0 / c : 1e300;
+    if (loss > worst) worst = loss;
+    double o[3];
+    for (int a = 0; a < 3; a++)
+      o[a] = P->org[a];
+    double a0 = o[0] * eu[0] + o[1] * eu[1] + o[2] * eu[2];
+    double b0 = o[0] * ev[0] + o[1] * ev[1] + o[2] * ev[2];
+    double a1 = P->eu[0] * eu[0] + P->eu[1] * eu[1] + P->eu[2] * eu[2];
+    double a2 = P->ev[0] * eu[0] + P->ev[1] * eu[1] + P->ev[2] * eu[2];
+    double b1 = P->eu[0] * ev[0] + P->eu[1] * ev[1] + P->eu[2] * ev[2];
+    double b2 = P->ev[0] * ev[0] + P->ev[1] * ev[1] + P->ev[2] * ev[2];
+    double m0 = P->mom[0], m1 = P->mom[1], m2 = P->mom[2];
+    double m3 = P->mom[3], m4 = P->mom[4], m5 = P->mom[5];
+    M0 += m0;
+    MU += a0 * m0 + a1 * m1 + a2 * m2;
+    MV += b0 * m0 + b1 * m1 + b2 * m2;
+    MUU += a0 * a0 * m0 + 2.0 * a0 * a1 * m1 + 2.0 * a0 * a2 * m2 + a1 * a1 * m3 +
+           2.0 * a1 * a2 * m4 + a2 * a2 * m5;
+    MVV += b0 * b0 * m0 + 2.0 * b0 * b1 * m1 + 2.0 * b0 * b2 * m2 + b1 * b1 * m3 +
+           2.0 * b1 * b2 * m4 + b2 * b2 * m5;
+    MUV += a0 * b0 * m0 + (a0 * b1 + a1 * b0) * m1 + (a0 * b2 + a2 * b0) * m2 + a1 * b1 * m3 +
+           (a1 * b2 + a2 * b1) * m4 + a2 * b2 * m5;
+  }
+  if (!(M0 > 0.0)) return;
+  double cuu = MUU / M0 - (MU / M0) * (MU / M0);
+  double cvv = MVV / M0 - (MV / M0) * (MV / M0);
+  double cuv = MUV / M0 - (MU / M0) * (MV / M0);
+  double tr = cuu + cvv, det = cuu * cvv - cuv * cuv;
+  double disc = tr * tr * 0.25 - det;
+  if (disc < 0.0) disc = 0.0;
+  double l1 = tr * 0.5 + sqrt(disc), l2 = tr * 0.5 - sqrt(disc);
+  /* Вырожденная ковариация (все точки на прямой) — вытянутость бесконечна;
+   * в последнюю корзину, а не в ноль: ложный ноль здесь означал бы «идеально
+   * круглая группа» ровно там, где она хуже всего. */
+  double asp = (l2 > 0.0 && l1 > 0.0) ? sqrt(l1 / l2) : 1e300;
+  int ab = (asp < 1e299) ? (int)(log(asp) / log(2.0)) : 11;
+  if (ab < 0) ab = 0;
+  if (ab > 11) ab = 11;
+  if (pasp != NULL) *pasp = asp;
+  if (ploss != NULL) *ploss = worst;
+  if (st == NULL) return;
+  st->asp_hist[ab]++;
+  if (asp < 1e299 && asp > st->asp_max) st->asp_max = asp;
+  int lb = (worst < 1e299) ? (int)((worst - 1.0) / 0.25) : 11;
+  if (lb < 0) lb = 0;
+  if (lb > 11) lb = 11;
+  st->loss_hist[lb]++;
+  if (worst < 1e299 && worst > st->loss_max) st->loss_max = worst;
+}
+
 static double group_plane(const hz_polyset *ps, const int32_t *mem, int32_t nm, double n[3],
                           double *off, int64_t *nwork, hz_mergestat *mmst, int quarter,
                           double conemax, double *pcone) {
@@ -1268,6 +1360,18 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
         st->nrej_geom++;
         continue;
       }
+      /* §38: ФОРМА КАК КРИТЕРИЙ. Потеря площади худшим членом (`1/|n_i·N|`) —
+       * МАКСИМУМ, а не среднее: среднее прячет одну перпендикулярную грань в
+       * сотне компланарных. Вытянутость — против вырожденной подгонки (А95). */
+      if (q < 1e299 && (cfg->lossmax > 0.0 || cfg->aspmax > 0.0)) {
+        double asp = 1.0, loss = 1.0;
+        pm_shape(ps, mem, nm, n, NULL, &asp, &loss);
+        if ((cfg->lossmax > 0.0 && loss > cfg->lossmax) ||
+            (cfg->aspmax > 0.0 && asp > cfg->aspmax)) {
+          st->nrej_shape++;
+          continue;
+        }
+      }
       /* Полураствор — в гистограмму ТОЛЬКО у принятого слияния (А99). */
       if (q < 1e299) {
         int bk = (int)(cone / 5.0);
@@ -1275,6 +1379,11 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
         if (bk > 17) bk = 17;
         st->cone_hist[bk]++;
         if (cone > st->cone_max) st->cone_max = cone;
+        /* §38: ВЫТЯНУТОСТЬ И ПОТЕРЯ ПЛОЩАДИ — замер по принятым слияниям. Обе
+         * величины считаются из уже имеющегося: вторые моменты `mom[6]` точны,
+         * взвешены площадью и аддитивны (А21), потеря площади есть `1/|n_i·N|`.
+         * Пока ТОЛЬКО замер: порогов нет, критерий не тронут. */
+        pm_shape(ps, mem, nm, n, st, NULL, NULL);
       }
       /* Плоскость объединения запоминается у БУДУЩЕГО корня (`ra`). */
       if (q < 1e299) {

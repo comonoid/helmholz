@@ -68,12 +68,13 @@ int main(int argc, char **argv) {
   double dcoarse = city ? 2.0 : 0.3;
   int32_t target = city ? 20000 : 250;
   int simp = 0, random = 0;
-  double conemax = 0.0;
+  double conemax = 0.0, lossmax = 0.0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "simp") == 0) simp = 1;
     if (strcmp(argv[i], "rand") == 0) random = 1;
     if (strncmp(argv[i], "d=", 2) == 0) dcoarse = strtod(argv[i] + 2, NULL);
     if (strncmp(argv[i], "cone=", 5) == 0) conemax = strtod(argv[i] + 5, NULL);
+    if (strncmp(argv[i], "loss=", 5) == 0) lossmax = strtod(argv[i] + 5, NULL);
   }
   hz_objmesh m;
   if (hz_obj_load(&m, city ? HZ_CFG_CITY_OBJ : HZ_CFG_HALL_OBJ,
@@ -97,6 +98,7 @@ int main(int argc, char **argv) {
   mc.use_overlap = !random;
   mc.random = random;
   mc.conemax = conemax;
+  mc.lossmax = lossmax;
   hz_pseglist so;
   hz_mergestat st;
   double t0 = now_s();

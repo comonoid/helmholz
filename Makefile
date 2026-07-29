@@ -15,7 +15,32 @@ WARN = -Wall -Wextra -Wshadow -Wconversion -Wsign-conversion -Wpointer-arith \
 # бит скалярного произведения в зависимости от инлайнинга, а на побитовом
 # совпадении держится водонепроницаемость разреза. #pragma STDC FP_CONTRACT
 # gcc не реализует — механизм только флагом.
-CFLAGS = -std=gnu11 -O2 -fopenmp -ffp-contract=off $(WARN) -I src
+#
+# НАБОР ИНСТРУКЦИЙ. До 07-29 сборка шла на базовом x86-64: SSE2 (он обязателен в
+# ABI для double) есть, AVX2 нет ВОВСЕ — проверено счётом регистров `ymm` в
+# дизассемблере, их было НОЛЬ во всех стендах.
+#
+# ПОЧЕМУ `skylake`, А НЕ `native`. `-march=native` на этой машине определяет
+# процессор НЕВЕРНО и разворачивается в базовый `x86-64` — проверено прямо:
+# пробный цикл `a[i] = b[i]*c[i] + a[i]` даёт `ymm 0` при `native` и `ymm 4` при
+# `-march=skylake`. Процессор — i9-9880H (Coffee Lake): AVX2 и FMA есть,
+# AVX-512 нет, и `skylake` — ровно его набор. Ставить сюда `native`, увидев его
+# в чужом Makefile, значит молча остаться без вектора: тот самый класс, где
+# величина перестаёт зависеть от параметра, которым её меняют.
+#
+# ТРИ ВЕЩИ, КОТОРЫЕ ПРИ ЭТОМ НАДО ДЕРЖАТЬ В ГОЛОВЕ:
+#   1. IEEE-СЕМАНТИКА НЕ МЕНЯЕТСЯ. Без `-ffast-math`/`-fassociative-math` gcc не
+#      переставляет слагаемые в редукциях, поэтому побитовые уговоры Г31/Г49
+#      остаются в силе. `-ffast-math` в этом проекте ЗАПРЕЩЁН по той же причине.
+#   2. FMA. `skylake` включает и его, но `-ffp-contract=off` запрещает
+#      контракцию. Замерено на том же пробном цикле: с `-ffp-contract=off` —
+#      `fma 0`, без него — `fma 2`. То есть оговорка Г31 держится флагом, а не
+#      надеждой, и `check-fp`/`check-simd` это проверяют.
+#   3. ПЕРЕНОСИМОСТЬ БИНАРНИКА теряется. Цена нулевая: считаем здесь. На другой
+#      машине — `make ARCH=-march=<её>`.
+# Проверка, что набор реально используется, — `make check-simd`, а не вера.
+ARCH   ?= -march=skylake
+CFLAGS = -std=gnu11 -O2 $(ARCH) -fopenmp -ffp-contract=off $(WARN) -I src
 LIBS   = -llapacke -llapack -lblas -lm
 
 all: build/test_octree build/test_sweep3 build/test_gather3 build/render3
@@ -123,6 +148,41 @@ build/pkernel: tools/pkernel.c $(PELEM) | build
 build/test_oven: tests/test_oven.c $(PELEM) | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_oven.c $(PELEM) -lm'
 
+# Слой ЛУЧА И КРАЯ: нужен стендам, которые спрашивают у сцены «что видно».
+PGEOM = src/scene_obj.c src/poly_seg.c src/polygon.c src/pedge.c src/pray.c \
+        src/cut/surf.c src/cut/poly3.c src/transport/cam3.c src/transport/ray3.c src/octree.c
+
+# §10, пункт 1: СОГЛАСОВАННОЕ УПРОЩЕНИЕ КРАЯ против независимого. Не в
+# `make test` — нужны assets/.
+build/psimp: tools/psimp.c $(PGEOM) | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/psimp.c $(PGEOM) -lm'
+
+# Полный набор полигональной модели: развёртка, луч, прямой свет, разрезы,
+# огрубление. Стенды Ш5…Ш8 и §10 собираются из него.
+PFULL = src/scene_obj.c src/poly_seg.c src/polygon.c src/pedge.c src/prast.c src/psweep.c \
+        src/pray.c src/pdirect.c src/pcut.c src/pmerge.c src/image.c \
+        src/cut/surf.c src/cut/poly3.c src/cut/qef.c \
+        src/transport/dirs3.c src/transport/quad.c src/transport/cam3.c src/transport/ray3.c \
+        src/octree.c
+
+build/prender: tools/prender.c $(PFULL) | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/prender.c $(PFULL) -lm'
+
+build/pconv: tools/pconv.c $(PFULL) | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pconv.c $(PFULL) -lm'
+
+build/pcuts: tools/pcuts.c $(PFULL) | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pcuts.c $(PFULL) -lm'
+
+build/ptex: tools/ptex.c $(PFULL) | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/ptex.c $(PFULL) -lm'
+
+# §10, пункты 2 и 6: ЦЕНА ОГРУБЛЕНИЯ и ГОРОД. Картинки не строит СОЗНАТЕЛЬНО —
+# на городе решать поле нечем и незачем, а вопрос здесь про число полигонов,
+# `dmax` и время.
+build/pcoarse: tools/pcoarse.c $(PFULL) | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pcoarse.c $(PFULL) -lm'
+
 # СРАВНЕНИЕ ДВУХ БУФЕРОВ РАДИАНСА (PFM), оснастка замеров К65 и К68.
 # Метрика берётся на РАДИАНСЕ, а не на картинке: К19 измерила, что тон-маппинг
 # ошибку съедает. Кромки (К20) докладываются ОТДЕЛЬНО, а не подмешиваются в
@@ -198,4 +258,31 @@ check-fp: | build
 	  echo "Г31: fma-инструкций в $$f.o при -mfma = $$n (обязано быть 0)"; \
 	  [ "$$n" -eq 0 ] || exit 1; done'
 
-.PHONY: all test check check-fp
+# СТРАЖ НАБОРА ИНСТРУКЦИЙ И ПОТОКОВ. Отвечает на вопрос «а точно ли это
+# используется» ИЗМЕРЕНИЕМ, а не флагом в командной строке: флаг можно передать
+# и не получить ничего, если цикл не векторизуется.
+#   ymm — 256-битные регистры AVX; ноль означает, что AVX не используется вовсе;
+#   xmm — 128-битные (SSE2), они есть всегда, потому что ABI x86-64 считает
+#         double именно в них, и их наличие НИЧЕГО не доказывает;
+#   fma — обязано быть НОЛЬ (Г31), см. check-fp.
+# Отдельно печатается, что gcc реально включил (`-Q --help=target`) и сколько
+# потоков видит OpenMP.
+check-simd: | build
+	nix-shell -p gcc binutils --run 'set -e; \
+	  echo "== что включил компилятор:"; \
+	  gcc $(ARCH) -Q --help=target 2>/dev/null | grep -E "^ *-m(avx2|avx512f|fma|sse2) " || true; \
+	  echo; echo "== регистры в горячих объектниках:"; \
+	  for f in src/psweep.c src/prast.c src/pray.c src/pmerge.c src/pdirect.c src/cut/qef.c; do \
+	    o=build/simd_$$(basename $$f .c).o; \
+	    gcc $(CFLAGS) -c $$f -o $$o; \
+	    y=$$(objdump -d $$o | grep -c "%ymm" || true); \
+	    x=$$(objdump -d $$o | grep -c "%xmm" || true); \
+	    m=$$(objdump -d $$o | grep -cE "vfmadd|vfmsub" || true); \
+	    printf "   %-20s ymm %5s  xmm %5s  fma %3s\n" $$f $$y $$x $$m; \
+	    [ "$$m" -eq 0 ] || { echo "   Г31 НАРУШЕН: fma в $$f"; exit 1; }; \
+	  done; \
+	  echo; echo "== потоки:"; \
+	  nproc | sed "s/^/   ядер: /"; \
+	  gcc $(CFLAGS) -o build/simd_omp tools/ompinfo.c && ./build/simd_omp'
+
+.PHONY: all test check check-fp check-simd

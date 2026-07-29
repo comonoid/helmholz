@@ -600,10 +600,20 @@ static int one(const hz_objmesh *base, const tr3_camera *cam, const tr3_dirs *d,
   printf("   %-30s %7d %7d %5d %9.3e %9.3e %8.2f%% %8.2f%% %9.3e %9.3e %7.2f %7.2f\n", label,
          S.ps.np, docut ? S.ncut : 0, S.nbounce, out->p50, out->p99, out->frac1, out->frac10,
          out->p50e, out->p99e, S.t_direct + S.t_solve, out->t_frame);
+  /* ПОЛИГОНЫ БЕЗ КРАЯ считаются и печатаются ВСЕГДА. `hz_poly_build` отбрасывает
+   * петли короче трёх вершин, и при мелком дроблении осколок вполне может не
+   * дать ни одной годной петли: он остаётся в наборе своими треугольниками, но
+   * для ЛУЧА его нет — `hz_poly_inside` по пустому краю всегда ложь. Это
+   * ровно тот подозреваемый, на котором Ш6 списал отказ шага 0.05 м на потерю
+   * геометрии; потеря вылечена (`ПОТЕРЯНО 0`), а отказ остался, значит диагноз
+   * был неполон, и величину надо предъявлять, а не подразумевать. */
+  int32_t noloop = 0;
+  for (int32_t k = 0; k < S.ps.np; k++)
+    if (S.ps.p[k].nloop == 0) noloop++;
   printf("        по классам точки  p99: свет %.3e (%d), ПОЛУТЕНЬ %.3e (%d), тень %.3e (%d)"
-         "   клиньев-кандидатов %d, ПОТЕРЯНО фрагментов %lld\n",
+         "   клиньев-кандидатов %d, ПОТЕРЯНО фрагментов %lld, полигонов БЕЗ КРАЯ %d (%.2f%%)\n",
          out->p99_lit, out->n_lit, out->p99_pen, out->n_pen, out->p99_shd, out->n_shd, ws.n,
-         (long long)S.nover);
+         (long long)S.nover, noloop, 100.0 * noloop / (double)(S.ps.np > 0 ? S.ps.np : 1));
   if (np_out != NULL) *np_out = S.ps.np;
   if (ncut_out != NULL) *ncut_out = S.ncut;
   fflush(stdout);
@@ -683,10 +693,15 @@ int main(int argc, char **argv) {
       if (one(&base, &cam, &d, delta, h, 8, 3, &cfg0, 0.0, lab, im, &s, NULL, NULL, L) != 0)
         return 1;
     }
-    for (int i = 0; i < 4; i++) {
-      double L = (double[]){1.20, 0.40, 0.20, 0.10}[i];
+    /* СВИП ДРОБЛЕНИЯ ПЛОСКОСТЯМИ ДОВЕДЁН НИЖЕ 0.10 м (§10, открытый пункт 4).
+     * Геометрия там уже проверена — площадь сохраняется ТОЧНО до шага 0.025 м
+     * (обход по ЯЧЕЙКАМ вместо резки плоскостями по очереди), — а качество на
+     * этих шагах снято не было, и сходимость `p99` до 0.10 м могла оказаться
+     * началом плато, как это уже один раз вышло с зубчатым краем. */
+    for (int i = 0; i < 6; i++) {
+      double L = (double[]){1.20, 0.40, 0.20, 0.10, 0.05, 0.025}[i];
       char lab[64], im[64];
-      snprintf(lab, sizeof lab, "ПЛОСКОСТЯМИ, шаг %.2f м", L);
+      snprintf(lab, sizeof lab, "ПЛОСКОСТЯМИ, шаг %.3f м", L);
       snprintf(im, sizeof im, "sh6_grid_%d", i);
       if (one(&base, &cam, &d, delta, h, 8, 4, &cfg0, 0.0, lab, im, &s, NULL, NULL, L) != 0)
         return 1;
@@ -696,7 +711,7 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  /* --- Ш7: ОГРУБЛЕНИЕ. Решаем на мелком, огрубляем по решённому полю. --- */
+  /* --- Ш7: ОГРУБЛЕНИЕ. Критерий ГЕОМЕТРИЧЕСКИЙ и от света НЕ зависит. --- */
   if (argc > 6 && argv[6][0] == 0x63) {
     /* Эталон удешевлён ВЧЕТВЕРО по пикселям и ВПЯТЕРО по пробам: у огрублённой
      * сцены он иначе дороже самого решения, а хвост распределения 65 тысяч
@@ -717,114 +732,103 @@ int main(int argc, char **argv) {
            s0.p99, s0.frac1, s0.frac10);
     fflush(stdout);
 
-    /* СВИП ПО ДОПУСКУ ПОЛЯ, без решения и кадра. Вопрос «почему поле отвергает
-     * 91% кандидатов» — это вопрос про ПОРОГ, и отвечать на него надо порогом,
-     * а не картинкой: `ltol` нормирован на СРЕДНЮЮ по сцене облучённость, то
-     * есть мягок в тени и жёсток у светильника, где `E` меняется на порядок за
-     * десятки сантиметров. `ltol = 1e9` выключает член вовсе. */
-    printf("\n   свип по допуску поля (только отбор, без решения):\n");
-    for (int q = 0; q < 5; q++) {
-      double lt = (double[]){0.01, 0.05, 0.2, 1.0, 1e9}[q];
-      hz_mergecfg mq;
-      memset(&mq, 0, sizeof mq);
-      mq.delta = eps;
-      mq.ltol = lt;
-      mq.rtol = 0.05;
-      mq.target = 1;
-      mq.use_geom = 1;
-      mq.use_rad = 1;
-      mq.use_mtl = 1;
-      mq.use_overlap = 1;
-      hz_pseglist sq;
-      hz_mergestat mst;
-      if (hz_merge(&sq, &base, &sgf, &F.ps, F.t.E, F.t.rho, &mq, &mst) != 0) return 1;
-      printf("      ltol %8.3g: пар %6lld, слито %5lld, участков %4d -> %4d; "
-             "отсев поля %6lld (%.1f%%), геом %5lld, мат %4lld, перекр %4lld; dmax %.3f м\n",
-             lt, (long long)mst.npair, (long long)mst.nmerged, mst.nseg_in, mst.nseg_out,
-             (long long)mst.nrej_rad,
-             100.0 * (double)mst.nrej_rad / (double)(mst.npair ? mst.npair : 1),
-             (long long)mst.nrej_geom, (long long)mst.nrej_mtl, (long long)mst.nrej_overlap,
-             mst.dmax_worst);
-      /* ГДЕ ИМЕННО СЛИЯНИЕ ПРОИСХОДИТ — в тёмном или в светлом. Критерий
-       * АБСОЛЮТЕН (`|ΔE| < ltol·⟨E⟩`), значит в ярких местах, где градиенты
-       * велики по абсолютной величине, он обязан запрещать чаще. Проверяется
-       * это не рассуждением, а долей слитых по яркостным корзинам. */
-      {
-        int32_t cnt[4] = {0, 0, 0, 0}, mrg[4] = {0, 0, 0, 0};
-        int32_t *gs = calloc((size_t)sq.nseg, sizeof *gs);
-        if (gs != NULL) {
-          for (int32_t k = 0; k < F.ps.np && k < sgf.nseg; k++)
-            if (F.ps.p[k].ntri > 0) gs[sq.label[F.ps.tri[F.ps.p[k].t0]]]++;
-          double em = 0.0, aa = 0.0;
-          for (int32_t k = 0; k < sgf.nseg; k++) {
-            em += fabs(F.t.E[(size_t)k * 3]) * F.ps.p[k].area;
-            aa += F.ps.p[k].area;
-          }
-          em = (aa > 0.0) ? em / aa : 1.0;
-          for (int32_t k = 0; k < F.ps.np && k < sgf.nseg; k++) {
-            if (F.ps.p[k].ntri <= 0) continue;
-            double r = fabs(F.t.E[(size_t)k * 3]) / (em > 0.0 ? em : 1.0);
-            int bin = (r < 0.1) ? 0 : ((r < 0.5) ? 1 : ((r < 2.0) ? 2 : 3));
-            cnt[bin]++;
-            if (gs[sq.label[F.ps.tri[F.ps.p[k].t0]]] > 1) mrg[bin]++;
-          }
-          printf("         слито по яркости E/⟨E⟩:  <0.1: %5.1f%% (%d)   0.1–0.5: %5.1f%% (%d)"
-                 "   0.5–2: %5.1f%% (%d)   >2: %5.1f%% (%d)\n",
-                 cnt[0] ? 100.0 * mrg[0] / cnt[0] : 0.0, cnt[0],
-                 cnt[1] ? 100.0 * mrg[1] / cnt[1] : 0.0, cnt[1],
-                 cnt[2] ? 100.0 * mrg[2] / cnt[2] : 0.0, cnt[2],
-                 cnt[3] ? 100.0 * mrg[3] / cnt[3] : 0.0, cnt[3]);
-          free(gs);
-        }
-      }
+    /* СЕТКА КАНДИДАТОВ РАВНА ПЕРЕБОРУ — проверяется, а не утверждается.
+     * Сравниваются РАЗМЕТКИ треугольников целиком: совпадение числа участков
+     * ничего не значило бы, потому что то же число достижимо разными
+     * слияниями. Порядок пар при равной ошибке доопределён (`cmp_pair`),
+     * поэтому совпадение обязано быть ТОЧНЫМ, а не «в пределах». */
+    {
+      hz_mergecfg mg;
+      memset(&mg, 0, sizeof mg);
+      mg.delta = eps;
+      mg.target = 400;
+      mg.use_geom = 1;
+      mg.use_overlap = 1;
+      hz_pseglist s1, s2;
+      hz_mergestat t1, t2;
+      double ta = now_s();
+      mg.brute = 0;
+      if (hz_merge(&s1, &base, &sgf, &F.ps, &mg, &t1) != 0) return 1;
+      double tb = now_s();
+      mg.brute = 1;
+      if (hz_merge(&s2, &base, &sgf, &F.ps, &mg, &t2) != 0) return 1;
+      double tc = now_s();
+      int64_t bad = 0;
+      for (int32_t t = 0; t < base.nt; t++)
+        if (s1.label[t] != s2.label[t]) bad++;
+      printf("\n   сетка кандидатов против перебора: участков %d против %d, "
+             "разметка расходится на %lld треугольниках; пар %lld против %lld; "
+             "%.3f с против %.3f с (×%.1f); ячеек %lld, вхождений %lld, "
+             "проверено пар %lld против %lld\n",
+             s1.nseg, s2.nseg, (long long)bad, (long long)t1.npair, (long long)t2.npair, tb - ta,
+             tc - tb, (tc - tb) / ((tb - ta) > 0.0 ? (tb - ta) : 1e-9), (long long)t1.ngridcell,
+             (long long)t1.ngrident, (long long)t1.ncand, (long long)t2.ncand);
+      if (bad != 0 || s1.nseg != s2.nseg) printf("   ОТКАЗ: сетка не равна перебору\n");
+      hz_seg_free(&s1);
+      hz_seg_free(&s2);
       fflush(stdout);
-      hz_seg_free(&sq);
     }
 
-    const int32_t tg[3] = {700, 450, 250};
-    for (int mode = 0; mode < 3; mode++)
-      for (int i = 0; i < 3; i++) {
-        hz_mergecfg mc;
-        memset(&mc, 0, sizeof mc);
-        /* Допуск ОГРУБЛЕНИЯ, и он обязан быть БОЛЬШЕ допуска сегментации: при
-         * равном сегментация Ш1 уже максимальна, и сливать нечего — замерено,
-         * 10 пар из 4 689. Здесь берётся из argv[3]. */
-        mc.delta = eps;
-        mc.ltol = 0.05;
-        mc.rtol = 0.05;
-        mc.target = tg[i];
-        /* mode 0 — полная конъюнкция; 1 — ТОЛЬКО геометрия (проверка довода
-         * плана: одна геометрия сливает то, что разделено полем); 2 —
-         * НЕГАТИВНЫЙ КОНТРОЛЬ по случайной метрике. */
-        mc.use_geom = 1;
-        mc.use_rad = (mode == 0);
-        mc.use_mtl = (mode == 0);
-        mc.use_overlap = (mode == 0);
-        mc.random = (mode == 2);
-        hz_pseglist sgc;
-        hz_mergestat ms;
-        if (hz_merge(&sgc, &base, &sgf, &F.ps, F.t.E, F.t.rho, &mc, &ms) != 0) return 1;
-        scene C;
-        if (scene_from(&C, &base, &sgc, base.lo, base.hi, 8) != 0) return 1;
-        if (solve(&C, &d, h, 1e-4) != 0) return 1;
-        imgstat sc;
-        char im[64];
-        snprintf(im, sizeof im, "img/sh7_m%d_t%d.ppm", mode, tg[i]);
-        if (render(&C, &cam, &sc, im, NULL) != 0) return 1;
-        const char *nm =
-            (mode == 0) ? "конъюнкция" : ((mode == 1) ? "ТОЛЬКО геометрия" : "СЛУЧАЙНО");
-        printf("   %-18s цель %4d: %7d %9.3e %9.3e %8.2f%% %8.2f%%  dmax %9.3e (%.2f δ)\n", nm,
-               tg[i], C.ps.np, sc.p50, sc.p99, sc.frac1, sc.frac10, ms.dmax_worst,
-               ms.dmax_worst / delta);
-        if (mode == 0)
-          printf("        пар %lld, слито %lld; отсеяно: геометрия %lld, поле %lld, "
-                 "материал %lld, ПЕРЕКРЫТИЕ %lld\n",
-                 (long long)ms.npair, (long long)ms.nmerged, (long long)ms.nrej_geom,
-                 (long long)ms.nrej_rad, (long long)ms.nrej_mtl, (long long)ms.nrej_overlap);
-        fflush(stdout);
-        scene_free(&C);
-        hz_seg_free(&sgc);
-      }
+    /* СВИП ПО ЦЕЛИ. Ш7 снял две точки (708 и 258) и увидел между ними разницу
+     * вчетверо по медиане; где именно ошибка становится видна — вопрос свипа, а
+     * не двух точек. Критерий чисто ГЕОМЕТРИЧЕСКИЙ: члены по полю и материалу
+     * убраны из кода вслед за замером Ш7 (вторая поправка). */
+    printf("\n   свип по цели, критерий ГЕОМЕТРИЧЕСКИЙ (δ огрубления = %g м):\n", eps);
+    const int32_t tg[9] = {850, 708, 600, 500, 400, 300, 258, 200, 150};
+    for (int i = 0; i < 9; i++) {
+      hz_mergecfg mc;
+      memset(&mc, 0, sizeof mc);
+      mc.delta = eps;
+      mc.target = tg[i];
+      mc.use_geom = 1;
+      mc.use_overlap = 1;
+      hz_pseglist sgc;
+      hz_mergestat ms;
+      if (hz_merge(&sgc, &base, &sgf, &F.ps, &mc, &ms) != 0) return 1;
+      scene C;
+      if (scene_from(&C, &base, &sgc, base.lo, base.hi, 8) != 0) return 1;
+      if (solve(&C, &d, h, 1e-4) != 0) return 1;
+      imgstat sc;
+      char im[64];
+      snprintf(im, sizeof im, "img/sh7_geom_t%d.ppm", tg[i]);
+      if (render(&C, &cam, &sc, im, NULL) != 0) return 1;
+      printf("   цель %4d: %7d %9.3e %9.3e %8.2f%% %8.2f%%  dmax %9.3e (%.2f δ)  "
+             "пар %lld, слито %lld, отсев: геом %lld, перекр %lld\n",
+             tg[i], C.ps.np, sc.p50, sc.p99, sc.frac1, sc.frac10, ms.dmax_worst,
+             ms.dmax_worst / delta, (long long)ms.npair, (long long)ms.nmerged,
+             (long long)ms.nrej_geom, (long long)ms.nrej_overlap);
+      fflush(stdout);
+      scene_free(&C);
+      hz_seg_free(&sgc);
+    }
+
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ: слияние по СЛУЧАЙНОЙ метрике. Ошибка обязана стать
+     * O(1), и ловят её `p99` с `dmax`, а не медиана: при разрушенной геометрии
+     * медиана даже УЛУЧШАЕТСЯ, потому что эталон считает точный свет в той же
+     * уехавшей точке (узор К13/К40/К94, Ш7). */
+    printf("\n   НЕГАТИВНЫЙ КОНТРОЛЬ (случайная метрика):\n");
+    for (int i = 0; i < 2; i++) {
+      int32_t t = (int32_t[]){450, 250}[i];
+      hz_mergecfg mc;
+      memset(&mc, 0, sizeof mc);
+      mc.delta = eps;
+      mc.target = t;
+      mc.use_geom = 1;
+      mc.random = 1;
+      hz_pseglist sgc;
+      hz_mergestat ms;
+      if (hz_merge(&sgc, &base, &sgf, &F.ps, &mc, &ms) != 0) return 1;
+      scene C;
+      if (scene_from(&C, &base, &sgc, base.lo, base.hi, 8) != 0) return 1;
+      if (solve(&C, &d, h, 1e-4) != 0) return 1;
+      imgstat sc;
+      if (render(&C, &cam, &sc, NULL, NULL) != 0) return 1;
+      printf("   СЛУЧАЙНО цель %4d: %7d %9.3e %9.3e %8.2f%% %8.2f%%  dmax %9.3e (%.2f δ)\n", t,
+             C.ps.np, sc.p50, sc.p99, sc.frac1, sc.frac10, ms.dmax_worst, ms.dmax_worst / delta);
+      fflush(stdout);
+      scene_free(&C);
+      hz_seg_free(&sgc);
+    }
     scene_free(&F);
     hz_seg_free(&sgf);
     tr3_dirs_free(&d);

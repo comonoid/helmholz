@@ -219,6 +219,9 @@ int hz_poly_add_quad(hz_polyset *ps, const double c[3], const double n[3], const
   double *nb = realloc(ps->bv, (size_t)(ps->nbv + 4) * 2 * sizeof *nb);
   if (nb == NULL) return 2;
   ps->bv = nb;
+  int32_t *nbw = realloc(ps->bw, (size_t)(ps->nbv + 4) * sizeof *nbw);
+  if (nbw == NULL) return 2;
+  ps->bw = nbw;
 
   hz_poly *P = &ps->p[ps->np];
   memset(P, 0, sizeof *P);
@@ -269,6 +272,10 @@ int hz_poly_add_quad(hz_polyset *ps, const double c[3], const double n[3], const
   for (int i = 0; i < 4; i++) {
     ps->bv[(size_t)(ps->nbv + i) * 2 + 0] = q[i][0];
     ps->bv[(size_t)(ps->nbv + i) * 2 + 1] = q[i][1];
+    /* Сварного номера у собранного полигона нет: он ни с чем не делит вершин.
+     * `−1` запирает его край от упрощения, и это верно по существу — четыре
+     * угла прямоугольника не избыточны. */
+    ps->bw[ps->nbv + i] = -1;
   }
   P->l0 = ps->nloopall;
   P->nloop = 1;
@@ -283,6 +290,7 @@ void hz_poly_free(hz_polyset *ps) {
   free(ps->p);
   free(ps->loop);
   free(ps->bv);
+  free(ps->bw);
   free(ps->tri);
   hz_facettab_free(&ps->ft);
   memset(ps, 0, sizeof *ps);
@@ -397,9 +405,10 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
   }
   /* Итоговые массивы края: длина не превосходит числа полурёбер. */
   ps->bv = malloc((size_t)maxe * 2 * sizeof *ps->bv);
+  ps->bw = malloc((size_t)maxe * sizeof *ps->bw);
   ps->loop = malloc(((size_t)nt + (size_t)nseg + 2) * sizeof *ps->loop);
   int32_t bvcap = maxe, loopcap = nt + nseg + 1;
-  if (ps->bv == NULL || ps->loop == NULL) {
+  if (ps->bv == NULL || ps->bw == NULL || ps->loop == NULL) {
     free(lbuf);
     pb_free(&w);
     return 2;
@@ -669,6 +678,13 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
           return 2;
         }
         ps->bv = nb2;
+        int32_t *nw2 = realloc(ps->bw, (size_t)nc * sizeof *ps->bw);
+        if (nw2 == NULL) {
+          free(lbuf);
+          pb_free(&w);
+          return 2;
+        }
+        ps->bw = nw2;
         bvcap = nc;
       }
       if (ps->nloopall + 1 >= loopcap) {
@@ -684,6 +700,10 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
       }
       for (int32_t i2 = 0; i2 < nvloop; i2++) {
         const double *X = w.wpos + (size_t)lbuf[i2] * 3;
+        /* СВАРНОЙ НОМЕР СОХРАНЯЕТСЯ, а не выбрасывается вместе с `lbuf`. По
+         * (u,v) соседние полигоны узнать общую вершину не могут — у каждого
+         * своя рама, — а согласованное упрощение края без этого невозможно. */
+        ps->bw[ps->nbv + i2] = lbuf[i2];
         double q[3];
         for (int a = 0; a < 3; a++)
           q[a] = X[a] - P->org[a];

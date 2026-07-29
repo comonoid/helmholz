@@ -612,15 +612,20 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
 
     P->l0 = ps->nloopall;
     P->nloop = 0;
+    int64_t drop0 = ps->nloop_drop;
     for (int32_t st = 0; st < nb; st++) {
       if (w.used[st]) continue;
       int32_t start = w.bd[st].a, cur = w.bd[st].b, prev = start;
       int32_t nvloop = 0;
       w.used[st] = 1;
       lbuf[nvloop++] = start;
+      int ltrunc = 0;
       for (;;) {
         if (cur == start) break;
-        if (nvloop > maxe) break; /* петля длиннее числа рёбер невозможна */
+        if (nvloop > maxe) { /* петля длиннее числа рёбер невозможна */
+          ltrunc = 1;
+          break;
+        }
         lbuf[nvloop++] = cur;
         /* следующее неиспользованное ребро, начинающееся в cur */
         int32_t lo = 0, hi = nb;
@@ -668,7 +673,14 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
         prev = cur;
         cur = w.bd[best].b;
       }
-      if (nvloop < 3) continue;
+      if (ltrunc) ps->nloop_trunc++;
+      /* ОТБРОШЕННАЯ ПЕТЛЯ — СЧИТАЕТСЯ. Полигон при этом может СОХРАНИТЬ другие
+       * петли, то есть остаться с НЕПОЛНЫМ краем, не попав в счёт «без края»
+       * вовсе. Разница существенна для всего, что меряет поверхность по краю. */
+      if (nvloop < 3) {
+        ps->nloop_drop++;
+        continue;
+      }
       if (ps->nbv + nvloop > bvcap) {
         int32_t nc = (bvcap * 2 > ps->nbv + nvloop) ? bvcap * 2 : ps->nbv + nvloop;
         double *nb2 = realloc(ps->bv, (size_t)nc * 2 * sizeof *ps->bv);
@@ -717,6 +729,9 @@ int hz_poly_build(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg) {
       ps->loop[ps->nloopall] = ps->nbv;
       P->nloop++;
     }
+    /* КРАЙ НЕПОЛОН, А НЕ ОТСУТСТВУЕТ: часть петель отброшена, часть осталась.
+     * Именно этот класс не покрывался счётом «полигонов без края». */
+    if (ps->nloop_drop > drop0 && P->nloop > 0) ps->nloop_part++;
   }
   /* габарит края в (u,v) — дешёвый отсев для луча и растеризации */
   for (int32_t r = 0; r < nseg; r++) {

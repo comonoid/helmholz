@@ -7,10 +7,19 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Проб на полигон при проверке НЕПЕРЕКРЫТИЯ. Число выведено, а не подобрано:
- * перекрытие, занимающее меньше 1/16 площади, слиянию не мешает (ошибка
- * площади ниже допуска на неё), а 16 проб по каждой оси такое перекрытие
- * обнаруживают заведомо. */
+/* Проб на полигон ПО КАЖДОЙ ОСИ при проверке НЕПЕРЕКРЫТИЯ.
+ *
+ * ОБОСНОВАНИЕ ИСПРАВЛЕНО 07-29 ПО АУДИТУ: прежнее говорило «16 проб по каждой
+ * оси обнаруживают такое перекрытие заведомо», тогда как в коде стоит ВОСЕМЬ.
+ * Обоснование относилось к другому числу, чем сама константа, и держать такое
+ * рядом нельзя: оно читается как вывод, а является опиской.
+ *
+ * ЧТО ВЕРНО СЕЙЧАС. Порог перекрытия — доля `1/16` (см. `overlaps`), сетка
+ * `8×8 = 64` пробы, то есть на долю `1/16` приходится в среднем 4 пробы.
+ * Обнаружение поэтому не «заведомо», а ВЕРОЯТНОСТНОЕ, и односторонность его не
+ * доказана — доказать её обязан О13 сравнением с ТОЧНЫМ пересечением
+ * многоугольников на подвыборке пар. До этого замера число проб не менять: оно
+ * входит в критерий, а не в скорость. */
 #define PM_OVSAMP 8
 
 typedef struct {
@@ -40,8 +49,30 @@ static int32_t uf_find(int32_t *p, int32_t x) {
   return x;
 }
 
-/* Мировая коробка полигона по краю. */
-static void pbox(const hz_polyset *ps, int32_t k, double lo[3], double hi[3]) {
+/* Мировая коробка полигона.
+ *
+ * КРАЙ ЕСТЬ ПРОЕКЦИЯ, И КОРОБКА ПО НЕМУ ПОЛИГОН НЕ НАКРЫВАЕТ. Найдено аудитом
+ * плана 07-29. Край хранится в местных `(u,v)` (`polygon.h`), а
+ * `hz_poly_world` возвращает `org + u·eu + v·ev` — точку СТРОГО в плоскости
+ * полигона. Треугольники же отходят от неё до `P->dmax`, и у зала при δ = 45 мм
+ * это `0.9997 δ` (Ш1), то есть почти весь допуск сегментации. Коробка по краю
+ * получалась ЗАНИЖЕННОЙ, а по ней работают оба отбора — и раскладка по ячейкам
+ * сетки, и точная проверка `near` в `pm_emit`. Значит терялись законные пары:
+ * треугольники сходились ближе `δ`, а проекции краёв — нет.
+ * Проверка «сетка = перебор» этого поймать не могла: оба пути берут одну и ту
+ * же коробку, и совпадали они друг с другом, а не с геометрией.
+ * ДОБАВКА ТОЧНАЯ, А НЕ ЗАПАС: смещение вдоль нормали на `d` меняет координату
+ * `c` ровно на `d·n_c`, поэтому раздутие на `dmax·|n_c|` по каждой оси и
+ * необходимо, и достаточно.
+ *
+ * ЗАПАСНОЙ ПУТЬ ПО ТРЕУГОЛЬНИКАМ — ЯВНЫЙ. Полигон без края (все петли короче
+ * трёх вершин отброшены в `hz_poly_build`) давал коробку ВЫВЕРНУТУЮ
+ * (`lo = 1e300`), а такая коробка отвергает любую пару в `pm_emit`: полигон
+ * молча выпадал из огрубления целиком. На обеих сценах таких ноль (измерено), но
+ * «ноль сегодня» — не свойство схемы, и именно на подразумеваемом запасном пути
+ * села первая редакция критерия. */
+static void pbox(const hz_polyset *ps, const hz_objmesh *m, int32_t k, double lo[3], double hi[3],
+                 int64_t *nbox_tri) {
   const hz_poly *P = &ps->p[k];
   for (int a = 0; a < 3; a++) {
     lo[a] = 1e300;
@@ -55,6 +86,29 @@ static void pbox(const hz_polyset *ps, int32_t k, double lo[3], double hi[3]) {
         if (x[a] < lo[a]) lo[a] = x[a];
         if (x[a] > hi[a]) hi[a] = x[a];
       }
+    }
+  if (lo[0] <= hi[0]) {
+    for (int a = 0; a < 3; a++) {
+      double e = P->dmax * fabs(P->n[a]);
+      lo[a] -= e;
+      hi[a] += e;
+    }
+    return;
+  }
+  (*nbox_tri)++;
+  for (int32_t q = 0; q < P->ntri; q++) {
+    double p[3][3];
+    hz_obj_tri(m, ps->tri[P->t0 + q], p);
+    for (int j = 0; j < 3; j++)
+      for (int a = 0; a < 3; a++) {
+        if (p[j][a] < lo[a]) lo[a] = p[j][a];
+        if (p[j][a] > hi[a]) hi[a] = p[j][a];
+      }
+  }
+  if (!(lo[0] <= hi[0]))
+    for (int a = 0; a < 3; a++) {
+      lo[a] = 0.0;
+      hi[a] = 0.0;
     }
 }
 
@@ -81,7 +135,7 @@ static void pbox(const hz_polyset *ps, int32_t k, double lo[3], double hi[3]) {
  * и докладываемый `dmax` становятся ОДНОЙ величиной, а не двумя похожими, и
  * тогда «`dmax_worst < δ`» — проверяемый инвариант, а не пожелание. */
 static double group_plane(const hz_polyset *ps, const hz_objmesh *m, const int32_t *mem, int32_t nm,
-                          double n[3], double *off) {
+                          double n[3], double *off, int64_t *nwork) {
   double s = 0.0, ns[3] = {0, 0, 0}, org[3] = {0, 0, 0};
   for (int32_t i = 0; i < nm; i++) {
     const hz_poly *P = &ps->p[mem[i]];
@@ -123,6 +177,7 @@ static double group_plane(const hz_polyset *ps, const hz_objmesh *m, const int32
   double dmax = 0.0;
   for (int32_t i = 0; i < nm; i++) {
     const hz_poly *P = &ps->p[mem[i]];
+    if (nwork != NULL) *nwork += 3 * (int64_t)P->ntri;
     for (int32_t q = 0; q < P->ntri; q++) {
       double p[3][3];
       hz_obj_tri(m, ps->tri[P->t0 + q], p);
@@ -188,8 +243,23 @@ static double pair_gate(const hz_polyset *ps, int32_t a, int32_t b) {
  * пределах δ от общей плоскости» разрешает слить две ОДИНАКОВО СМОТРЯЩИЕ
  * поверхности ближе δ, и на грубом δ это съедает до 10.6% площади сцены, чего
  * баланс энергии не ловит вовсе. */
-static int overlaps(const hz_polyset *ps, int32_t a, int32_t b) {
+/* НЕСИММЕТРИЧНОСТЬ, НАЙДЕННАЯ АУДИТОМ 07-29 И ОСТАВЛЕННАЯ ДО ЗАМЕРА О13.
+ * Пробы ставятся по коробке `B`, а доля считается от числа проб, попавших в
+ * `B`, — то есть нормировка идёт на площадь `B`. Дешёвый же отсев ниже
+ * нормирует на `amin`, МЕНЬШУЮ из двух коробок. Это две разные величины под
+ * одним именем «1/16», и слабее из них та, что решает.
+ * Следствие проверяемое: если `A` мал и лежит ЦЕЛИКОМ внутри `B`, доля проб
+ * равна отношению площадей, и при разнице в 20 раз она ниже `1/16` ⇒
+ * перекрытие объявляется отсутствующим ⇒ листы слипаются, а площадь теряется
+ * физически (Ш3, до 10.6%). Промах управляется ОТНОШЕНИЕМ РАЗМЕРОВ, а не
+ * тонкостью перекрытия.
+ * ПОЧЕМУ НЕ ИСПРАВЛЕНО ЗДЕСЬ И СЕЙЧАС: это правка КРИТЕРИЯ, а не скорости, и
+ * О13 заведён ровно затем, чтобы сперва измерить величину промаха точным
+ * пересечением многоугольников. Чинить до замера значит менять критерий
+ * вслепую и потерять точку отсчёта. */
+static int overlaps(const hz_polyset *ps, int32_t a, int32_t b, hz_mergestat *st) {
   const hz_poly *A = &ps->p[a], *B = &ps->p[b];
+  st->ngate_ov++;
   /* ДЕШЁВЫЙ ОТСЕВ ПЕРЕД ПРОБАМИ, и он снимает девять десятых цены огрубления.
    * Измерено 07-29: с проверкой перекрытия ворота стоили `14.19` мкс на пару,
    * без неё — `1.45`, то есть 90% времени уходило сюда. Причина простая:
@@ -231,11 +301,26 @@ static int overlaps(const hz_polyset *ps, int32_t a, int32_t b) {
      * площадь пересечения коробок эту долю ограничивает сверху: если она сама
      * меньше 1/16 меньшей коробки, настоящее перекрытие тем более меньше, и
      * шестьдесят четыре пробы можно не ставить. */
-    if (!(w0 > 0.0) || !(w1 > 0.0)) return 0;
+    if (!(w0 > 0.0) || !(w1 > 0.0)) {
+      st->ngate_ovbox++;
+      return 0;
+    }
     double ab = (hi[0] - lo[0]) * (hi[1] - lo[1]);
     double aa = (A->uvhi[0] - A->uvlo[0]) * (A->uvhi[1] - A->uvlo[1]);
     double amin = (aa < ab) ? aa : ab;
-    if (w0 * w1 * 16.0 < amin) return 0;
+    if (w0 * w1 * 16.0 < amin) {
+      st->ngate_ovbox++;
+      return 0;
+    }
+  }
+  /* РАБОТА, А НЕ ВЫЗОВЫ. `hz_poly_inside` обходит ВЕСЬ край, поэтому цена этой
+   * проверки линейна по его длине, и О6 намерил это прямо: сжатие края втрое
+   * уронило ворота втрое. Число вызовов такой цены не выражает — считаются
+   * тронутые вершины. */
+  {
+    const hz_poly *P = B;
+    int32_t nb2 = (P->nloop > 0) ? ps->loop[P->l0 + P->nloop] - ps->loop[P->l0] : 0;
+    st->nwork_bv += (int64_t)PM_OVSAMP * PM_OVSAMP * nb2;
   }
   int inside = 0, tried = 0;
   for (int i = 0; i < PM_OVSAMP; i++)
@@ -251,6 +336,7 @@ static int overlaps(const hz_polyset *ps, int32_t a, int32_t b) {
       double ua = q[0] * A->eu[0] + q[1] * A->eu[1] + q[2] * A->eu[2];
       double va = q[0] * A->ev[0] + q[1] * A->ev[1] + q[2] * A->ev[2];
       if (ua < A->uvlo[0] || ua > A->uvhi[0] || va < A->uvlo[1] || va > A->uvhi[1]) continue;
+      st->nwork_bv += (A->nloop > 0) ? ps->loop[A->l0 + A->nloop] - ps->loop[A->l0] : 0;
       if (hz_poly_inside(ps, A, ua, va)) inside++;
     }
   /* Соседние по ребру полигоны дают единичные попадания на самой кромке;
@@ -306,21 +392,29 @@ static int pm_emit(pm_plist *L, const hz_polyset *ps, const hz_objmesh *m, const
       if (qg > cfg->delta) {
         int32_t mm[2] = {a, b};
         double gn[3], goff;
-        qg = group_plane(ps, m, mm, 2, gn, &goff);
+        st->ngate_exact++;
+        qg = group_plane(ps, m, mm, 2, gn, &goff, &st->nwork_tri);
         if (qg > cfg->delta) {
           st->nrej_geom++;
           return 0;
         }
+      } else {
+        st->ngate_major++;
       }
       err += qg / cfg->delta;
     }
-    if (cfg->use_overlap && overlaps(ps, a, b)) {
+    if (cfg->use_overlap && overlaps(ps, a, b, st)) {
       st->nrej_overlap++;
       return 0;
     }
   }
   if (L->pn >= L->pcap) {
     int64_t nc = L->pcap * 2;
+    /* ПИК ПАМЯТИ СИДИТ В САМОМ УДВОЕНИИ: `realloc` в худшем случае держит
+     * СТАРЫЙ и НОВЫЙ массивы одновременно, то есть полтора итоговых размера.
+     * Мерить надо этот момент, а не конечную длину списка (О10). */
+    int64_t pk = (L->pcap + nc) * (int64_t)sizeof *L->pl;
+    if (pk > st->bytes_pairs_peak) st->bytes_pairs_peak = pk;
     pm_pair *q = realloc(L->pl, (size_t)nc * sizeof *q);
     if (q == NULL) return 2;
     L->pl = q;
@@ -352,7 +446,7 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
   }
   double glo[3] = {1e300, 1e300, 1e300}, ghi[3] = {-1e300, -1e300, -1e300};
   for (int32_t k = 0; k < np; k++) {
-    pbox(ps, k, bb + (size_t)k * 6, bb + (size_t)k * 6 + 3);
+    pbox(ps, m, k, bb + (size_t)k * 6, bb + (size_t)k * 6 + 3, &st->nbox_tri);
     par[k] = k;
     for (int c = 0; c < 3; c++) {
       if (bb[(size_t)k * 6 + (size_t)c] < glo[c]) glo[c] = bb[(size_t)k * 6 + (size_t)c];
@@ -457,6 +551,8 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
       start[c] = start[c - 1];
     st->ngridcell = tot;
     st->ngrident = start[tot];
+    st->bytes_grid = (int64_t)np * 6 * (int64_t)sizeof *cr + (tot + 1) * (int64_t)sizeof *start +
+                     (int64_t)start[tot] * (int64_t)sizeof *idx;
     start[0] = 0;
 
     st->t_grid = pm_now() - tphase;
@@ -508,6 +604,14 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
    * ОБЪЕДИНЁННОЙ группы `dmax < δ`; иначе пара отбрасывается, а группы живут
    * дальше и могут слиться с другими. */
   qsort(pl, (size_t)pn, sizeof *pl, cmp_pair);
+  st->bytes_pairs = pn * (int64_t)sizeof *pl;
+  if (st->bytes_pairs > st->bytes_pairs_peak) st->bytes_pairs_peak = st->bytes_pairs;
+  /* СОВПАДАЮЩИЕ ОШИБКИ — мера силы негативного контроля О8, а не статистика.
+   * Порядок доопределён номерами именно на этот случай; если совпадений нет,
+   * снятие доопределения ничего не изменит, и контроль окажется слепым, не
+   * будучи от этого пройденным. */
+  for (int64_t i = 1; i < pn; i++)
+    if (pl[i].err >= pl[i - 1].err && pl[i].err <= pl[i - 1].err) st->ntie++;
   int32_t *head = malloc((size_t)np * sizeof *head);
   int32_t *nxt = malloc((size_t)np * sizeof *nxt);
   int32_t *mem = malloc((size_t)np * sizeof *mem);
@@ -529,14 +633,36 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
     if (cfg->target > 0 && nleft <= cfg->target) break;
     int32_t ra = uf_find(par, pl[i].a), rb = uf_find(par, pl[i].b);
     if (ra == rb) continue;
+    /* ГРУППА НЕ ПОМЕСТИЛАСЬ — ОТКАЗ, А НЕ ОБРЕЗАНИЕ. Прежняя форма
+     * (`nm < np` в условии цикла) молча останавливала сбор членов, и `dmax`
+     * считался по УСЕЧЁННОЙ группе, то есть выходил ложно малым, а слияние
+     * принималось. Случиться этого не может (группы суть разбиение `np`
+     * полигонов), но «не может» — это то самое место, где ложный ноль и
+     * заводится: он опаснее UNKNOWN, потому что не останавливает потребителя
+     * (Ш7). Поэтому счётчик и отказ от слияния — fail closed. */
     int32_t nm = 0;
-    for (int32_t x = head[ra]; x >= 0 && nm < np; x = nxt[x])
+    int trunc = 0;
+    for (int32_t x = head[ra]; x >= 0; x = nxt[x]) {
+      if (nm >= np) {
+        trunc = 1;
+        break;
+      }
       mem[nm++] = x;
-    for (int32_t x = head[rb]; x >= 0 && nm < np; x = nxt[x])
+    }
+    for (int32_t x = head[rb]; x >= 0 && !trunc; x = nxt[x]) {
+      if (nm >= np) {
+        trunc = 1;
+        break;
+      }
       mem[nm++] = x;
+    }
+    if (trunc) {
+      st->ntrunc++;
+      continue;
+    }
     if (cfg->use_geom && !cfg->random) {
       double n[3], off;
-      if (!(group_plane(ps, m, mem, nm, n, &off) < cfg->delta)) {
+      if (!(group_plane(ps, m, mem, nm, n, &off, NULL) < cfg->delta)) {
         st->nrej_geom++;
         continue;
       }
@@ -547,7 +673,6 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
       tail = nxt[tail];
     nxt[tail] = head[rb];
     par[rb] = ra;
-    head[ra] = head[ra];
     nleft--;
     st->nmerged++;
   }
@@ -641,6 +766,22 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
   }
   for (int32_t g = 0; g < nn; g++)
     if (so->seg[g].dmax > st->dmax_worst) st->dmax_worst = so->seg[g].dmax;
+  /* СЛЕПОК РАЗМЕТКИ (FNV-1a). Сквозное требование фазы I — «выход не меняется
+   * ПОБИТОВО» — было записано, а сличать его было нечем: ни один стенд не
+   * печатал величины, по которой два прогона сравниваются. Сравнение «по числу
+   * полигонов и dmax» этого не заменяет: те же 700 участков можно получить
+   * ДРУГИМ разбиением. */
+  {
+    uint64_t h = 1469598103934665603ULL;
+    for (int32_t t = 0; t < m->nt; t++) {
+      uint32_t v = (uint32_t)so->label[t];
+      for (int i = 0; i < 4; i++) {
+        h ^= (uint64_t)((v >> (8 * i)) & 0xFFu);
+        h *= 1099511628211ULL;
+      }
+    }
+    st->digest = h;
+  }
   st->t_label = pm_now() - tphase;
   so->nseg = nn;
   so->delta = si->delta;

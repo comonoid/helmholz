@@ -164,6 +164,296 @@ static void pbox(const hz_polyset *ps, const hz_objmesh *m, int32_t k, double lo
  * Треугольники — это и есть поверхность; край есть её проекция. Заодно критерий
  * и докладываемый `dmax` становятся ОДНОЙ величиной, а не двумя похожими, и
  * тогда «`dmax_worst < δ`» — проверяемый инвариант, а не пожелание. */
+/* ПРЕДЕЛ ЧИСЛА ОБМЕНОВ В МИНИМАКСНОМ РЕШАТЕЛЕ.
+ *
+ * ОТКУДА ЧИСЛО. Обмен строго увеличивает `t` (нижнюю оценку оптимума по текущей
+ * четвёрке), а четвёрок конечное число, поэтому зацикливания нет и предел —
+ * страховка, а не механизм останова. Шестьдесят четыре выбрано как заведомо
+ * больше наблюдаемого: замер §26 на тех же данных показывал сходимость за
+ * единицы шагов. Срабатывания СЧИТАЮТСЯ и печатаются: если счётчик не ноль,
+ * предел стал рабочей частью, и это надо чинить, а не терпеть. */
+#define PM_MMEXCH 64
+
+/* Состояние минимаксного решателя — замер, а не отладка (А89: сходимость этой
+ * формы обмена НЕ доказана, значит её надо мерить). */
+static int pm_solve4(double A[4][4], double rhs[4], double x[4]) {
+  for (int c = 0; c < 4; c++) {
+    int piv = c;
+    for (int r = c + 1; r < 4; r++)
+      if (fabs(A[r][c]) > fabs(A[piv][c])) piv = r;
+    if (!(fabs(A[piv][c]) > 0.0)) return 1;
+    if (piv != c) {
+      for (int k = 0; k < 4; k++) {
+        double tt = A[c][k];
+        A[c][k] = A[piv][k];
+        A[piv][k] = tt;
+      }
+      double tt = rhs[c];
+      rhs[c] = rhs[piv];
+      rhs[piv] = tt;
+    }
+    for (int r = 0; r < 4; r++) {
+      if (r == c) continue;
+      double f = A[r][c] / A[c][c];
+      for (int k = 0; k < 4; k++)
+        A[r][k] -= f * A[c][k];
+      rhs[r] -= f * rhs[c];
+    }
+  }
+  for (int c = 0; c < 4; c++)
+    x[c] = rhs[c] / A[c][c];
+  return 0;
+}
+
+/* РЕШЕНИЕ ПО ЧЕТВЁРКЕ: ЗНАКИ БЕРУТСЯ ИЗ АФФИННОЙ ЗАВИСИМОСТИ, А НЕ ПЕРЕБОРОМ.
+ *
+ * ПЕРВАЯ РЕДАКЦИЯ ПЕРЕБИРАЛА ВОСЕМЬ ЗНАКОВЫХ КОМБИНАЦИЙ И БРАЛА НАИБОЛЬШЕЕ `t`
+ * — И ЭТО НЕВЕРНО (А94). У почти вырожденной системы решение уходит в
+ * бесконечность, «наибольшее `t`» выбирает именно её, и замер показал это сразу:
+ * наклон `√(1+a²+b²)` дорастал до `2.4e31`, а `dmax_worst` — до `3.994` м при
+ * допуске `0.3`.
+ *
+ * ПРАВИЛЬНОЕ ПОСТРОЕНИЕ. Четыре точки в плоскости всегда аффинно зависимы:
+ * существует `λ ≠ 0` с `Σ λ_k = 0`, `Σ λ_k u_k = 0`, `Σ λ_k v_k = 0`. Он
+ * находится ровно как в правиле Крамера — минорами `3×3`. Знаки опорных невязок
+ * задаются им: `σ_k = sign(λ_k)`, а сама величина — двойственная оценка
+ *   `t = |Σ λ_k w_k| / Σ |λ_k|`,
+ * то есть нижняя оценка минимакса (де ла Валле Пуссен) для ЛЮБОЙ плоскости. Она
+ * ограничена по построению и в бесконечность уйти не может.
+ * Плоскость затем берётся из трёх уравнений `a u + b v + c = w − σ t`. */
+static double pm_det3(double a1, double a2, double a3, double b1, double b2, double b3, double c1,
+                      double c2, double c3) {
+  return a1 * (b2 * c3 - b3 * c2) - a2 * (b1 * c3 - b3 * c1) + a3 * (b1 * c2 - b2 * c1);
+}
+
+static int pm_ref4(const double ref[4][3], double *pa, double *pb, double *pc, double *pt) {
+  double lam[4];
+  const double *p0 = ref[0], *p1 = ref[1], *p2 = ref[2], *p3 = ref[3];
+  lam[0] = +pm_det3(1.0, 1.0, 1.0, p1[0], p2[0], p3[0], p1[1], p2[1], p3[1]);
+  lam[1] = -pm_det3(1.0, 1.0, 1.0, p0[0], p2[0], p3[0], p0[1], p2[1], p3[1]);
+  lam[2] = +pm_det3(1.0, 1.0, 1.0, p0[0], p1[0], p3[0], p0[1], p1[1], p3[1]);
+  lam[3] = -pm_det3(1.0, 1.0, 1.0, p0[0], p1[0], p2[0], p0[1], p1[1], p2[1]);
+  double sabs = 0.0, sw = 0.0;
+  for (int k = 0; k < 4; k++) {
+    sabs += fabs(lam[k]);
+    sw += lam[k] * ref[k][2];
+  }
+  /* Вырожденная четвёрка (совпавшие точки, три на одной прямой при нулевом
+   * четвёртом миноре) — отказ, а не подстановка нуля: ложный ноль здесь дал бы
+   * «идеальную плоскость» на пустом месте. */
+  if (!(sabs > 0.0)) return 1;
+  double t = fabs(sw) / sabs;
+  double sgn = (sw >= 0.0) ? 1.0 : -1.0;
+  /* Три уравнения из четырёх: берутся точки с наибольшими `|λ|` — у них система
+   * заведомо не вырождена, потому что именно они и определяют зависимость. */
+  int id[4] = {0, 1, 2, 3};
+  for (int i = 0; i < 4; i++)
+    for (int j = i + 1; j < 4; j++)
+      if (fabs(lam[id[j]]) > fabs(lam[id[i]])) {
+        int tmp = id[i];
+        id[i] = id[j];
+        id[j] = tmp;
+      }
+  double A[4][4], rhs[4], x[4];
+  for (int r = 0; r < 3; r++) {
+    int k = id[r];
+    double sk = (lam[k] >= 0.0) ? sgn : -sgn;
+    A[r][0] = ref[k][0];
+    A[r][1] = ref[k][1];
+    A[r][2] = 1.0;
+    A[r][3] = 0.0;
+    rhs[r] = ref[k][2] - sk * t;
+  }
+  A[3][0] = 0.0;
+  A[3][1] = 0.0;
+  A[3][2] = 0.0;
+  A[3][3] = 1.0;
+  rhs[3] = 0.0;
+  if (pm_solve4(A, rhs, x) != 0) return 1;
+  *pa = x[0];
+  *pb = x[1];
+  *pc = x[2];
+  *pt = t;
+  return 0;
+}
+
+/* МИНИМАКСНАЯ (ЧЕБЫШЕВСКАЯ) ПЛОСКОСТЬ ПО ОПОРНЫМ ТОЧКАМ — ОБМЕННЫЙ РЕШАТЕЛЬ.
+ *
+ * Задача решается в ГРАФОВОЙ форме `w ≈ a·u + b·v + c` в раме `(eu, ev, n)`, где
+ * `n` — уже найденная ориентация группы. Мировая плоскость восстанавливается как
+ * `N = n − a·eu − b·ev`, и ортогональное отклонение равно графовому, делённому
+ * на `|N| = √(1+a²+b²)`.
+ *
+ * ЧТО ЭТО ЗА ВЕЛИЧИНА, БЕЗ ПРИКРАС (А92): это минимакс ГРАФОВОЙ задачи,
+ * приведённый к ортогональной мере, а не минимакс ортогональной. Он даёт оценку
+ * СВЕРХУ для ортогонального оптимума, то есть ошибается в сторону ОТКАЗА:
+ * приняли — значит влезло точно. Обратного (принять невлезающее) быть не может.
+ *
+ * СХОДИМОСТЬ ЭТОЙ ФОРМЫ ОБМЕНА НЕ ДОКАЗАНА (А89). `t` строго растёт, четвёрок
+ * конечное число — зацикливания нет; но выход на оптимум не гарантирован, и
+ * процесс может встать. Поэтому «недосход» СЧИТАЕТСЯ, а на зале результат
+ * сверяется с ПЕРЕБОРОМ (`pfit`). На городе перебор вырожден (А88).
+ *
+ * `quarter` — негативный контроль (§28): плоскость подгоняется по ЧЕТВЕРТИ
+ * точек, отобранной хешем от номеров, то есть детерминированно и как функция
+ * пары (А93), а проверяется потом по ВСЕМ. */
+static int pm_minimax(const hz_polyset *ps, const int32_t *mem, int32_t nm, double n[3],
+                      const double org[3], double *off, int64_t *nwork, hz_mergestat *ms,
+                      int quarter) {
+  double eu[3], ev[3];
+  {
+    int ax = 0;
+    for (int a = 1; a < 3; a++)
+      if (fabs(n[a]) < fabs(n[ax])) ax = a;
+    double e0[3] = {0.0, 0.0, 0.0};
+    e0[ax] = 1.0;
+    double d = e0[0] * n[0] + e0[1] * n[1] + e0[2] * n[2];
+    for (int a = 0; a < 3; a++)
+      eu[a] = e0[a] - d * n[a];
+    double en = sqrt(eu[0] * eu[0] + eu[1] * eu[1] + eu[2] * eu[2]);
+    if (!(en > 0.0)) return 1;
+    for (int a = 0; a < 3; a++)
+      eu[a] /= en;
+    ev[0] = n[1] * eu[2] - n[2] * eu[1];
+    ev[1] = n[2] * eu[0] - n[0] * eu[2];
+    ev[2] = n[0] * eu[1] - n[1] * eu[0];
+  }
+/* Один проход по опорным точкам группы: `(u, v, w)` считаются на лету, а не
+ * материализуются — проходов будет несколько, а памяти на группу нет. */
+#define PM_MM_FOREACH(BODY)                                                                        \
+  do {                                                                                             \
+    for (int32_t i_ = 0; i_ < nm; i_++) {                                                          \
+      const hz_poly *P_ = &ps->p[mem[i_]];                                                         \
+      const double *S_ = ps->sup + (size_t)P_->s0 * 3;                                             \
+      for (int32_t q_ = 0; q_ < P_->nsup; q_++) {                                                  \
+        if (quarter &&                                                                             \
+            (pm_mix64(((uint64_t)(uint32_t)mem[i_] << 32) | (uint64_t)(uint32_t)q_) & 3u) != 0u)   \
+          continue;                                                                                \
+        double dx_ = S_[(size_t)q_ * 3] - org[0], dy_ = S_[(size_t)q_ * 3 + 1] - org[1],           \
+               dz_ = S_[(size_t)q_ * 3 + 2] - org[2];                                              \
+        double pu = dx_ * eu[0] + dy_ * eu[1] + dz_ * eu[2];                                       \
+        double pv = dx_ * ev[0] + dy_ * ev[1] + dz_ * ev[2];                                       \
+        double pw = dx_ * n[0] + dy_ * n[1] + dz_ * n[2];                                          \
+        BODY                                                                                       \
+      }                                                                                            \
+    }                                                                                              \
+  } while (0)
+
+  /* Начальная четвёрка — крайние точки по `w` и по `u`: они почти наверняка
+   * опорные, и вырожденность такой четвёрки ловится отказом системы. */
+  double ref[4][3];
+  int have = 0;
+  {
+    double wlo = 1e300, whi = -1e300, ulo = 1e300, uhi = -1e300;
+    double rw0[3] = {0, 0, 0}, rw1[3] = {0, 0, 0}, ru0[3] = {0, 0, 0}, ru1[3] = {0, 0, 0};
+    PM_MM_FOREACH({
+      if (pw < wlo) {
+        wlo = pw;
+        rw0[0] = pu;
+        rw0[1] = pv;
+        rw0[2] = pw;
+      }
+      if (pw > whi) {
+        whi = pw;
+        rw1[0] = pu;
+        rw1[1] = pv;
+        rw1[2] = pw;
+      }
+      if (pu < ulo) {
+        ulo = pu;
+        ru0[0] = pu;
+        ru0[1] = pv;
+        ru0[2] = pw;
+      }
+      if (pu > uhi) {
+        uhi = pu;
+        ru1[0] = pu;
+        ru1[1] = pv;
+        ru1[2] = pw;
+      }
+      have++;
+    });
+    if (have < 4) return 1;
+    for (int c = 0; c < 3; c++) {
+      ref[0][c] = rw0[c];
+      ref[1][c] = rw1[c];
+      ref[2][c] = ru0[c];
+      ref[3][c] = ru1[c];
+    }
+  }
+  double a = 0.0, b = 0.0, cc = 0.0, t = 0.0;
+  if (pm_ref4(ref, &a, &b, &cc, &t) != 0) {
+    a = 0.0;
+    b = 0.0;
+    cc = 0.0;
+    t = 0.0;
+  }
+  int it = 0;
+  for (; it < PM_MMEXCH; it++) {
+    double worst = -1.0, wp[3] = {0, 0, 0};
+    PM_MM_FOREACH({
+      double r = fabs(pw - a * pu - b * pv - cc);
+      if (r > worst) {
+        worst = r;
+        wp[0] = pu;
+        wp[1] = pv;
+        wp[2] = pw;
+      }
+    });
+    if (nwork != NULL) *nwork += have;
+    if (!(worst > t)) break; /* ни одна точка не хуже опорных — оптимум */
+    /* ОБМЕН: нарушитель заменяет одну из четырёх, берётся замена с наибольшим
+     * `t`. Монотонность `t` и конечность множества четвёрок дают конечность
+     * процесса; оптимальность — нет (А89), поэтому останов без улучшения
+     * считается НЕДОСХОДОМ и печатается. */
+    double ba = a, bb2 = b, bc = cc, bt = t;
+    int best = -1;
+    for (int k = 0; k < 4; k++) {
+      double cand[4][3];
+      memcpy(cand, ref, sizeof cand);
+      for (int c = 0; c < 3; c++)
+        cand[k][c] = wp[c];
+      double a2, b2, c2, t2;
+      if (pm_ref4(cand, &a2, &b2, &c2, &t2) != 0) continue;
+      if (t2 > bt) {
+        bt = t2;
+        ba = a2;
+        bb2 = b2;
+        bc = c2;
+        best = k;
+      }
+    }
+    if (best < 0) {
+      if (ms != NULL) ms->nmm_under++;
+      break;
+    }
+    for (int c = 0; c < 3; c++)
+      ref[best][c] = wp[c];
+    a = ba;
+    b = bb2;
+    cc = bc;
+    t = bt;
+  }
+  if (ms != NULL) {
+    ms->nmm_call++;
+    ms->nmm_exch += it;
+    if (it > ms->nmm_exch_max) ms->nmm_exch_max = it;
+    if (it >= PM_MMEXCH) ms->nmm_cap++;
+  }
+#undef PM_MM_FOREACH
+  /* Мировая плоскость: `N = n − a·eu − b·ev`, нормируется. */
+  double N[3];
+  for (int c = 0; c < 3; c++)
+    N[c] = n[c] - a * eu[c] - b * ev[c];
+  double nl = sqrt(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]);
+  if (!(nl > 0.0)) return 1;
+  if (ms != NULL && nl > ms->mm_gmax) ms->mm_gmax = nl;
+  for (int c = 0; c < 3; c++)
+    n[c] = N[c] / nl;
+  *off = (N[0] * org[0] + N[1] * org[1] + N[2] * org[2] + cc) / nl;
+  return 0;
+}
+
 /* О7: ХОДИМ ПО ОПОРНОМУ МНОЖЕСТВУ, А НЕ ПО ВСЕМ ТРЕУГОЛЬНИКАМ. Величина ТА ЖЕ —
  * максимум аффинной функции достигается на вершине выпуклой оболочки, — а работа
  * падает на столько, во сколько оболочка мельче набора (`polygon.h`, поле `sup`).
@@ -171,7 +461,7 @@ static void pbox(const hz_polyset *ps, const hz_objmesh *m, int32_t k, double lo
  * отличие от Г40/Г44. Треугольники сюда больше не приходят вовсе, поэтому и
  * сетка (`m`) функции не нужна. */
 static double group_plane(const hz_polyset *ps, const int32_t *mem, int32_t nm, double n[3],
-                          double *off, int64_t *nwork) {
+                          double *off, int64_t *nwork, hz_mergestat *mmst, int quarter) {
   double s = 0.0, ns[3] = {0, 0, 0}, org[3] = {0, 0, 0};
   for (int32_t i = 0; i < nm; i++) {
     const hz_poly *P = &ps->p[mem[i]];
@@ -209,6 +499,39 @@ static double group_plane(const hz_polyset *ps, const int32_t *mem, int32_t nm, 
     if (!(P->n[0] * n[0] + P->n[1] * n[1] + P->n[2] * n[2] > 0.0)) return 1e300;
   }
   *off = n[0] * org[0] + n[1] * org[1] + n[2] * org[2];
+
+  /* О11: ПЛОСКОСТЬ МИНИМАКСНАЯ, А НЕ СРЕДНЕВЗВЕШЕННАЯ. Средневзвешенная —
+   * не подгонка вовсе, а среднее нормалей и центров; критерий же есть МАКСИМУМ,
+   * и подгонять надо в той же норме, в какой меряют (А20, §22). Замер §26:
+   * минимакс даёт отклонение `0.83` от средневзвешенного по медиане на городе и
+   * `0.64` на зале, а пул допустимых объединений растёт в `6.4` и `1.5` раза.
+   * Ориентация при этом остаётся ОТДЕЛЬНОЙ величиной (А22) и берётся выше из
+   * `Σ A·n`: собственный вектор минимакса знака не имеет, и встречные грани дали
+   * бы ему идеальную плоскость. */
+  /* ОТКАТ К СРЕДНЕВЗВЕШЕННОЙ, ЕСЛИ МИНИМАКС НАКЛОНИЛ ПЛОСКОСТЬ ЗА ПРЕДЕЛЫ КОНУСА
+   * НОРМАЛЕЙ (А95). Графовая задача наклон не ограничивает: если опорные точки
+   * почти коллинеарны в проекции, плоскость можно повернуть почти «на ребро», и
+   * отклонение формально упадёт — но такая плоскость поверхность уже не
+   * представляет, а проверка ориентации выше сделана по СТАРОЙ нормали и этого
+   * не видит. Замер на зале: `√(1+a²+b²)` доходил до `10.5`, то есть нормаль
+   * уезжала на 84°. Поэтому после решателя ориентация проверяется ЗАНОВО, и при
+   * отказе берётся прежняя плоскость — с ней слияние просто останется тем, чем
+   * было до О11. */
+  double nav[3] = {n[0], n[1], n[2]}, offav = *off;
+  if (pm_minimax(ps, mem, nm, n, org, off, nwork, mmst, quarter) != 0) return 1e300;
+  {
+    int okc = 1;
+    for (int32_t i = 0; i < nm && okc; i++) {
+      const hz_poly *P = &ps->p[mem[i]];
+      if (!(P->n[0] * n[0] + P->n[1] * n[1] + P->n[2] * n[2] > 0.0)) okc = 0;
+    }
+    if (!okc) {
+      for (int c = 0; c < 3; c++)
+        n[c] = nav[c];
+      *off = offav;
+      if (mmst != NULL) mmst->nmm_revert++;
+    }
+  }
 
   double dmax = 0.0;
   for (int32_t i = 0; i < nm; i++) {
@@ -459,7 +782,7 @@ static int pm_emit(pm_plist *L, const hz_polyset *ps, const double *bb, int32_t 
         int32_t mm[2] = {a, b};
         double gn[3], goff;
         st->ngate_exact++;
-        qg = group_plane(ps, mm, 2, gn, &goff, &st->nwork_tri);
+        qg = group_plane(ps, mm, 2, gn, &goff, &st->nwork_tri, st, cfg->quarter);
         if (qg > cfg->delta) {
           st->nrej_geom++;
           return 0;
@@ -772,7 +1095,16 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
    * есть направление остатка округления (А76, А77). Хвост же ни одного числа не
    * меняет — он снимает только проход до конца списка. */
   int32_t *tail = malloc((size_t)np * sizeof *tail);
-  if (head == NULL || nxt == NULL || mem == NULL || tail == NULL) {
+  /* РЕШАЮЩАЯ ПЛОСКОСТЬ ХРАНИТСЯ У КОРНЯ, А НЕ ПЕРЕСЧИТЫВАЕТСЯ В РАЗМЕТКЕ (А96).
+   * Минимаксный решатель зависит от ПОРЯДКА членов (обмен идёт от начальной
+   * четвёрки), а разметка обходит полигоны по номерам, а не по списку группы, —
+   * и получает ДРУГУЮ плоскость. Замер на зале: группа из пяти кусков прошла по
+   * наклонной плоскости при δ = 0.3, а разметка пересчитала по средневзвешенной
+   * и дала `dmax = 1.602` м. Инвариант ломался ровно на этом. Плоскость, по
+   * которой принято решение, — единственная законная для доклада. */
+  double *gpl = malloc((size_t)np * 4 * sizeof *gpl);
+  if (head == NULL || nxt == NULL || mem == NULL || tail == NULL || gpl == NULL) {
+    free(gpl);
     free(head);
     free(nxt);
     free(mem);
@@ -786,6 +1118,10 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
     head[k] = k;
     nxt[k] = -1;
     tail[k] = k;
+    /* Одиночная группа: плоскость — собственная плоскость полигона. */
+    for (int c = 0; c < 3; c++)
+      gpl[(size_t)k * 4 + (size_t)c] = ps->p[k].n[c];
+    gpl[(size_t)k * 4 + 3] = ps->p[k].off;
   }
   int32_t nleft = np;
   for (int64_t i = 0; i < pn; i++) {
@@ -858,11 +1194,18 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
     }
     st->nmerge_exact++;
     st->nwork_merge_mem += nm;
-    if (cfg->use_geom && !cfg->random && !cfg->noexact) {
+    {
       double n[3], off;
-      if (!(group_plane(ps, mem, nm, n, &off, &st->nwork_merge_sup) < cfg->delta)) {
+      double q = group_plane(ps, mem, nm, n, &off, &st->nwork_merge_sup, st, cfg->quarter);
+      if (cfg->use_geom && !cfg->random && !cfg->noexact && !(q < cfg->delta)) {
         st->nrej_geom++;
         continue;
+      }
+      /* Плоскость объединения запоминается у БУДУЩЕГО корня (`ra`). */
+      if (q < 1e299) {
+        for (int c = 0; c < 3; c++)
+          gpl[(size_t)ra * 4 + (size_t)c] = n[c];
+        gpl[(size_t)ra * 4 + 3] = off;
       }
     }
     /* СЦЕПКА ЗА `O(1)`: корнем объединения всегда становится `ra`, поэтому
@@ -908,45 +1251,22 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
       nn++;
     }
   }
-  /* ПЛОСКОСТЬ ГРУППЫ ПЕРЕСЧИТЫВАЕТСЯ, а не берётся у первого: слияние меняет
-   * и нормаль, и смещение, а `dmax` после него ДРУГОЙ. Ложный ноль опаснее
-   * UNKNOWN — тот останавливает потребителя, этот пропускает. */
-  double *acc = calloc((size_t)(nn > 0 ? nn : 1) * 8, sizeof *acc);
-  if (acc == NULL) {
-    free(rank);
-    free(par);
-    hz_seg_free(so);
-    return 2;
-  }
+  /* ПЛОСКОСТЬ ВЫХОДНОЙ ГРУППЫ — ТА ЖЕ МИНИМАКСНАЯ, ЧТО РЕШАЛА ПРИ СЛИЯНИИ, И
+   * ИНАЧЕ НЕЛЬЗЯ (§28, п. 4). Если критерий принимает по одной плоскости, а
+   * разметка считает `dmax` по другой (средневзвешенной), инвариант ломается
+   * ровно так, как сломался в О9: город при δ = 8 м дал тогда `9.236` м при
+   * допуске `8` (А76). Поэтому здесь собираются члены каждой группы и
+   * вызывается тот же `group_plane`. Цена — один проход по опорным точкам всей
+   * сцены, то есть меньше одной попытки слияния на группу. */
   for (int32_t k = 0; k < np; k++) {
-    int32_t g = rank[uf_find(par, k)];
-    const hz_poly *P = &ps->p[k];
-    double w = P->area;
-    for (int c = 0; c < 3; c++) {
-      acc[(size_t)g * 8 + (size_t)c] += w * P->n[c];
-      acc[(size_t)g * 8 + 3 + (size_t)c] += w * P->org[c];
-    }
-    acc[(size_t)g * 8 + 6] += w;
+    int32_t r = uf_find(par, k);
+    if (r != k) continue;
+    int32_t g = rank[r];
+    for (int c = 0; c < 3; c++)
+      so->seg[g].n[c] = gpl[(size_t)r * 4 + (size_t)c];
+    so->seg[g].off = gpl[(size_t)r * 4 + 3];
   }
-  for (int32_t g = 0; g < nn; g++) {
-    double w = acc[(size_t)g * 8 + 6];
-    if (!(w > 0.0)) continue;
-    double n[3], nl = 0.0;
-    for (int c = 0; c < 3; c++) {
-      n[c] = acc[(size_t)g * 8 + (size_t)c] / w;
-      nl += n[c] * n[c];
-    }
-    nl = sqrt(nl);
-    if (!(nl > 0.0)) continue;
-    double org[3];
-    for (int c = 0; c < 3; c++) {
-      n[c] /= nl;
-      org[c] = acc[(size_t)g * 8 + 3 + (size_t)c] / w;
-      so->seg[g].n[c] = n[c];
-    }
-    so->seg[g].off = n[0] * org[0] + n[1] * org[1] + n[2] * org[2];
-  }
-  free(acc);
+  free(gpl);
 
   /* Треугольник знает свой ИСХОДНЫЙ участок; полигон — тот же индекс, потому
    * что `hz_poly_build` нумерует полигоны участками один к одному. */

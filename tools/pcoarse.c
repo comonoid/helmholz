@@ -46,6 +46,7 @@ static double g_only = -1.0;
 static int g_notie = 0;
 static int g_rand = 0;
 static int g_noexact = 0;
+static int g_quarter = 0;
 
 static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps, double eps,
                 int32_t target, int random, int brute, double delta, int ov) {
@@ -65,6 +66,7 @@ static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps
   mc.brute = brute;
   mc.notie = g_notie;
   mc.noexact = g_noexact;
+  mc.quarter = g_quarter;
   hz_pseglist so;
   hz_mergestat st;
   double t0 = now_s();
@@ -91,6 +93,16 @@ static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps
          st.nthreads, st.t_gate, st.t_gate_cpu, (st.t_gate > 0.0) ? st.t_gate_cpu / st.t_gate : 0.0,
          (long long)st.npair_thr_max,
          (long long)(st.nthreads > 0 ? st.npair_list / st.nthreads : st.npair_list));
+  /* МИНИМАКСНЫЙ РЕШАТЕЛЬ (О11): сходимость этой формы обмена не доказана (А89),
+   * поэтому печатается её поведение, а не только результат. Два последних числа
+   * обязаны быть нулями. */
+  printf("        минимакс: вызовов %lld, обменов в среднем %.2f, максимум %lld; упёрлись в предел "
+         "%lld, недосходов %lld; max sqrt(1+a²+b²) %.6f\n",
+         (long long)st.nmm_call,
+         (st.nmm_call > 0) ? (double)st.nmm_exch / (double)st.nmm_call : 0.0,
+         (long long)st.nmm_exch_max, (long long)st.nmm_cap, (long long)st.nmm_under, st.mm_gmax);
+  printf("        минимакс: откатов к средневзвешенной %lld (%.2f%%)\n", (long long)st.nmm_revert,
+         (st.nmm_call > 0) ? 100.0 * (double)st.nmm_revert / (double)st.nmm_call : 0.0);
   /* СЛИЯНИЕ ПОСЛЕ О9: доля точных пересчётов и РАБОТА, ими вызванная. Доля
    * попыток зависит от истории слияний (А67), поэтому вывод делается по работе
    * (А71), а не по ней. */
@@ -282,6 +294,8 @@ int main(int argc, char **argv) {
     /* НЕГАТИВНЫЙ КОНТРОЛЬ О9: точный пересчёт отключён там, где граница его
      * требует; инвариант dmax_worst <= δ обязан НАРУШИТЬСЯ на городе. */
     if (strcmp(argv[i], "noexact") == 0) g_noexact = 1;
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ О11: минимакс по четверти точек. */
+    if (strcmp(argv[i], "quarter") == 0) g_quarter = 1;
   }
   double delta = (argc > 2) ? strtod(argv[2], NULL) : (city ? 0.05 : 0.045);
   hz_objmesh m;

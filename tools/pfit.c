@@ -299,6 +299,56 @@ int main(int argc, char **argv) {
   for (int32_t k = 0; k < np; k++)
     if (gof[k] >= 0) gmem[cur[gof[k]]++] = k;
   free(cur);
+  /* --- А122: СКОЛЬКО ГРУПП СХОДИТСЯ В ВЕРШИНЕ ---
+   * Замер ставится ПЕРВЫМ, до всякой подгонки вершин, потому что от него зависит,
+   * стоит ли писать О17 вообще: двигать имеет смысл только вершины, где сходятся
+   * ТРИ плоскости и больше (А121 — при одной-двух задача недоопределена в двух
+   * направлениях, и вершина поедет вдоль поверхности). Если таких вершин единицы
+   * процентов, вся ставка шага беспочвенна.
+   * Считается по СВАРНЫМ номерам (`ps->bw`, заведены для О1): один и тот же
+   * объект у всех полигонов, которые эту вершину делят. Группы обходятся ПОДРЯД
+   * (по `gmem`), поэтому «последняя виденная группа» различает их точно. */
+  {
+    int32_t nw = (int32_t)ps.nweld;
+    int32_t *lastg = malloc((size_t)(nw > 0 ? nw : 1) * sizeof *lastg);
+    int32_t *ngrp = calloc((size_t)(nw > 0 ? nw : 1), sizeof *ngrp);
+    if (lastg != NULL && ngrp != NULL) {
+      for (int32_t i = 0; i < nw; i++)
+        lastg[i] = -1;
+      for (int32_t g = 0; g < so.nseg; g++)
+        for (int32_t i = goff[g]; i < goff[g + 1]; i++) {
+          const hz_poly *P = &ps.p[gmem[i]];
+          for (int32_t l = P->l0; l < P->l0 + P->nloop; l++)
+            for (int32_t b = ps.loop[l]; b < ps.loop[l + 1]; b++) {
+              int32_t w = ps.bw[b];
+              if (w < 0 || w >= nw) continue;
+              if (lastg[w] != g) {
+                lastg[w] = g;
+                ngrp[w]++;
+              }
+            }
+        }
+      int64_t hist[9];
+      memset(hist, 0, sizeof hist);
+      int64_t tot = 0, ge3 = 0;
+      for (int32_t i = 0; i < nw; i++) {
+        if (ngrp[i] <= 0) continue;
+        tot++;
+        int k = ngrp[i] > 8 ? 8 : ngrp[i];
+        hist[k]++;
+        if (ngrp[i] >= 3) ge3++;
+      }
+      printf("   А122: групп в вершине (по сварным номерам, %lld вершин на краю):", (long long)tot);
+      for (int k = 1; k <= 8; k++)
+        if (hist[k] > 0)
+          printf(" [%d%s] %.2f%%", k, (k == 8) ? "+" : "",
+                 100.0 * (double)hist[k] / (double)(tot ? tot : 1));
+      printf("; ТРИ И БОЛЬШЕ — %lld (%.2f%%)\n", (long long)ge3,
+             100.0 * (double)ge3 / (double)(tot ? tot : 1));
+    }
+    free(lastg);
+    free(ngrp);
+  }
 
   int32_t cap = 1 << 20;
   fp_pt *buf = malloc((size_t)cap * sizeof *buf);

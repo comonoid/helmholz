@@ -33,6 +33,7 @@
 #include "poly_seg.h"
 #include "polygon.h"
 #include "pray.h"
+#include "pvfit.h"
 #include "scene_cfg.h"
 #include "scene_obj.h"
 #include "transport/cam3.h"
@@ -69,12 +70,19 @@ int main(int argc, char **argv) {
   int32_t target = city ? 20000 : 250;
   int simp = 0, random = 0;
   double conemax = 0.0, lossmax = 0.0;
+  int vfit = 0;
+  double vmove = 1.0; /* предел смещения вершины в долях допуска огрубления */
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "simp") == 0) simp = 1;
     if (strcmp(argv[i], "rand") == 0) random = 1;
     if (strncmp(argv[i], "d=", 2) == 0) dcoarse = strtod(argv[i] + 2, NULL);
     if (strncmp(argv[i], "cone=", 5) == 0) conemax = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "loss=", 5) == 0) lossmax = strtod(argv[i] + 5, NULL);
+    if (strcmp(argv[i], "vfit") == 0) vfit = 1;
+    if (strncmp(argv[i], "vfit=", 5) == 0) {
+      vfit = 1;
+      vmove = strtod(argv[i] + 5, NULL);
+    }
   }
   hz_objmesh m;
   if (hz_obj_load(&m, city ? HZ_CFG_CITY_OBJ : HZ_CFG_HALL_OBJ,
@@ -105,6 +113,27 @@ int main(int argc, char **argv) {
   if (hz_merge(&so, &m, &sg, &psf, &mc, &st) != 0) return 1;
   hz_polyset psc;
   if (hz_poly_build(&psc, &m, &so) != 0) return 1;
+  /* О17: подгонка вершин края в 3D (§40…§43). Ставится ЗДЕСЬ, после сборки
+   * огрублённых полигонов: она правит только край, оставляя элемент плоским. */
+  if (vfit) {
+    hz_vfitstat vs;
+    if (hz_poly_vfit(&psc, vmove * dcoarse, &vs) != 0) return 1;
+    printf("   О17: вершин %lld, передвинуто %lld (%.2f%%), оставлено %lld, L2 вне гарантии %lld, "
+           "отказов %lld; худшее t* %.4f м\n",
+           (long long)vs.nvert, (long long)vs.nvert_moved,
+           100.0 * (double)vs.nvert_moved / (double)(vs.nvert ? vs.nvert : 1),
+           (long long)vs.nvert_fixed, (long long)vs.nvert_l2out, (long long)vs.nvert_fail, vs.tmax);
+    printf("   О17: отказов по смещению %lld, худшее принятое смещение %.4f м\n",
+           (long long)vs.nvert_far, vs.dmax_move);
+    printf("   О17: отказов без улучшения %lld; предел смещения %.4f м\n",
+           (long long)vs.nvert_noimp, vmove * dcoarse);
+    printf("   О17: t* по корзинам 10^k м (от 1e-6):");
+    for (int i = 0; i < 12; i++)
+      if (vs.t_hist[i] > 0)
+        printf(" [1e%d] %.2f%%", i - 6,
+               100.0 * (double)vs.t_hist[i] / (double)(vs.nvert_moved ? vs.nvert_moved : 1));
+    printf("\n");
+  }
   printf("== метрика огрубления: %s, δ сегм %g, δ огр %g%s%s; участков %d -> %d, dmax_worst %.3f\n",
          city ? "ГОРОД" : "зал", dseg, dcoarse, random ? ", СЛУЧАЙНОЕ" : "",
          (conemax > 0.0) ? ", конус ограничен" : "", sg.nseg, so.nseg, st.dmax_worst);

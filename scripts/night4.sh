@@ -17,7 +17,7 @@ OUT=build/night4
 mkdir -p "$OUT"
 LOG="$OUT/log.txt"
 : > "$LOG"
-while pgrep -x pmetric > /dev/null; do sleep 60; done
+# (ожидание снято 01:40, см. выше)
 
 run() {
   local name=$1

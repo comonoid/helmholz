@@ -812,18 +812,20 @@ int hz_lod_seglist(const hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, 
  */
 int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, const hz_polyset *ps0,
                        double delta0, int maxlev, double eps, int bands, int bycount, int byangle,
-                       double radmul) {
+                       double radmul, double angle0) {
   memset(L, 0, sizeof *L);
   L->bands = bands;
   L->bycount = bycount;
   L->byangle = byangle;
-  L->angle0 = 0.5; /* первая ступень двоичной лестницы углов: за 8 уровней до 64° */
   L->radmul = (radmul > 0.0) ? radmul : 1.0;
-  L->byangle = byangle;
-  /* Нулевой полураствор — ПОЛГРАДУСА. Число не подобрано под результат: это первая
-   * ступень двоичной лестницы, доходящей за восемь уровней до 64°, то есть до
-   * «почти перпендикулярно». Оно параметр, а не константа. */
-  L->angle0 = 0.5;
+  /* ПЕРВАЯ СТУПЕНЬ УГЛОВОЙ ЛЕСТНИЦЫ — ПАРАМЕТР, А НЕ КОНСТАНТА (А174). Стояло
+   * `0.5°`, то есть НИЖЕ всего, что в сцене бывает: у города минимальный излом
+   * между смежными участками ровно `90°`, пара под прямым углом даёт полураствор
+   * конуса `45°`, и лестница `0.5…64°` доходила до него лишь на последнем уровне.
+   * Отсюда «насыщение угловой тактики», записанное в А171 как её свойство, — а это
+   * было свойство ЛЕСТНИЦЫ. Та же ошибка, что с `δ0`: начинать там, где у сцены
+   * ничего нет. Ноль читается как прежние `0.5°`, чтобы старые прогоны совпали. */
+  L->angle0 = (angle0 > 0.0) ? angle0 : 0.5;
   const int32_t np = (ps0->np < sg->nseg) ? ps0->np : sg->nseg;
   if (np <= 0 || maxlev < 1) return 1;
   L->np = np;
@@ -899,7 +901,11 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
        * сняты через `dgate` (А144), цель по числу снята. */
       mc.delta = drad;
       mc.dgate = dscene;
+      /* Полураствор конуса ограничен `90°` по смыслу (полусфера), поэтому лестница
+       * упирается в потолок, а не уходит за него: `89°` — последняя осмысленная
+       * ступень, дальше условие вырождается в «конус существует». */
       mc.conemax = L->angle0 * pow(2.0, (double)(lev - 1));
+      if (mc.conemax > 89.0) mc.conemax = 89.0;
       mc.target = 0;
     } else if (L->bycount) {
       /* ТАКТИКА ПО ЧИСЛУ. Цель — четверть предыдущего уровня: четвёрка здесь уже

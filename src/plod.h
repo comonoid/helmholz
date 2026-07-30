@@ -134,6 +134,6 @@ int hz_lod_seglist(const hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, 
  * сокращают лишь `1.03…1.21x` — ступени стоят там, где сливать нечего. */
 int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, const hz_polyset *ps0,
                        double delta0, int maxlev, double eps, int bands, int bycount, int byangle,
-                       double radmul);
+                       double radmul, double angle0);
 
 #endif

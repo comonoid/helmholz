@@ -256,6 +256,13 @@ static void adj_angles(const hz_objmesh *m, const hz_pseglist *sg, const hz_poly
    * замера, а не под него. */
   const double thr[8] = {0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 45.0, 91.0};
   int64_t below[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  /* ПОЛНАЯ ГИСТОГРАММА `0…180°` ПО 5° (А173). Прежние пороги кончались на `91°`, и
+   * весь хвост выше сваливался в одну корзину: отличить `135°` (скат к стене) от
+   * `180°` (лицо к изнанке) было нечем, а я при этом утверждал, что в сцене «всё
+   * либо 90, либо 180». Утверждение шло сверх измеренного; корзины заведены. */
+  int64_t hist[36];
+  for (int q = 0; q < 36; q++)
+    hist[q] = 0;
   int64_t nadjpair = 0, nconv = 0, nconc = 0;
   double amin = 999.0;
   for (int64_t i = 1; i < ne; i++) {
@@ -278,6 +285,12 @@ static void adj_angles(const hz_objmesh *m, const hz_pseglist *sg, const hz_poly
     if (th < amin) amin = th;
     for (int q = 0; q < 8; q++)
       if (th <= thr[q]) below[q]++;
+    {
+      int hb = (int)(th / 5.0);
+      if (hb < 0) hb = 0;
+      if (hb > 35) hb = 35;
+      hist[hb]++;
+    }
     /* Заодно: во сколько групп схлопнулась бы сцена при пороге 45°, если сливать
      * ТОЛЬКО соседей. Это верхняя оценка для угловой тактики при связности. */
     if (th <= 45.0) {
@@ -294,6 +307,11 @@ static void adj_angles(const hz_objmesh *m, const hz_pseglist *sg, const hz_poly
   printf("      доля пар с изломом не более:");
   for (int q = 0; q < 8; q++)
     printf(" %.1f°:%.2f%%", thr[q], 100.0 * (double)below[q] / (double)(nadjpair ? nadjpair : 1));
+  printf("\n      ПОЛНАЯ гистограмма по 5°, %% (только непустые):");
+  for (int q = 0; q < 36; q++)
+    if (hist[q] > 0)
+      printf(" [%d-%d°] %.2f", q * 5, q * 5 + 5,
+             100.0 * (double)hist[q] / (double)(nadjpair ? nadjpair : 1));
   printf("\n      если слить ВСЕ смежные пары с изломом до 45°: %lld групп (сокращение %.1fx)\n",
          (long long)ng, (double)ps->np / (double)(ng ? ng : 1));
   free(er);
@@ -483,7 +501,7 @@ int main(int argc, char **argv) {
   double dseg = city ? 0.05 : 0.045;
   int simp = 0, vfit = 0, maxlev = 9, uniform = 0, viamerge = 0, bands = 0, bycount = 0,
       byangle = 0, curve = 0;
-  double epsmul = 1.0, radmul = 1.0, eyemul = 1.0;
+  double epsmul = 1.0, radmul = 1.0, eyemul = 1.0, ang0 = 0.0;
   const char *save = NULL, *load = NULL;
   /* НЕИЗВЕСТНЫЙ АРГУМЕНТ — ОШИБКА, А НЕ ПРОПУСК (§60, дефект оснастки). Флаг,
    * который не совпал, молчал, и конфигурация вышла тождественной другой; поймать
@@ -509,6 +527,11 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "curve") == 0) ok = curve = 1;
     if (strncmp(argv[i], "lev=", 4) == 0) {
       maxlev = (int)strtol(argv[i] + 4, NULL, 10);
+      ok = 1;
+    }
+    /* §71: ПЕРВАЯ СТУПЕНЬ УГЛОВОЙ ЛЕСТНИЦЫ, ГРАДУСЫ. */
+    if (strncmp(argv[i], "ang0=", 5) == 0) {
+      ang0 = strtod(argv[i] + 5, NULL);
       ok = 1;
     }
     /* §71: ОТОДВИНУТЬ КАМЕРУ. Глаз уезжает от точки прицела в `eyemul` раз, поле
@@ -543,7 +566,8 @@ int main(int argc, char **argv) {
       fprintf(stderr,
               "plod: неизвестный аргумент «%s»\n"
               "  ожидается: [city|hall] [simp] [vfit] [uniform] [viamerge] [bands]\n"
-              "             [bycount] [byangle] [curve] [rad=X] [eye=X] [lev=N] [eps=X] [save=Ф] "
+              "             [bycount] [byangle] [curve] [rad=X] [eye=X] [ang0=X] [lev=N] [eps=X] "
+              "[save=Ф] "
               "[load=Ф]\n",
               argv[i]);
       return 2;
@@ -618,7 +642,7 @@ int main(int argc, char **argv) {
     dseg = L.delta0;
   } else {
     rc = viamerge ? hz_lod_build_merge(&L, &m, &sg, &psf, dseg, maxlev, eps, bands, bycount,
-                                       byangle, radmul)
+                                       byangle, radmul, ang0)
                   : hz_lod_build(&L, &m, &sg, &psf, dseg, maxlev, eps);
     if (rc != 0) {
       fprintf(stderr, "отказ построения лестницы\n");

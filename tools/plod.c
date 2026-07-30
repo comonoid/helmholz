@@ -483,7 +483,7 @@ int main(int argc, char **argv) {
   double dseg = city ? 0.05 : 0.045;
   int simp = 0, vfit = 0, maxlev = 9, uniform = 0, viamerge = 0, bands = 0, bycount = 0,
       byangle = 0, curve = 0;
-  double epsmul = 1.0, radmul = 1.0;
+  double epsmul = 1.0, radmul = 1.0, eyemul = 1.0;
   const char *save = NULL, *load = NULL;
   /* НЕИЗВЕСТНЫЙ АРГУМЕНТ — ОШИБКА, А НЕ ПРОПУСК (§60, дефект оснастки). Флаг,
    * который не совпал, молчал, и конфигурация вышла тождественной другой; поймать
@@ -511,6 +511,15 @@ int main(int argc, char **argv) {
       maxlev = (int)strtol(argv[i] + 4, NULL, 10);
       ok = 1;
     }
+    /* §71: ОТОДВИНУТЬ КАМЕРУ. Глаз уезжает от точки прицела в `eyemul` раз, поле
+     * зрения то же. Нужно потому, что при штатной камере `ε·R` по кадру равно
+     * размеру грани города (p50 = 1.414 м), то есть LOD меряется там, где ему
+     * нечего делать: огрубление законно лишь с `ε·R > s/2`. Свип по `ε` этого не
+     * заменяет — он меняет допуск среза, но не то, ЧТО видно и с какого удаления. */
+    if (strncmp(argv[i], "eye=", 4) == 0) {
+      eyemul = strtod(argv[i] + 4, NULL);
+      ok = 1;
+    }
     /* §68: РАДИУС ПОИСКА КАНДИДАТОВ В ДОПУСКАХ УРОВНЯ. */
     if (strncmp(argv[i], "rad=", 4) == 0) {
       radmul = strtod(argv[i] + 4, NULL);
@@ -531,12 +540,12 @@ int main(int argc, char **argv) {
       ok = 1;
     }
     if (!ok) {
-      fprintf(
-          stderr,
-          "plod: неизвестный аргумент «%s»\n"
-          "  ожидается: [city|hall] [simp] [vfit] [uniform] [viamerge] [bands]\n"
-          "             [bycount] [byangle] [curve] [rad=X] [lev=N] [eps=X] [save=Ф] [load=Ф]\n",
-          argv[i]);
+      fprintf(stderr,
+              "plod: неизвестный аргумент «%s»\n"
+              "  ожидается: [city|hall] [simp] [vfit] [uniform] [viamerge] [bands]\n"
+              "             [bycount] [byangle] [curve] [rad=X] [eye=X] [lev=N] [eps=X] [save=Ф] "
+              "[load=Ф]\n",
+              argv[i]);
       return 2;
     }
   }
@@ -562,6 +571,13 @@ int main(int argc, char **argv) {
   tr3_camera cam;
   double eyeh[3] = HZ_CFG_HALL_EYE, ath[3] = HZ_CFG_HALL_AT;
   double eyec[3] = HZ_CFG_CITY_EYE, atc[3] = HZ_CFG_CITY_AT, up[3] = HZ_CFG_UP;
+  if (!(eyemul >= 1.0 && eyemul <= 1.0)) {
+    double *e = city ? eyec : eyeh;
+    const double *a = city ? atc : ath;
+    for (int c = 0; c < 3; c++)
+      e[c] = a[c] + (e[c] - a[c]) * eyemul;
+    printf("== КАМЕРА ОТОДВИНУТА в %.1f раз: глаз (%.1f %.1f %.1f)\n", eyemul, e[0], e[1], e[2]);
+  }
   const int W = 512, H = 512;
   if (tr3_camera_look(&cam, city ? eyec : eyeh, city ? atc : ath, up, HZ_CFG_FOV_DEG * M_PI / 180.0,
                       W, H) != 0)

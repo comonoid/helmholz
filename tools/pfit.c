@@ -299,6 +299,57 @@ int main(int argc, char **argv) {
   for (int32_t k = 0; k < np; k++)
     if (gof[k] >= 0) gmem[cur[gof[k]]++] = k;
   free(cur);
+  /* --- ВЫПУКЛОСТЬ ГРУПП (§55) ---
+   * Требование выпуклости — ограничение БЕЗ ПОРОГА: знаки векторных произведений
+   * по контуру, один проход. Прежде чем его вводить, надо знать, какая доля
+   * нынешних групп ему удовлетворяет: лёгкая это правка или переворот критерия. */
+  {
+    int64_t nconv = 0, nhole = 0, nconc = 0, ntot = 0;
+    double worst = 0.0;
+    for (int32_t g = 0; g < so.nseg; g++) {
+      int32_t nm = goff[g + 1] - goff[g];
+      if (nm <= 0) continue;
+      /* Контур группы у нас не собран как один многоугольник, поэтому выпуклость
+       * проверяется по контурам ЧЛЕНОВ: группа не может быть выпуклой, если
+       * невыпукл хоть один её член или у члена есть дыра. Это оценка СВЕРХУ на
+       * долю выпуклых, и она названа таковой. */
+      int conv = 1, hole = 0;
+      double wneg = 0.0;
+      for (int32_t i = goff[g]; i < goff[g + 1]; i++) {
+        const hz_poly *P = &ps.p[gmem[i]];
+        if (P->nloop > 1) hole = 1;
+        for (int32_t l = P->l0; l < P->l0 + P->nloop; l++) {
+          int32_t b = ps.loop[l], e = ps.loop[l + 1], n = e - b;
+          if (n < 3) continue;
+          double amax = 0.0;
+          for (int32_t k = 0; k < n; k++) {
+            const double *A = ps.bv + (size_t)(b + k) * 2;
+            const double *B = ps.bv + (size_t)(b + (k + 1) % n) * 2;
+            const double *C = ps.bv + (size_t)(b + (k + 2) % n) * 2;
+            double cr = (B[0] - A[0]) * (C[1] - B[1]) - (B[1] - A[1]) * (C[0] - B[0]);
+            if (cr < 0.0) {
+              conv = 0;
+              if (-cr > amax) amax = -cr;
+            }
+          }
+          if (amax > wneg) wneg = amax;
+        }
+      }
+      ntot++;
+      if (hole) nhole++;
+      if (conv && !hole)
+        nconv++;
+      else if (!conv)
+        nconc++;
+      if (wneg > worst) worst = wneg;
+    }
+    printf("   §55 выпуклость: групп %lld, выпуклы (оценка сверху) %lld (%.2f%%), с дырами %lld "
+           "(%.2f%%), невыпуклы %lld (%.2f%%)\n",
+           (long long)ntot, (long long)nconv, 100.0 * (double)nconv / (double)(ntot ? ntot : 1),
+           (long long)nhole, 100.0 * (double)nhole / (double)(ntot ? ntot : 1), (long long)nconc,
+           100.0 * (double)nconc / (double)(ntot ? ntot : 1));
+  }
+
   /* --- А122: СКОЛЬКО ГРУПП СХОДИТСЯ В ВЕРШИНЕ ---
    * Замер ставится ПЕРВЫМ, до всякой подгонки вершин, потому что от него зависит,
    * стоит ли писать О17 вообще: двигать имеет смысл только вершины, где сходятся

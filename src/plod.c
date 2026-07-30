@@ -428,6 +428,8 @@ int hz_lod_build(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, const hz
       if (grp == NULL || cur == NULL) {
         free(grp);
         free(cur);
+        grp = NULL;
+        cur = NULL;
         break;
       }
       /* Сортировкой по ключу найти пары: собираем массив (ключ, узел). */

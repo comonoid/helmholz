@@ -167,6 +167,12 @@ int main(int argc, char **argv) {
     int32_t cnt = 0;
     double *dm = malloc((size_t)L.np * sizeof *dm);
     double *sh = malloc((size_t)L.np * sizeof *sh);
+    if (dm == NULL || sh == NULL) {
+      free(seen);
+      free(dm);
+      free(sh);
+      break;
+    }
     int64_t nd = 0;
     for (int32_t k = 0; k < L.np; k++) {
       int32_t id = lab[k];
@@ -174,16 +180,16 @@ int main(int argc, char **argv) {
       seen[id] = 1;
       cnt++;
       const hz_lodnode *n = &L.nd[id];
-      if (dm != NULL) dm[nd] = n->dmax;
-      if (sh != NULL)
-        sh[nd] = (n->area_surf > 0.0 && n->perim > 0.0) ? n->perim / sqrt(n->area_surf) : 0.0;
+      dm[nd] = n->dmax;
+      sh[nd] = (n->area_surf > 0.0 && n->perim > 0.0) ? n->perim / sqrt(n->area_surf) : 0.0;
       nd++;
     }
     qsort(dm, (size_t)nd, sizeof *dm, cmp_dbl);
     qsort(sh, (size_t)nd, sizeof *sh, cmp_dbl);
-    printf("   уровень %d (допуск %.3f м): элементов %d%s; dmax p50 %.4f p90 %.4f макс %.4f\n", lev,
-           dseg * pow(2.0, lev), cnt, (lev > 0 && cnt > 0) ? "" : "", pct(dm, nd, 0.5),
-           pct(dm, nd, 0.9), pct(dm, nd, 1.0));
+    printf("   уровень %d (допуск %.3f м): элементов %d; dmax p50 %.4f p90 %.4f макс %.4f; "
+           "форма P/√A p50 %.2f p90 %.2f\n",
+           lev, dseg * pow(2.0, lev), cnt, pct(dm, nd, 0.5), pct(dm, nd, 0.9), pct(dm, nd, 1.0),
+           pct(sh, nd, 0.5), pct(sh, nd, 0.9));
     if (lev > 0 && cnt > 0)
       printf("      сокращение к предыдущему %.2f× (четвёрка — структура, не требование: §54.2)\n",
              (double)prevn / (double)cnt);

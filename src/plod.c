@@ -811,9 +811,10 @@ int hz_lod_seglist(const hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, 
  * построению, а качество равно измеренному у плоского слияния — это тот же код.
  */
 int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, const hz_polyset *ps0,
-                       double delta0, int maxlev, double eps, int bands) {
+                       double delta0, int maxlev, double eps, int bands, int bycount) {
   memset(L, 0, sizeof *L);
   L->bands = bands;
+  L->bycount = bycount;
   const int32_t np = (ps0->np < sg->nseg) ? ps0->np : sg->nseg;
   if (np <= 0 || maxlev < 1) return 1;
   L->np = np;
@@ -858,20 +859,51 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
   L->nlev = 1;
 
   /* Текущее разбиение: сегментация (уровень 0) и её полигоны. */
+  /* ГАБАРИТ СЦЕНЫ — для тактики по числу: допуск, снятый с диагонали, не может
+   * быть превышен ни одним отклонением внутри сцены, то есть ворота выключены
+   * ДОКАЗУЕМО, а не «большим числом». */
+  double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+  for (int32_t k = 0; k < np; k++)
+    for (int c = 0; c < 3; c++) {
+      double v = ps0->p[k].org[c];
+      if (v < lo[c]) lo[c] = v;
+      if (v > hi[c]) hi[c] = v;
+    }
+  double dscene = 0.0;
+  for (int c = 0; c < 3; c++)
+    dscene += (hi[c] - lo[c]) * (hi[c] - lo[c]);
+  dscene = sqrt(dscene) + delta0;
+
   hz_pseglist cs = *sg;
   hz_polyset cp = *ps0;
   int owns = 0; /* владеем ли текущими `cs`/`cp` (уровни выше нулевого) */
   for (int lev = 1; lev < maxlev; lev++) {
     hz_mergecfg mc;
     memset(&mc, 0, sizeof mc);
-    mc.delta = delta0 * pow(2.0, (double)lev);
-    mc.target = 0; /* цель по числу — БЮДЖЕТ, а не критерий (§46) */
+    if (L->bycount) {
+      /* ТАКТИКА ПО ЧИСЛУ. Цель — четверть предыдущего уровня: четвёрка здесь уже
+       * не структура, а ТРЕБОВАНИЕ (§60). Допуск снят с ГАБАРИТА сцены, то есть
+       * не ограничивает ничего: ни одно отклонение в сцене его не превысит. Это
+       * не порог, подобранный под результат, а выключатель ворот — и достигнутый
+       * `dmax` печатается уровнем как ЗАМЕР, а не проверяется. */
+      mc.delta = dscene;
+      mc.target = (int32_t)((cs.nseg + 3) / 4);
+      if (mc.target < 1) mc.target = 1;
+    } else {
+      mc.delta = delta0 * pow(2.0, (double)lev);
+      mc.target = 0; /* цель по числу — БЮДЖЕТ, а не критерий (§46) */
+    }
     mc.use_geom = 1;
     mc.use_overlap = 1;
     mc.bands = L->bands;
     hz_pseglist so;
     hz_mergestat st;
     if (hz_merge(&so, m, &cs, &cp, &mc, &st) != 0) break;
+    for (int q = 0; q < 12; q++)
+      L->dih_hist[q] += st.dih_hist[q];
+    L->ndih_conv += st.ndih_conv;
+    L->ndih_conc += st.ndih_conc;
+    L->ndih_flat += st.ndih_flat;
     if (so.nseg >= cs.nseg) {
       hz_seg_free(&so);
       break; /* слить больше нечего */

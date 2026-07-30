@@ -112,17 +112,39 @@ static void metric(const hz_polyset *pf, const hz_polyset *pc, const tr3_camera 
 int main(int argc, char **argv) {
   int city = (argc > 1 && strcmp(argv[1], "city") == 0);
   double dseg = city ? 0.05 : 0.045;
-  int simp = 0, vfit = 0, maxlev = 9, uniform = 0, viamerge = 0, bands = 0;
+  int simp = 0, vfit = 0, maxlev = 9, uniform = 0, viamerge = 0, bands = 0, bycount = 0;
   double epsmul = 1.0;
+  /* НЕИЗВЕСТНЫЙ АРГУМЕНТ — ОШИБКА, А НЕ ПРОПУСК (§60, дефект оснастки). Флаг,
+   * который не совпал, молчал, и конфигурация вышла тождественной другой; поймать
+   * это удалось лишь по совпадению всех семи чисел. Обрыв дешевле. */
   for (int i = 1; i < argc; i++) {
-    if (strcmp(argv[i], "simp") == 0) simp = 1;
-    if (strcmp(argv[i], "vfit") == 0) vfit = 1;
-    if (strcmp(argv[i], "uniform") == 0) uniform = 1;
+    int ok = 0;
+    if (strcmp(argv[i], "city") == 0 || strcmp(argv[i], "hall") == 0) ok = 1;
+    if (strcmp(argv[i], "simp") == 0) ok = simp = 1;
+    if (strcmp(argv[i], "vfit") == 0) ok = vfit = 1;
+    if (strcmp(argv[i], "uniform") == 0) ok = uniform = 1;
     /* Второй построитель: уровень строится `hz_merge` над предыдущим (§58). */
-    if (strcmp(argv[i], "viamerge") == 0) viamerge = 1;
-    if (strcmp(argv[i], "bands") == 0) bands = 1;
-    if (strncmp(argv[i], "lev=", 4) == 0) maxlev = (int)strtol(argv[i] + 4, NULL, 10);
-    if (strncmp(argv[i], "eps=", 4) == 0) epsmul = strtod(argv[i] + 4, NULL);
+    if (strcmp(argv[i], "viamerge") == 0) ok = viamerge = 1;
+    if (strcmp(argv[i], "bands") == 0) ok = bands = 1;
+    /* ВТОРАЯ ТАКТИКА (§60): уровень задан ЧИСЛОМ (четверть), допуск не
+     * ограничивает, достигнутое отклонение печатается замером. */
+    if (strcmp(argv[i], "bycount") == 0) ok = bycount = 1;
+    if (strncmp(argv[i], "lev=", 4) == 0) {
+      maxlev = (int)strtol(argv[i] + 4, NULL, 10);
+      ok = 1;
+    }
+    if (strncmp(argv[i], "eps=", 4) == 0) {
+      epsmul = strtod(argv[i] + 4, NULL);
+      ok = 1;
+    }
+    if (!ok) {
+      fprintf(stderr,
+              "plod: неизвестный аргумент «%s»\n"
+              "  ожидается: [city|hall] [simp] [vfit] [uniform] [viamerge] [bands]\n"
+              "             [bycount] [lev=N] [eps=X]\n",
+              argv[i]);
+      return 2;
+    }
   }
   hz_objmesh m;
   if (hz_obj_load(&m, city ? HZ_CFG_CITY_OBJ : HZ_CFG_HALL_OBJ,
@@ -150,7 +172,7 @@ int main(int argc, char **argv) {
 
   double t0 = now_s();
   hz_lod L;
-  int rc = viamerge ? hz_lod_build_merge(&L, &m, &sg, &psf, dseg, maxlev, eps, bands)
+  int rc = viamerge ? hz_lod_build_merge(&L, &m, &sg, &psf, dseg, maxlev, eps, bands, bycount)
                     : hz_lod_build(&L, &m, &sg, &psf, dseg, maxlev, eps);
   if (rc != 0) {
     fprintf(stderr, "отказ построения лестницы\n");
@@ -192,18 +214,38 @@ int main(int argc, char **argv) {
     }
     qsort(dm, (size_t)nd, sizeof *dm, cmp_dbl);
     qsort(sh, (size_t)nd, sizeof *sh, cmp_dbl);
-    printf("   уровень %d (допуск %.3f м): элементов %d; dmax p50 %.4f p90 %.4f макс %.4f; "
-           "форма P/√A p50 %.2f p90 %.2f\n",
-           lev, dseg * pow(2.0, lev), cnt, pct(dm, nd, 0.5), pct(dm, nd, 0.9), pct(dm, nd, 1.0),
-           pct(sh, nd, 0.5), pct(sh, nd, 0.9));
+    if (L.bycount)
+      printf("   уровень %d (ЦЕЛЬ по числу): элементов %d; dmax ЗАМЕР p50 %.4f p90 %.4f макс %.4f; "
+             "форма P/√A p50 %.2f p90 %.2f\n",
+             lev, cnt, pct(dm, nd, 0.5), pct(dm, nd, 0.9), pct(dm, nd, 1.0), pct(sh, nd, 0.5),
+             pct(sh, nd, 0.9));
+    else
+      printf("   уровень %d (допуск %.3f м): элементов %d; dmax p50 %.4f p90 %.4f макс %.4f; "
+             "форма P/√A p50 %.2f p90 %.2f\n",
+             lev, dseg * pow(2.0, lev), cnt, pct(dm, nd, 0.5), pct(dm, nd, 0.9), pct(dm, nd, 1.0),
+             pct(sh, nd, 0.5), pct(sh, nd, 0.9));
     if (lev > 0 && cnt > 0)
-      printf("      сокращение к предыдущему %.2f× (четвёрка — структура, не требование: §54.2)\n",
-             (double)prevn / (double)cnt);
+      printf("      сокращение к предыдущему %.2f× (%s)\n", (double)prevn / (double)cnt,
+             L.bycount ? "четвёрка — ТРЕБОВАНИЕ: §60"
+                       : "четвёрка — структура, не требование: §54.2");
     prevn = cnt;
     fflush(stdout);
     free(seen);
     free(dm);
     free(sh);
+  }
+
+  /* --- ДВУГРАННЫЙ УГОЛ ПАР-КАНДИДАТОВ (§59) ---
+   * Печатается характеристика СЦЕНЫ, а не алгоритма: где стоят изломы и с какой
+   * стороны. `180°` — плоское; левее выпуклое (внешний угол), правее вогнутое. */
+  if (L.ndih_conv + L.ndih_conc + L.ndih_flat > 0) {
+    printf("   двугранный угол кандидатов: плоских (180°) %lld, выпуклых (<180°) %lld, "
+           "вогнутых (>180°) %lld\n",
+           (long long)L.ndih_flat, (long long)L.ndih_conv, (long long)L.ndih_conc);
+    printf("      корзины по 30°:");
+    for (int q = 0; q < 12; q++)
+      printf(" %d-%d:%lld", q * 30, q * 30 + 30, (long long)L.dih_hist[q]);
+    printf("\n");
   }
 
   /* --- ВЛОЖЕННОСТЬ, целочисленно (А132) --- */

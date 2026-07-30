@@ -510,6 +510,11 @@ int hz_lod_build(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, const hz
         }
       }
       L->npair_edge += pn;
+      /* Периметр — в узлы текущего разбиения: он посчитан здесь и нужен и для
+       * приоритета формы, и для доклада `P/√A`. Без этого поле оставалось нулём,
+       * и печать формы показывала нули (найдено прогоном на зале). */
+      for (int32_t k = 0; k < np; k++)
+        L->nd[prev[k]].perim = per[prev[k]];
       /* Приоритет: сперва наибольший косинус угла, при равенстве — компактность
        * объединения по `P/√A` (§55). Сортировка простая: ключ = косинус, вниз. */
       double *pri = malloc((size_t)(pn > 0 ? pn : 1) * sizeof *pri);
@@ -621,6 +626,20 @@ int hz_lod_build(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, const hz
         if (nm <= 0) continue;
         for (int32_t i = 0; i < nm; i++)
           memb[i] = gmem[goff[g] + i];
+        /* НИЖНЯЯ ОЦЕНКА, БЕСПЛАТНАЯ И ТОЧНАЯ: `dmax` объединения не меньше `dmax`
+         * любого его члена, потому что собственная плоскость члена для него
+         * оптимальна. Значит член с `dmax ≥ δ` уровня делает группу безнадёжной,
+         * и полную подгонку звать незачем. Отсев ОТВЕРГАЮЩИЙ, в отличие от
+         * мажоранты `dev_box`, которая умеет только принимать (§54.1). */
+        int hopeless = 0;
+        for (int32_t i = 0; i < nm && !hopeless; i++)
+          if (!(L->nd[prev[memb[i]]].dmax < dlev)) hopeless = 1;
+        if (hopeless && nm > 1) {
+          for (int32_t i = 0; i < nm; i++)
+            out[memb[i]] = prev[memb[i]];
+          L->nlow_rej++;
+          continue;
+        }
         if (L->nnd + 8 > L->ndcap) {
           int32_t nc = L->ndcap * 2;
           hz_lodnode *nn2 = realloc(L->nd, (size_t)nc * sizeof *nn2);

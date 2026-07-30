@@ -157,6 +157,7 @@ int main(int argc, char **argv) {
   printf("   постройка: пар по ребру %lld, отказов ворот %lld, тождественных продвижений %lld, "
          "худший прирост площади %.3f\n",
          (long long)L.npair_edge, (long long)L.ngate_rej, (long long)L.nident, L.area_grow);
+  fflush(stdout);
 
   /* --- по уровням --- */
   int32_t prevn = 0;
@@ -194,6 +195,7 @@ int main(int argc, char **argv) {
       printf("      сокращение к предыдущему %.2f× (четвёрка — структура, не требование: §54.2)\n",
              (double)prevn / (double)cnt);
     prevn = cnt;
+    fflush(stdout);
     free(seen);
     free(dm);
     free(sh);

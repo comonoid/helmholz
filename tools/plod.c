@@ -56,7 +56,7 @@ static double pct(double *v, int64_t n, double p) {
 
 /* Метрика О20 через общий набор лучей: две сцены, разница по ЛУЧУ. */
 static void metric(const hz_polyset *pf, const hz_polyset *pc, const tr3_camera *cam, double eps_px,
-                   const char *tag) {
+                   const char *tag, int32_t nelem) {
   hz_pray gf, gc;
   if (hz_pray_build(&gf, pf, 4.0) != 0) return;
   if (hz_pray_build(&gc, pc, 4.0) != 0) {
@@ -99,11 +99,22 @@ static void metric(const hz_polyset *pf, const hz_polyset *pc, const tr3_camera 
   qsort(dt, (size_t)nb, sizeof *dt, cmp_dbl);
   qsort(dp, (size_t)nb, sizeof *dp, cmp_dbl);
   int64_t tot = nb + nl + ng;
-  printf("      %s: попали в обеих %.2f%%, потеряли %.2f%%, приобрели %.2f%%; |Δt| p50 %.4f p90 "
-         "%.4f м; пиксели p50 %.2f p90 %.2f\n",
-         tag, 100.0 * (double)nb / (double)(tot ? tot : 1),
+  /* ХВОСТ ПЕЧАТАЕТСЯ ОБЯЗАТЕЛЬНО, И ЭТО НЕ УКРАШЕНИЕ (А158). Первый городской
+   * прогон дал у среза и у ПЕРЕМЕШАННОГО контроля одинаковые `p50` и `p90` — оба
+   * ноль, — из чего следовало бы, что критерий среза пуст. Но порча от
+   * перестановки затрагивает малую долю пикселей, и `p90` её не видит по
+   * построению: при 99.86 % целых пикселей девяностый процентиль стоит глубоко
+   * внутри целой части. Различать обязаны `p99`, `p99.9`, максимум и ДОЛЯ
+   * пикселей грубее одного — они и печатаются. */
+  int64_t nbad = 0;
+  for (int64_t i = 0; i < nb; i++)
+    if (dp[i] > 1.0) nbad++;
+  printf("      %-28s элем %7d | попали %6.2f%% потеряли %5.2f%% приобрели %5.2f%% | "
+         "ПИКСЕЛИ p50 %6.2f p90 %6.2f p99 %7.2f p99.9 %8.2f макс %8.2f | >1пкс %6.3f%%\n",
+         tag, nelem, 100.0 * (double)nb / (double)(tot ? tot : 1),
          100.0 * (double)nl / (double)(tot ? tot : 1), 100.0 * (double)ng / (double)(tot ? tot : 1),
-         pct(dt, nb, 0.5), pct(dt, nb, 0.9), pct(dp, nb, 0.5), pct(dp, nb, 0.9));
+         pct(dp, nb, 0.5), pct(dp, nb, 0.9), pct(dp, nb, 0.99), pct(dp, nb, 0.999),
+         pct(dp, nb, 1.0), 100.0 * (double)nbad / (double)(nb ? nb : 1));
   free(dt);
   free(dp);
   hz_pray_free(&gf);
@@ -345,7 +356,7 @@ int main(int argc, char **argv) {
           printf("      подгонка вершин: передвинуто %lld, отказов по смещению %lld\n",
                  (long long)vs.nvert_moved, (long long)vs.nvert_far);
         }
-        metric(&psf, &pc, &cam, eps_px, "срез");
+        metric(&psf, &pc, &cam, eps_px, "СРЕЗ по камере", pc.np);
         hz_poly_free(&pc);
       }
       hz_seg_free(&so);
@@ -362,11 +373,93 @@ int main(int argc, char **argv) {
       if (hz_poly_build(&pc, &m, &so) == 0) {
         char tag[64];
         snprintf(tag, sizeof tag, "однородный уровень %d", lev);
-        metric(&psf, &pc, &cam, eps_px, tag);
+        metric(&psf, &pc, &cam, eps_px, tag, pc.np);
         hz_poly_free(&pc);
       }
       hz_seg_free(&so);
     }
+  /* --- НЕГАТИВНЫЙ КОНТРОЛЬ: ТЕ ЖЕ УРОВНИ, РОЗДАННЫЕ ДРУГИМ ПОЛИГОНАМ (А146) ---
+   *
+   * Случайный ПРЕДОК не годится: он меняет цену, и провал вышел бы по причине, к
+   * критерию среза отношения не имеющей. Перестановка сохраняет мультимножество
+   * выбранных уровней ТОЧНО и рвёт только связь «грубее там, где дальше».
+   * Перестановка ДЕТЕРМИНИРОВАННАЯ — хешем от номера: замер обязан повторяться.
+   * Печатается и гистограмма уровней (обязана совпасть с гистограммой среза), и
+   * итоговое число элементов — оно разойтись МОЖЕТ, и это не порок контроля, а
+   * его цена: два соседних полигона на разных уровнях дают два узла там, где срез
+   * давал один (А155). */
+  if (uniform) {
+    int32_t *lv = malloc((size_t)L.np * sizeof *lv);
+    int64_t hcut[64], hperm[64];
+    for (int i = 0; i < 64; i++)
+      hcut[i] = hperm[i] = 0;
+    if (lv != NULL) {
+      /* СРЕЗ ПЕРЕСЧИТЫВАЕТСЯ ЗАНОВО: цикл по однородным уровням выше пишет в тот
+       * же `cut`, и без этого контроль брал бы уровни ПОСЛЕДНЕГО однородного
+       * уровня вместо среза. Поймано печатью гистограммы (А155) в первом же
+       * прогоне: она показала «всё на уровне 6» там, где срез сидит на нулевом. */
+      hz_lod_cut(&L, eye, eps, cut);
+      for (int32_t k = 0; k < L.np; k++) {
+        lv[k] = L.nd[cut[k]].level;
+        if (lv[k] >= 0 && lv[k] < 64) hcut[lv[k]]++;
+      }
+      for (int32_t k = 0; k < L.np; k++) {
+        uint64_t x = (uint64_t)(uint32_t)k * 0x9e3779b97f4a7c15ull;
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ull;
+        x ^= x >> 27;
+        int32_t j = (int32_t)(x % (uint64_t)(uint32_t)L.np);
+        int32_t t = lv[k];
+        lv[k] = lv[j];
+        lv[j] = t;
+      }
+      for (int32_t k = 0; k < L.np; k++) {
+        int32_t l = lv[k];
+        if (l < 0) l = 0;
+        if (l >= L.nlev) l = L.nlev - 1;
+        if (l < 64) hperm[l]++;
+        cut[k] = L.lab[(size_t)l * (size_t)L.np + (size_t)k];
+      }
+      int same = 1;
+      for (int i = 0; i < 64; i++)
+        if (hcut[i] != hperm[i]) same = 0;
+      printf("   КОНТРОЛЬ (перестановка уровней): гистограмма уровней %s;",
+             same ? "СОВПАЛА ТОЧНО — цена сохранена" : "РАЗОШЛАСЬ — контроль недоказателен");
+      for (int i = 0; i < L.nlev && i < 64; i++)
+        printf(" %d:%lld", i, (long long)hcut[i]);
+      printf("\n");
+      hz_pseglist so;
+      if (hz_lod_seglist(&L, &m, &sg, cut, &so) == 0) {
+        hz_polyset pc;
+        if (hz_poly_build(&pc, &m, &so) == 0) {
+          metric(&psf, &pc, &cam, eps_px, "КОНТРОЛЬ: уровни перемешаны", pc.np);
+          hz_poly_free(&pc);
+        }
+        hz_seg_free(&so);
+      }
+      free(lv);
+    }
+  }
+
+  /* --- СВИП ПО `ε`: ПОДПИСЬ АРТЕФАКТА (а) ---
+   * Число элементов среза ОБЯЗАНО меняться от `ε` — от той самой величины, которой
+   * его меняют. Метрика здесь НЕ считается (А157): вопрос свипа не про качество, а
+   * про то, что критерий вообще работает, и ответ на него стоит секунды.
+   * Рядом печатается доля полигонов, СЕВШИХ НА ПОСЛЕДНИЙ УРОВЕНЬ (А156): пока она
+   * мала, свип мерит КРИТЕРИЙ; когда велика — ПОТОЛОК лестницы, и это разные вещи.
+   * Оговорка: лестница откалибрована под своё `ε`, здесь меняется только срез. */
+  {
+    printf("   СВИП ПО ε (подпись артефакта; лестница откалибрована под ε = %.3e):\n", L.eps);
+    const double mul[4] = {0.5, 1.0, 2.0, 4.0};
+    for (int i = 0; i < 4; i++) {
+      int32_t nc = hz_lod_cut(&L, eye, eps * mul[i], cut);
+      int64_t top = 0;
+      for (int32_t k = 0; k < L.np; k++)
+        if (L.nd[cut[k]].level == L.nlev - 1) top++;
+      printf("      ε × %.1f = %.3e: узлов среза %7d, на последнем уровне %.2f%% полигонов\n",
+             mul[i], eps * mul[i], nc, 100.0 * (double)top / (double)(L.np ? L.np : 1));
+    }
+  }
   printf("   время: постройка %.1f с, всего %.1f с\n", t1 - t0, now_s() - t0);
   free(cut);
   hz_lod_free(&L);

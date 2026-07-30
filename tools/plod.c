@@ -76,10 +76,14 @@ static void metric(const hz_polyset *pf, const hz_polyset *pc, const tr3_camera 
    * направлениям УЛЕТЕЛ В НЕБО. Это внешний силуэт, определённый точно: небо есть
    * промах луча, а не значение глубины, и порога тут нет по построению. */
   uint8_t *hit = calloc((size_t)W * (size_t)H, 1);
-  if (dt == NULL || dp == NULL || hit == NULL) {
+  double *tref = calloc((size_t)W * (size_t)H, sizeof *tref);
+  int32_t *pref = malloc((size_t)W * (size_t)H * sizeof *pref);
+  if (dt == NULL || dp == NULL || hit == NULL || tref == NULL || pref == NULL) {
     free(dt);
     free(dp);
     free(hit);
+    free(tref);
+    free(pref);
     hz_pray_free(&gf);
     hz_pray_free(&gc);
     return;
@@ -90,7 +94,11 @@ static void metric(const hz_polyset *pf, const hz_polyset *pc, const tr3_camera 
       tr3_camera_ray(cam, i, j, o, d);
       int32_t hf = hz_pray_hit(&gf, o, d, 1e-6, &tf);
       int32_t hc = hz_pray_hit(&gc, o, d, 1e-6, &tc);
-      if (hf >= 0) hit[(size_t)j * (size_t)W + (size_t)i] = 1;
+      if (hf >= 0) {
+        hit[(size_t)j * (size_t)W + (size_t)i] = 1;
+        tref[(size_t)j * (size_t)W + (size_t)i] = tf;
+        pref[(size_t)j * (size_t)W + (size_t)i] = hf;
+      }
       if (hf < 0 && hc < 0) continue;
       if (hf >= 0 && hc < 0) {
         nl++;
@@ -120,15 +128,40 @@ static void metric(const hz_polyset *pf, const hz_polyset *pc, const tr3_camera 
   int64_t nbad = 0;
   for (int64_t i = 0; i < nb; i++)
     if (dp[i] > 1.0) nbad++;
-  /* Длина внешнего силуэта эталона: попавший пиксель, у которого сосед — небо. */
+  /* ДЛИНА СИЛУЭТА (А166, вторая редакция). Первая считала соседство с промахом
+   * луча и дала ровно `4·512 − 4 = 2044` на ОБЕИХ сценах — то есть периметр кадра:
+   * сцены заполняют кадр, неба нет. Вторая брала скачок глубины больше `ε·t` и
+   * пометила 65 % кадра: на СКОЛЬЗЯЩЕМ взгляде непрерывная поверхность меняет
+   * глубину быстрее пиксельного следа, и порог верен лишь при взгляде в лоб.
+   * Третья, эта: сосед считается разрывом, если его точка попадания лежит ВНЕ
+   * ПЛОСКОСТИ текущего элемента дальше пиксельного следа `ε·t`. Тогда наклон
+   * поверхности учтён точно — по её собственной плоскости, — и порога нет: `ε·t`
+   * есть предел разрешения кадра. */
   int64_t nsil = 0;
   for (int j = 0; j < H; j++)
     for (int i = 0; i < W; i++) {
       size_t q = (size_t)j * (size_t)W + (size_t)i;
       if (!hit[q]) continue;
-      int edge = (i == 0 || i == W - 1 || j == 0 || j == H - 1);
-      if (!edge) {
-        if (!hit[q - 1] || !hit[q + 1] || !hit[q - (size_t)W] || !hit[q + (size_t)W]) edge = 1;
+      const hz_poly *P = &pf->p[pref[q]];
+      double o[3], d[3];
+      tr3_camera_ray(cam, i, j, o, d);
+      int edge = 0;
+      const int di[4] = {-1, 1, 0, 0}, dj[4] = {0, 0, -1, 1};
+      for (int k = 0; k < 4 && !edge; k++) {
+        int ii = i + di[k], jj = j + dj[k];
+        if (ii < 0 || ii >= W || jj < 0 || jj >= H) continue;
+        size_t r = (size_t)jj * (size_t)W + (size_t)ii;
+        if (!hit[r]) {
+          edge = 1;
+          break;
+        }
+        double o2[3], d2[3];
+        tr3_camera_ray(cam, ii, jj, o2, d2);
+        double dev = 0.0;
+        for (int c = 0; c < 3; c++)
+          dev += P->n[c] * (o2[c] + tref[r] * d2[c]);
+        dev = fabs(dev - P->off);
+        if (dev > eps_px * tref[q]) edge = 1;
       }
       if (edge) nsil++;
     }
@@ -143,8 +176,306 @@ static void metric(const hz_polyset *pf, const hz_polyset *pc, const tr3_camera 
   free(dt);
   free(dp);
   free(hit);
+  free(tref);
+  free(pref);
   hz_pray_free(&gf);
   hz_pray_free(&gc);
+}
+
+/* ПОТОЛОК КОМПЛАНАРНОГО СЛИЯНИЯ (§70). Сколько РАЗЛИЧНЫХ плоскостей в сцене —
+ * это нижняя граница числа элементов, достижимая слиянием С НУЛЕВОЙ ошибкой, если
+ * бы радиус поиска не мешал. Считается сортировкой по квантованной плоскости, а не
+ * кластеризацией: квантование РАЗРЕЗАЕТ группы на границах корзин, поэтому число
+ * получается ЗАВЫШЕННЫМ, то есть оценка потолка КОНСЕРВАТИВНА, и это её главное
+ * свойство. Печатается по нескольким допускам сразу — единственного «правильного»
+ * тут нет, и подбирать его под ответ нельзя. */
+typedef struct {
+  int64_t k0, k1, k2, k3;
+} plkey;
+
+static int cmp_plkey(const void *x, const void *y) {
+  const plkey *a = (const plkey *)x, *b = (const plkey *)y;
+  if (a->k0 != b->k0) return (a->k0 < b->k0) ? -1 : 1;
+  if (a->k1 != b->k1) return (a->k1 < b->k1) ? -1 : 1;
+  if (a->k2 != b->k2) return (a->k2 < b->k2) ? -1 : 1;
+  if (a->k3 != b->k3) return (a->k3 < b->k3) ? -1 : 1;
+  return 0;
+}
+
+/* УГОЛ МЕЖДУ СОСЕДНИМИ УЧАСТКАМИ (§70.1, требование пользователя 07-30: «угол
+ * считать только между соседними полигонами, объединять имеет смысл только
+ * соседние»). Прежний замер считал КОМПЛАНАРНОСТЬ и дал ноль: смежные
+ * компланарные грани сегментация уже слила, их не осталось. Но вопрос был не про
+ * компланарность, а про УГОЛ — и распределение углов по СМЕЖНЫМ парам не мерилось
+ * ни разу. Гистограмма ниже и есть ответ на «есть ли чем работать угловой
+ * сортировке»: сколько смежных пар лежит ниже каждого порога.
+ *
+ * Двугранный угол печатается в шкале пользователя: `180°` — плоско, вниз к `90°`
+ * — выпуклый излом, вверх к `270°` — вогнутый. Знак берётся признаком
+ * `(n_A − n_B)·(c_B − c_A)`. */
+static int32_t uf_find(int32_t *par, int32_t x) {
+  while (par[x] != x) {
+    par[x] = par[par[x]];
+    x = par[x];
+  }
+  return x;
+}
+
+typedef struct {
+  int64_t key;
+  int32_t tri;
+} edgerec;
+
+static int cmp_edge(const void *x, const void *y) {
+  const edgerec *a = (const edgerec *)x, *b = (const edgerec *)y;
+  return (a->key < b->key) ? -1 : ((a->key > b->key) ? 1 : 0);
+}
+
+static void adj_angles(const hz_objmesh *m, const hz_pseglist *sg, const hz_polyset *ps) {
+  edgerec *er = malloc((size_t)m->nt * 3 * sizeof *er);
+  int32_t *par = malloc((size_t)ps->np * sizeof *par);
+  if (er == NULL || par == NULL) {
+    free(er);
+    free(par);
+    return;
+  }
+  for (int32_t i = 0; i < ps->np; i++)
+    par[i] = i;
+  int64_t ne = 0;
+  for (int32_t t = 0; t < m->nt; t++)
+    for (int e = 0; e < 3; e++) {
+      int32_t v0 = m->f[(size_t)t * 3 + (size_t)e],
+              v1 = m->f[(size_t)t * 3 + (size_t)((e + 1) % 3)];
+      int32_t lo = (v0 < v1) ? v0 : v1, hi = (v0 < v1) ? v1 : v0;
+      er[ne].key = (int64_t)lo * 2147483647ll + (int64_t)hi;
+      er[ne].tri = t;
+      ne++;
+    }
+  qsort(er, (size_t)ne, sizeof *er, cmp_edge);
+  /* Пороги — та же двоично-десятичная шкала, что у полос §59, и выбраны они до
+   * замера, а не под него. */
+  const double thr[8] = {0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 45.0, 91.0};
+  int64_t below[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  int64_t nadjpair = 0, nconv = 0, nconc = 0;
+  double amin = 999.0;
+  for (int64_t i = 1; i < ne; i++) {
+    if (er[i].key != er[i - 1].key) continue;
+    int32_t la = sg->label[er[i].tri], lb = sg->label[er[i - 1].tri];
+    if (la < 0 || lb < 0 || la >= ps->np || lb >= ps->np || la == lb) continue;
+    const hz_poly *A = &ps->p[la], *B = &ps->p[lb];
+    double cs = A->n[0] * B->n[0] + A->n[1] * B->n[1] + A->n[2] * B->n[2];
+    if (cs > 1.0) cs = 1.0;
+    if (cs < -1.0) cs = -1.0;
+    double th = acos(cs) * 180.0 / 3.14159265358979323846;
+    double dd = 0.0;
+    for (int c = 0; c < 3; c++)
+      dd += (A->n[c] - B->n[c]) * (B->org[c] - A->org[c]);
+    nadjpair++;
+    if (dd < 0.0)
+      nconv++;
+    else
+      nconc++;
+    if (th < amin) amin = th;
+    for (int q = 0; q < 8; q++)
+      if (th <= thr[q]) below[q]++;
+    /* Заодно: во сколько групп схлопнулась бы сцена при пороге 45°, если сливать
+     * ТОЛЬКО соседей. Это верхняя оценка для угловой тактики при связности. */
+    if (th <= 45.0) {
+      int32_t ra = uf_find(par, la), rb = uf_find(par, lb);
+      if (ra != rb) par[ra] = rb;
+    }
+  }
+  int64_t ng = 0;
+  for (int32_t i = 0; i < ps->np; i++)
+    if (uf_find(par, i) == i) ng++;
+  printf("   УГОЛ МЕЖДУ СМЕЖНЫМИ УЧАСТКАМИ (§70.1): смежных пар %lld, из них выпуклых %lld, "
+         "вогнутых %lld; минимальный излом %.4f°\n",
+         (long long)nadjpair, (long long)nconv, (long long)nconc, amin);
+  printf("      доля пар с изломом не более:");
+  for (int q = 0; q < 8; q++)
+    printf(" %.1f°:%.2f%%", thr[q], 100.0 * (double)below[q] / (double)(nadjpair ? nadjpair : 1));
+  printf("\n      если слить ВСЕ смежные пары с изломом до 45°: %lld групп (сокращение %.1fx)\n",
+         (long long)ng, (double)ps->np / (double)(ng ? ng : 1));
+  free(er);
+  free(par);
+}
+
+/* СКОЛЬКО ГРАНЕЙ СМОТРИТ В СТЕНУ (§70.2). Третий путь для города, где пологих
+ * стыков нет вовсе: грань, упирающаяся в соседний блок, не видна ниоткуда и не
+ * участвует ни в переносе, ни в картинке — её удаление стоит РОВНО НОЛЬ ошибки.
+ * Меряется прямо: из центра элемента вдоль его ВНЕШНЕЙ нормали пускается луч, и
+ * печатается распределение расстояния до первого попадания. Порога здесь нет —
+ * печатается кривая, а «сколько удалить» решается по ней, а не до неё. */
+static void buried_faces(const hz_polyset *ps) {
+  hz_pray g;
+  if (hz_pray_build(&g, ps, 4.0) != 0) return;
+  const double thr[6] = {0.01, 0.05, 0.2, 1.0, 5.0, 20.0};
+  int64_t below[6] = {0, 0, 0, 0, 0, 0};
+  int64_t nfree = 0, ntot = 0;
+  for (int32_t i = 0; i < ps->np; i++) {
+    const hz_poly *P = &ps->p[i];
+    if (!(P->area > 0.0)) continue;
+    double o[3], d[3];
+    for (int c = 0; c < 3; c++) {
+      d[c] = P->n[c];
+      o[c] = P->org[c] + 1e-6 * P->n[c];
+    }
+    double t = 0.0;
+    int32_t h = hz_pray_hit(&g, o, d, 1e-9, &t);
+    ntot++;
+    if (h < 0) {
+      nfree++;
+      continue;
+    }
+    for (int q = 0; q < 6; q++)
+      if (t <= thr[q]) below[q]++;
+  }
+  printf("   ГРАНИ, СМОТРЯЩИЕ В СТЕНУ (§70.2): элементов %lld; луч вдоль внешней нормали "
+         "не встретил ничего у %lld (%.2f%%)\n",
+         (long long)ntot, (long long)nfree, 100.0 * (double)nfree / (double)(ntot ? ntot : 1));
+  printf("      доля с препятствием ближе:");
+  for (int q = 0; q < 6; q++)
+    printf(" %5.2f м:%.2f%%", thr[q], 100.0 * (double)below[q] / (double)(ntot ? ntot : 1));
+  printf("\n");
+  hz_pray_free(&g);
+}
+
+/* ЗАПЕРТЫЕ ГРАНИ (§70.3, предложение пользователя 07-30: «находясь на расстоянии
+ * от закрытой коробки, ты в принципе не можешь видеть, что там внутри»).
+ *
+ * ЧТО МЕРИТСЯ И ЧТО НЕТ. Из центра элемента пускается `K` лучей по полусфере его
+ * нормали; если НИ ОДИН не ушёл наружу, элемент заперт — снаружи он не виден ни
+ * при какой камере. Это ЗАМЕР ПОТЕНЦИАЛА, а не критерий удаления, и разница
+ * принципиальна: выборка по направлениям может ПРОПУСТИТЬ узкую щель (окно,
+ * дверь, зазор), и тогда грань, на самом деле видимую, мы объявим запертой. Для
+ * УДАЛЕНИЯ нужен консервативный тест, который щель пропустить не может, — заливка
+ * пустого пространства от внешней границы с шагом мельче самого узкого проёма.
+ * Пользователь предупредил об этом прямо («чтобы не было там полупрозрачных стен
+ * или окон»), и предупреждение записано здесь, а не в докладе задним числом. */
+static void enclosed_faces(const hz_polyset *ps, int K) {
+  hz_pray g;
+  if (hz_pray_build(&g, ps, 4.0) != 0) return;
+  int64_t nlock = 0, ntot = 0, nopen = 0;
+  double alock = 0.0, atot = 0.0;
+  for (int32_t i = 0; i < ps->np; i++) {
+    const hz_poly *P = &ps->p[i];
+    if (!(P->area > 0.0)) continue;
+    ntot++;
+    atot += P->area;
+    int esc = 0;
+    for (int k = 0; k < K && !esc; k++) {
+      /* Направления — детерминированной решёткой Фибоначчи по полусфере: замер
+       * обязан повторяться, поэтому никакого генератора. */
+      double u = ((double)k + 0.5) / (double)K;
+      double z = u;                 /* косинусное распределение не нужно: вопрос */
+      double r = sqrt(1.0 - z * z); /* бинарный — ушёл или нет */
+      double ph = 2.39996322972865332 * (double)k;
+      double lu = r * cos(ph), lv = r * sin(ph);
+      double eu[3], ev[3];
+      int ax = 0;
+      for (int c = 1; c < 3; c++)
+        if (fabs(P->n[c]) < fabs(P->n[ax])) ax = c;
+      double t0[3] = {0.0, 0.0, 0.0};
+      t0[ax] = 1.0;
+      eu[0] = P->n[1] * t0[2] - P->n[2] * t0[1];
+      eu[1] = P->n[2] * t0[0] - P->n[0] * t0[2];
+      eu[2] = P->n[0] * t0[1] - P->n[1] * t0[0];
+      double en = sqrt(eu[0] * eu[0] + eu[1] * eu[1] + eu[2] * eu[2]);
+      if (!(en > 0.0)) continue;
+      for (int c = 0; c < 3; c++)
+        eu[c] /= en;
+      ev[0] = P->n[1] * eu[2] - P->n[2] * eu[1];
+      ev[1] = P->n[2] * eu[0] - P->n[0] * eu[2];
+      ev[2] = P->n[0] * eu[1] - P->n[1] * eu[0];
+      double d[3], o[3];
+      for (int c = 0; c < 3; c++) {
+        d[c] = z * P->n[c] + lu * eu[c] + lv * ev[c];
+        o[c] = P->org[c] + 1e-5 * P->n[c];
+      }
+      double t = 0.0;
+      if (hz_pray_hit(&g, o, d, 1e-9, &t) < 0) esc = 1;
+    }
+    if (esc)
+      nopen++;
+    else {
+      nlock++;
+      alock += P->area;
+    }
+  }
+  printf("   ЗАПЕРТЫЕ ГРАНИ (§70.3, %d луча по полусфере): заперто %lld из %lld (%.2f%%), "
+         "по площади %.2f%%\n",
+         K, (long long)nlock, (long long)ntot, 100.0 * (double)nlock / (double)(ntot ? ntot : 1),
+         100.0 * alock / (atot > 0.0 ? atot : 1.0));
+  printf("      ЭТО ПОТЕНЦИАЛ, А НЕ КРИТЕРИЙ: выборка направлений может пропустить узкую щель, "
+         "и тогда видимая грань объявлена запертой. Удалять — только по заливке пустоты.\n");
+  hz_pray_free(&g);
+}
+
+/* РАЗМЕР ГРАНИ И ПРЕДСКАЗАНИЕ ПУСТЫХ УРОВНЕЙ (§70.4, вывод пользователя 07-30:
+ * «это просто геометрия такая; предсказуемо, что первые два уровня работать не
+ * будут»).
+ *
+ * ПОЧЕМУ ЭТО ПРЕДСКАЗАНИЕ, А НЕ НАБЛЮДЕНИЕ. Замер §70.1 дал минимальный излом
+ * между СМЕЖНЫМИ участками ровно `90°` на городе. Две перпендикулярные грани
+ * размера `s`, слитые в одну плоскость, дают отклонение около `s/2`: подогнанная
+ * плоскость режет угол по диагонали. Значит уровень с допуском `δ` не может слить
+ * НИЧЕГО, пока `δ < s/2` для типичной грани, и число пустых уровней считается
+ * заранее — по распределению размеров, а не по прогону лестницы.
+ * Размер берётся как `sqrt(площадь)`: у почти квадратной грани это её сторона, а
+ * подгонять более хитрую меру не под что. */
+static void face_sizes(const hz_polyset *ps, double delta0) {
+  double *sz = malloc((size_t)ps->np * sizeof *sz);
+  if (sz == NULL) return;
+  int64_t n = 0;
+  for (int32_t i = 0; i < ps->np; i++)
+    if (ps->p[i].area > 0.0) sz[n++] = sqrt(ps->p[i].area);
+  if (n == 0) {
+    free(sz);
+    return;
+  }
+  qsort(sz, (size_t)n, sizeof *sz, cmp_dbl);
+  double p10 = sz[(int64_t)(0.10 * (double)(n - 1))], p50 = sz[(int64_t)(0.50 * (double)(n - 1))];
+  double p90 = sz[(int64_t)(0.90 * (double)(n - 1))];
+  printf("   РАЗМЕР ГРАНИ (§70.4): sqrt(площадь) p10 %.3f, p50 %.3f, p90 %.3f м\n", p10, p50, p90);
+  /* Уровень L имеет допуск `delta0·2^L`; первый работающий — тот, где допуск
+   * дошёл до половины МЕДИАННОЙ грани. */
+  int lfirst = 0;
+  while (delta0 * pow(2.0, (double)lfirst) < 0.5 * p50 && lfirst < 32)
+    lfirst++;
+  int lp10 = 0;
+  while (delta0 * pow(2.0, (double)lp10) < 0.5 * p10 && lp10 < 32)
+    lp10++;
+  printf("      ПРЕДСКАЗАНИЕ: при δ0 = %.3f м первые %d уровней обязаны быть ПУСТЫМИ "
+         "(допуск ниже половины медианной грани %.3f м); самые мелкие грани (p10) "
+         "начнут сливаться с уровня %d\n",
+         delta0, lfirst, 0.5 * p50, lp10);
+  free(sz);
+}
+
+static void plane_ceiling(const hz_polyset *ps) {
+  const double ang[3] = {0.1, 0.5, 2.0};    /* градусы */
+  const double off[3] = {0.01, 0.05, 0.20}; /* метры */
+  plkey *k = malloc((size_t)ps->np * sizeof *k);
+  if (k == NULL) return;
+  printf("   ПОТОЛОК КОМПЛАНАРНОГО СЛИЯНИЯ (§70): элементов %d; различных плоскостей —\n", ps->np);
+  for (int a = 0; a < 3; a++)
+    for (int o = 0; o < 3; o++) {
+      double qa = ang[a] * 3.14159265358979323846 / 180.0;
+      for (int32_t i = 0; i < ps->np; i++) {
+        const hz_poly *P = &ps->p[i];
+        k[i].k0 = (int64_t)floor(P->n[0] / qa);
+        k[i].k1 = (int64_t)floor(P->n[1] / qa);
+        k[i].k2 = (int64_t)floor(P->n[2] / qa);
+        k[i].k3 = (int64_t)floor(P->off / off[o]);
+      }
+      qsort(k, (size_t)ps->np, sizeof *k, cmp_plkey);
+      int64_t nd = (ps->np > 0) ? 1 : 0;
+      for (int32_t i = 1; i < ps->np; i++)
+        if (cmp_plkey(&k[i], &k[i - 1]) != 0) nd++;
+      printf("      угол %4.1f°, смещение %5.2f м: %8lld  (сокращение до %5.1f×)\n", ang[a], off[o],
+             (long long)nd, (double)ps->np / (double)(nd ? nd : 1));
+    }
+  free(k);
 }
 
 int main(int argc, char **argv) {
@@ -223,6 +554,11 @@ int main(int argc, char **argv) {
     hz_edgestat es;
     if (hz_edge_simplify(&psf, 0.25 * dseg, HZ_EDGE_SHARED, &es) != 0) return 1;
   }
+  plane_ceiling(&psf);
+  adj_angles(&m, &sg, &psf);
+  face_sizes(&psf, dseg);
+  buried_faces(&psf);
+  enclosed_faces(&psf, 32);
   tr3_camera cam;
   double eyeh[3] = HZ_CFG_HALL_EYE, ath[3] = HZ_CFG_HALL_AT;
   double eyec[3] = HZ_CFG_CITY_EYE, atc[3] = HZ_CFG_CITY_AT, up[3] = HZ_CFG_UP;

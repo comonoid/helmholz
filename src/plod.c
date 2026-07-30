@@ -811,10 +811,19 @@ int hz_lod_seglist(const hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, 
  * построению, а качество равно измеренному у плоского слияния — это тот же код.
  */
 int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, const hz_polyset *ps0,
-                       double delta0, int maxlev, double eps, int bands, int bycount) {
+                       double delta0, int maxlev, double eps, int bands, int bycount, int byangle,
+                       double radmul) {
   memset(L, 0, sizeof *L);
   L->bands = bands;
   L->bycount = bycount;
+  L->byangle = byangle;
+  L->angle0 = 0.5; /* первая ступень двоичной лестницы углов: за 8 уровней до 64° */
+  L->radmul = (radmul > 0.0) ? radmul : 1.0;
+  L->byangle = byangle;
+  /* Нулевой полураствор — ПОЛГРАДУСА. Число не подобрано под результат: это первая
+   * ступень двоичной лестницы, доходящей за восемь уровней до 64°, то есть до
+   * «почти перпендикулярно». Оно параметр, а не константа. */
+  L->angle0 = 0.5;
   const int32_t np = (ps0->np < sg->nseg) ? ps0->np : sg->nseg;
   if (np <= 0 || maxlev < 1) return 1;
   L->np = np;
@@ -880,7 +889,19 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
   for (int lev = 1; lev < maxlev; lev++) {
     hz_mergecfg mc;
     memset(&mc, 0, sizeof mc);
-    if (L->bycount) {
+    /* РАДИУС ПОИСКА ОТДЕЛЁН ОТ ДОПУСКА (§68): при `radmul > 1` кандидатами
+     * становятся полигоны, отстоящие дальше допуска. Ошибка от этого не растёт —
+     * её держат ВОРОТА, — а слияний становится больше: замер на зале дал
+     * `202 -> 104` элемента при неизменном `dmax = 0.18 м`. */
+    const double drad = delta0 * pow(2.0, (double)lev) * L->radmul;
+    if (L->byangle) {
+      /* ТАКТИКА ПО УГЛУ. Ворота — полураствор конуса нормалей; ворота по `dmax`
+       * сняты через `dgate` (А144), цель по числу снята. */
+      mc.delta = drad;
+      mc.dgate = dscene;
+      mc.conemax = L->angle0 * pow(2.0, (double)(lev - 1));
+      mc.target = 0;
+    } else if (L->bycount) {
       /* ТАКТИКА ПО ЧИСЛУ. Цель — четверть предыдущего уровня: четвёрка здесь уже
        * не структура, а ТРЕБОВАНИЕ (§60). Допуск снят с ГАБАРИТА сцены, то есть
        * не ограничивает ничего: ни одно отклонение в сцене его не превысит. Это
@@ -889,12 +910,13 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
       /* РАДИУС кандидатов остаётся ДВОИЧНЫМ ДОПУСКОМ УРОВНЯ — иначе кандидатом
        * становится каждая пара, и город падает по памяти (А144). Выключаются
        * только ВОРОТА, через `dgate`. */
-      mc.delta = delta0 * pow(2.0, (double)lev);
+      mc.delta = drad;
       mc.dgate = dscene;
       mc.target = (int32_t)((cs.nseg + 3) / 4);
       if (mc.target < 1) mc.target = 1;
     } else {
-      mc.delta = delta0 * pow(2.0, (double)lev);
+      mc.delta = drad;
+      mc.dgate = (L->radmul > 1.0) ? delta0 * pow(2.0, (double)lev) : 0.0;
       mc.target = 0; /* цель по числу — БЮДЖЕТ, а не критерий (§46) */
     }
     mc.use_geom = 1;

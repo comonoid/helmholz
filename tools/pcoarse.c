@@ -48,6 +48,17 @@ static int g_rand = 0;
 static int g_noexact = 0;
 static int g_quarter = 0;
 static double g_conemax = 0.0;
+/* ОПЫТ О23: РАДИУС КАНДИДАТОВ ОТДЕЛЬНО ОТ ВОРОТ (А144, флаг `dgate=`).
+ *
+ * Вопрос, который он отвечает: почему на городе огрубление почти ничего не даёт?
+ * Подозрение — не в геометрии, а в устройстве поиска: пара становится
+ * кандидатом, только если коробки ближе `δ`. Два компланарных куска фасада,
+ * разнесённые окном на два метра, при `δ = 0.4 м` кандидатами НЕ становятся, хотя
+ * слить их стоило бы ровно ноль ошибки. Проверяется прямо: ворота фиксируются на
+ * `dgate`, а `δ` (он же радиус) свипуется. Если счёт падает — виноват радиус;
+ * если стоит — виновата геометрия, и экономить нечего. */
+static double g_dgate = 0.0;
+static double g_radexp = 0.0; /* опыт «ворота стоят, радиус растёт» (§67) */
 static double g_lossmax = 0.0, g_aspmax = 0.0;
 
 static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps, double eps,
@@ -70,6 +81,7 @@ static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps
   mc.noexact = g_noexact;
   mc.quarter = g_quarter;
   mc.conemax = g_conemax;
+  mc.dgate = g_dgate;
   mc.lossmax = g_lossmax;
   mc.aspmax = g_aspmax;
   hz_pseglist so;
@@ -343,6 +355,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "quarter") == 0) g_quarter = 1;
     /* О21: ограничение полураствора конуса нормалей, градусы. */
     if (strncmp(argv[i], "cone=", 5) == 0) g_conemax = strtod(argv[i] + 5, NULL);
+    if (strncmp(argv[i], "dgate=", 6) == 0) g_dgate = strtod(argv[i] + 6, NULL);
+    if (strncmp(argv[i], "radexp=", 7) == 0) g_radexp = strtod(argv[i] + 7, NULL);
     if (strncmp(argv[i], "loss=", 5) == 0) g_lossmax = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "asp=", 4) == 0) g_aspmax = strtod(argv[i] + 4, NULL);
   }
@@ -487,6 +501,29 @@ int main(int argc, char **argv) {
       run(&m, &sg, &ps, 0.5, 150000, 1, 0, delta, 1);
     else
       run(&m, &sg, &ps, 0.3, 250, 1, 0, delta, 1);
+    hz_poly_free(&ps);
+    hz_seg_free(&sg);
+    hz_obj_free(&m);
+    return 0;
+  }
+  /* ОПЫТ О23: ВОРОТА ЗАКРЕПЛЕНЫ, РАДИУС СВИПУЕТСЯ (`radexp=ВОРОТА`).
+   *
+   * Вопрос пользователя 07-30: почему на городе экономия почти никакая, размеры
+   * ведь большие? Улика уже есть: срез не ставит НИ ОДНОГО полигона на уровни 0 и
+   * 1, то есть камера разрешает огрублять везде, а лестница всё равно сокращает
+   * лишь `1.15…1.21×` на уровень, и `dmax p50` при этом РОВНО НОЛЬ — сливается
+   * только строго компланарное. Значит упирается не выбор уровня, а слияние.
+   * Подозреваемый назван: пара становится кандидатом, только если коробки ближе
+   * `δ`, а `δ` служит и воротами. Компланарные куски фасада, разделённые окном,
+   * при `δ = 0.4 м` кандидатами не станут — хотя слить их стоит НОЛЬ ошибки.
+   * Опыт разделяет: ворота стоят, радиус растёт. Цель по числу снята (`0`), иначе
+   * мерился бы бюджет, а не критерий. */
+  if (g_radexp > 0.0) {
+    g_dgate = g_radexp;
+    const double rad[5] = {1.0, 2.0, 4.0, 8.0, 16.0};
+    printf("   ОПЫТ: ворота закреплены на %.3f м, радиус кандидатов растёт\n", g_radexp);
+    for (int i = 0; i < 5; i++)
+      run(&m, &sg, &ps, g_radexp * rad[i], 0, 0, 0, delta, 1);
     hz_poly_free(&ps);
     hz_seg_free(&sg);
     hz_obj_free(&m);

@@ -124,8 +124,9 @@ static void metric(const hz_polyset *pf, const hz_polyset *pc, const tr3_camera 
 int main(int argc, char **argv) {
   int city = (argc > 1 && strcmp(argv[1], "city") == 0);
   double dseg = city ? 0.05 : 0.045;
-  int simp = 0, vfit = 0, maxlev = 9, uniform = 0, viamerge = 0, bands = 0, bycount = 0;
-  double epsmul = 1.0;
+  int simp = 0, vfit = 0, maxlev = 9, uniform = 0, viamerge = 0, bands = 0, bycount = 0,
+      byangle = 0;
+  double epsmul = 1.0, radmul = 1.0;
   const char *save = NULL, *load = NULL;
   /* НЕИЗВЕСТНЫЙ АРГУМЕНТ — ОШИБКА, А НЕ ПРОПУСК (§60, дефект оснастки). Флаг,
    * который не совпал, молчал, и конфигурация вышла тождественной другой; поймать
@@ -142,8 +143,15 @@ int main(int argc, char **argv) {
     /* ВТОРАЯ ТАКТИКА (§60): уровень задан ЧИСЛОМ (четверть), допуск не
      * ограничивает, достигнутое отклонение печатается замером. */
     if (strcmp(argv[i], "bycount") == 0) ok = bycount = 1;
+    /* ТРЕТЬЯ ТАКТИКА (§67): критерий уровня — УГОЛ (полураствор конуса нормалей). */
+    if (strcmp(argv[i], "byangle") == 0) ok = byangle = 1;
     if (strncmp(argv[i], "lev=", 4) == 0) {
       maxlev = (int)strtol(argv[i] + 4, NULL, 10);
+      ok = 1;
+    }
+    /* §68: РАДИУС ПОИСКА КАНДИДАТОВ В ДОПУСКАХ УРОВНЯ. */
+    if (strncmp(argv[i], "rad=", 4) == 0) {
+      radmul = strtod(argv[i] + 4, NULL);
       ok = 1;
     }
     if (strncmp(argv[i], "eps=", 4) == 0) {
@@ -164,7 +172,7 @@ int main(int argc, char **argv) {
       fprintf(stderr,
               "plod: неизвестный аргумент «%s»\n"
               "  ожидается: [city|hall] [simp] [vfit] [uniform] [viamerge] [bands]\n"
-              "             [bycount] [lev=N] [eps=X] [save=Ф] [load=Ф]\n",
+              "             [bycount] [byangle] [rad=X] [lev=N] [eps=X] [save=Ф] [load=Ф]\n",
               argv[i]);
       return 2;
     }
@@ -225,7 +233,8 @@ int main(int argc, char **argv) {
     }
     dseg = L.delta0;
   } else {
-    rc = viamerge ? hz_lod_build_merge(&L, &m, &sg, &psf, dseg, maxlev, eps, bands, bycount)
+    rc = viamerge ? hz_lod_build_merge(&L, &m, &sg, &psf, dseg, maxlev, eps, bands, bycount,
+                                       byangle, radmul)
                   : hz_lod_build(&L, &m, &sg, &psf, dseg, maxlev, eps);
     if (rc != 0) {
       fprintf(stderr, "отказ построения лестницы\n");

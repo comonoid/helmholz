@@ -71,6 +71,7 @@ typedef struct {
   int64_t nident;      /* тождественных продвижений (слить не удалось) */
   int64_t nlow_rej;    /* групп, отсеянных НИЖНЕЙ оценкой без подгонки */
   double area_grow;    /* худшее отношение площади элемента к площади поверхности */
+  int bands;           /* тактика полос по углу (§59) в слиянии уровня */
 } hz_lod;
 
 /* Построить лестницу от `sg` (сегментация) вверх, пока сливается либо пока
@@ -108,6 +109,6 @@ int hz_lod_seglist(const hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, 
  * треугольникам от плоскости группы, то есть от ИСХОДНОЙ геометрии (А134).
  */
 int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, const hz_polyset *ps0,
-                       double delta0, int maxlev, double eps);
+                       double delta0, int maxlev, double eps, int bands);
 
 #endif

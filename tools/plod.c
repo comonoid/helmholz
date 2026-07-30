@@ -112,7 +112,7 @@ static void metric(const hz_polyset *pf, const hz_polyset *pc, const tr3_camera 
 int main(int argc, char **argv) {
   int city = (argc > 1 && strcmp(argv[1], "city") == 0);
   double dseg = city ? 0.05 : 0.045;
-  int simp = 0, vfit = 0, maxlev = 9, uniform = 0, viamerge = 0;
+  int simp = 0, vfit = 0, maxlev = 9, uniform = 0, viamerge = 0, bands = 0;
   double epsmul = 1.0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "simp") == 0) simp = 1;
@@ -120,6 +120,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "uniform") == 0) uniform = 1;
     /* Второй построитель: уровень строится `hz_merge` над предыдущим (§58). */
     if (strcmp(argv[i], "viamerge") == 0) viamerge = 1;
+    if (strcmp(argv[i], "bands") == 0) bands = 1;
     if (strncmp(argv[i], "lev=", 4) == 0) maxlev = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "eps=", 4) == 0) epsmul = strtod(argv[i] + 4, NULL);
   }
@@ -149,7 +150,7 @@ int main(int argc, char **argv) {
 
   double t0 = now_s();
   hz_lod L;
-  int rc = viamerge ? hz_lod_build_merge(&L, &m, &sg, &psf, dseg, maxlev, eps)
+  int rc = viamerge ? hz_lod_build_merge(&L, &m, &sg, &psf, dseg, maxlev, eps, bands)
                     : hz_lod_build(&L, &m, &sg, &psf, dseg, maxlev, eps);
   if (rc != 0) {
     fprintf(stderr, "отказ построения лестницы\n");

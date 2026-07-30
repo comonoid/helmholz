@@ -811,8 +811,9 @@ int hz_lod_seglist(const hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, 
  * построению, а качество равно измеренному у плоского слияния — это тот же код.
  */
 int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, const hz_polyset *ps0,
-                       double delta0, int maxlev, double eps) {
+                       double delta0, int maxlev, double eps, int bands) {
   memset(L, 0, sizeof *L);
+  L->bands = bands;
   const int32_t np = (ps0->np < sg->nseg) ? ps0->np : sg->nseg;
   if (np <= 0 || maxlev < 1) return 1;
   L->np = np;
@@ -867,6 +868,7 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
     mc.target = 0; /* цель по числу — БЮДЖЕТ, а не критерий (§46) */
     mc.use_geom = 1;
     mc.use_overlap = 1;
+    mc.bands = L->bands;
     hz_pseglist so;
     hz_mergestat st;
     if (hz_merge(&so, m, &cs, &cp, &mc, &st) != 0) break;

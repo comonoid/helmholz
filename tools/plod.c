@@ -67,9 +67,19 @@ static void metric(const hz_polyset *pf, const hz_polyset *pc, const tr3_camera 
   int64_t nb = 0, nl = 0, ng = 0;
   double *dt = malloc((size_t)W * (size_t)H * sizeof *dt);
   double *dp = malloc((size_t)W * (size_t)H * sizeof *dp);
-  if (dt == NULL || dp == NULL) {
+  /* СИЛУЭТНЫЙ КАНАЛ (§69). Пиксельная метрика мерит СМЕЩЕНИЕ ПЛОСКОСТИ вдоль
+   * луча, а ломается картинка на СИЛУЭТЕ — там, где огрублённый край врезается в
+   * очертание или отступает от него. До сих пор это схлопывалось в проценты
+   * «потеряли/приобрели», то есть в площадь, а видна глазу ШИРИНА полосы.
+   * Ширина берётся без единого порога: `(потеряли + приобрели) / длина силуэта`,
+   * где длина силуэта — число пикселей эталона, у которых сосед по четырём
+   * направлениям УЛЕТЕЛ В НЕБО. Это внешний силуэт, определённый точно: небо есть
+   * промах луча, а не значение глубины, и порога тут нет по построению. */
+  uint8_t *hit = calloc((size_t)W * (size_t)H, 1);
+  if (dt == NULL || dp == NULL || hit == NULL) {
     free(dt);
     free(dp);
+    free(hit);
     hz_pray_free(&gf);
     hz_pray_free(&gc);
     return;
@@ -80,6 +90,7 @@ static void metric(const hz_polyset *pf, const hz_polyset *pc, const tr3_camera 
       tr3_camera_ray(cam, i, j, o, d);
       int32_t hf = hz_pray_hit(&gf, o, d, 1e-6, &tf);
       int32_t hc = hz_pray_hit(&gc, o, d, 1e-6, &tc);
+      if (hf >= 0) hit[(size_t)j * (size_t)W + (size_t)i] = 1;
       if (hf < 0 && hc < 0) continue;
       if (hf >= 0 && hc < 0) {
         nl++;
@@ -109,14 +120,29 @@ static void metric(const hz_polyset *pf, const hz_polyset *pc, const tr3_camera 
   int64_t nbad = 0;
   for (int64_t i = 0; i < nb; i++)
     if (dp[i] > 1.0) nbad++;
+  /* Длина внешнего силуэта эталона: попавший пиксель, у которого сосед — небо. */
+  int64_t nsil = 0;
+  for (int j = 0; j < H; j++)
+    for (int i = 0; i < W; i++) {
+      size_t q = (size_t)j * (size_t)W + (size_t)i;
+      if (!hit[q]) continue;
+      int edge = (i == 0 || i == W - 1 || j == 0 || j == H - 1);
+      if (!edge) {
+        if (!hit[q - 1] || !hit[q + 1] || !hit[q - (size_t)W] || !hit[q + (size_t)W]) edge = 1;
+      }
+      if (edge) nsil++;
+    }
   printf("      %-28s элем %7d | попали %6.2f%% потеряли %5.2f%% приобрели %5.2f%% | "
-         "ПИКСЕЛИ p50 %6.2f p90 %6.2f p99 %7.2f p99.9 %8.2f макс %8.2f | >1пкс %6.3f%%\n",
+         "ПИКСЕЛИ p50 %6.2f p90 %6.2f p99 %7.2f p99.9 %8.2f макс %8.2f | >1пкс %6.3f%% | "
+         "СИЛУЭТ: длина %6lld пкс, сдвиг %6.2f пкс\n",
          tag, nelem, 100.0 * (double)nb / (double)(tot ? tot : 1),
          100.0 * (double)nl / (double)(tot ? tot : 1), 100.0 * (double)ng / (double)(tot ? tot : 1),
          pct(dp, nb, 0.5), pct(dp, nb, 0.9), pct(dp, nb, 0.99), pct(dp, nb, 0.999),
-         pct(dp, nb, 1.0), 100.0 * (double)nbad / (double)(nb ? nb : 1));
+         pct(dp, nb, 1.0), 100.0 * (double)nbad / (double)(nb ? nb : 1), (long long)nsil,
+         (nsil > 0) ? (double)(nl + ng) / (double)nsil : 0.0);
   free(dt);
   free(dp);
+  free(hit);
   hz_pray_free(&gf);
   hz_pray_free(&gc);
 }
@@ -125,7 +151,7 @@ int main(int argc, char **argv) {
   int city = (argc > 1 && strcmp(argv[1], "city") == 0);
   double dseg = city ? 0.05 : 0.045;
   int simp = 0, vfit = 0, maxlev = 9, uniform = 0, viamerge = 0, bands = 0, bycount = 0,
-      byangle = 0;
+      byangle = 0, curve = 0;
   double epsmul = 1.0, radmul = 1.0;
   const char *save = NULL, *load = NULL;
   /* НЕИЗВЕСТНЫЙ АРГУМЕНТ — ОШИБКА, А НЕ ПРОПУСК (§60, дефект оснастки). Флаг,
@@ -145,6 +171,11 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "bycount") == 0) ok = bycount = 1;
     /* ТРЕТЬЯ ТАКТИКА (§67): критерий уровня — УГОЛ (полураствор конуса нормалей). */
     if (strcmp(argv[i], "byangle") == 0) ok = byangle = 1;
+    /* §69: КРИВАЯ «ЭЛЕМЕНТЫ ПРОТИВ ОШИБКИ» ПО СВИПУ ε. Одна точка тактики не
+     * решает ничего: на зале срез оставляет 865 полигонов из 993 на нулевом
+     * уровне, то есть сравниваются сцены, совпадающие на 87 %. Сравнивать надо
+     * при РАВНОЙ ЦЕНЕ, а цена задаётся ε. */
+    if (strcmp(argv[i], "curve") == 0) ok = curve = 1;
     if (strncmp(argv[i], "lev=", 4) == 0) {
       maxlev = (int)strtol(argv[i] + 4, NULL, 10);
       ok = 1;
@@ -169,11 +200,12 @@ int main(int argc, char **argv) {
       ok = 1;
     }
     if (!ok) {
-      fprintf(stderr,
-              "plod: неизвестный аргумент «%s»\n"
-              "  ожидается: [city|hall] [simp] [vfit] [uniform] [viamerge] [bands]\n"
-              "             [bycount] [byangle] [rad=X] [lev=N] [eps=X] [save=Ф] [load=Ф]\n",
-              argv[i]);
+      fprintf(
+          stderr,
+          "plod: неизвестный аргумент «%s»\n"
+          "  ожидается: [city|hall] [simp] [vfit] [uniform] [viamerge] [bands]\n"
+          "             [bycount] [byangle] [curve] [rad=X] [lev=N] [eps=X] [save=Ф] [load=Ф]\n",
+          argv[i]);
       return 2;
     }
   }
@@ -387,6 +419,24 @@ int main(int argc, char **argv) {
       }
       hz_seg_free(&so);
     }
+  /* --- КРИВАЯ ПО ε: ЦЕНА ПРОТИВ ОШИБКИ ДЛЯ ЭТОЙ ТАКТИКИ (§69) --- */
+  if (curve) {
+    const double mul[6] = {0.25, 0.5, 1.0, 2.0, 4.0, 8.0};
+    for (int i = 0; i < 6; i++) {
+      hz_lod_cut(&L, eye, eps * mul[i], cut);
+      hz_pseglist so;
+      if (hz_lod_seglist(&L, &m, &sg, cut, &so) != 0) continue;
+      hz_polyset pc;
+      if (hz_poly_build(&pc, &m, &so) == 0) {
+        char tag[64];
+        snprintf(tag, sizeof tag, "КРИВАЯ: срез ε × %.2f", mul[i]);
+        metric(&psf, &pc, &cam, eps_px, tag, pc.np);
+        hz_poly_free(&pc);
+      }
+      hz_seg_free(&so);
+    }
+  }
+
   /* --- НЕГАТИВНЫЙ КОНТРОЛЬ: ТЕ ЖЕ УРОВНИ, РОЗДАННЫЕ ДРУГИМ ПОЛИГОНАМ (А146) ---
    *
    * Случайный ПРЕДОК не годится: он меняет цену, и провал вышел бы по причине, к

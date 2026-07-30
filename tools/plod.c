@@ -19,6 +19,7 @@
  */
 
 #include "pedge.h"
+#include "lodio.h"
 #include "plod.h"
 #include "poly_seg.h"
 #include "polygon.h"
@@ -114,6 +115,7 @@ int main(int argc, char **argv) {
   double dseg = city ? 0.05 : 0.045;
   int simp = 0, vfit = 0, maxlev = 9, uniform = 0, viamerge = 0, bands = 0, bycount = 0;
   double epsmul = 1.0;
+  const char *save = NULL, *load = NULL;
   /* НЕИЗВЕСТНЫЙ АРГУМЕНТ — ОШИБКА, А НЕ ПРОПУСК (§60, дефект оснастки). Флаг,
    * который не совпал, молчал, и конфигурация вышла тождественной другой; поймать
    * это удалось лишь по совпадению всех семи чисел. Обрыв дешевле. */
@@ -137,11 +139,21 @@ int main(int argc, char **argv) {
       epsmul = strtod(argv[i] + 4, NULL);
       ok = 1;
     }
+    /* ЛЕСТНИЦА КАК АРТЕФАКТ СЦЕНЫ (§62, пункт 2): строится один раз, дальше
+     * читается. `load` заменяет постройку целиком. */
+    if (strncmp(argv[i], "save=", 5) == 0) {
+      save = argv[i] + 5;
+      ok = 1;
+    }
+    if (strncmp(argv[i], "load=", 5) == 0) {
+      load = argv[i] + 5;
+      ok = 1;
+    }
     if (!ok) {
       fprintf(stderr,
               "plod: неизвестный аргумент «%s»\n"
               "  ожидается: [city|hall] [simp] [vfit] [uniform] [viamerge] [bands]\n"
-              "             [bycount] [lev=N] [eps=X]\n",
+              "             [bycount] [lev=N] [eps=X] [save=Ф] [load=Ф]\n",
               argv[i]);
       return 2;
     }
@@ -172,15 +184,59 @@ int main(int argc, char **argv) {
 
   double t0 = now_s();
   hz_lod L;
-  int rc = viamerge ? hz_lod_build_merge(&L, &m, &sg, &psf, dseg, maxlev, eps, bands, bycount)
-                    : hz_lod_build(&L, &m, &sg, &psf, dseg, maxlev, eps);
-  if (rc != 0) {
-    fprintf(stderr, "отказ построения лестницы\n");
-    return 1;
+  int rc;
+  if (load != NULL) {
+    /* ЧТЕНИЕ ВМЕСТО ПОСТРОЙКИ. Проверки — внутри `hz_lod_read`, включая полную
+     * целочисленную вложенность; отказ печатается СЛОВАМИ, потому что «не ноль»
+     * не различает чужой файл, порчу и несогласованность. */
+    int fsimp = 0;
+    rc = hz_lod_read(&L, load, &sg, m.nt, &fsimp);
+    if (rc != HZ_LODIO_OK) {
+      fprintf(stderr, "лестница не прочитана: %s (код %d)\n", hz_lodio_str(rc), rc);
+      return 1;
+    }
+    /* УПРОЩЕНИЕ КРАЯ СВЕРЯЕТСЯ ОТДЕЛЬНО: сумма разметки его не видит (см. оговорку
+     * в `lodio.h`), а границы полигонов от него зависят. */
+    if (fsimp != (simp ? 1 : 0)) {
+      fprintf(stderr, "лестница построена %s края, а запрошено %s — отказ\n",
+              fsimp ? "С УПРОЩЕНИЕМ" : "БЕЗ УПРОЩЕНИЯ", simp ? "С УПРОЩЕНИЕМ" : "БЕЗ УПРОЩЕНИЯ");
+      hz_lod_free(&L);
+      return 1;
+    }
+    /* КАМЕРА СВЕРЯЕТСЯ С ФАЙЛОМ (А131). Лестница строилась под своё `ε`, и срез
+     * под другим `ε` дал бы ступени, не совпадающие с построенными. Отказ, а не
+     * пересчёт. */
+    if (!(fabs(L.eps - eps) <= 1e-12 * (fabs(eps) + 1.0))) {
+      fprintf(stderr, "лестница построена под ε = %.9g, а запрошено %.9g — отказ (А131)\n", L.eps,
+              eps);
+      hz_lod_free(&L);
+      return 1;
+    }
+    dseg = L.delta0;
+  } else {
+    rc = viamerge ? hz_lod_build_merge(&L, &m, &sg, &psf, dseg, maxlev, eps, bands, bycount)
+                  : hz_lod_build(&L, &m, &sg, &psf, dseg, maxlev, eps);
+    if (rc != 0) {
+      fprintf(stderr, "отказ построения лестницы\n");
+      return 1;
+    }
   }
   double t1 = now_s();
-  printf("== ЛЕСТНИЦА: %s, δ0 %g м, уровней %d, узлов %d, построена за %.1f с\n",
-         city ? "ГОРОД" : "зал", dseg, L.nlev, L.nnd, t1 - t0);
+  printf("== ЛЕСТНИЦА: %s, δ0 %g м, уровней %d, узлов %d, %s за %.1f с\n", city ? "ГОРОД" : "зал",
+         dseg, L.nlev, L.nnd, load ? "ПРОЧИТАНА" : "построена", t1 - t0);
+  if (save != NULL) {
+    /* ЗАПИСЬ СРАЗУ ПОСЛЕ ПОСТРОЙКИ, ДО всякого замера: если дальше что-то упадёт,
+     * двести секунд постройки уже не потеряны. */
+    double ts = now_s();
+    int wr = hz_lod_write(&L, save, &sg, m.nt, simp);
+    if (wr != HZ_LODIO_OK) {
+      fprintf(stderr, "лестница не записана: %s (код %d)\n", hz_lodio_str(wr), wr);
+      hz_lod_free(&L);
+      return 1;
+    }
+    printf("== ЗАПИСАНА: %s за %.2f с\n", save, now_s() - ts);
+    fflush(stdout);
+  }
   printf("   постройка: пар по ребру %lld, отказов ворот %lld, тождественных продвижений %lld, "
          "худший прирост площади %.3f\n",
          (long long)L.npair_edge, (long long)L.ngate_rej, (long long)L.nident, L.area_grow);

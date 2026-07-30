@@ -926,6 +926,9 @@ static int pm_emit(pm_plist *L, const hz_polyset *ps, const double *bb, int32_t 
     uint64_t h = pm_mix64(((uint64_t)(uint32_t)a << 32) | (uint64_t)(uint32_t)b);
     err = (double)(h >> 11) / 9007199254740992.0;
   } else {
+    /* ВОРОТА — `dgate`, РАДИУС — `delta` (А144). Нормировка приоритета ниже
+     * остаётся на `delta` сознательно (А145). */
+    const double dgate = (cfg->dgate > 0.0) ? cfg->dgate : cfg->delta;
     if (cfg->use_geom) {
       /* МАЖОРАНТА ЗА O(1), И ТОЧНЫЙ РАСЧЁТ ТОЛЬКО ЕСЛИ ОНА НЕ ПРОПУСТИЛА.
        * Одна мажоранта качество портит: она строже точного критерия, и замер
@@ -935,13 +938,13 @@ static int pm_emit(pm_plist *L, const hz_polyset *ps, const double *bb, int32_t 
        * величиной, а не двумя похожими. Дорогой путь берётся лишь там, где
        * дешёвый сомневается. */
       double qg = pair_gate(ps, a, b);
-      if (qg > cfg->delta) {
+      if (qg > dgate) {
         int32_t mm[2] = {a, b};
         double gn[3], goff;
         st->ngate_exact++;
         qg =
             group_plane(ps, mm, 2, gn, &goff, &st->nwork_tri, st, cfg->quarter, cfg->conemax, NULL);
-        if (qg > cfg->delta) {
+        if (qg > dgate) {
           st->nrej_geom++;
           return 0;
         }
@@ -1419,7 +1422,8 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
       double n[3], off, cone = 0.0;
       double q = group_plane(ps, mem, nm, n, &off, &st->nwork_merge_sup, st, cfg->quarter,
                              cfg->conemax, &cone);
-      if (cfg->use_geom && !cfg->random && !cfg->noexact && !(q < cfg->delta)) {
+      const double dgate = (cfg->dgate > 0.0) ? cfg->dgate : cfg->delta;
+      if (cfg->use_geom && !cfg->random && !cfg->noexact && !(q < dgate)) {
         st->nrej_geom++;
         continue;
       }

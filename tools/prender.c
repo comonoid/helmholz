@@ -28,6 +28,7 @@
  */
 
 #include "image.h"
+#include "lodio.h"
 #include "pcut.h"
 #include "pmerge.h"
 #include "pdirect.h"
@@ -472,7 +473,11 @@ static int render(scene *S, const tr3_camera *cam, imgstat *out, const char *ppm
       q[a] = o[a] + t * d[a] - P->org[a];
     double u = q[0] * P->eu[0] + q[1] * P->eu[1] + q[2] * P->eu[2];
     double v = q[0] * P->ev[0] + q[1] * P->ev[1] + q[2] * P->ev[2];
-    double x[3];
+    /* Инициализация ПРИ ОБЪЯВЛЕНИИ, как у `q` двумя строками выше: без неё
+     * `gcc -fanalyzer` теряет заполнение цикла и сообщает о чтении
+     * неинициализированного в `direct_exact` (CWE-457). Находка старше правки
+     * О22, но файл тронут — значит гейт на нём мой. */
+    double x[3] = {0.0, 0.0, 0.0};
     for (int a = 0; a < 3; a++)
       x[a] = o[a] + t * d[a];
 
@@ -591,7 +596,10 @@ static int one(const hz_objmesh *base, const tr3_camera *cam, const tr3_dirs *d,
    * а не абсолютная константа. 1e−6 стоило бы вчетверо больше отскоков и не
    * изменило бы ни одной цифры метрики. */
   if (solve(&S, d, h, 1e-4) != 0) return 1;
-  char ppm[96], pfm[96];
+  /* Нулями ПРИ ОБЪЯВЛЕНИИ: заполняются только при , и связи между
+   * этим условием и  ниже cppcheck не видит (legacyUninitvar).
+   * Находка старше правки О22, но файл тронут. */
+  char ppm[96] = {0}, pfm[96] = {0};
   if (img != NULL) {
     snprintf(ppm, sizeof ppm, "img/%s.ppm", img);
     snprintf(pfm, sizeof pfm, "img/%s.pfm", img);
@@ -706,6 +714,140 @@ int main(int argc, char **argv) {
       if (one(&base, &cam, &d, delta, h, 8, 4, &cfg0, 0.0, lab, im, &s, NULL, NULL, L) != 0)
         return 1;
     }
+    tr3_dirs_free(&d);
+    hz_obj_free(&base);
+    return 0;
+  }
+
+  /* --- О22: РЕНДЕР СРЕЗА LOD (§62, пункт 3). Аргумент 7 — файл лестницы. ---
+   *
+   * ЧТО СРАВНИВАЕТСЯ. Три ветви одной сцены: НУЛЕВОЙ УРОВЕНЬ (эталон цены),
+   * СРЕЗ по камере и ОДНОРОДНЫЕ УРОВНИ лестницы. Однородные берутся ГОТОВЫМИ, а
+   * не подбором `δ` под равное число элементов (А148): число элементов от `δ`
+   * немонотонно, подбор не гарантирован и стоит минуты на прогон, а два соседних
+   * готовых уровня отвечают на тот же вопрос без единого лишнего слияния.
+   *
+   * ОШИБКА РАДИАНСА СЧИТАЕТСЯ ПРОТИВ ЗАМКНУТОЙ ФОРМЫ, А НЕ ПРОТИВ НУЛЕВОГО
+   * УРОВНЯ, и это решение Ш6, а не удобство: эталон, зависящий от полигонов,
+   * спорил бы сам с собой. Поэтому строка нулевого уровня — тоже ЗАМЕР со своей
+   * ошибкой, а не ноль по определению.
+   *
+   * НЕГАТИВНЫЙ КОНТРОЛЬ — ПЕРЕСТАНОВКА УРОВНЕЙ (А146), а не случайный предок:
+   * случайный предок меняет ЦЕНУ, и провал вышел бы по причине, к критерию среза
+   * отношения не имеющей. Перестановка сохраняет набор выбранных уровней и рвёт
+   * только связь «грубее там, где дальше». */
+  if (argc > 6 && argv[6][0] == 'o') {
+    const char *lodf = (argc > 7) ? argv[7] : "build/lod/hall_r.lod";
+    NVIS_REF = 4;
+    IMGW = 256;
+    IMGH = 256;
+    if (tr3_camera_look(&cam, eye, at, up, HZ_CFG_FOV_DEG * M_PI / 180.0, IMGW, IMGH) != 0)
+      return 1;
+    const double eps_px = (HZ_CFG_FOV_DEG * M_PI / 180.0) / (double)IMGH;
+    hz_pseglist sgf;
+    if (hz_seg_planar(&sgf, &base, delta) != 0) return 1;
+    hz_lod L;
+    int fsimp = 0;
+    int lrc = hz_lod_read(&L, lodf, &sgf, base.nt, &fsimp);
+    if (lrc != HZ_LODIO_OK) {
+      fprintf(stderr, "лестница %s не прочитана: %s (код %d)\n", lodf, hz_lodio_str(lrc), lrc);
+      return 1;
+    }
+    /* УПРОЩЕНИЕ КРАЯ ЗДЕСЬ НЕ ПРИМЕНЯЕТСЯ, значит лестница обязана быть построена
+     * БЕЗ него. Отказ, а не «примерно то же»: границы полигонов от него зависят, а
+     * сумма разметки его не видит (оговорка в `lodio.h`). */
+    if (fsimp) {
+      fprintf(stderr, "лестница построена С УПРОЩЕНИЕМ края, а рендер его не делает — отказ\n");
+      return 1;
+    }
+    if (!(fabs(L.eps - eps_px) <= 1e-12 * (fabs(eps_px) + 1.0))) {
+      fprintf(stderr, "лестница под ε = %.9g, а кадр даёт %.9g — отказ (А131)\n", L.eps, eps_px);
+      return 1;
+    }
+    printf("\n== О22: РЕНДЕР СРЕЗА LOD, лестница %s (уровней %d, узлов %d, ε = %.6g)\n", lodf,
+           L.nlev, L.nnd, L.eps);
+    printf("   %-30s %7s %9s %9s %8s %8s %7s\n", "ветвь", "элем", "p50", "p99", "S>1%", "S>10%",
+           "кадр,с");
+    fflush(stdout);
+
+    int32_t *sel = malloc((size_t)L.np * sizeof *sel);
+    int32_t *lev_of = malloc((size_t)L.np * sizeof *lev_of);
+    if (sel == NULL || lev_of == NULL) return 1;
+
+    /* Ветвь: по выбору узлов `sel` построить сцену, решить, снять кадр. */
+    for (int pass = 0; pass < L.nlev + 2; pass++) {
+      char tag[64], img[96];
+      if (pass == 0) {
+        /* НУЛЕВОЙ УРОВЕНЬ. */
+        for (int32_t k = 0; k < L.np; k++)
+          sel[k] = L.lab[k];
+        snprintf(tag, sizeof tag, "уровень 0 (мелкий)");
+        snprintf(img, sizeof img, "img/o22_lev0.ppm");
+      } else if (pass == 1) {
+        /* СРЕЗ. */
+        if (hz_lod_cut(&L, eye, L.eps, sel) <= 0) return 1;
+        for (int32_t k = 0; k < L.np; k++)
+          lev_of[k] = L.nd[sel[k]].level;
+        snprintf(tag, sizeof tag, "СРЕЗ по камере");
+        snprintf(img, sizeof img, "img/o22_cut.ppm");
+      } else {
+        int lev = pass - 1;
+        if (lev >= L.nlev) break;
+        for (int32_t k = 0; k < L.np; k++)
+          sel[k] = L.lab[(size_t)lev * (size_t)L.np + (size_t)k];
+        snprintf(tag, sizeof tag, "однородный уровень %d", lev);
+        snprintf(img, sizeof img, "img/o22_uni%d.ppm", lev);
+      }
+      hz_pseglist so;
+      if (hz_lod_seglist(&L, &base, &sgf, sel, &so) != 0) return 1;
+      scene C;
+      if (scene_from(&C, &base, &so, base.lo, base.hi, 8) != 0) return 1;
+      if (solve(&C, &d, h, 1e-4) != 0) return 1;
+      imgstat sc;
+      if (render(&C, &cam, &sc, img, NULL) != 0) return 1;
+      printf("   %-30s %7d %9.3e %9.3e %8.2f%% %8.2f%% %7.2f\n", tag, C.ps.np, sc.p50, sc.p99,
+             sc.frac1, sc.frac10, sc.t_frame);
+      fflush(stdout);
+      scene_free(&C);
+      hz_seg_free(&so);
+    }
+
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ: те же уровни, розданные ДРУГИМ полигонам (А146).
+     * Перестановка детерминированная — хешем от номера, а не генератором: замер
+     * обязан повторяться, и «случайно» здесь означало бы «неповторимо». */
+    {
+      for (int32_t k = 0; k < L.np; k++) {
+        uint64_t x = (uint64_t)(uint32_t)k * 0x9e3779b97f4a7c15ull;
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ull;
+        x ^= x >> 27;
+        int32_t j = (int32_t)(x % (uint64_t)(uint32_t)L.np);
+        int32_t t = lev_of[k];
+        lev_of[k] = lev_of[j];
+        lev_of[j] = t;
+      }
+      for (int32_t k = 0; k < L.np; k++) {
+        int32_t lv = lev_of[k];
+        if (lv < 0) lv = 0;
+        if (lv >= L.nlev) lv = L.nlev - 1;
+        sel[k] = L.lab[(size_t)lv * (size_t)L.np + (size_t)k];
+      }
+      hz_pseglist so;
+      if (hz_lod_seglist(&L, &base, &sgf, sel, &so) != 0) return 1;
+      scene C;
+      if (scene_from(&C, &base, &so, base.lo, base.hi, 8) != 0) return 1;
+      if (solve(&C, &d, h, 1e-4) != 0) return 1;
+      imgstat sc;
+      if (render(&C, &cam, &sc, "img/o22_perm.ppm", NULL) != 0) return 1;
+      printf("   %-30s %7d %9.3e %9.3e %8.2f%% %8.2f%% %7.2f\n", "КОНТРОЛЬ: уровни перемешаны",
+             C.ps.np, sc.p50, sc.p99, sc.frac1, sc.frac10, sc.t_frame);
+      scene_free(&C);
+      hz_seg_free(&so);
+    }
+    free(sel);
+    free(lev_of);
+    hz_lod_free(&L);
+    hz_seg_free(&sgf);
     tr3_dirs_free(&d);
     hz_obj_free(&base);
     return 0;

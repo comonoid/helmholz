@@ -120,6 +120,12 @@ static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps
     printf("; максимум %.2f°, поворотов оси %lld, вырожденных %lld, отвергнуто порогом %lld\n",
            st.cone_max, (long long)st.ncone_turn, (long long)st.ncone_fail,
            (long long)st.ncone_rej);
+    /* §61: СТОРОНА. Полураствор `90°` не запрещает члену смотреть в другую
+     * сторону, а `|n_i·N|` знака не видит — поэтому знак печатается отдельной
+     * строкой, и «ни одного» есть `n_i·N = 1`, а не ноль. */
+    printf("        сторона члена: худшее n_i·N %.4f; слияний с членом наизнанку "
+           "%lld (из них лицо-изнанка, n_i·N < −0.9: %lld) из %lld принятых\n",
+           st.side_min, (long long)st.nside_mix, (long long)st.nside_anti, (long long)tot);
   }
   {
     int64_t ta = 0, tl = 0;

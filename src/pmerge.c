@@ -977,6 +977,7 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
              const hz_mergecfg *cfg, hz_mergestat *st) {
   memset(so, 0, sizeof *so);
   memset(st, 0, sizeof *st);
+  st->side_min = 1.0; /* худшее из ни одного есть единица, а не ложный ноль */
   st->nseg_in = si->nseg;
   /* ТОЛЬКО ПОЛИГОНЫ ИЗ УЧАСТКОВ. В наборе за ними идут ИСТОЧНИКИ, добавленные
    * `hz_poly_add_quad`: у них нет треугольников в сетке, сливать их не с чем и
@@ -1441,6 +1442,20 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
         if (bk > 17) bk = 17;
         st->cone_hist[bk]++;
         if (cone > st->cone_max) st->cone_max = cone;
+        /* §61: СТОРОНА ЧЛЕНА ОТНОСИТЕЛЬНО ЭЛЕМЕНТА. Замер, а не ворота: ставить
+         * порог до того, как известно, случается ли это вовсе, значило бы
+         * подобрать его под догадку. */
+        {
+          double smin = 1.0;
+          for (int32_t mi = 0; mi < nm; mi++) {
+            const hz_poly *P = &ps->p[mem[mi]];
+            double d = P->n[0] * n[0] + P->n[1] * n[1] + P->n[2] * n[2];
+            if (d < smin) smin = d;
+          }
+          if (smin < st->side_min) st->side_min = smin;
+          if (smin < 0.0) st->nside_mix++;
+          if (smin < -0.9) st->nside_anti++;
+        }
         /* §38: ВЫТЯНУТОСТЬ И ПОТЕРЯ ПЛОЩАДИ — замер по принятым слияниям. Обе
          * величины считаются из уже имеющегося: вторые моменты `mom[6]` точны,
          * взвешены площадью и аддитивны (А21), потеря площади есть `1/|n_i·N|`.

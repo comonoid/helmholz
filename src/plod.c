@@ -1,6 +1,7 @@
 /* Иерархическое огрубление и срез LOD. Разбор и оговорки — в `plod.h`. */
 
 #include "plod.h"
+#include "pmerge.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -801,5 +802,155 @@ int hz_lod_seglist(const hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, 
   so->nseg = nn;
   so->delta = sg->delta;
   free(rank);
+  return 0;
+}
+
+/* --- ВТОРОЙ ПОСТРОИТЕЛЬ: УРОВЕНЬ = `hz_merge` НАД ПРЕДЫДУЩИМ -----------------
+ * Разбор — в `plod.h`. Здесь только устройство: на каждом уровне слияние
+ * работает над РАЗБИЕНИЕМ предыдущего уровня, поэтому вложенность выходит по
+ * построению, а качество равно измеренному у плоского слияния — это тот же код.
+ */
+int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, const hz_polyset *ps0,
+                       double delta0, int maxlev, double eps) {
+  memset(L, 0, sizeof *L);
+  const int32_t np = (ps0->np < sg->nseg) ? ps0->np : sg->nseg;
+  if (np <= 0 || maxlev < 1) return 1;
+  L->np = np;
+  L->eps = eps;
+  L->delta0 = delta0;
+  L->lab = malloc((size_t)maxlev * (size_t)np * sizeof *L->lab);
+  L->ndcap = np + 16;
+  L->nd = malloc((size_t)L->ndcap * sizeof *L->nd);
+  if (L->lab == NULL || L->nd == NULL) {
+    hz_lod_free(L);
+    return 2;
+  }
+  /* Уровень 0 — узел на полигон; плоскость и `dmax` берутся у сегментации. */
+  for (int32_t k = 0; k < np; k++) {
+    hz_lodnode *nd = &L->nd[k];
+    memset(nd, 0, sizeof *nd);
+    nd->level = 0;
+    nd->parent = -1;
+    for (int c = 0; c < 3; c++)
+      nd->n[c] = ps0->p[k].n[c];
+    nd->off = ps0->p[k].off;
+    nd->dmax = ps0->p[k].dmax;
+    nd->area_surf = ps0->p[k].area;
+    nd->area_elem = ps0->p[k].mom[0];
+    nd->cx = ps0->p[k].org[0];
+    nd->cy = ps0->p[k].org[1];
+    nd->cz = ps0->p[k].org[2];
+    nd->nmemb = 1;
+    double per = 0.0;
+    for (int32_t l = ps0->p[k].l0; l < ps0->p[k].l0 + ps0->p[k].nloop; l++) {
+      int32_t b = ps0->loop[l], e = ps0->loop[l + 1], n = e - b;
+      for (int32_t i = 0; i < n; i++) {
+        const double *A = ps0->bv + (size_t)(b + i) * 2;
+        const double *B = ps0->bv + (size_t)(b + (i + 1) % n) * 2;
+        per += sqrt((B[0] - A[0]) * (B[0] - A[0]) + (B[1] - A[1]) * (B[1] - A[1]));
+      }
+    }
+    nd->perim = per;
+    L->lab[k] = k;
+  }
+  L->nnd = np;
+  L->nlev = 1;
+
+  /* Текущее разбиение: сегментация (уровень 0) и её полигоны. */
+  hz_pseglist cs = *sg;
+  hz_polyset cp = *ps0;
+  int owns = 0; /* владеем ли текущими `cs`/`cp` (уровни выше нулевого) */
+  for (int lev = 1; lev < maxlev; lev++) {
+    hz_mergecfg mc;
+    memset(&mc, 0, sizeof mc);
+    mc.delta = delta0 * pow(2.0, (double)lev);
+    mc.target = 0; /* цель по числу — БЮДЖЕТ, а не критерий (§46) */
+    mc.use_geom = 1;
+    mc.use_overlap = 1;
+    hz_pseglist so;
+    hz_mergestat st;
+    if (hz_merge(&so, m, &cs, &cp, &mc, &st) != 0) break;
+    if (so.nseg >= cs.nseg) {
+      hz_seg_free(&so);
+      break; /* слить больше нечего */
+    }
+    /* Разметка по ИСХОДНЫМ полигонам: у полигона все треугольники в одном узле. */
+    int32_t *now = L->lab + (size_t)lev * (size_t)np;
+    if (L->nnd + so.nseg + 1 > L->ndcap) {
+      int32_t nc = L->nnd + so.nseg + 16;
+      hz_lodnode *nn = realloc(L->nd, (size_t)nc * sizeof *nn);
+      if (nn == NULL) {
+        hz_seg_free(&so);
+        break;
+      }
+      L->nd = nn;
+      L->ndcap = nc;
+    }
+    int32_t base = L->nnd;
+    for (int32_t g = 0; g < so.nseg; g++) {
+      hz_lodnode *nd = &L->nd[base + g];
+      memset(nd, 0, sizeof *nd);
+      nd->level = lev;
+      nd->parent = -1;
+      for (int c = 0; c < 3; c++)
+        nd->n[c] = so.seg[g].n[c];
+      nd->off = so.seg[g].off;
+      nd->dmax = so.seg[g].dmax; /* по ВСЕМ треугольникам от плоскости (А134) */
+      nd->area_surf = so.seg[g].area;
+      nd->nmemb = 0;
+    }
+    L->nnd = base + so.nseg;
+    for (int32_t k = 0; k < np; k++) {
+      const hz_poly *P = &ps0->p[k];
+      int32_t t = (P->ntri > 0) ? ps0->tri[P->t0] : -1;
+      int32_t g = (t >= 0 && t < m->nt) ? so.label[t] : 0;
+      now[k] = base + g;
+      L->nd[base + g].nmemb++;
+      L->nd[L->lab[(size_t)(lev - 1) * (size_t)np + (size_t)k]].parent = base + g;
+    }
+    /* Полигоны нового уровня: нужны и как вход следующего слияния, и ради
+     * периметра с моментами (форма `P/√A`, §55). */
+    hz_polyset npset;
+    if (hz_poly_build(&npset, m, &so) != 0) {
+      hz_seg_free(&so);
+      break;
+    }
+    for (int32_t g = 0; g < so.nseg && g < npset.np; g++) {
+      hz_lodnode *nd = &L->nd[base + g];
+      nd->area_elem = npset.p[g].mom[0];
+      nd->cx = npset.p[g].org[0];
+      nd->cy = npset.p[g].org[1];
+      nd->cz = npset.p[g].org[2];
+      double per = 0.0;
+      for (int32_t l = npset.p[g].l0; l < npset.p[g].l0 + npset.p[g].nloop; l++) {
+        int32_t b = npset.loop[l], e = npset.loop[l + 1], n = e - b;
+        for (int32_t i = 0; i < n; i++) {
+          const double *A = npset.bv + (size_t)(b + i) * 2;
+          const double *B = npset.bv + (size_t)(b + (i + 1) % n) * 2;
+          per += sqrt((B[0] - A[0]) * (B[0] - A[0]) + (B[1] - A[1]) * (B[1] - A[1]));
+        }
+      }
+      nd->perim = per;
+    }
+    if (owns) {
+      hz_poly_free(&cp);
+      hz_seg_free(&cs);
+    }
+    cs = so;
+    cp = npset;
+    owns = 1;
+    L->nlev = lev + 1;
+  }
+  if (owns) {
+    hz_poly_free(&cp);
+    hz_seg_free(&cs);
+  }
+  for (int32_t i = 0; i < L->nnd; i++) {
+    const hz_lodnode *nd = &L->nd[i];
+    if (nd->area_surf > 0.0 && nd->area_elem > 0.0) {
+      double r = nd->area_elem / nd->area_surf;
+      if (r > L->area_grow) L->area_grow = r;
+    }
+  }
   return 0;
 }

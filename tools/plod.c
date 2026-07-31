@@ -173,6 +173,11 @@ static void metric(const hz_polyset *pf, const hz_polyset *pc, const tr3_camera 
          pct(dp, nb, 0.5), pct(dp, nb, 0.9), pct(dp, nb, 0.99), pct(dp, nb, 0.999),
          pct(dp, nb, 1.0), 100.0 * (double)nbad / (double)(nb ? nb : 1), (long long)nsil,
          (nsil > 0) ? (double)(nl + ng) / (double)nsil : 0.0);
+  /* СБРОС БУФЕРА ПОСЛЕ КАЖДОЙ СТРОКИ. Без него вывод, перенаправленный в файл,
+   * копится блоками, и прогон, убитый на середине (перезагрузка машины 07-31),
+   * оставляет ноль метрических строк при часе работы. Строка метрики стоит
+   * минуты — сброс на её фоне бесплатен. */
+  fflush(stdout);
   free(dt);
   free(dp);
   free(hit);

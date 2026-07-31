@@ -501,7 +501,7 @@ int main(int argc, char **argv) {
   double dseg = city ? 0.05 : 0.045;
   int simp = 0, vfit = 0, maxlev = 9, uniform = 0, viamerge = 0, bands = 0, bycount = 0,
       byangle = 0, curve = 0;
-  double epsmul = 1.0, radmul = 1.0, eyemul = 1.0, ang0 = 0.0;
+  double epsmul = 1.0, radmul = 1.0, eyemul = 1.0, ang0 = 0.0, vfitlim = 0.0;
   const char *save = NULL, *load = NULL;
   /* НЕИЗВЕСТНЫЙ АРГУМЕНТ — ОШИБКА, А НЕ ПРОПУСК (§60, дефект оснастки). Флаг,
    * который не совпал, молчал, и конфигурация вышла тождественной другой; поймать
@@ -511,6 +511,15 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "city") == 0 || strcmp(argv[i], "hall") == 0) ok = 1;
     if (strcmp(argv[i], "simp") == 0) ok = simp = 1;
     if (strcmp(argv[i], "vfit") == 0) ok = vfit = 1;
+    /* §73: ПРЕДЕЛ СМЕЩЕНИЯ ВЕРШИНЫ, МЕТРЫ. Прежде он брался как допуск САМОГО
+     * ГРУБОГО уровня (`0.045·2⁶ = 2.88 м` на зале) — то есть вершине разрешалось
+     * уехать на два метра в комнате, и подгонка портила качество в восемь раз:
+     * `p99` с 0.08 до 35.01 пикселя. Величина обязана быть параметром и
+     * выбираться замером, а не наследоваться от глубины лестницы. */
+    if (strncmp(argv[i], "vfit=", 5) == 0) {
+      vfitlim = strtod(argv[i] + 5, NULL);
+      ok = vfit = 1;
+    }
     if (strcmp(argv[i], "uniform") == 0) ok = uniform = 1;
     /* Второй построитель: уровень строится `hz_merge` над предыдущим (§58). */
     if (strcmp(argv[i], "viamerge") == 0) ok = viamerge = 1;
@@ -566,7 +575,8 @@ int main(int argc, char **argv) {
       fprintf(stderr,
               "plod: неизвестный аргумент «%s»\n"
               "  ожидается: [city|hall] [simp] [vfit] [uniform] [viamerge] [bands]\n"
-              "             [bycount] [byangle] [curve] [rad=X] [eye=X] [ang0=X] [lev=N] [eps=X] "
+              "             [bycount] [byangle] [curve] [rad=X] [eye=X] [ang0=X] [vfit=X] [lev=N] "
+              "[eps=X] "
               "[save=Ф] "
               "[load=Ф]\n",
               argv[i]);
@@ -804,6 +814,26 @@ int main(int argc, char **argv) {
       if (hz_lod_seglist(&L, &m, &sg, cut, &so) != 0) continue;
       hz_polyset pc;
       if (hz_poly_build(&pc, &m, &so) == 0) {
+        /* ПОДГОНКА ВЕРШИН ВНУТРИ КРИВОЙ (§73). Прежде она стояла только в ветви
+         * «срез», и прогон с `vfit` давал кривую, ТОЖДЕСТВЕННУЮ прогону без него —
+         * до последней цифры. Молчаливо недействительный замер того же класса, что
+         * и `bycount bands` в zsh: конфигурация выглядит новой и повторяет старую. */
+        if (vfit) {
+          hz_vfitstat vs;
+          hz_poly_vfit(&pc, (vfitlim > 0.0) ? vfitlim : dseg * pow(2.0, L.nlev - 1), &vs);
+          /* ПОЛНЫЙ ЗАМЕР ПОДГОНКИ, а не два счётчика (§73). Вопрос пользователя:
+           * как оптимизация может ухудшать, если у неё есть проверка улучшения?
+           * Ответ обязан быть числом: `t*` — невязка ЕЁ цели (вершина на всех
+           * своих плоскостях), и она обязана быть мала, тогда как лучевая метрика
+           * при этом портится. Расхождение двух чисел и есть механизм: цель одна,
+           * мерится другое, а между ними — проекция в двумерный край. */
+          printf("      подгонка: вершин %lld, двинуто %lld, оставлено %lld, отказов "
+                 "(далеко %lld, без улучшения %lld); t* макс %.4f м, смещение макс %.4f м, "
+                 "расхождение площади %.3e\n",
+                 (long long)vs.nvert, (long long)vs.nvert_moved, (long long)vs.nvert_fixed,
+                 (long long)vs.nvert_far, (long long)vs.nvert_noimp, vs.tmax, vs.dmax_move,
+                 vs.dmax_area);
+        }
         char tag[64];
         snprintf(tag, sizeof tag, "КРИВАЯ: срез ε × %.2f", mul[i]);
         metric(&psf, &pc, &cam, eps_px, tag, pc.np);

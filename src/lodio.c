@@ -6,7 +6,7 @@
 #include <string.h>
 
 #define HZ_LODIO_MAGIC "HZLOD\x01\x00\x00"
-#define HZ_LODIO_VERSION 2u
+#define HZ_LODIO_VERSION 3u
 /* Образец порядка байт: все восемь байт различны, поэтому любая перестановка
  * видна, а не только обращение. */
 #define HZ_LODIO_ENDIAN 0x0102030405060708ull

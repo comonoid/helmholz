@@ -202,6 +202,24 @@ static uint64_t pl_mix(uint64_t k) {
 
 /* --- построение узла --------------------------------------------------------- */
 
+/* Радиус объемлющей сферы узла вокруг точки `c` — по ОПОРНЫМ ТОЧКАМ членов, то есть
+ * по тем же данным, что дают `dmax`. Оболочка уже посчитана огрубителем (О7), и
+ * лишней работы здесь нет. */
+static double pl_radius(const hz_polyset *ps, const int32_t *memb, int32_t nm, const double c[3]) {
+  double r2 = 0.0;
+  for (int32_t i = 0; i < nm; i++) {
+    const hz_poly *P = &ps->p[memb[i]];
+    const double *S = ps->sup + (size_t)P->s0 * 3;
+    for (int32_t q = 0; q < P->nsup; q++) {
+      double dx = S[(size_t)q * 3] - c[0], dy = S[(size_t)q * 3 + 1] - c[1],
+             dz = S[(size_t)q * 3 + 2] - c[2];
+      double d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 > r2) r2 = d2;
+    }
+  }
+  return sqrt(r2);
+}
+
 /* Плоскость и `dmax` узла по ИСХОДНЫМ полигонам (А134). Ориентация — из `Σ A·n`
  * (она остаётся ОТДЕЛЬНОЙ величиной, А22), затем минимакс в её раме, затем
  * точный `dmax` по опорным точкам. */
@@ -299,6 +317,7 @@ static int pl_fit(const hz_polyset *ps, const int32_t *memb, int32_t nm, pl_pt *
   nd->cx = org[0];
   nd->cy = org[1];
   nd->cz = org[2];
+  nd->rad = pl_radius(ps, memb, nm, org);
   nd->nmemb = nm;
   return 0;
 }
@@ -341,6 +360,7 @@ int hz_lod_build(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, const hz
       nd->off = ps->p[k].off;
       nd->dmax = ps->p[k].dmax;
       nd->area_surf = ps->p[k].area;
+      nd->rad = pl_radius(ps, &k, 1, ps->p[k].org);
       nd->cx = ps->p[k].org[0];
       nd->cy = ps->p[k].org[1];
       nd->cz = ps->p[k].org[2];
@@ -729,10 +749,17 @@ int32_t hz_lod_cut(const hz_lod *L, const double eye[3], double eps, int32_t *ou
       int32_t id = L->lab[(size_t)lev * (size_t)L->np + (size_t)k];
       const hz_lodnode *nd = &L->nd[id];
       double dx = nd->cx - eye[0], dy = nd->cy - eye[1], dz = nd->cz - eye[2];
-      double R = sqrt(dx * dx + dy * dy + dz * dz);
+      double Rc = sqrt(dx * dx + dy * dy + dz * dz);
+      /* РАССТОЯНИЕ ДО БЛИЖАЙШЕЙ ТОЧКИ УЗЛА, А НЕ ДО ЦЕНТРА (§72). Критерий обязан
+       * держаться ВЕЗДЕ на узле, а худшее место — ближайшее к глазу. */
+      double R = Rc - nd->rad;
       if (!(R > 0.0)) break;
-      /* Проецируемая ошибка: смещение вдоль луча экран почти не двигает (§27). */
-      double cs = (nd->n[0] * dx + nd->n[1] * dy + nd->n[2] * dz) / R;
+      /* Проецируемая ошибка: смещение вдоль луча экран почти не двигает (§27).
+       * Косинус делится на `Rc` — длину ТОГО ЖЕ вектора `(dx,dy,dz)`, а не на
+       * укороченное `R`. На `R` он зашкаливал за единицу, обрезался, `sin`
+       * обращался в ноль, и критерий начинал пропускать что угодно: срез на зале
+       * дал 861 элемент вместо 966 при СТРОГОМ правиле, чего быть не может. */
+      double cs = (nd->n[0] * dx + nd->n[1] * dy + nd->n[2] * dz) / Rc;
       if (cs > 1.0) cs = 1.0;
       if (cs < -1.0) cs = -1.0;
       double sn = sqrt(1.0 - cs * cs);
@@ -850,6 +877,7 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
     nd->dmax = ps0->p[k].dmax;
     nd->area_surf = ps0->p[k].area;
     nd->area_elem = ps0->p[k].mom[0];
+    nd->rad = pl_radius(ps0, &k, 1, ps0->p[k].org);
     nd->cx = ps0->p[k].org[0];
     nd->cy = ps0->p[k].org[1];
     nd->cz = ps0->p[k].org[2];
@@ -984,6 +1012,7 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
     for (int32_t g = 0; g < so.nseg && g < npset.np; g++) {
       hz_lodnode *nd = &L->nd[base + g];
       nd->area_elem = npset.p[g].mom[0];
+      nd->rad = pl_radius(&npset, &g, 1, npset.p[g].org);
       nd->cx = npset.p[g].org[0];
       nd->cy = npset.p[g].org[1];
       nd->cz = npset.p[g].org[2];

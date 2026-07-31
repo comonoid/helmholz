@@ -740,7 +740,7 @@ void hz_lod_free(hz_lod *L) {
   memset(L, 0, sizeof *L);
 }
 
-int32_t hz_lod_cut(const hz_lod *L, const double eye[3], double eps, int32_t *out) {
+int32_t hz_lod_cut(const hz_lod *L, const double eye[3], double eps, int nosin, int32_t *out) {
   /* Для каждого исходного полигона — САМЫЙ ГРУБЫЙ уровень, чей узел ещё
    * удовлетворяет `dmax < ε·R`. Расстояние берётся ЗДЕСЬ, в узле его нет (А133). */
   for (int32_t k = 0; k < L->np; k++) {
@@ -762,7 +762,7 @@ int32_t hz_lod_cut(const hz_lod *L, const double eye[3], double eps, int32_t *ou
       double cs = (nd->n[0] * dx + nd->n[1] * dy + nd->n[2] * dz) / Rc;
       if (cs > 1.0) cs = 1.0;
       if (cs < -1.0) cs = -1.0;
-      double sn = sqrt(1.0 - cs * cs);
+      double sn = nosin ? 1.0 : sqrt(1.0 - cs * cs);
       if (nd->dmax * sn < eps * R)
         sel = id;
       else
@@ -838,13 +838,15 @@ int hz_lod_seglist(const hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, 
  * построению, а качество равно измеренному у плоского слияния — это тот же код.
  */
 int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, const hz_polyset *ps0,
-                       double delta0, int maxlev, double eps, int bands, int bycount, int byangle,
-                       double radmul, double angle0) {
+                       const hz_lodcfg *cf) {
+  const double delta0 = cf->delta0, eps = cf->eps;
+  const int maxlev = cf->maxlev;
+  const double base = (cf->base > 0.0) ? cf->base : 2.0;
   memset(L, 0, sizeof *L);
-  L->bands = bands;
-  L->bycount = bycount;
-  L->byangle = byangle;
-  L->radmul = (radmul > 0.0) ? radmul : 1.0;
+  L->bands = cf->bands;
+  L->bycount = cf->bycount;
+  L->byangle = cf->byangle;
+  L->radmul = (cf->radmul > 0.0) ? cf->radmul : 1.0;
   /* ПЕРВАЯ СТУПЕНЬ УГЛОВОЙ ЛЕСТНИЦЫ — ПАРАМЕТР, А НЕ КОНСТАНТА (А174). Стояло
    * `0.5°`, то есть НИЖЕ всего, что в сцене бывает: у города минимальный излом
    * между смежными участками ровно `90°`, пара под прямым углом даёт полураствор
@@ -852,7 +854,7 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
    * Отсюда «насыщение угловой тактики», записанное в А171 как её свойство, — а это
    * было свойство ЛЕСТНИЦЫ. Та же ошибка, что с `δ0`: начинать там, где у сцены
    * ничего нет. Ноль читается как прежние `0.5°`, чтобы старые прогоны совпали. */
-  L->angle0 = (angle0 > 0.0) ? angle0 : 0.5;
+  L->angle0 = (cf->angle0 > 0.0) ? cf->angle0 : 0.5;
   const int32_t np = (ps0->np < sg->nseg) ? ps0->np : sg->nseg;
   if (np <= 0 || maxlev < 1) return 1;
   L->np = np;
@@ -923,7 +925,8 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
      * становятся полигоны, отстоящие дальше допуска. Ошибка от этого не растёт —
      * её держат ВОРОТА, — а слияний становится больше: замер на зале дал
      * `202 -> 104` элемента при неизменном `dmax = 0.18 м`. */
-    const double drad = delta0 * pow(2.0, (double)lev) * L->radmul;
+    const double dlev = delta0 * pow(base, (double)lev);
+    const double drad = dlev * L->radmul;
     if (L->byangle) {
       /* ТАКТИКА ПО УГЛУ. Ворота — полураствор конуса нормалей; ворота по `dmax`
        * сняты через `dgate` (А144), цель по числу снята. */
@@ -932,7 +935,7 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
       /* Полураствор конуса ограничен `90°` по смыслу (полусфера), поэтому лестница
        * упирается в потолок, а не уходит за него: `89°` — последняя осмысленная
        * ступень, дальше условие вырождается в «конус существует». */
-      mc.conemax = L->angle0 * pow(2.0, (double)(lev - 1));
+      mc.conemax = L->angle0 * pow(base, (double)(lev - 1));
       if (mc.conemax > 89.0) mc.conemax = 89.0;
       mc.target = 0;
     } else if (L->bycount) {
@@ -945,12 +948,14 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
        * становится каждая пара, и город падает по памяти (А144). Выключаются
        * только ВОРОТА, через `dgate`. */
       mc.delta = drad;
-      mc.dgate = dscene;
+      /* Ворота: либо сняты совсем (прежнее поведение), либо держатся на
+       * `cgate · допуск уровня` — число ведёт, ошибка ограничена (§77). */
+      mc.dgate = (cf->cgate > 0.0) ? cf->cgate * dlev : dscene;
       mc.target = (int32_t)((cs.nseg + 3) / 4);
       if (mc.target < 1) mc.target = 1;
     } else {
       mc.delta = drad;
-      mc.dgate = (L->radmul > 1.0) ? delta0 * pow(2.0, (double)lev) : 0.0;
+      mc.dgate = (L->radmul > 1.0) ? dlev : 0.0;
       mc.target = 0; /* цель по числу — БЮДЖЕТ, а не критерий (§46) */
     }
     mc.use_geom = 1;
@@ -980,9 +985,9 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
       L->nd = nn;
       L->ndcap = nc;
     }
-    int32_t base = L->nnd;
+    int32_t nd0 = L->nnd; /* имя не `base`: оно занято основанием лестницы (§78) */
     for (int32_t g = 0; g < so.nseg; g++) {
-      hz_lodnode *nd = &L->nd[base + g];
+      hz_lodnode *nd = &L->nd[nd0 + g];
       memset(nd, 0, sizeof *nd);
       nd->level = lev;
       nd->parent = -1;
@@ -993,14 +998,14 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
       nd->area_surf = so.seg[g].area;
       nd->nmemb = 0;
     }
-    L->nnd = base + so.nseg;
+    L->nnd = nd0 + so.nseg;
     for (int32_t k = 0; k < np; k++) {
       const hz_poly *P = &ps0->p[k];
       int32_t t = (P->ntri > 0) ? ps0->tri[P->t0] : -1;
       int32_t g = (t >= 0 && t < m->nt) ? so.label[t] : 0;
-      now[k] = base + g;
-      L->nd[base + g].nmemb++;
-      L->nd[L->lab[(size_t)(lev - 1) * (size_t)np + (size_t)k]].parent = base + g;
+      now[k] = nd0 + g;
+      L->nd[nd0 + g].nmemb++;
+      L->nd[L->lab[(size_t)(lev - 1) * (size_t)np + (size_t)k]].parent = nd0 + g;
     }
     /* Полигоны нового уровня: нужны и как вход следующего слияния, и ради
      * периметра с моментами (форма `P/√A`, §55). */
@@ -1010,7 +1015,7 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
       break;
     }
     for (int32_t g = 0; g < so.nseg && g < npset.np; g++) {
-      hz_lodnode *nd = &L->nd[base + g];
+      hz_lodnode *nd = &L->nd[nd0 + g];
       nd->area_elem = npset.p[g].mom[0];
       nd->rad = pl_radius(&npset, &g, 1, npset.p[g].org);
       nd->cx = npset.p[g].org[0];

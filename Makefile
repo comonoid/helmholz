@@ -184,6 +184,12 @@ build/pcoarse: tools/pcoarse.c $(PFULL) | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pcoarse.c $(PFULL) -lm'
 
 # plod — иерархическое огрубление и срез LOD (§56, О16).
+# ОТДЕЛЬНОЕ ИМЯ ДЛЯ РАБОТЫ ПОВЕРХ ИДУЩЕЙ ОЧЕРЕДИ. Пересборка build/plod, пока
+# очередь запускает его по одному прогону, дала бы РАЗНЫЕ версии на разных
+# конфигурациях замера — этот дефект уже кусался (затёртый эталон, §36).
+build/plodx: tools/plod.c $(PFULL) | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/plod.c $(PFULL) -lm'
+
 build/plod: tools/plod.c $(PFULL) | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/plod.c $(PFULL) -lm'
 

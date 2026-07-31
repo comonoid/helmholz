@@ -231,13 +231,13 @@ static int cmp_edge(const void *x, const void *y) {
   return (a->key < b->key) ? -1 : ((a->key > b->key) ? 1 : 0);
 }
 
-static void adj_angles(const hz_objmesh *m, const hz_pseglist *sg, const hz_polyset *ps) {
+static double adj_angles(const hz_objmesh *m, const hz_pseglist *sg, const hz_polyset *ps) {
   edgerec *er = malloc((size_t)m->nt * 3 * sizeof *er);
   int32_t *par = malloc((size_t)ps->np * sizeof *par);
   if (er == NULL || par == NULL) {
     free(er);
     free(par);
-    return;
+    return 0.0;
   }
   for (int32_t i = 0; i < ps->np; i++)
     par[i] = i;
@@ -314,8 +314,35 @@ static void adj_angles(const hz_objmesh *m, const hz_pseglist *sg, const hz_poly
              100.0 * (double)hist[q] / (double)(nadjpair ? nadjpair : 1));
   printf("\n      если слить ВСЕ смежные пары с изломом до 45°: %lld групп (сокращение %.1fx)\n",
          (long long)ng, (double)ps->np / (double)(ng ? ng : 1));
+  /* КАЛИБРОВКА УГЛОВОЙ ЛЕСТНИЦЫ ПО СЦЕНЕ (§76). Возвращается нижняя граница первой
+   * корзины, где лежит хотя бы `1 %` смежных пар, — то есть излом, с которого у
+   * сцены НАЧИНАЕТСЯ масса. Полураствор конуса у пары с изломом `θ` равен `θ/2`,
+   * поэтому первая ступень лестницы есть половина этой величины. Один процент —
+   * не подобранный порог, а требование «корзина не пуста статистически»: при
+   * меньшей доле ступень обслуживала бы единицы пар из миллионов. */
+  double a1 = 0.0;
+  {
+    /* ПЕРВЫЙ ПРОЦЕНТИЛЬ ПО НАКОПЛЕНИЮ, А НЕ ПЕРВАЯ КОРЗИНА С МАССОЙ (§76, поправка
+     * по замеру). Первая редакция брала корзину, где лежит хотя бы процент пар, —
+     * то есть ОСНОВНУЮ МАССУ, — и на зале выбрала `70°`, проскочив все пологие
+     * стыки, которых там 0.44 % ниже пяти градусов. Лестница обязана начинаться у
+     * НИЖНЕГО края распределения, иначе повторяется ровно та ошибка, ради которой
+     * калибровка и заводится. Один процент — требование статистической
+     * непустоты: ниже него ступень обслуживала бы единицы пар из миллионов. */
+    int64_t need = (nadjpair + 99) / 100, acc = 0;
+    for (int q = 0; q < 36; q++) {
+      acc += hist[q];
+      if (acc >= need) {
+        a1 = (double)q * 5.0;
+        break;
+      }
+    }
+  }
+  printf("      КАЛИБРОВКА: масса углов начинается с %.1f°, первая ступень лестницы %.2f°\n", a1,
+         0.5 * a1);
   free(er);
   free(par);
+  return 0.5 * a1;
 }
 
 /* СКОЛЬКО ГРАНЕЙ СМОТРИТ В СТЕНУ (§70.2). Третий путь для города, где пологих
@@ -441,15 +468,15 @@ static void enclosed_faces(const hz_polyset *ps, int K) {
  * заранее — по распределению размеров, а не по прогону лестницы.
  * Размер берётся как `sqrt(площадь)`: у почти квадратной грани это её сторона, а
  * подгонять более хитрую меру не под что. */
-static void face_sizes(const hz_polyset *ps, double delta0) {
+static double face_sizes(const hz_polyset *ps, double delta0) {
   double *sz = malloc((size_t)ps->np * sizeof *sz);
-  if (sz == NULL) return;
+  if (sz == NULL) return 0.0;
   int64_t n = 0;
   for (int32_t i = 0; i < ps->np; i++)
     if (ps->p[i].area > 0.0) sz[n++] = sqrt(ps->p[i].area);
   if (n == 0) {
     free(sz);
-    return;
+    return 0.0;
   }
   qsort(sz, (size_t)n, sizeof *sz, cmp_dbl);
   double p10 = sz[(int64_t)(0.10 * (double)(n - 1))], p50 = sz[(int64_t)(0.50 * (double)(n - 1))];
@@ -468,6 +495,7 @@ static void face_sizes(const hz_polyset *ps, double delta0) {
          "начнут сливаться с уровня %d\n",
          delta0, lfirst, 0.5 * p50, lp10);
   free(sz);
+  return 0.5 * p50;
 }
 
 static void plane_ceiling(const hz_polyset *ps) {
@@ -500,8 +528,9 @@ int main(int argc, char **argv) {
   int city = (argc > 1 && strcmp(argv[1], "city") == 0);
   double dseg = city ? 0.05 : 0.045;
   int simp = 0, vfit = 0, maxlev = 9, uniform = 0, viamerge = 0, bands = 0, bycount = 0,
-      byangle = 0, curve = 0;
+      byangle = 0, curve = 0, auto0 = 0, nosin = 0;
   double epsmul = 1.0, radmul = 1.0, eyemul = 1.0, ang0 = 0.0, vfitlim = 0.0;
+  double cgate = 0.0, ladbase = 0.0;
   const char *save = NULL, *load = NULL;
   /* НЕИЗВЕСТНЫЙ АРГУМЕНТ — ОШИБКА, А НЕ ПРОПУСК (§60, дефект оснастки). Флаг,
    * который не совпал, молчал, и конфигурация вышла тождественной другой; поймать
@@ -529,6 +558,26 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "bycount") == 0) ok = bycount = 1;
     /* ТРЕТЬЯ ТАКТИКА (§67): критерий уровня — УГОЛ (полураствор конуса нормалей). */
     if (strcmp(argv[i], "byangle") == 0) ok = byangle = 1;
+    /* §76: АВТОКАЛИБРОВКА ОБЕИХ ЛЕСТНИЦ ПО РАСПРЕДЕЛЕНИЯМ СЦЕНЫ. Обе величины —
+     * первый допуск и первый угол — задавались руками, и оба раза мимо всего, что
+     * в сцене есть: у города четыре нижних уровня пусты по построению, а угловая
+     * лестница доходила до первого кандидата лишь на последнем уровне. Следствия я
+     * оба раза записал как свойство сцены или тактики. Здесь они берутся из
+     * измеренных распределений: половина медианной грани и половина угла, с
+     * которого начинается масса. */
+    if (strcmp(argv[i], "auto0") == 0) ok = auto0 = 1;
+    /* §79: критерий среза по ПОЛНОМУ смещению, без множителя sin угла взгляда. */
+    if (strcmp(argv[i], "nosin") == 0) ok = nosin = 1;
+    /* §77: ворота при цели по числу, в допусках уровня. */
+    if (strncmp(argv[i], "cgate=", 6) == 0) {
+      cgate = strtod(argv[i] + 6, NULL);
+      ok = 1;
+    }
+    /* §78: основание лестницы (было жёстко 2). */
+    if (strncmp(argv[i], "base=", 5) == 0) {
+      ladbase = strtod(argv[i] + 5, NULL);
+      ok = 1;
+    }
     /* §69: КРИВАЯ «ЭЛЕМЕНТЫ ПРОТИВ ОШИБКИ» ПО СВИПУ ε. Одна точка тактики не
      * решает ничего: на зале срез оставляет 865 полигонов из 993 на нулевом
      * уровне, то есть сравниваются сцены, совпадающие на 87 %. Сравнивать надо
@@ -575,7 +624,8 @@ int main(int argc, char **argv) {
       fprintf(stderr,
               "plod: неизвестный аргумент «%s»\n"
               "  ожидается: [city|hall] [simp] [vfit] [uniform] [viamerge] [bands]\n"
-              "             [bycount] [byangle] [curve] [rad=X] [eye=X] [ang0=X] [vfit=X] [lev=N] "
+              "             [bycount] [byangle] [curve] [rad=X] [eye=X] [ang0=X] [vfit=X] [auto0] "
+              "[lev=N] "
               "[eps=X] "
               "[save=Ф] "
               "[load=Ф]\n",
@@ -598,8 +648,8 @@ int main(int argc, char **argv) {
     if (hz_edge_simplify(&psf, 0.25 * dseg, HZ_EDGE_SHARED, &es) != 0) return 1;
   }
   plane_ceiling(&psf);
-  adj_angles(&m, &sg, &psf);
-  face_sizes(&psf, dseg);
+  double cal_ang = adj_angles(&m, &sg, &psf);
+  double cal_delta = face_sizes(&psf, dseg);
   buried_faces(&psf);
   enclosed_faces(&psf, 32);
   tr3_camera cam;
@@ -619,6 +669,16 @@ int main(int argc, char **argv) {
   const double eps_px = (HZ_CFG_FOV_DEG * M_PI / 180.0) / (double)H;
   const double eps = eps_px * epsmul;
 
+  /* Ладдер начинается со СВОЕГО допуска, отдельного от допуска СЕГМЕНТАЦИИ:
+   * сегментация задаёт точность базового представления и мельчить её нельзя, а
+   * лестнице ниже половины медианной грани делать нечего. */
+  double lad0 = dseg;
+  if (auto0) {
+    if (cal_delta > dseg) lad0 = cal_delta;
+    if (ang0 <= 0.0 && cal_ang > 0.0) ang0 = cal_ang;
+    printf("== АВТОКАЛИБРОВКА: допуск лестницы %.4f м (сегментация %.4f м), первый угол %.2f°\n",
+           lad0, dseg, ang0);
+  }
   double t0 = now_s();
   hz_lod L;
   int rc;
@@ -651,8 +711,19 @@ int main(int argc, char **argv) {
     }
     dseg = L.delta0;
   } else {
-    rc = viamerge ? hz_lod_build_merge(&L, &m, &sg, &psf, dseg, maxlev, eps, bands, bycount,
-                                       byangle, radmul, ang0)
+    hz_lodcfg lc;
+    memset(&lc, 0, sizeof lc);
+    lc.delta0 = lad0;
+    lc.eps = eps;
+    lc.maxlev = maxlev;
+    lc.bands = bands;
+    lc.bycount = bycount;
+    lc.byangle = byangle;
+    lc.radmul = radmul;
+    lc.angle0 = ang0;
+    lc.cgate = cgate;
+    lc.base = ladbase;
+    rc = viamerge ? hz_lod_build_merge(&L, &m, &sg, &psf, &lc)
                   : hz_lod_build(&L, &m, &sg, &psf, dseg, maxlev, eps);
     if (rc != 0) {
       fprintf(stderr, "отказ построения лестницы\n");
@@ -770,7 +841,7 @@ int main(int argc, char **argv) {
   int32_t *cut = malloc((size_t)L.np * sizeof *cut);
   if (cut == NULL) return 1;
   const double *eye = city ? eyec : eyeh;
-  int32_t ncut = hz_lod_cut(&L, eye, eps, cut);
+  int32_t ncut = hz_lod_cut(&L, eye, eps, nosin, cut);
   printf("   СРЕЗ при камере §2 (ε = %.3e рад): элементов %d\n", eps, ncut);
   {
     hz_pseglist so;
@@ -809,7 +880,7 @@ int main(int argc, char **argv) {
   if (curve) {
     const double mul[6] = {0.25, 0.5, 1.0, 2.0, 4.0, 8.0};
     for (int i = 0; i < 6; i++) {
-      hz_lod_cut(&L, eye, eps * mul[i], cut);
+      hz_lod_cut(&L, eye, eps * mul[i], nosin, cut);
       hz_pseglist so;
       if (hz_lod_seglist(&L, &m, &sg, cut, &so) != 0) continue;
       hz_polyset pc;
@@ -863,7 +934,7 @@ int main(int argc, char **argv) {
        * же `cut`, и без этого контроль брал бы уровни ПОСЛЕДНЕГО однородного
        * уровня вместо среза. Поймано печатью гистограммы (А155) в первом же
        * прогоне: она показала «всё на уровне 6» там, где срез сидит на нулевом. */
-      hz_lod_cut(&L, eye, eps, cut);
+      hz_lod_cut(&L, eye, eps, nosin, cut);
       for (int32_t k = 0; k < L.np; k++) {
         lv[k] = L.nd[cut[k]].level;
         if (lv[k] >= 0 && lv[k] < 64) hcut[lv[k]]++;
@@ -917,7 +988,7 @@ int main(int argc, char **argv) {
     printf("   СВИП ПО ε (подпись артефакта; лестница откалибрована под ε = %.3e):\n", L.eps);
     const double mul[4] = {0.5, 1.0, 2.0, 4.0};
     for (int i = 0; i < 4; i++) {
-      int32_t nc = hz_lod_cut(&L, eye, eps * mul[i], cut);
+      int32_t nc = hz_lod_cut(&L, eye, eps * mul[i], nosin, cut);
       int64_t top = 0;
       for (int32_t k = 0; k < L.np; k++)
         if (L.nd[cut[k]].level == L.nlev - 1) top++;

@@ -62,6 +62,23 @@ static int WANT_REF = 1;
  * мог бы оказаться выигрышем над СОБСТВЕННОЙ ступенькой выборки, а не над
  * физикой. Свип по этому числу — обязательная часть приёмки Ш6. */
 static int NVIS_RUN = 2;
+/* Потолок выборки по приёмнику, точек на ось (§80). Значение выбирается ЗАМЕРОМ:
+ * свип по нему обязан показать, с какого места оно перестаёт влиять. */
+static int SAMP_CAP = 64;
+/* РАДИАНС НЕБА В СВИПЕ (§80, вопрос пользователя «зачем там пробы видимости»).
+ *
+ * Пробы видимости — цена ОБХОДНОГО МАНЁВРА, а не свойство механизма. В свипе по
+ * ординатам заслонение возникает само: свет идёт вдоль направления и гасится
+ * геометрией, попарной видимости там нет как объекта. `pdirect` вынесен ИЗ
+ * ординат по замеру Ш5 — компактный источник углового размера `0.15` рад виден
+ * лишь вдоль немногих ординат, и при `ND = 256` это давало 11 % площади сцены с
+ * ошибкой выше 10 %. Вынесли — пришлось доставать заслонение отдельно.
+ *
+ * К НЕБУ ЭТОТ ДОВОД НЕ ОТНОСИТСЯ: его угловой размер порядка `π`, то есть полная
+ * противоположность компактному, и ординаты представляют его отлично. Поэтому у
+ * города источник задаётся ФОНОМ свипа, а не площадкой через `pdirect`: ни одной
+ * пробы видимости, ни одного теневого луча — тени получаются из самого свипа. */
+static double SKY_L = 0.0;
 /* Кадр МЕТРИКИ — 512², а не 1024² из §2. Эталон стоит (пиксели × источники ×
  * 36 лучей), и на 1024² один прогон занимает минуты, а их в свипе двадцать.
  * Для КАРТИНКИ НА ГЛАЗ это не годится, и картинка пишется отдельно в полном
@@ -387,7 +404,10 @@ static int solve(scene *S, const tr3_dirs *d, double h, double tol) {
   memset(&st, 0, sizeof st);
   double t0 = now_s();
   hz_psweep_zero(&S->t);
-  hz_direct_add(&S->t, &S->g, S->src, S->nsrc, S->srcLe, NVIS_RUN, h, &st);
+  /* При небе-фоне прямой свет через `pdirect` не считается вовсе: источника-полигона
+   * нет, и считать нечего. */
+  if (S->nsrc > 0)
+    hz_direct_add(&S->t, &S->g, S->src, S->nsrc, S->srcLe, NVIS_RUN, h, SAMP_CAP, &st);
   double *accdir = malloc((size_t)S->t.np * 3 * sizeof *accdir);
   if (accdir == NULL) return 1;
   memcpy(accdir, S->t.acc, (size_t)S->t.np * 3 * sizeof *accdir);
@@ -402,7 +422,7 @@ static int solve(scene *S, const tr3_dirs *d, double h, double tol) {
   for (; nb < 200; nb++) {
     memset(&st, 0, sizeof st);
     memcpy(S->t.acc, accdir, (size_t)S->t.np * 3 * sizeof *accdir);
-    if (hz_psweep_gather(&S->t, d, h, 0, 0.0, HZ_LAYOUT_RUNS, &st) != 0) {
+    if (hz_psweep_gather(&S->t, d, h, 0, SKY_L, HZ_LAYOUT_RUNS, &st) != 0) {
       free(accdir);
       return 1;
     }
@@ -1000,6 +1020,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "нет сцены\n");
     return 1;
   }
+  printf("== СЦЕНА: габарит (%.1f %.1f %.1f) … (%.1f %.1f %.1f), треугольников %d\n", base.lo[0],
+         base.lo[1], base.lo[2], base.hi[0], base.hi[1], base.hi[2], base.nt);
   tr3_camera cam;
   double eyeh[3] = HZ_CFG_HALL_EYE, ath[3] = HZ_CFG_HALL_AT;
   double eyec[3] = HZ_CFG_CITY_EYE, atc[3] = HZ_CFG_CITY_AT;
@@ -1007,6 +1029,16 @@ int main(int argc, char **argv) {
   for (int c = 0; c < 3; c++) {
     eye[c] = city ? eyec[c] : eyeh[c];
     at[c] = city ? atc[c] : ath[c];
+  }
+  /* КАМЕРА ПЕРЕОПРЕДЕЛЯЕТСЯ С КОМАНДНОЙ СТРОКИ (§80). Городская камера из
+   * конфигурации стоит на земле и смотрит горизонтально — она заводилась для
+   * МЕТРИКИ, где важен разброс дальностей, а не для показа города. Положение
+   * камеры на срез не влияет иначе как через дальности: `ε` лестницы сверяется по
+   * разрешению кадра, а не по точке съёмки. */
+  for (int i = 1; i < argc; i++) {
+    if (strncmp(argv[i], "eye=", 4) == 0)
+      sscanf(argv[i] + 4, "%lf,%lf,%lf", &eye[0], &eye[1], &eye[2]);
+    if (strncmp(argv[i], "at=", 3) == 0) sscanf(argv[i] + 3, "%lf,%lf,%lf", &at[0], &at[1], &at[2]);
   }
   if (tr3_camera_look(&cam, eye, at, up, HZ_CFG_FOV_DEG * M_PI / 180.0, IMGW, IMGH) != 0) return 1;
   tr3_dirs d;
@@ -1096,6 +1128,8 @@ int main(int argc, char **argv) {
     for (int i = 7; i < argc; i++) {
       if (strncmp(argv[i], "w=", 2) == 0) IMGW = (int)strtol(argv[i] + 2, NULL, 10);
       if (strncmp(argv[i], "vis=", 4) == 0) NVIS_RUN = (int)strtol(argv[i] + 4, NULL, 10);
+      if (strncmp(argv[i], "cap=", 4) == 0) SAMP_CAP = (int)strtol(argv[i] + 4, NULL, 10);
+      if (strncmp(argv[i], "sky=", 4) == 0) SKY_L = strtod(argv[i] + 4, NULL);
     }
     if (IMGW < 64) IMGW = 64;
     IMGH = IMGW;
@@ -1135,16 +1169,20 @@ int main(int argc, char **argv) {
       if (strncmp(argv[i], "ball=", 5) != 0) continue;
       const char *w = argv[i] + 5;
       double sx = base.hi[0] - base.lo[0], sz = base.hi[2] - base.lo[2];
-      double rr = ((sx > sz) ? sx : sz) / 18.0;
+      double rr = ((sx > sz) ? sx : sz) / 16.0;
       int mir = (strcmp(w, "mirror") == 0 || strcmp(w, "both") == 0);
       int gls = (strcmp(w, "glass") == 0 || strcmp(w, "both") == 0);
       /* Центр — НЕ у точки прицела: там стена, и шары в неё упирались. Берётся
        * точка на 45 % пути от глаза к прицелу и поднимается — это середина
        * открытого пространства кадра при любой камере, а не подобранные числа. */
+      /* НАД СТОЛОМ (замечание пользователя: «лучше всего, когда они над столом,
+       * видно хорошо»). Точка прицела камеры и есть стол; `0.8` пути от глаза
+       * ставит шары над ним и при этом не вплотную к дальней стене, в которую они
+       * упирались при `1.0`. Подъём — полтора радиуса над точкой прицела. */
       double ctr[3];
       for (int c = 0; c < 3; c++)
-        ctr[c] = eye[c] + 0.45 * (at[c] - eye[c]);
-      double up0 = rr * 1.1;
+        ctr[c] = eye[c] + 0.8 * (at[c] - eye[c]);
+      double up0 = rr * 1.5;
       if (mir) {
         g_ball[g_nball].c[0] = ctr[0];
         g_ball[g_nball].c[1] = ctr[1] + up0;
@@ -1165,6 +1203,13 @@ int main(int argc, char **argv) {
       }
       printf("== ШАРЫ: %d, радиус %.3f м, центр у точки прицела\n", g_nball, rr);
     }
+    /* ТОЛЬКО СРЕЗ (§79, оснастка). Ветвь гоняла ВСЕ уровни лестницы: нулевой,
+     * срез, каждый однородный и контроль — то есть семнадцать полных решений
+     * свипа при пятнадцати уровнях. Для ЗАМЕРА это и нужно, для КАРТИНКИ — нет, и
+     * на городе разница между «сорок минут» и «двенадцать часов». */
+    int only_cut = 0;
+    for (int i = 7; i < argc; i++)
+      if (strcmp(argv[i], "onlycut") == 0) only_cut = 1;
     int ssaa = 2;
     for (int i = 7; i < argc; i++)
       if (strncmp(argv[i], "ss=", 3) == 0) ssaa = (int)strtol(argv[i] + 3, NULL, 10);
@@ -1198,7 +1243,7 @@ int main(int argc, char **argv) {
     }
 
     /* Ветвь: по выбору узлов `sel` построить сцену, решить, снять кадр. */
-    for (int pass = 0; pass < L.nlev + 2; pass++) {
+    for (int pass = only_cut ? 1 : 0; pass < (only_cut ? 2 : L.nlev + 2); pass++) {
       char tag[64], img[96];
       if (pass == 0) {
         /* НУЛЕВОЙ УРОВЕНЬ. */
@@ -1226,12 +1271,21 @@ int main(int argc, char **argv) {
       hz_pseglist so;
       if (hz_lod_seglist(&L, &base, &sgf, sel, &so) != 0) return 1;
       scene C;
-      if (scene_from(&C, &base, &so, base.lo, base.hi, city ? -1 : 8) != 0) return 1;
+      /* `nsrc = 0` — источников-полигонов нет вовсе: город освещён ФОНОМ свипа. */
+      if (scene_from(&C, &base, &so, base.lo, base.hi, city ? ((SKY_L > 0.0) ? 0 : -1) : 8) != 0)
+        return 1;
       if (solve(&C, &d, h, 1e-4) != 0) return 1;
       if (havefine) {
         C.gfine = &gfine;
         C.albf = albf;
       }
+      /* РАЗБИВКА ПО ФАЗАМ (§79, оснастка). «Рендер идёт пятнадцать минут» — жалоба,
+       * а не адрес: тот же урок, что в `pcoarse`. Без этих трёх чисел я гадал,
+       * где время — в геометрии, в прямом свете или в свипе, — и один раз уже
+       * угадал неверно (винил шаг растра). */
+      printf("      фазы, с: прямой свет %.1f, свип %.1f (отскоков %d), элементов %d\n", C.t_direct,
+             C.t_solve, C.nbounce, C.ps.np);
+      fflush(stdout);
       imgstat sc;
       if (render(&C, &cam, &sc, NULL, NULL) != 0) return 1;
       /* Цветной кадр — отдельным путём, суперсэмплинг 2×2 (§78). */
@@ -1241,6 +1295,21 @@ int main(int argc, char **argv) {
       fflush(stdout);
       scene_free(&C);
       hz_seg_free(&so);
+    }
+
+    if (only_cut) {
+      free(sel);
+      free(lev_of);
+      if (havefine) {
+        hz_pray_free(&gfine);
+        hz_poly_free(&psfine);
+        free(albf);
+      }
+      hz_lod_free(&L);
+      hz_seg_free(&sgf);
+      tr3_dirs_free(&d);
+      hz_obj_free(&base);
+      return 0;
     }
 
     /* НЕГАТИВНЫЙ КОНТРОЛЬ: те же уровни, розданные ДРУГИМ полигонам (А146).
@@ -1266,7 +1335,9 @@ int main(int argc, char **argv) {
       hz_pseglist so;
       if (hz_lod_seglist(&L, &base, &sgf, sel, &so) != 0) return 1;
       scene C;
-      if (scene_from(&C, &base, &so, base.lo, base.hi, city ? -1 : 8) != 0) return 1;
+      /* `nsrc = 0` — источников-полигонов нет вовсе: город освещён ФОНОМ свипа. */
+      if (scene_from(&C, &base, &so, base.lo, base.hi, city ? ((SKY_L > 0.0) ? 0 : -1) : 8) != 0)
+        return 1;
       if (solve(&C, &d, h, 1e-4) != 0) return 1;
       imgstat sc;
       if (render(&C, &cam, &sc, "img/o22_perm.ppm", NULL) != 0) return 1;

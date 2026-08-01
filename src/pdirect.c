@@ -88,9 +88,10 @@ static void src_point(const hz_polyset *ps, int32_t src, double a, double b, dou
 }
 
 int hz_direct_add(hz_ptrans *t, const hz_pray *g, const int32_t *src, int nsrc, const double *Le,
-                  int nvis, double hsamp, hz_pstats *st) {
+                  int nvis, double hsamp, int cap, hz_pstats *st) {
   const hz_polyset *ps = t->ps;
   if (nvis < 1) nvis = 1;
+  if (cap < 4) cap = (cap <= 0) ? 64 : 4;
   int64_t nray = 0, nsample = 0;
 
 #pragma omp parallel for schedule(dynamic, 8) reduction(+ : nray, nsample)
@@ -114,8 +115,8 @@ int hz_direct_add(hz_ptrans *t, const hz_pray *g, const int32_t *src, int nsrc, 
      * полигону 65 536 точек, то есть 18.9 млн теневых лучей на ОДИН полигон при
      * восьми источниках и 36 пробах, — час на конфигурацию и ни одной цифры
      * сверх того, что даёт `64`. */
-    if (nu > 64) nu = 64;
-    if (nvv > 64) nvv = 64;
+    if (nu > cap) nu = cap;
+    if (nvv > cap) nvv = cap;
     double s0 = 0.0, s1 = 0.0, s2 = 0.0;
     int32_t nin = 0;
     for (int iu = 0; iu < nu; iu++)

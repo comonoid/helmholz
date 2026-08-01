@@ -109,7 +109,9 @@ void hz_hcube_free(hz_hcube *h) {
  * `w = p·f > 0`: без него точки позади камеры грани дают зеркальные призраки. */
 static void hc_tri_face(hz_hcube *h, const hc_face *F, int base, const double v0[3],
                         const double v1[3], const double v2[3], int32_t pid) {
-  double P[4][3];
+  /* Инициализация не косметика: цикл отсечения пишет от 0 до 4 вершин, и
+   * анализатор обязан видеть, что чтения ниже покрыты записями. */
+  double P[4][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
   int np = 0;
   const double *in[3] = {v0, v1, v2};
   double wv[3];
@@ -131,7 +133,8 @@ static void hc_tri_face(hz_hcube *h, const hc_face *F, int base, const double v0
   }
   if (np < 3) return;
   /* экранные координаты и дальность */
-  double sx[4], sy[4], sd[4];
+  double sx[4] = {0.0, 0.0, 0.0, 0.0}, sy[4] = {0.0, 0.0, 0.0, 0.0};
+  double sd[4] = {0.0, 0.0, 0.0, 0.0};
   double da = (F->u1 - F->u0) / F->w, db = (F->v1 - F->v0) / F->h;
   for (int i = 0; i < np; i++) {
     double w = P[i][0] * F->f[0] + P[i][1] * F->f[1] + P[i][2] * F->f[2];

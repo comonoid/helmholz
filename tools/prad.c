@@ -77,7 +77,7 @@ static int cmp_d(const void *a, const void *b) {
  * Сверх того есть явный флаг материала `flat`.
  */
 #define SH_DEPTH                                                                                   \
-  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает \
+  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает                                 \
      * стоимость; глубже вклад падает как произведение долей */
 
 /* ТОЧНЫЙ ФРЕНЕЛЬ ПО НЕПОЛЯРИЗОВАННОМУ СВЕТУ. Приближение Шлика не нужно: точная
@@ -379,7 +379,7 @@ static void shade_ray(const sh_ctx *S, const double o[3], const double d[3], int
 int main(int argc, char **argv) {
   int city = 0, w = 512, ss = 2, nvis = 2, maxlev = 13, noself = 0, nopull = 0, disk = 0,
       noclip = 0, oldpt = 0, flatn = 0, nospec = 0, noballs = 0, h = 0, spec = 0, nodiag = 0,
-      ceillight = 0, novis = 0;
+      ceillight = 0, novis = 0, hemi = 0;
   double ballior = 1.5;
   double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0, segcap = 0.5;
   for (int i = 1; i < argc; i++) {
@@ -415,6 +415,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "novis") == 0) novis = 1;
     /* §92: ограничение габарита элемента переноса, метры; `0` — без него. */
     if (strncmp(argv[i], "cap=", 4) == 0) segcap = strtod(argv[i] + 4, NULL);
+    /* §94: сборка ПОЛУКУБОМ разрешения `hemi`; `0` — прежняя, попарная. */
+    if (strncmp(argv[i], "hemi=", 5) == 0) hemi = (int)strtol(argv[i] + 5, NULL, 10);
   }
 
   /* САМОПРОВЕРКА ФОРМУЛЫ — ПЕРВОЙ, ДО ВСЯКОЙ СЦЕНЫ (А205). Ошибка знака или
@@ -542,7 +544,8 @@ int main(int argc, char **argv) {
   lkc.novis = novis;
   hz_linkset S;
   t0 = now_s();
-  if (hz_links_build(&S, &sc, &lkc) != 0) {
+  int brc = (hemi > 0) ? hz_links_build_hemi(&S, &sc, &lkc, hemi) : hz_links_build(&S, &sc, &lkc);
+  if (brc != 0) {
     fprintf(stderr, "отказ сборки связей\n");
     return 1;
   }

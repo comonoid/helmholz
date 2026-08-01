@@ -1,4 +1,5 @@
 /* plink.c — сборка и решение оператора связями. Разбор — в `plink.h`. */
+#include "phcube.h"
 #include "plink.h"
 #include <math.h>
 #include <stdlib.h>
@@ -912,4 +913,132 @@ void hz_links_evec(const hz_linkset *S, const hz_lod *L, const double *pt, const
           Ev[3 * k + c] += Ev[3 * p + c];
       }
     }
+}
+
+/* --- СБОРКА ПОЛУКУБОМ (§94) -------------------------------------------------
+ *
+ * Пары не перебираются вовсе. Для каждого ЛИСТА ставится полукуб, сцена рисуется
+ * в него один раз, и каждый пиксель голосует дельта-форм-фактором за ПРЕДКА того
+ * полигона, в который попал. Предок выбирается тем же критерием `√A/r < ε`, но
+ * `ε` берётся НЕ МЕНЬШЕ угловой ширины пикселя полукуба `2/R`: дробить мельче
+ * того, что полукуб способен разрешить, бессмысленно, и это не порог, а
+ * разрешение прибора.
+ *
+ * ВИДИМОСТЬ И ФОРМ-ФАКТОР ЗДЕСЬ ОДНО ЧИСЛО. Заслонение учитывается буфером
+ * глубины: если пиксель занят ближним полигоном, дальний за него не голосует.
+ * Отсюда `Σf` по листу выходит равным ДОЛЕ ПОЛУСФЕРЫ, накрытой геометрией, —
+ * то есть той самой замкнутости `0.980`, что мерилась лучами независимо.
+ *
+ * ПРАВИЛО «ЭЛЕМЕНТ НЕ ЗАТЕНЯЕТ САМ СЕБЯ» (§88) здесь выражается прямо: свой
+ * полигон в полукуб не рисуется вовсе. Компланарные чужие куски (§93) отсекаются
+ * тем, что лежат в касательной плоскости и дают нулевой дельта-форм-фактор. */
+static int32_t hc_pick(const hz_lod *L, int32_t poly, double r, double eps) {
+  if (poly < 0 || poly >= L->np) return -1;
+  int32_t nd = L->lab[poly];
+  if (!(r > 0.0)) return nd;
+  for (;;) {
+    int32_t p = L->nd[nd].parent;
+    if (p < 0 || p >= L->nnd) break;
+    if (sqrt(L->nd[p].area_surf) / r >= eps) break;
+    nd = p;
+  }
+  return nd;
+}
+
+int hz_links_build_hemi(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg, int R) {
+  memset(S, 0, sizeof *S);
+  const hz_lod *L = sc->L;
+  if (sc->ps == NULL || sc->m == NULL) return 1;
+  double *pt = malloc(3 * (size_t)L->nnd * sizeof *pt);
+  int32_t *t2p = malloc((size_t)sc->m->nt * sizeof *t2p);
+  if (pt == NULL || t2p == NULL || hz_links_points(pt, L, sc->ps, sc->m, cfg->oldpt) != 0) {
+    free(pt);
+    free(t2p);
+    return 2;
+  }
+  for (int32_t k = 0; k < sc->ps->np; k++)
+    for (int32_t t = sc->ps->p[k].t0; t < sc->ps->p[k].t0 + sc->ps->p[k].ntri; t++)
+      t2p[sc->ps->tri[t]] = k;
+  /* Допуск связи: не мельче разрешения полукуба (см. заголовок). */
+  double eps = cfg->eps;
+  double epx = 2.0 / (double)R;
+  if (eps < epx) eps = epx;
+
+  int64_t nmiss = 0, npix = 0;
+  int rc = 0;
+#pragma omp parallel reduction(+ : nmiss, npix)
+  {
+    hz_hcube h;
+    double *acc = calloc((size_t)L->nnd, sizeof *acc);
+    int32_t *touch = malloc((size_t)L->nnd * sizeof *touch);
+    hz_link *loc = NULL;
+    int64_t nloc = 0, cloc = 0;
+    int ok = (acc != NULL && touch != NULL && hz_hcube_init(&h, R) == 0);
+#pragma omp for schedule(dynamic, 8)
+    for (int32_t k = 0; k < L->np; k++) {
+      if (!ok) continue;
+      int32_t nd = L->lab[k]; /* лист-приёмник */
+      hz_hcube_draw(&h, sc->m, t2p, pt + 3 * nd, L->nd[nd].n, k);
+      int32_t nt2 = 0;
+      for (int i = 0; i < h.npix; i++) {
+        double w = h.dff[i];
+        if (!(w > 0.0)) continue;
+        npix++;
+        if (h.id[i] < 0) {
+          nmiss++;
+          continue;
+        }
+        int32_t e = hc_pick(L, h.id[i], h.depth[i], eps);
+        if (e < 0 || e == nd) continue;
+        if (!(acc[e] > 0.0)) touch[nt2++] = e;
+        acc[e] += w;
+      }
+      for (int32_t q = 0; q < nt2; q++) {
+        int32_t e = touch[q];
+        if (nloc >= cloc) {
+          int64_t nc = (cloc > 0) ? cloc * 2 : 4096;
+          hz_link *nl = realloc(loc, (size_t)nc * sizeof *nl);
+          if (nl == NULL) {
+            ok = 0;
+            break;
+          }
+          loc = nl;
+          cloc = nc;
+        }
+        loc[nloc].i = nd;
+        loc[nloc].j = e;
+        loc[nloc].f = acc[e];
+        nloc++;
+        acc[e] = 0.0;
+      }
+    }
+#pragma omp critical
+    {
+      if (!ok) rc = 2;
+      for (int64_t q = 0; q < nloc && rc == 0; q++)
+        if (lk_push(S, loc[q].i, loc[q].j, loc[q].f) != 0) rc = 2;
+    }
+    free(acc);
+    free(touch);
+    free(loc);
+    hz_hcube_free(&h);
+  }
+  free(pt);
+  free(t2p);
+  if (rc != 0) return rc;
+  S->nray = npix;
+  S->nzero = nmiss;
+  S->nvisit = (int64_t)L->np * sc->m->nt;
+  {
+    int64_t *cnt = calloc((size_t)L->nnd, sizeof *cnt);
+    if (cnt != NULL) {
+      for (int64_t q = 0; q < S->n; q++)
+        cnt[S->l[q].i]++;
+      for (int32_t q = 0; q < L->nnd; q++)
+        if (cnt[q] > S->nmax_node) S->nmax_node = cnt[q];
+      free(cnt);
+    }
+  }
+  lk_closure(S, L);
+  return 0;
 }

@@ -169,8 +169,14 @@ static int mtl_add(hz_objmesh *m, const char *name, size_t n, double kd) {
   memcpy(m->mtl[m->nmtl].name, name, n);
   m->mtl[m->nmtl].name[n] = '\0';
   m->mtl[m->nmtl].kd = kd;
-  for (int c = 0; c < 3; c++)
+  for (int c = 0; c < 3; c++) {
     m->mtl[m->nmtl].kd3[c] = kd;
+    m->mtl[m->nmtl].ks3[c] = 0.0;
+  }
+  m->mtl[m->nmtl].ns = 0.0;
+  m->mtl[m->nmtl].ior = 1.0;
+  m->mtl[m->nmtl].alpha = 1.0;
+  m->mtl[m->nmtl].flat = 0;
   m->nmtl++;
   return (int)(m->nmtl - 1);
 }
@@ -209,6 +215,19 @@ static void mtl_load(hz_objmesh *m, const char *objpath, const char *name, size_
       m->mtl[cur].kd3[0] = c0;
       m->mtl[cur].kd3[1] = c1;
       m->mtl[cur].kd3[2] = c2;
+    } else if (p[0] == 0x4B && p[1] == 0x73 && is_sp(p[2]) && cur >= 0) {
+      char *e = NULL;
+      m->mtl[cur].ks3[0] = strtod(p + 2, &e);
+      m->mtl[cur].ks3[1] = strtod(e, &e);
+      m->mtl[cur].ks3[2] = strtod(e, &e);
+    } else if (p[0] == 0x4E && p[1] == 0x73 && is_sp(p[2]) && cur >= 0) {
+      m->mtl[cur].ns = strtod(p + 2, NULL);
+    } else if (p[0] == 0x4E && p[1] == 0x69 && is_sp(p[2]) && cur >= 0) {
+      m->mtl[cur].ior = strtod(p + 2, NULL);
+    } else if (p[0] == 0x64 && is_sp(p[1]) && cur >= 0) {
+      m->mtl[cur].alpha = strtod(p + 1, NULL);
+    } else if (strncmp(p, "hz_flat", 7) == 0 && is_sp(p[7]) && cur >= 0) {
+      m->mtl[cur].flat = (strtod(p + 7, NULL) > 0.5);
     }
     p = skip_line(p);
   }

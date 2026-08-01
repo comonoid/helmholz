@@ -137,6 +137,12 @@ double hz_links_ff_selftest(double *f_big, double *f_unit, double *ref_unit);
  * только ручки внутри одной формулы, величина не двигалась вовсе (А204). */
 void hz_links_sf(const hz_linkset *S, const hz_lod *L, double *sf);
 
+/* Вектор облучённости на узле — четыре числа `E₀` и `E⃗` из §85.2. Разбор в
+ * `plink.c`. `pt` — опорные точки переноса, `B` — решённый радианс; `E0` на
+ * `nnd`, `Ev` на `3·nnd`. Считается ОДИН раз после сходимости. */
+void hz_links_evec(const hz_linkset *S, const hz_lod *L, const double *pt, const double *B,
+                   double *E0, double *Ev);
+
 /* ЭТАЛОН ПОЛНЫМ ПЕРЕБОРОМ. Для каждого `stride`-го листа `Σf` считается по ВСЕМ
  * листьям сцены, без иерархии, тем же точным форм-фактором. Различает две
  * причины, которые ни `Σf`, ни ссылка лучами по отдельности не различают:

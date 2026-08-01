@@ -656,6 +656,129 @@ int main(int argc, char **argv) {
            "%lld, больше двух %lld\n",
            (long long)st, (long long)s1, 100.0 * (double)s1 / (double)st, (long long)s2,
            (long long)sm);
+    /* А ЯВЛЯЮТСЯ ЛИ ОДИНОКИЕ РЁБРА КРАЯ настоящими открытыми краями СЕТКИ?
+     * Если да — дефекта нет вовсе, и вывод §104 неверен. Сверка идёт по
+     * ПОЛОЖЕНИЮ середины ребра, потому что номера у сетки и у края разные. */
+    {
+      int64_t nme = (int64_t)m.nt * 3;
+      int64_t *mk = malloc((size_t)nme * sizeof *mk);
+      if (mk == NULL) return 1;
+      const double QQ = 1e6; /* квантование положения, 1 мкм на единицу */
+      for (int32_t t = 0; t < m.nt; t++)
+        for (int i2 = 0; i2 < 3; i2++) {
+          const double *pa = m.v + 3 * (size_t)m.f[(size_t)t * 3 + (size_t)i2];
+          const double *pb = m.v + 3 * (size_t)m.f[(size_t)t * 3 + (size_t)((i2 + 1) % 3)];
+          int64_t hh = 1469598103934665603LL;
+          for (int c2 = 0; c2 < 3; c2++) {
+            int64_t q3 = (int64_t)llround(0.5 * (pa[c2] + pb[c2]) * QQ);
+            hh = (hh ^ q3) * 1099511628211LL;
+          }
+          mk[(size_t)t * 3 + (size_t)i2] = hh;
+        }
+      qsort(mk, (size_t)nme, sizeof *mk, cmp_i64);
+      /* для каждого одинокого ребра края — сколько треугольников у сетки */
+      int64_t nopen = 0, nclosed = 0;
+      for (int32_t k = 0; k < ps.np; k++) {
+        const hz_poly *p = &ps.p[k];
+        for (int32_t li = 0; li < p->nloop; li++) {
+          int32_t b0 = ps.loop[p->l0 + li], b1 = ps.loop[p->l0 + li + 1];
+          for (int32_t b = b0; b < b1; b++) {
+            int32_t c2 = (b + 1 < b1) ? b + 1 : b0;
+            int64_t a = (ps.bw != NULL) ? ps.bw[b] : b, d = (ps.bw != NULL) ? ps.bw[c2] : c2;
+            int64_t lo2 = a < d ? a : d, hi2 = a < d ? d : a;
+            int64_t key = lo2 * 4294967296LL + hi2;
+            /* одиноко ли это ребро края */
+            int64_t *f2 = bsearch(&key, ek, (size_t)q2, sizeof *ek, cmp_i64);
+            if (f2 == NULL) continue;
+            int64_t cnt2 = 0;
+            for (int64_t z = f2 - ek; z >= 0 && ek[z] == key; z--)
+              cnt2++;
+            for (int64_t z = f2 - ek + 1; z < q2 && ek[z] == key; z++)
+              cnt2++;
+            if (cnt2 != 1) continue;
+            double w0[3], w1[3];
+            for (int c3 = 0; c3 < 3; c3++) {
+              w0[c3] = p->org[c3] + ps.bv[2 * b] * p->eu[c3] + ps.bv[2 * b + 1] * p->ev[c3];
+              w1[c3] = p->org[c3] + ps.bv[2 * c2] * p->eu[c3] + ps.bv[2 * c2 + 1] * p->ev[c3];
+            }
+            int64_t hh2 = 1469598103934665603LL;
+            for (int c3 = 0; c3 < 3; c3++) {
+              int64_t q3 = (int64_t)llround(0.5 * (w0[c3] + w1[c3]) * QQ);
+              hh2 = (hh2 ^ q3) * 1099511628211LL;
+            }
+            int64_t *g2 = bsearch(&hh2, mk, (size_t)nme, sizeof *mk, cmp_i64);
+            int64_t mc = 0;
+            if (g2 != NULL) {
+              for (int64_t z = g2 - mk; z >= 0 && mk[z] == hh2; z--)
+                mc++;
+              for (int64_t z = g2 - mk + 1; z < nme && mk[z] == h; z++)
+                mc++;
+            }
+            if (mc <= 1)
+              nopen++;
+            else
+              nclosed++;
+          }
+        }
+      }
+      printf("   из них ОТКРЫТЫХ краёв сетки %lld, а внутренних (дефект) %lld\n", (long long)nopen,
+             (long long)nclosed);
+      /* СКОЛЬКО ОТКРЫТЫХ РЁБЕР ИМЕЮТ ГЕОМЕТРИЧЕСКОГО ПАРТНЁРА В ПРЕДЕЛАХ ε.
+       * Предложение пользователя 08-02: отождествить точки, отличающиеся меньше
+       * чем на ε. Здесь мерится, СКОЛЬКО оно склеит — панели, смыкающиеся
+       * геометрически, но не сшитые топологически. Партнёр ищется по середине
+       * ребра, квантованной шагом ε. */
+      for (int pw = 0; pw < 3; pw++) {
+        double eps2 = (pw == 0) ? 1e-4 : ((pw == 1) ? 1e-3 : 1e-2);
+        int64_t *op = malloc((size_t)(nopen > 0 ? nopen : 1) * sizeof *op);
+        if (op == NULL) return 1;
+        int64_t no2 = 0;
+        for (int32_t k = 0; k < ps.np && no2 < nopen; k++) {
+          const hz_poly *p = &ps.p[k];
+          for (int32_t li = 0; li < p->nloop; li++) {
+            int32_t b0 = ps.loop[p->l0 + li], b1 = ps.loop[p->l0 + li + 1];
+            for (int32_t b = b0; b < b1 && no2 < nopen; b++) {
+              int32_t c2 = (b + 1 < b1) ? b + 1 : b0;
+              int64_t a = (ps.bw != NULL) ? ps.bw[b] : b, d = (ps.bw != NULL) ? ps.bw[c2] : c2;
+              int64_t lo2 = a < d ? a : d, hi2 = a < d ? d : a;
+              int64_t key = lo2 * 4294967296LL + hi2;
+              int64_t *f2 = bsearch(&key, ek, (size_t)q2, sizeof *ek, cmp_i64);
+              if (f2 == NULL) continue;
+              int64_t cnt2 = 0;
+              for (int64_t z = f2 - ek; z >= 0 && ek[z] == key; z--)
+                cnt2++;
+              for (int64_t z = f2 - ek + 1; z < q2 && ek[z] == key; z++)
+                cnt2++;
+              if (cnt2 != 1) continue;
+              double w0[3], w1[3];
+              for (int c3 = 0; c3 < 3; c3++) {
+                w0[c3] = p->org[c3] + ps.bv[2 * b] * p->eu[c3] + ps.bv[2 * b + 1] * p->ev[c3];
+                w1[c3] = p->org[c3] + ps.bv[2 * c2] * p->eu[c3] + ps.bv[2 * c2 + 1] * p->ev[c3];
+              }
+              int64_t hh3 = 1469598103934665603LL;
+              for (int c3 = 0; c3 < 3; c3++) {
+                int64_t q4 = (int64_t)llround(0.5 * (w0[c3] + w1[c3]) / eps2);
+                hh3 = (hh3 ^ q4) * 1099511628211LL;
+              }
+              op[no2++] = hh3;
+            }
+          }
+        }
+        qsort(op, (size_t)no2, sizeof *op, cmp_i64);
+        int64_t npair = 0;
+        for (int64_t i3 = 0; i3 < no2;) {
+          int64_t j3 = i3;
+          while (j3 < no2 && op[j3] == op[i3])
+            j3++;
+          if (j3 - i3 > 1) npair += j3 - i3;
+          i3 = j3;
+        }
+        printf("   при ε = %.0e м: у %lld из %lld открытых рёбер есть партнёр (%.1f %%)\n", eps2,
+               (long long)npair, (long long)no2, 100.0 * (double)npair / (double)(no2 ? no2 : 1));
+        free(op);
+      }
+      free(mk);
+    }
     free(ek);
   }
   {

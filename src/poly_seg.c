@@ -269,7 +269,31 @@ static void work_free(seg_work *w) {
   free(w->g.lev);
 }
 
-int hz_seg_planar(hz_pseglist *s, const hz_objmesh *m, double delta) {
+/* Влезает ли кандидат в ограничение габарита участка. `smax <= 0` — без него. */
+static int fits_cap(const double rlo[3], const double rhi[3], const double bb[6], double smax) {
+  if (!(smax > 0.0)) return 1;
+  for (int a = 0; a < 3; a++) {
+    double l = (rlo[a] < bb[a]) ? rlo[a] : bb[a];
+    double h = (rhi[a] > bb[3 + a]) ? rhi[a] : bb[3 + a];
+    if (h - l > smax) return 0;
+  }
+  return 1;
+}
+
+static void grow_box(double rlo[3], double rhi[3], const double bb[6]) {
+  for (int a = 0; a < 3; a++) {
+    if (bb[a] < rlo[a]) rlo[a] = bb[a];
+    if (bb[3 + a] > rhi[a]) rhi[a] = bb[3 + a];
+  }
+}
+
+/* ОГРАНИЧЕНИЕ РАЗМЕРА УЧАСТКА (§92). Прежде критерий роста был ОДИН —
+ * планарность в пределах `delta`, — и плоскому полу расти было нечего мешать:
+ * замерено 3.23 м² одним элементом на 557 536 пикселей кадра, а тень внутри
+ * одного элемента не появится ни при каком решателе. `smax` ограничивает габарит
+ * участка по каждой оси; `0` — прежнее поведение, без ограничения. Отвергнутый
+ * кандидат НЕ теряется: внешний цикл заводит для него новое зерно. */
+int hz_seg_planar_cap(hz_pseglist *s, const hz_objmesh *m, double delta, double smax) {
   memset(s, 0, sizeof *s);
   s->delta = delta;
   const int32_t nt = m->nt;
@@ -514,6 +538,11 @@ int hz_seg_planar(hz_pseglist *s, const hz_objmesh *m, double delta) {
       fit_solve(&fit);
       label[sd] = r;
       int32_t qs = 0, qe = 0, nextrefit = 2;
+      double rlo[3], rhi[3];
+      for (int a = 0; a < 3; a++) {
+        rlo[a] = w.bb[(size_t)sd * 6 + (size_t)a];
+        rhi[a] = w.bb[(size_t)sd * 6 + 3 + (size_t)a];
+      }
       w.queue[qe++] = sd;
 
       while (qs < qe) {
@@ -542,7 +571,9 @@ int hz_seg_planar(hz_pseglist *s, const hz_objmesh *m, double delta) {
                   double q[3][3];
                   hz_obj_tri(m, c, q);
                   if (tri_dev(q, fit.n, fit.off) > delta) continue;
+                  if (!fits_cap(rlo, rhi, w.bb + (size_t)c * 6, smax)) continue;
                   label[c] = r;
+                  grow_box(rlo, rhi, w.bb + (size_t)c * 6);
                   fit_add(&fit, q, w.gn + (size_t)c * 3, w.ar[c]);
                   w.queue[qe++] = c;
                   if (qe >= nextrefit) {
@@ -564,7 +595,9 @@ int hz_seg_planar(hz_pseglist *s, const hz_objmesh *m, double delta) {
           double q[3][3];
           hz_obj_tri(m, c, q);
           if (tri_dev(q, fit.n, fit.off) > delta) continue;
+          if (!fits_cap(rlo, rhi, w.bb + (size_t)c * 6, smax)) continue;
           label[c] = r;
+          grow_box(rlo, rhi, w.bb + (size_t)c * 6);
           fit_add(&fit, q, w.gn + (size_t)c * 3, w.ar[c]);
           w.queue[qe++] = c;
           if (qe >= nextrefit) {
@@ -665,4 +698,8 @@ int hz_seg_planar(hz_pseglist *s, const hz_objmesh *m, double delta) {
   s->nreleased = nreleased;
   s->ncand = ncand;
   return 0;
+}
+
+int hz_seg_planar(hz_pseglist *s, const hz_objmesh *m, double delta) {
+  return hz_seg_planar_cap(s, m, delta, 0.0);
 }

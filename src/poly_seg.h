@@ -68,6 +68,12 @@ typedef struct {
 
 /* delta — метры. Возврат 0 — успех, 2 — нет памяти. */
 int hz_seg_planar(hz_pseglist *s, const hz_objmesh *m, double delta);
+
+/* То же с ОГРАНИЧЕНИЕМ ГАБАРИТА участка (§92): `smax` метров по каждой оси,
+ * `0` — без ограничения. Заведено потому, что единственный прежний критерий —
+ * планарность — оставлял плоский пол ОДНИМ элементом на 557 536 пикселей кадра,
+ * и тень внутри такого элемента не появится ни при каком решателе. */
+int hz_seg_planar_cap(hz_pseglist *s, const hz_objmesh *m, double delta, double smax);
 void hz_seg_free(hz_pseglist *s);
 
 #endif

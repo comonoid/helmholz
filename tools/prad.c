@@ -77,7 +77,7 @@ static int cmp_d(const void *a, const void *b) {
  * Сверх того есть явный флаг материала `flat`.
  */
 #define SH_DEPTH                                                                                   \
-  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает                                 \
+  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает \
      * стоимость; глубже вклад падает как произведение долей */
 
 /* ТОЧНЫЙ ФРЕНЕЛЬ ПО НЕПОЛЯРИЗОВАННОМУ СВЕТУ. Приближение Шлика не нужно: точная
@@ -381,7 +381,7 @@ int main(int argc, char **argv) {
       noclip = 0, oldpt = 0, flatn = 0, nospec = 0, noballs = 0, h = 0, spec = 0, nodiag = 0,
       ceillight = 0, novis = 0;
   double ballior = 1.5;
-  double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0;
+  double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0, segcap = 0.5;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "city") == 0) city = 1;
     if (strncmp(argv[i], "w=", 2) == 0) w = (int)strtol(argv[i] + 2, NULL, 10);
@@ -413,6 +413,8 @@ int main(int argc, char **argv) {
     /* База §91 и НК9: прежний потолочный источник; видимость тождественно 1. */
     if (strcmp(argv[i], "ceillight") == 0) ceillight = 1;
     if (strcmp(argv[i], "novis") == 0) novis = 1;
+    /* §92: ограничение габарита элемента переноса, метры; `0` — без него. */
+    if (strncmp(argv[i], "cap=", 4) == 0) segcap = strtod(argv[i] + 4, NULL);
   }
 
   /* САМОПРОВЕРКА ФОРМУЛЫ — ПЕРВОЙ, ДО ВСЯКОЙ СЦЕНЫ (А205). Ошибка знака или
@@ -471,7 +473,7 @@ int main(int argc, char **argv) {
   }
 
   hz_pseglist sg;
-  if (hz_seg_planar(&sg, &m, dseg) != 0) return 1;
+  if (hz_seg_planar_cap(&sg, &m, dseg, segcap) != 0) return 1;
   hz_polyset ps;
   if (hz_poly_build(&ps, &m, &sg) != 0) return 1;
   {

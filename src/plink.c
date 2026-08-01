@@ -1044,6 +1044,7 @@ int hz_links_build_hemi(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg
   S->nzero_coarse = ncull_z;
   S->nvisit = nnode;
   S->wleaf = T.redundancy;
+  S->nmax_node = T.n_inner; /* застряло у внутренних узлов — см. `ptree.h` */
   hz_ptree_free(&T);
   free(pt);
   free(t2p);

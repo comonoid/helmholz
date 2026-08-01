@@ -593,6 +593,10 @@ int main(int argc, char **argv) {
            "треугольник\n",
            (long long)S.nvisit, (long long)S.nrefine, (long long)S.nzero_coarse,
            (long long)S.nlink_leaf, S.wleaf);
+  if (hemi > 0)
+    printf("   ТРЕУГОЛЬНИКОВ У ВНУТРЕННИХ УЗЛОВ (в порядок обхода не встраиваются): %lld из "
+           "%d (%.2f %%)\n",
+           (long long)S.nmax_node, m.nt, 100.0 * (double)S.nmax_node / (double)m.nt);
   else
     printf("   из отброшенных на ГРУБОМ уровне (обрубило поддерево): %lld\n",
            (long long)S.nzero_coarse);

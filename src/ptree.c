@@ -55,6 +55,7 @@ static int pt_split(hz_ptree *t, const hz_objmesh *m, int32_t nid, int32_t *list
     memcpy(t->ref + t->nref, list, (size_t)n * sizeof *list);
     t->nref += n;
     t->nleaf++;
+    t->n_leaf_tri += n;
     return 0;
   }
   double mid[3];
@@ -111,6 +112,7 @@ static int pt_split(hz_ptree *t, const hz_objmesh *m, int32_t nid, int32_t *list
   }
   t->nd[nid].t0 = (int32_t)t->nref;
   t->nd[nid].ntri = nk;
+  t->n_inner += nk;
   memcpy(t->ref + t->nref, keep, (size_t)nk * sizeof *keep);
   t->nref += nk;
   free(keep);

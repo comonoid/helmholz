@@ -79,6 +79,13 @@ static int SAMP_CAP = 64;
  * города источник задаётся ФОНОМ свипа, а не площадкой через `pdirect`: ни одной
  * пробы видимости, ни одного теневого луча — тени получаются из самого свипа. */
 static double SKY_L = 0.0;
+/* ЛАМПЫ ЧЕРЕЗ СВИП, А НЕ ЧЕРЕЗ `pdirect` (§82, позиция пользователя: первый порядок
+ * встаёт на место сам, в одном проходе). Тогда источник — обычный излучающий
+ * элемент (`t->Le`), `pdirect` не зовётся вовсе, и метрика против эталона
+ * замкнутой формы меряет РОВНО лучевой эффект: насколько плохо базис из `ND`
+ * направлений представляет сосредоточенный первый порядок. */
+static int SWEEP_SRC = 0;
+static int ND_MU = 4, ND_PHI = 4; /* ND = 2·nmu · 4·nphi */
 /* Кадр МЕТРИКИ — 512², а не 1024² из §2. Эталон стоит (пиксели × источники ×
  * 36 лучей), и на 1024² один прогон занимает минуты, а их в свипе двадцать.
  * Для КАРТИНКИ НА ГЛАЗ это не годится, и картинка пишется отдельно в полном
@@ -392,7 +399,9 @@ static int scene_from(scene *S, const hz_objmesh *m, const hz_pseglist *sg, cons
   for (int i = 0; i < nsrc; i++) {
     S->srcLe[S->src[i]] = HZ_CFG_LAMP_LE;
     S->t.rho[S->src[i]] = 0.0;
-    S->t.Le[S->src[i]] = 0.0;
+    /* В свипе источник НЕ излучает (К9, двойной учёт) — кроме режима `sweepsrc`,
+     * где он излучает именно там и только там. */
+    S->t.Le[S->src[i]] = SWEEP_SRC ? HZ_CFG_LAMP_LE : 0.0;
   }
   if (hz_pray_build(&S->g, &S->ps, 4.0) != 0) return 1;
   return 0;
@@ -406,13 +415,27 @@ static int solve(scene *S, const tr3_dirs *d, double h, double tol) {
   hz_psweep_zero(&S->t);
   /* При небе-фоне прямой свет через `pdirect` не считается вовсе: источника-полигона
    * нет, и считать нечего. */
-  if (S->nsrc > 0)
+  if (S->nsrc > 0 && !SWEEP_SRC)
     hz_direct_add(&S->t, &S->g, S->src, S->nsrc, S->srcLe, NVIS_RUN, h, SAMP_CAP, &st);
   double *accdir = malloc((size_t)S->t.np * 3 * sizeof *accdir);
   if (accdir == NULL) return 1;
   memcpy(accdir, S->t.acc, (size_t)S->t.np * 3 * sizeof *accdir);
   S->nray += st.nfrag;
-  /* Поле ТОЛЬКО прямого света — нужно эталону, чтобы вычесть его и заменить. */
+  /* Поле ТОЛЬКО прямого света — нужно эталону, чтобы вычесть его и заменить.
+   * В режиме `sweepsrc` прямого света в `acc` нет вовсе (его не считал `pdirect`),
+   * и он приходит ПЕРВЫМ ОТСКОКОМ свипа. Без этого отскока `Edir` остался бы
+   * нулём, эталон прибавил бы точный прямой свет к полю, где он уже есть, и
+   * метрика перестала бы зависеть от `ND` — что и наблюдалось: 0.1356, 0.1330,
+   * 0.1362, 0.1366 при ND = 32…512. Подпись «величина не меняется от параметра,
+   * которым её меняют» сработала как детектор. */
+  if (SWEEP_SRC) {
+    hz_pstats s1;
+    memset(&s1, 0, sizeof s1);
+    if (hz_psweep_gather(&S->t, d, h, 0, SKY_L, HZ_LAYOUT_RUNS, &s1) != 0) {
+      free(accdir);
+      return 1;
+    }
+  }
   hz_psweep_solve(&S->t, &st);
   memcpy(S->Edir, S->t.E, (size_t)S->t.np * 3 * sizeof *S->Edir);
   S->t_direct = now_s() - t0;
@@ -435,6 +458,101 @@ static int solve(scene *S, const tr3_dirs *d, double h, double tol) {
   S->t_solve = now_s() - t1;
   S->nbounce = nb + 1;
   return 0;
+}
+
+static int cmp_d(const void *a, const void *b); /* определён ниже, у метрики */
+
+/* СРАВНЕНИЕ ТОЛЬКО ПОЛЯ ПРЯМОГО СВЕТА (§82, требование пользователя).
+ *
+ * ЗАЧЕМ ОТДЕЛЬНО. Общая метрика упирается в `p99 ≈ 1.33` во ВСЕХ конфигурациях,
+ * включая аналитическую, — значит она ограничена не прямым светом, а чем-то
+ * другим (скорее всего линейностью `E` по крупному элементу). Сравнивать под
+ * таким полом два способа посчитать одно слагаемое бессмысленно: разница тонет.
+ *
+ * ЧТО СРАВНИВАЕТСЯ. Средняя облучённость элемента `Ē = (c₀m₀ + c₁m₁ + c₂m₂)/m₀`,
+ * то есть физическая величина (поток на площадь), а не значение в точке. Три
+ * поля: эталон (`pdirect` с максимальной выборкой и 64 пробами), рабочий
+ * `pdirect`, и ОДИН отскок свипа с излучающими лампами. Веса — по ПЛОЩАДИ: без
+ * них мелкий тёмный элемент весит как стена. */
+static void dircmp(scene *S, const tr3_dirs *d, double h) {
+  int32_t np = S->t.np;
+  double *Er = malloc((size_t)np * sizeof *Er), *Ea = malloc((size_t)np * sizeof *Ea),
+         *Es = malloc((size_t)np * sizeof *Es), *ar = malloc((size_t)np * sizeof *ar);
+  if (Er == NULL || Ea == NULL || Es == NULL || ar == NULL) {
+    free(Er);
+    free(Ea);
+    free(Es);
+    free(ar);
+    return;
+  }
+  hz_pstats st;
+  double tref = 0.0, ta = 0.0, ts = 0.0;
+  for (int pass = 0; pass < 3; pass++) {
+    double t0 = now_s();
+    memset(&st, 0, sizeof st);
+    hz_psweep_zero(&S->t);
+    if (pass == 2) {
+      for (int i = 0; i < S->nsrc; i++)
+        S->t.Le[S->src[i]] = HZ_CFG_LAMP_LE;
+      hz_psweep_gather(&S->t, d, h, 0, SKY_L, HZ_LAYOUT_RUNS, &st);
+      for (int i = 0; i < S->nsrc; i++)
+        S->t.Le[S->src[i]] = 0.0;
+    } else if (pass == 0)
+      hz_direct_add(&S->t, &S->g, S->src, S->nsrc, S->srcLe, 8, h, 64, &st);
+    else
+      hz_direct_add(&S->t, &S->g, S->src, S->nsrc, S->srcLe, NVIS_RUN, h, SAMP_CAP, &st);
+    hz_psweep_solve(&S->t, &st);
+    double *dst = (pass == 0) ? Er : ((pass == 1) ? Ea : Es);
+    for (int32_t k = 0; k < np; k++) {
+      const hz_poly *P = &S->ps.p[k];
+      double m0 = P->mom[0];
+      dst[k] = (m0 > 0.0) ? (S->t.E[3 * k] * m0 + S->t.E[3 * k + 1] * P->mom[1] +
+                             S->t.E[3 * k + 2] * P->mom[2]) /
+                                m0
+                          : 0.0;
+      if (pass == 0) ar[k] = P->area;
+    }
+    double el = now_s() - t0;
+    if (pass == 0)
+      tref = el;
+    else if (pass == 1)
+      ta = el;
+    else
+      ts = el;
+  }
+  /* Относительная ошибка по элементам, отсортированная по ВЕСУ ПЛОЩАДИ. */
+  double *ea = malloc((size_t)np * sizeof *ea), *es = malloc((size_t)np * sizeof *es);
+  double fr = 0.0, fa = 0.0, fs = 0.0;
+  int32_t n = 0;
+  if (ea != NULL && es != NULL) {
+    for (int32_t k = 0; k < np; k++) {
+      fr += Er[k] * ar[k];
+      fa += Ea[k] * ar[k];
+      fs += Es[k] * ar[k];
+      if (!(Er[k] > 1e-12)) continue;
+      ea[n] = fabs(Ea[k] - Er[k]) / Er[k];
+      es[n] = fabs(Es[k] - Er[k]) / Er[k];
+      n++;
+    }
+    qsort(ea, (size_t)n, sizeof *ea, cmp_d);
+    qsort(es, (size_t)n, sizeof *es, cmp_d);
+    printf("   ПОЛЕ ПРЯМОГО СВЕТА, элементов с E>0: %d из %d\n", n, np);
+    printf("      pdirect (проб %d, потолок %d): отн. ошибка p50 %.4f p90 %.4f p99 %.4f; "
+           "поток %.4f от эталона; %.2f с\n",
+           NVIS_RUN * NVIS_RUN, SAMP_CAP, ea[n / 2], ea[(int32_t)(0.9 * n)],
+           ea[(int32_t)(0.99 * n)], (fr > 0.0) ? fa / fr : 0.0, ta);
+    printf("      свип, ND = %d:                  отн. ошибка p50 %.4f p90 %.4f p99 %.4f; "
+           "поток %.4f от эталона; %.2f с\n",
+           d->n, es[n / 2], es[(int32_t)(0.9 * n)], es[(int32_t)(0.99 * n)],
+           (fr > 0.0) ? fs / fr : 0.0, ts);
+    printf("      (эталон: pdirect, 64 пробы, потолок 64, %.2f с)\n", tref);
+  }
+  free(ea);
+  free(es);
+  free(Er);
+  free(Ea);
+  free(Es);
+  free(ar);
 }
 
 /* Точный прямой свет в точке — эталон. `*cls` получает класс точки:
@@ -534,6 +652,46 @@ typedef struct {
 static int g_nball = 0;
 static gball g_ball[2];
 
+/* ПЛОСКОЕ ЗЕРКАЛО (§83, решение пользователя 08-01: «пока плоские зеркала»).
+ *
+ * ЭТАП 1 — ЗЕРКАЛО ВИДНО: прямоугольник, отражающий на этапе съёмки. Отражение
+ * резкое по построению, потому что дельта перенесена в ГЕОМЕТРИЮ (луч отражается
+ * относительно плоскости), а не представлена направленным базисом.
+ *
+ * ЭТАП 2 — ЗЕРКАЛО СВЕТИТ — здесь НЕ делается, и это сказано заранее: для него
+ * нужна мнимая сцена в операторе (связь `A → C′`, где `C′` есть отражённый `C`),
+ * то есть переделка переноса, а не камеры. Пока зеркало в освещение не входит и
+ * теней не отбрасывает — ровно как шары. */
+typedef struct {
+  double c[3];  /* центр */
+  double n[3];  /* нормаль */
+  double eu[3]; /* первая ось в плоскости */
+  double ev[3]; /* вторая ось */
+  double hu, hv;
+} gmirror;
+
+static int g_nmir = 0;
+static gmirror g_mir[2];
+
+/* Пересечение луча с прямоугольником: плоскость, затем габарит в её осях. */
+static double mirror_hit(const gmirror *M, const double o[3], const double d[3], double tmin) {
+  double dn = d[0] * M->n[0] + d[1] * M->n[1] + d[2] * M->n[2];
+  if (fabs(dn) < 1e-12) return -1.0;
+  double t = 0.0;
+  for (int c = 0; c < 3; c++)
+    t += (M->c[c] - o[c]) * M->n[c];
+  t /= dn;
+  if (!(t > tmin)) return -1.0;
+  double q[3], u = 0.0, v = 0.0;
+  for (int c = 0; c < 3; c++) {
+    q[c] = o[c] + t * d[c] - M->c[c];
+    u += q[c] * M->eu[c];
+    v += q[c] * M->ev[c];
+  }
+  if (fabs(u) > M->hu || fabs(v) > M->hv) return -1.0;
+  return t;
+}
+
 /* Ближайшее пересечение луча со сферой при `t > tmin`. */
 static double ball_hit(const gball *b, const double o[3], const double d[3], double tmin) {
   double oc[3], B = 0.0, C = 0.0, dd = 0.0;
@@ -591,6 +749,37 @@ static void trace_rgb(const scene *S, const double o[3], const double d[3], int 
       tb = t;
       hb = i;
     }
+  }
+  /* Зеркало-плоскость проверяется наравне с шарами и геометрией. */
+  int hm = -1;
+  double tm = 1e300;
+  for (int i = 0; i < g_nmir; i++) {
+    double t = mirror_hit(&g_mir[i], o, d, 1e-6);
+    if (t > 0.0 && t < tm) {
+      tm = t;
+      hm = i;
+    }
+  }
+  if (hm >= 0 && tm < tb && (k < 0 || tm < tp)) {
+    if (depth <= 0) return;
+    const gmirror *M = &g_mir[hm];
+    double dl = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    double dir[3], x[3], xo[3], refl[3];
+    for (int c = 0; c < 3; c++)
+      dir[c] = d[c] / dl;
+    double cosi = -(dir[0] * M->n[0] + dir[1] * M->n[1] + dir[2] * M->n[2]);
+    for (int c = 0; c < 3; c++) {
+      x[c] = o[c] + tm * d[c];
+      refl[c] = dir[c] + 2.0 * cosi * M->n[c];
+      xo[c] = x[c] + 1e-5 * ((cosi > 0.0) ? M->n[c] : -M->n[c]);
+    }
+    double r3[3];
+    trace_rgb(S, xo, refl, depth - 1, r3);
+    /* Отражательная способность `0.9`: идеальных зеркал не бывает, а число
+     * влияет только на яркость и никакой физики не подменяет. */
+    for (int c = 0; c < 3; c++)
+      out[c] = 0.9 * r3[c];
+    return;
   }
   if (hb >= 0 && (k < 0 || tb < tp)) {
     if (depth <= 0) return;
@@ -726,7 +915,7 @@ static int render_rgb(scene *S, const tr3_camera *cam, int ss, const char *ppm) 
             for (int c = 0; c < 3; c++)
               d[c] /= dn;
         }
-        if (g_nball > 0) {
+        if (g_nball > 0 || g_nmir > 0) {
           /* С шарами кадр идёт через трассировку: она сама решает, что ближе —
            * шар или геометрия, — и рекурсивно читает поле за отражением. */
           double c3[3];
@@ -1042,7 +1231,11 @@ int main(int argc, char **argv) {
   }
   if (tr3_camera_look(&cam, eye, at, up, HZ_CFG_FOV_DEG * M_PI / 180.0, IMGW, IMGH) != 0) return 1;
   tr3_dirs d;
-  if (tr3_dirs_product(&d, 4, 4) != 0) return 1;
+  for (int i = 1; i < argc; i++) {
+    if (strncmp(argv[i], "nmu=", 4) == 0) ND_MU = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "nphi=", 5) == 0) ND_PHI = (int)strtol(argv[i] + 5, NULL, 10);
+  }
+  if (tr3_dirs_product(&d, ND_MU, ND_PHI) != 0) return 1;
 
   printf("== Ш6: зал, δ = %g м, h = %g м, ε = %g м, tol = %g, ND = %d, метрика на %d×%d\n", delta,
          h, eps, tol, d.n, IMGW, IMGH);
@@ -1130,6 +1323,9 @@ int main(int argc, char **argv) {
       if (strncmp(argv[i], "vis=", 4) == 0) NVIS_RUN = (int)strtol(argv[i] + 4, NULL, 10);
       if (strncmp(argv[i], "cap=", 4) == 0) SAMP_CAP = (int)strtol(argv[i] + 4, NULL, 10);
       if (strncmp(argv[i], "sky=", 4) == 0) SKY_L = strtod(argv[i] + 4, NULL);
+      if (strcmp(argv[i], "sweepsrc") == 0) SWEEP_SRC = 1;
+      if (strncmp(argv[i], "nmu=", 4) == 0) ND_MU = (int)strtol(argv[i] + 4, NULL, 10);
+      if (strncmp(argv[i], "nphi=", 5) == 0) ND_PHI = (int)strtol(argv[i] + 5, NULL, 10);
     }
     if (IMGW < 64) IMGW = 64;
     IMGH = IMGW;
@@ -1210,6 +1406,45 @@ int main(int argc, char **argv) {
     int only_cut = 0;
     for (int i = 7; i < argc; i++)
       if (strcmp(argv[i], "onlycut") == 0) only_cut = 1;
+    /* ЗЕРКАЛО СТАВИТСЯ ВЕРТИКАЛЬНО, ЛИЦОМ К КАМЕРЕ, за точкой прицела: так в нём
+     * видно то, что камера видит и сама, — а значит отражение можно проверить
+     * глазом, сличив с оригиналом. Размер — треть меньшего горизонтального
+     * габарита сцены; числа не подобраны под кадр, а взяты от сцены. */
+    for (int i = 7; i < argc; i++) {
+      if (strcmp(argv[i], "mirror") != 0) continue;
+      double sx = base.hi[0] - base.lo[0], sz = base.hi[2] - base.lo[2];
+      double sm = (sx < sz) ? sx : sz;
+      double fwd[3], nl = 0.0;
+      for (int c = 0; c < 3; c++) {
+        fwd[c] = at[c] - eye[c];
+        nl += fwd[c] * fwd[c];
+      }
+      nl = sqrt(nl);
+      if (!(nl > 0.0)) break;
+      gmirror *M = &g_mir[g_nmir];
+      for (int c = 0; c < 3; c++) {
+        M->n[c] = -fwd[c] / nl;                /* лицом к камере */
+        M->c[c] = at[c] - 0.15 * sm * M->n[c]; /* чуть за точкой прицела */
+      }
+      /* Оси плоскости: горизонталь как `up × n`, вертикаль как `n × eu`. */
+      double up0[3] = HZ_CFG_UP;
+      M->eu[0] = up0[1] * M->n[2] - up0[2] * M->n[1];
+      M->eu[1] = up0[2] * M->n[0] - up0[0] * M->n[2];
+      M->eu[2] = up0[0] * M->n[1] - up0[1] * M->n[0];
+      double el = sqrt(M->eu[0] * M->eu[0] + M->eu[1] * M->eu[1] + M->eu[2] * M->eu[2]);
+      if (!(el > 0.0)) break;
+      for (int c = 0; c < 3; c++)
+        M->eu[c] /= el;
+      M->ev[0] = M->n[1] * M->eu[2] - M->n[2] * M->eu[1];
+      M->ev[1] = M->n[2] * M->eu[0] - M->n[0] * M->eu[2];
+      M->ev[2] = M->n[0] * M->eu[1] - M->n[1] * M->eu[0];
+      M->hu = 0.22 * sm;
+      M->hv = 0.16 * sm;
+      g_nmir++;
+      printf("== ЗЕРКАЛО: %.2f × %.2f м, центр (%.2f %.2f %.2f)\n", 2 * M->hu, 2 * M->hv, M->c[0],
+             M->c[1], M->c[2]);
+      break;
+    }
     int ssaa = 2;
     for (int i = 7; i < argc; i++)
       if (strncmp(argv[i], "ss=", 3) == 0) ssaa = (int)strtol(argv[i] + 3, NULL, 10);
@@ -1279,6 +1514,8 @@ int main(int argc, char **argv) {
         C.gfine = &gfine;
         C.albf = albf;
       }
+      for (int i = 7; i < argc; i++)
+        if (strcmp(argv[i], "dircmp") == 0) dircmp(&C, &d, h);
       /* РАЗБИВКА ПО ФАЗАМ (§79, оснастка). «Рендер идёт пятнадцать минут» — жалоба,
        * а не адрес: тот же урок, что в `pcoarse`. Без этих трёх чисел я гадал,
        * где время — в геометрии, в прямом свете или в свипе, — и один раз уже

@@ -45,6 +45,11 @@ static double now_s(void) {
   return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
+static int cmp_i32(const void *a, const void *b) {
+  int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
+  return (x < y) ? -1 : ((x > y) ? 1 : 0);
+}
+
 static int cmp_d(const void *a, const void *b) {
   double x = *(const double *)a, y = *(const double *)b;
   return (x < y) ? -1 : ((x > y) ? 1 : 0);
@@ -72,7 +77,7 @@ static int cmp_d(const void *a, const void *b) {
  * Сверх того есть явный флаг материала `flat`.
  */
 #define SH_DEPTH                                                                                   \
-  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает                                 \
+  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает \
      * стоимость; глубже вклад падает как произведение долей */
 
 /* ТОЧНЫЙ ФРЕНЕЛЬ ПО НЕПОЛЯРИЗОВАННОМУ СВЕТУ. Приближение Шлика не нужно: точная
@@ -987,6 +992,38 @@ int main(int argc, char **argv) {
     }
   }
   double tframe = now_s() - t0;
+  /* СКОЛЬКО ЭЛЕМЕНТОВ ВИДНО В КАДРЕ И КАКОГО ОНИ РАЗМЕРА В ПИКСЕЛЯХ. Поле может
+   * быть сколь угодно неоднородным ПО ЭЛЕМЕНТАМ, но если один элемент
+   * закрывает тысячи пикселей, тень внутри него не появится ни при каком
+   * решателе. Замер отвечает на возражение «теней не видно» числом. */
+  {
+    int32_t *pix = calloc((size_t)L.nnd, sizeof *pix);
+    if (pix == NULL) return 1;
+    for (int i = 0; i < n; i++) {
+      double o[3], d[3], t;
+      tr3_camera_ray(&cam, i % w, i / w, o, d);
+      int32_t k2 = hz_pray_hit(&g, o, d, 0.0, &t);
+      if (k2 >= 0) pix[cut[k2]]++;
+    }
+    int32_t nvis2 = 0;
+    int32_t *cnt2 = malloc((size_t)L.nnd * sizeof *cnt2);
+    if (cnt2 == NULL) return 1;
+    for (int32_t k2 = 0; k2 < L.nnd; k2++)
+      if (pix[k2] > 0) cnt2[nvis2++] = pix[k2];
+    qsort(cnt2, (size_t)nvis2, sizeof(int32_t), cmp_i32);
+    int64_t half = 0, med = 0;
+    for (int32_t k2 = nvis2 - 1; k2 >= 0; k2--) {
+      half += cnt2[k2];
+      if (half * 2 >= (int64_t)n && med == 0) med = cnt2[k2];
+    }
+    printf("== ЭЛЕМЕНТЫ В КАДРЕ: видно %d из %d узлов среза; пикселей на элемент: "
+           "медиана %d, p90 %d, максимум %d; ПОЛОВИНА КАДРА покрыта элементами\n"
+           "   крупнее %lld пикселей\n",
+           nvis2, ncut, cnt2[nvis2 / 2], cnt2[(int32_t)(0.90 * nvis2)], cnt2[nvis2 - 1],
+           (long long)med);
+    free(pix);
+    free(cnt2);
+  }
   {
     double pr = (double)(int64_t)n * ss * ss;
     printf("== ПРОФИЛЬ КАДРА: лучей %lld (первичных %.0f, прочих %.2f на первичный); "

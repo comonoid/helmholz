@@ -77,7 +77,7 @@ static int cmp_d(const void *a, const void *b) {
  * Сверх того есть явный флаг материала `flat`.
  */
 #define SH_DEPTH                                                                                   \
-  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает                                 \
+  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает \
      * стоимость; глубже вклад падает как произведение долей */
 
 /* ТОЧНЫЙ ФРЕНЕЛЬ ПО НЕПОЛЯРИЗОВАННОМУ СВЕТУ. Приближение Шлика не нужно: точная
@@ -379,7 +379,7 @@ static void shade_ray(const sh_ctx *S, const double o[3], const double d[3], int
 int main(int argc, char **argv) {
   int city = 0, w = 512, ss = 2, nvis = 2, maxlev = 13, noself = 0, nopull = 0, disk = 0,
       noclip = 0, oldpt = 0, flatn = 0, nospec = 0, noballs = 0, h = 0, spec = 0, nodiag = 0,
-      ceillight = 0, novis = 0, hemi = 0;
+      ceillight = 0, novis = 0, hemi = 0, ptleaf = 0, nozb = 0;
   double ballior = 1.5;
   double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0, segcap = 0.5;
   for (int i = 1; i < argc; i++) {
@@ -417,6 +417,9 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "cap=", 4) == 0) segcap = strtod(argv[i] + 4, NULL);
     /* §94: сборка ПОЛУКУБОМ разрешения `hemi`; `0` — прежняя, попарная. */
     if (strncmp(argv[i], "hemi=", 5) == 0) hemi = (int)strtol(argv[i] + 5, NULL, 10);
+    /* §95: порог листа дерева (НК13 — большое значение) и НК12 — без буфера. */
+    if (strncmp(argv[i], "leaf=", 5) == 0) ptleaf = (int)strtol(argv[i] + 5, NULL, 10);
+    if (strcmp(argv[i], "nozb") == 0) nozb = 1;
   }
 
   /* САМОПРОВЕРКА ФОРМУЛЫ — ПЕРВОЙ, ДО ВСЯКОЙ СЦЕНЫ (А205). Ошибка знака или
@@ -542,6 +545,8 @@ int main(int argc, char **argv) {
   lkc.noclip = noclip;
   lkc.oldpt = oldpt;
   lkc.novis = novis;
+  lkc.ptleaf = ptleaf;
+  lkc.nozb = nozb;
   hz_linkset S;
   t0 = now_s();
   int brc = (hemi > 0) ? hz_links_build_hemi(&S, &sc, &lkc, hemi) : hz_links_build(&S, &sc, &lkc);
@@ -554,8 +559,15 @@ int main(int argc, char **argv) {
          "проб видимости %lld, максимум связей у узла %lld\n",
          (long long)S.n, S.t_build, (long long)S.nvisit, (long long)S.nrefine, (long long)S.nzero,
          (long long)S.nray, (long long)S.nmax_node);
-  printf("   из отброшенных на ГРУБОМ уровне (обрубило поддерево): %lld\n",
-         (long long)S.nzero_coarse);
+  if (hemi > 0)
+    printf("   ДЕРЕВО: узлов посещено %lld, установок треугольника %lld, отсеяно буфером "
+           "глубины %lld, под плоскостью и повторов %lld; избыточность %.2f ссылки на "
+           "треугольник\n",
+           (long long)S.nvisit, (long long)S.nrefine, (long long)S.nzero_coarse,
+           (long long)S.nlink_leaf, S.wleaf);
+  else
+    printf("   из отброшенных на ГРУБОМ уровне (обрубило поддерево): %lld\n",
+           (long long)S.nzero_coarse);
   printf("   с излучателем-листом %lld связей (%.1f %%), несут %.1f %% суммы коэффициентов\n",
          (long long)S.nlink_leaf, 100.0 * (double)S.nlink_leaf / (double)(S.n ? S.n : 1),
          100.0 * S.wleaf);

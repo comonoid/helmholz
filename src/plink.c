@@ -1,6 +1,7 @@
 /* plink.c — сборка и решение оператора связями. Разбор — в `plink.h`. */
 #include "phcube.h"
 #include "plink.h"
+#include "ptree.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -964,21 +965,31 @@ int hz_links_build_hemi(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg
   double epx = 2.0 / (double)R;
   if (eps < epx) eps = epx;
 
-  int64_t nmiss = 0, npix = 0;
+  hz_ptree T;
+  if (hz_ptree_build(&T, sc->m, cfg->ptleaf, 0) != 0) {
+    free(pt);
+    free(t2p);
+    return 2;
+  }
+  int64_t nmiss = 0, npix = 0, nsetup = 0, nnode = 0, ncull_h = 0, ncull_z = 0, ndup = 0;
   int rc = 0;
-#pragma omp parallel reduction(+ : nmiss, npix)
+#pragma omp parallel reduction(+ : nmiss, npix, nsetup, nnode, ncull_h, ncull_z, ndup)
   {
     hz_hcube h;
     double *acc = calloc((size_t)L->nnd, sizeof *acc);
     int32_t *touch = malloc((size_t)L->nnd * sizeof *touch);
+    int32_t *stamp = calloc((size_t)sc->m->nt, sizeof *stamp);
+    hz_hcube_stat hst;
+    memset(&hst, 0, sizeof hst);
     hz_link *loc = NULL;
     int64_t nloc = 0, cloc = 0;
-    int ok = (acc != NULL && touch != NULL && hz_hcube_init(&h, R) == 0);
+    int ok = (acc != NULL && touch != NULL && stamp != NULL && hz_hcube_init(&h, R) == 0);
 #pragma omp for schedule(dynamic, 8)
     for (int32_t k = 0; k < L->np; k++) {
       if (!ok) continue;
       int32_t nd = L->lab[k]; /* лист-приёмник */
-      hz_hcube_draw(&h, sc->m, t2p, pt + 3 * nd, L->nd[nd].n, k);
+      hz_hcube_draw_tree(&h, sc->m, t2p, &T, pt + 3 * nd, L->nd[nd].n, k, stamp, k + 1, cfg->nozb,
+                         &hst);
       int32_t nt2 = 0;
       for (int i = 0; i < h.npix; i++) {
         double w = h.dff[i];
@@ -1012,6 +1023,11 @@ int hz_links_build_hemi(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg
         acc[e] = 0.0;
       }
     }
+    nsetup += hst.nsetup;
+    nnode += hst.nnode;
+    ncull_h += hst.ncull_h;
+    ncull_z += hst.ncull_z;
+    ndup += hst.ndup;
 #pragma omp critical
     {
       if (!ok) rc = 2;
@@ -1020,15 +1036,21 @@ int hz_links_build_hemi(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg
     }
     free(acc);
     free(touch);
+    free(stamp);
     free(loc);
     hz_hcube_free(&h);
   }
+  S->nrefine = nsetup;
+  S->nzero_coarse = ncull_z;
+  S->nvisit = nnode;
+  S->wleaf = T.redundancy;
+  hz_ptree_free(&T);
   free(pt);
   free(t2p);
   if (rc != 0) return rc;
   S->nray = npix;
   S->nzero = nmiss;
-  S->nvisit = (int64_t)L->np * sc->m->nt;
+  S->nlink_leaf = ncull_h + ndup;
   {
     int64_t *cnt = calloc((size_t)L->nnd, sizeof *cnt);
     if (cnt != NULL) {

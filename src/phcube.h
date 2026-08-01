@@ -33,6 +33,7 @@
 #define HZ_PHCUBE_H
 
 #include "polygon.h"
+#include "ptree.h"
 #include "scene_obj.h"
 
 typedef struct {
@@ -58,5 +59,23 @@ void hz_hcube_free(hz_hcube *h);
  * затеняет себя, §88); `-1`, если пропускать нечего. */
 void hz_hcube_draw(hz_hcube *h, const hz_objmesh *m, const int32_t *tri2poly, const double x[3],
                    const double n[3], int32_t skip);
+
+/* ЗАМЕРЫ ОТСЕВА (§95). Три правила, три счётчика: без них нельзя сказать, какое
+ * из них работает, а какое относится к пустому множеству. */
+typedef struct {
+  int64_t nsetup;  /* установок треугольника — величина, ради которой всё */
+  int64_t nnode;   /* узлов дерева посещено */
+  int64_t ncull_h; /* отсеяно: коробка под касательной плоскостью */
+  int64_t ncull_z; /* отсеяно: заслонено буфером глубины */
+  int64_t ndup;    /* треугольник уже рисовался в этот полукуб */
+} hz_hcube_stat;
+
+/* То же рисование, но СПЕРЕДИ НАЗАД по пространственному дереву, с тремя
+ * отсевами (§95). `stamp` — метка на треугольник, `3·m->nt` не нужно, хватит
+ * `m->nt`; вызывающий обнуляет её один раз. `nozb = 1` выключает буфер глубины —
+ * это негативный контроль НК12. */
+void hz_hcube_draw_tree(hz_hcube *h, const hz_objmesh *m, const int32_t *tri2poly,
+                        const hz_ptree *t, const double x[3], const double n[3], int32_t skip,
+                        int32_t *stamp, int32_t mark, int nozb, hz_hcube_stat *st);
 
 #endif

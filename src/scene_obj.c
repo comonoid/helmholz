@@ -498,3 +498,102 @@ int hz_obj_add_quad(hz_objmesh *m, const char *mtlname, const double c[3], const
     }
   return mi;
 }
+
+/* РАЗБИЕНИЕ КРУПНЫХ ТРЕУГОЛЬНИКОВ (§97). Условие, а не удобство: один и тот же
+ * крупный входной треугольник убил три построения подряд — ограничение размера
+ * элемента бессильно против 18.85 м² в одном треугольнике (§92.1.4), дерево
+ * получило от него избыточность 1193 (§95.1), а элемент в 439 999 пикселей
+ * делает тень невозможной ни при каком решателе (§91.4).
+ *
+ * ДЕЛИТСЯ ПО САМОЙ ДЛИННОЙ СТОРОНЕ, а не на четыре: деление длинной стороны
+ * пополам не даёт отношению сторон расти, тогда как деление на четыре плодит
+ * иглы на вытянутых треугольниках. Материал и нормали углов наследуются;
+ * новая вершина получает нормаль как среднее концов делимого ребра. */
+int hz_obj_subdivide(hz_objmesh *m, double smax) {
+  if (!(smax > 0.0) || m->nt <= 0) return 0;
+  const double s2 = smax * smax;
+  for (;;) {
+    int32_t nsplit = 0;
+    for (int32_t t = 0; t < m->nt; t++) {
+      const int32_t *fv = m->f + (size_t)t * 3;
+      int e = -1;
+      double best = s2;
+      for (int i = 0; i < 3; i++) {
+        const double *a = m->v + 3 * (size_t)fv[i];
+        const double *b = m->v + 3 * (size_t)fv[(i + 1) % 3];
+        double d = 0.0;
+        for (int c = 0; c < 3; c++)
+          d += (b[c] - a[c]) * (b[c] - a[c]);
+        if (d > best) {
+          best = d;
+          e = i;
+        }
+      }
+      if (e < 0) continue;
+      size_t i0 = (size_t)e, i1 = (size_t)((e + 1) % 3), i2 = (size_t)((e + 2) % 3);
+      double *nv = realloc(m->v, ((size_t)m->nv + 1) * 3 * sizeof *nv);
+      if (nv == NULL) return 2;
+      m->v = nv;
+      int32_t vm = m->nv;
+      for (int c = 0; c < 3; c++)
+        m->v[3 * (size_t)vm + (size_t)c] =
+            0.5 * (m->v[3 * (size_t)m->f[(size_t)t * 3 + i0] + (size_t)c] +
+                   m->v[3 * (size_t)m->f[(size_t)t * 3 + i1] + (size_t)c]);
+      m->nv++;
+      int32_t nm = -1;
+      if (m->vn != NULL && m->fn != NULL) {
+        int32_t a0 = m->fn[(size_t)t * 3 + i0], a1 = m->fn[(size_t)t * 3 + i1];
+        if (a0 >= 0 && a1 >= 0) {
+          double *nn = realloc(m->vn, ((size_t)m->nvn + 1) * 3 * sizeof *nn);
+          if (nn == NULL) return 2;
+          m->vn = nn;
+          double q[3], l = 0.0;
+          for (int c = 0; c < 3; c++) {
+            q[c] = 0.5 * (m->vn[3 * (size_t)a0 + (size_t)c] + m->vn[3 * (size_t)a1 + (size_t)c]);
+            l += q[c] * q[c];
+          }
+          l = sqrt(l);
+          for (int c = 0; c < 3; c++)
+            m->vn[3 * (size_t)m->nvn + (size_t)c] = (l > 0.0) ? q[c] / l : q[c];
+          nm = m->nvn;
+          m->nvn++;
+        }
+      }
+      int32_t *nf = realloc(m->f, ((size_t)m->nt + 1) * 3 * sizeof *nf);
+      if (nf == NULL) return 2;
+      m->f = nf;
+      int32_t *nfm = realloc(m->fm, ((size_t)m->nt + 1) * sizeof *nfm);
+      if (nfm == NULL) return 2;
+      m->fm = nfm;
+      if (m->fn != NULL) {
+        int32_t *nfn = realloc(m->fn, ((size_t)m->nt + 1) * 3 * sizeof *nfn);
+        if (nfn == NULL) return 2;
+        m->fn = nfn;
+      }
+      int32_t v0 = m->f[(size_t)t * 3 + i0], v1 = m->f[(size_t)t * 3 + i1];
+      int32_t v2 = m->f[(size_t)t * 3 + i2];
+      int32_t k = m->nt;
+      m->f[(size_t)t * 3 + 0] = v0;
+      m->f[(size_t)t * 3 + 1] = vm;
+      m->f[(size_t)t * 3 + 2] = v2;
+      m->f[(size_t)k * 3 + 0] = vm;
+      m->f[(size_t)k * 3 + 1] = v1;
+      m->f[(size_t)k * 3 + 2] = v2;
+      m->fm[k] = m->fm[t];
+      if (m->fn != NULL) {
+        int32_t n0 = m->fn[(size_t)t * 3 + i0], n1 = m->fn[(size_t)t * 3 + i1];
+        int32_t n2 = m->fn[(size_t)t * 3 + i2];
+        m->fn[(size_t)t * 3 + 0] = n0;
+        m->fn[(size_t)t * 3 + 1] = nm;
+        m->fn[(size_t)t * 3 + 2] = n2;
+        m->fn[(size_t)k * 3 + 0] = nm;
+        m->fn[(size_t)k * 3 + 1] = n1;
+        m->fn[(size_t)k * 3 + 2] = n2;
+      }
+      m->nt++;
+      nsplit++;
+    }
+    if (nsplit == 0) break;
+  }
+  return 0;
+}

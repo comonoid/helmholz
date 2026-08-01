@@ -77,7 +77,7 @@ static int cmp_d(const void *a, const void *b) {
  * Сверх того есть явный флаг материала `flat`.
  */
 #define SH_DEPTH                                                                                   \
-  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает \
+  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает                                 \
      * стоимость; глубже вклад падает как произведение долей */
 
 /* ТОЧНЫЙ ФРЕНЕЛЬ ПО НЕПОЛЯРИЗОВАННОМУ СВЕТУ. Приближение Шлика не нужно: точная
@@ -381,7 +381,7 @@ int main(int argc, char **argv) {
       noclip = 0, oldpt = 0, flatn = 0, nospec = 0, noballs = 0, h = 0, spec = 0, nodiag = 0,
       ceillight = 0, novis = 0, hemi = 0, ptleaf = 0, nozb = 0;
   double ballior = 1.5;
-  double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0, segcap = 0.5;
+  double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0, segcap = 0.5, trimax = 0.0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "city") == 0) city = 1;
     if (strncmp(argv[i], "w=", 2) == 0) w = (int)strtol(argv[i] + 2, NULL, 10);
@@ -420,6 +420,8 @@ int main(int argc, char **argv) {
     /* §95: порог листа дерева (НК13 — большое значение) и НК12 — без буфера. */
     if (strncmp(argv[i], "leaf=", 5) == 0) ptleaf = (int)strtol(argv[i] + 5, NULL, 10);
     if (strcmp(argv[i], "nozb") == 0) nozb = 1;
+    /* §97: длина стороны треугольника, метры; `0` — без разбиения (НК15). */
+    if (strncmp(argv[i], "tri=", 4) == 0) trimax = strtod(argv[i] + 4, NULL);
   }
 
   /* САМОПРОВЕРКА ФОРМУЛЫ — ПЕРВОЙ, ДО ВСЯКОЙ СЦЕНЫ (А205). Ошибка знака или
@@ -475,6 +477,14 @@ int main(int argc, char **argv) {
     printf("== ЛАМПЫ: %d штук на высоте %.2f м, сторона %.2f м, материал %d; габарит зала "
            "y = %.2f…%.2f\n",
            HZ_CFG_LAMP_NX * HZ_CFG_LAMP_NZ, lampy, HZ_CFG_LAMP_SIDE, lampmtl, m.lo[1], m.hi[1]);
+  }
+
+  /* РАЗБИЕНИЕ КРУПНЫХ ТРЕУГОЛЬНИКОВ — ДО ЛАМП И ДО СЕГМЕНТАЦИИ (§97), чтобы вся
+   * цепочка ниже видела уже разбитый меш. */
+  if (trimax > 0.0) {
+    int32_t nt0 = m.nt;
+    if (hz_obj_subdivide(&m, trimax) != 0) return 1;
+    printf("== РАЗБИЕНИЕ: треугольников %d -> %d (сторона не длиннее %.2f м)\n", nt0, m.nt, trimax);
   }
 
   hz_pseglist sg;

@@ -527,6 +527,14 @@ int hz_seg_planar_cap(hz_pseglist *s, const hz_objmesh *m, double delta, double 
       int32_t sd = w.ord[oi].t;
       if (label[sd] >= 0) continue;
       int32_t r = nseg++;
+      /* МАТЕРИАЛ — ЧАСТЬ КРИТЕРИЯ РОСТА (§97.1). Без него участок сливается через
+       * границу материала, и цвет, читаемый у первого треугольника, оказывается
+       * чужим для большей части элемента: на картинке это куски доски по стене.
+       * Для ПЕРЕНОСА это тоже неверно — альбедо `ρ` у элемента одно, и молчаливое
+       * усреднение по разным материалам есть гомогенизация, сделанная случайно.
+       * Дефект был латентным: при крупных треугольниках слияние через границу
+       * материала не проходило по планарности, при мелких прошло. */
+      int32_t seedm = (m->fm != NULL) ? m->fm[sd] : 0;
       double org[3];
       for (int a = 0; a < 3; a++)
         org[a] = w.ord[oi].c[a];
@@ -571,6 +579,7 @@ int hz_seg_planar_cap(hz_pseglist *s, const hz_objmesh *m, double delta, double 
                   double q[3][3];
                   hz_obj_tri(m, c, q);
                   if (tri_dev(q, fit.n, fit.off) > delta) continue;
+                  if (m->fm != NULL && m->fm[c] != seedm) continue;
                   if (!fits_cap(rlo, rhi, w.bb + (size_t)c * 6, smax)) continue;
                   label[c] = r;
                   grow_box(rlo, rhi, w.bb + (size_t)c * 6);
@@ -595,6 +604,7 @@ int hz_seg_planar_cap(hz_pseglist *s, const hz_objmesh *m, double delta, double 
           double q[3][3];
           hz_obj_tri(m, c, q);
           if (tri_dev(q, fit.n, fit.off) > delta) continue;
+          if (m->fm != NULL && m->fm[c] != seedm) continue;
           if (!fits_cap(rlo, rhi, w.bb + (size_t)c * 6, smax)) continue;
           label[c] = r;
           grow_box(rlo, rhi, w.bb + (size_t)c * 6);

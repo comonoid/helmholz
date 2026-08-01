@@ -392,7 +392,7 @@ int main(int argc, char **argv) {
       ceillight = 0, novis = 0, hemi = 0, ptleaf = 0, nozb = 0;
   double ballior = 1.5;
   double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0, segcap = 0.5, trimax = 0.0;
-  int flatfield = 0, vertR = 0;
+  int flatfield = 0, vertR = 0, noshift = 0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "city") == 0) city = 1;
     if (strncmp(argv[i], "w=", 2) == 0) w = (int)strtol(argv[i] + 2, NULL, 10);
@@ -437,6 +437,9 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "flatfield") == 0) flatfield = 1;
     /* §100: неизвестные НА ВЕРШИНАХ, разрешение полукуба вершины. */
     if (strncmp(argv[i], "vert=", 5) == 0) vertR = (int)strtol(argv[i] + 5, NULL, 10);
+    /* §100.3: восстановление БЕЗ сдвига под среднее — непрерывность против
+     * точного сохранения потока; цена замеряется. */
+    if (strcmp(argv[i], "noshift") == 0) noshift = 1;
   }
 
   /* САМОПРОВЕРКА ФОРМУЛЫ — ПЕРВОЙ, ДО ВСЯКОЙ СЦЕНЫ (А205). Ошибка знака или
@@ -1099,7 +1102,7 @@ int main(int argc, char **argv) {
         ndist++;
       }
     }
-    double worst = 0.0, vmax = 0.0;
+    double worst = 0.0, vmax = 0.0, wrel = 0.0;
     int64_t nsing = 0;
     for (int32_t k = 0; k < ps.np; k++) {
       const hz_poly *p = &ps.p[k];
@@ -1135,9 +1138,13 @@ int main(int argc, char **argv) {
           c[1] = 0.0;
           c[2] = 0.0;
         } else {
+          /* БЕЗ СДВИГА непрерывность не ломается, но среднее сохраняется лишь
+           * приближённо — цена замеряется тут же и печатается. */
+          if (noshift) c[0] -= E[cut[k]] - avg;
           double chk = (c[0] * p->mom[0] + c[1] * p->mom[1] + c[2] * p->mom[2]) / p->mom[0];
           double e2 = fabs(chk - E[cut[k]]);
           if (e2 > worst) worst = e2;
+          if (E[cut[k]] > 0.0 && e2 / E[cut[k]] > wrel) wrel = e2 / E[cut[k]];
           if (sp > vmax) vmax = sp;
         }
       } else {
@@ -1155,6 +1162,41 @@ int main(int argc, char **argv) {
     printf("   подгонка: вырожденных элементов %lld из %d (%.1f %%); худшее отклонение "
            "среднего %.3e; наибольший размах %.3e\n",
            (long long)nsing, ps.np, 100.0 * (double)nsing / (double)ps.np, worst, vmax);
+    if (noshift) printf("   БЕЗ СДВИГА: худшее ОТНОСИТЕЛЬНОЕ отклонение среднего %.3e\n", wrel);
+    /* СКАЧОК МЕЖДУ ВЛАДЕЛЬЦАМИ — та же мера, что в §100, чтобы пути сравнивались
+     * одной величиной, а не на глаз. */
+    {
+      double *vmn = malloc((size_t)nid * sizeof *vmn);
+      double *vmx = malloc((size_t)nid * sizeof *vmx);
+      if (vmn == NULL || vmx == NULL) return 1;
+      for (int32_t q = 0; q < nid; q++) {
+        vmn[q] = 1e300;
+        vmx[q] = -1e300;
+      }
+      for (int32_t k = 0; k < ps.np; k++) {
+        const double *cf = pfit + 3 * (size_t)k;
+        for (int32_t b = ps.loop[ps.p[k].l0]; b < ps.loop[ps.p[k].l0 + ps.p[k].nloop]; b++) {
+          double val = cf[0] + cf[1] * ps.bv[2 * b] + cf[2] * ps.bv[2 * b + 1];
+          if (val < vmn[vid[b]]) vmn[vid[b]] = val;
+          if (val > vmx[vid[b]]) vmx[vid[b]] = val;
+        }
+      }
+      double jmax = 0.0, jsum = 0.0, bref = 0.0;
+      int64_t njn = 0;
+      for (int32_t q = 0; q < nid; q++) {
+        if (own[q] < 2) continue;
+        double d = vmx[q] - vmn[q];
+        if (d > jmax) jmax = d;
+        jsum += d;
+        njn++;
+      }
+      for (int32_t k = 0; k < ps.np; k++)
+        if (E[cut[k]] > bref) bref = E[cut[k]];
+      printf("   СКАЧОК В ОБЩЕЙ ВЕРШИНЕ: максимум %.3e, средний %.3e при уровне %.3e\n", jmax,
+             (njn > 0) ? jsum / (double)njn : 0.0, bref);
+      free(vmn);
+      free(vmx);
+    }
     free(vid);
     free(vs);
     free(vw);

@@ -487,6 +487,171 @@ static int cmp_d(const void *a, const void *b) {
   return (x < y) ? -1 : ((x > y) ? 1 : 0);
 }
 
+/* ЗЕРКАЛЬНЫЙ И СТЕКЛЯННЫЙ ШАРЫ (§79, просьба пользователя: показать, что по
+ * возможностям это сравнимо с трассировкой лучей).
+ *
+ * ЧТО ЭТО ЕСТЬ И ЧЕГО НЕ ЕСТЬ — СКАЗАНО ДО КАРТИНКИ, А НЕ ПОСЛЕ. Решатель хранит
+ * ОБЛУЧЁННОСТЬ `E` на полигоне и читает `L = ρ·E/π`; направленности в этой
+ * величине нет вовсе, поэтому зеркало в неё не помещается в принципе. Здесь
+ * сделан ГИБРИД: диффузный свет берётся из решённого поля, а зеркальность и
+ * преломление — трассировкой НА ЭТАПЕ КАМЕРЫ. Луч отражается или преломляется,
+ * летит в сцену и читает там уже посчитанное `L`.
+ *
+ * ЧЕГО В НЁМ НЕТ, И ЭТО ВИДНО НА КАРТИНКЕ: шары не отдают свет обратно в сцену и
+ * НЕ ОТБРАСЫВАЮТ ТЕНЕЙ — решение о них не знает. Честный путь к тому и другому
+ * один: направленный радианс на элементе, то есть ординаты и BRDF с Френелем, —
+ * это веха переноса, а не вечер работы.
+ *
+ * Преломление сферы считается двумя пересечениями (вход и выход) с законом
+ * Снеллиуса на каждой границе; доля отражения — Френель по неполяризованному
+ * свету (приближение Шлика здесь не нужно, точная формула столь же дёшева). */
+typedef struct {
+  double c[3], r;
+  int kind;   /* 0 — зеркало, 1 — стекло */
+  double ior; /* показатель преломления стекла */
+} gball;
+
+static int g_nball = 0;
+static gball g_ball[2];
+
+/* Ближайшее пересечение луча со сферой при `t > tmin`. */
+static double ball_hit(const gball *b, const double o[3], const double d[3], double tmin) {
+  double oc[3], B = 0.0, C = 0.0, dd = 0.0;
+  for (int i = 0; i < 3; i++) {
+    oc[i] = o[i] - b->c[i];
+    B += oc[i] * d[i];
+    C += oc[i] * oc[i];
+    dd += d[i] * d[i];
+  }
+  C -= b->r * b->r;
+  double disc = B * B - dd * C;
+  if (disc <= 0.0) return -1.0;
+  double sq = sqrt(disc);
+  double t1 = (-B - sq) / dd, t2 = (-B + sq) / dd;
+  if (t1 > tmin) return t1;
+  if (t2 > tmin) return t2;
+  return -1.0;
+}
+
+/* Диффузный радианс сцены в точке попадания луча — то самое ЧТЕНИЕ поля. */
+static void shade_diffuse(const scene *S, int32_t k, const double o[3], const double d[3], double t,
+                          double out[3]) {
+  const hz_poly *P = &S->ps.p[k];
+  double q[3];
+  for (int a = 0; a < 3; a++)
+    q[a] = o[a] + t * d[a] - P->org[a];
+  double u = q[0] * P->eu[0] + q[1] * P->eu[1] + q[2] * P->eu[2];
+  double v = q[0] * P->ev[0] + q[1] * P->ev[1] + q[2] * P->ev[2];
+  const double *ce = S->t.E + (size_t)k * 3;
+  double E = ce[0] + ce[1] * u + ce[2] * v;
+  if (E < 0.0) E = 0.0;
+  double alb[3] = {S->t.rho[k], S->t.rho[k], S->t.rho[k]};
+  if (S->gfine != NULL && S->albf != NULL) {
+    double tf = 0.0;
+    int32_t kf = hz_pray_hit(S->gfine, o, d, 0.0, &tf);
+    if (kf >= 0)
+      for (int c = 0; c < 3; c++)
+        alb[c] = S->albf[(size_t)kf * 3 + (size_t)c];
+  }
+  for (int c = 0; c < 3; c++)
+    out[c] = S->srcLe[k] + alb[c] * E / M_PI;
+}
+
+/* Трассировка с шарами. `depth` — оставшиеся отскоки; `0` обрывает рекурсию. */
+static void trace_rgb(const scene *S, const double o[3], const double d[3], int depth,
+                      double out[3]) {
+  out[0] = out[1] = out[2] = 0.0;
+  double tp = 0.0;
+  int32_t k = hz_pray_hit(&S->g, o, d, 0.0, &tp);
+  int hb = -1;
+  double tb = 1e300;
+  for (int i = 0; i < g_nball; i++) {
+    double t = ball_hit(&g_ball[i], o, d, 1e-6);
+    if (t > 0.0 && t < tb) {
+      tb = t;
+      hb = i;
+    }
+  }
+  if (hb >= 0 && (k < 0 || tb < tp)) {
+    if (depth <= 0) return;
+    const gball *b = &g_ball[hb];
+    double x[3], nn[3];
+    double nl = 0.0;
+    for (int c = 0; c < 3; c++) {
+      x[c] = o[c] + tb * d[c];
+      nn[c] = (x[c] - b->c[c]) / b->r;
+      nl += nn[c] * nn[c];
+    }
+    (void)nl;
+    double dl = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    double dir[3];
+    for (int c = 0; c < 3; c++)
+      dir[c] = d[c] / dl;
+    double cosi = -(dir[0] * nn[0] + dir[1] * nn[1] + dir[2] * nn[2]);
+    double refl[3], xo[3];
+    for (int c = 0; c < 3; c++) {
+      refl[c] = dir[c] + 2.0 * cosi * nn[c];
+      xo[c] = x[c] + 1e-5 * nn[c];
+    }
+    if (b->kind == 0) { /* зеркало: одно отражение, поглощения 5 % */
+      double r3[3];
+      trace_rgb(S, xo, refl, depth - 1, r3);
+      for (int c = 0; c < 3; c++)
+        out[c] = 0.95 * r3[c];
+      return;
+    }
+    /* СТЕКЛО. Френель по неполяризованному свету, вход и выход считаются порознь. */
+    double n1 = 1.0, n2 = b->ior;
+    double eta = n1 / n2;
+    double k2 = 1.0 - eta * eta * (1.0 - cosi * cosi);
+    double R = 1.0;
+    if (k2 > 0.0) {
+      double cost = sqrt(k2);
+      double rs = (n1 * cosi - n2 * cost) / (n1 * cosi + n2 * cost);
+      double rp = (n1 * cost - n2 * cosi) / (n1 * cost + n2 * cosi);
+      R = 0.5 * (rs * rs + rp * rp);
+      /* Преломлённый луч внутрь, второе пересечение — выход наружу. */
+      double ti[3], xin[3];
+      for (int c = 0; c < 3; c++) {
+        ti[c] = eta * dir[c] + (eta * cosi - cost) * nn[c];
+        xin[c] = x[c] - 1e-5 * nn[c];
+      }
+      double t2 = ball_hit(b, xin, ti, 1e-6);
+      double th[3] = {0.0, 0.0, 0.0};
+      if (t2 > 0.0) {
+        double y[3], n2v[3];
+        for (int c = 0; c < 3; c++) {
+          y[c] = xin[c] + t2 * ti[c];
+          n2v[c] = (b->c[c] - y[c]) / b->r; /* нормаль ИЗНУТРИ наружу */
+        }
+        double cosi2 = -(ti[0] * n2v[0] + ti[1] * n2v[1] + ti[2] * n2v[2]);
+        double eta2 = n2 / n1;
+        double kk = 1.0 - eta2 * eta2 * (1.0 - cosi2 * cosi2);
+        if (kk > 0.0) {
+          double cost2 = sqrt(kk), to[3], yo[3];
+          for (int c = 0; c < 3; c++) {
+            to[c] = eta2 * ti[c] + (eta2 * cosi2 - cost2) * n2v[c];
+            yo[c] = y[c] - 1e-5 * n2v[c];
+          }
+          trace_rgb(S, yo, to, depth - 1, th);
+        }
+      }
+      double r3[3];
+      trace_rgb(S, xo, refl, depth - 1, r3);
+      for (int c = 0; c < 3; c++)
+        out[c] = R * r3[c] + (1.0 - R) * th[c];
+      return;
+    }
+    double r3[3]; /* полное внутреннее отражение */
+    trace_rgb(S, xo, refl, depth - 1, r3);
+    for (int c = 0; c < 3; c++)
+      out[c] = r3[c];
+    return;
+  }
+  if (k < 0) return;
+  shade_diffuse(S, k, o, d, tp, out);
+}
+
 /* ЦВЕТНОЙ КАДР ДЛЯ ГЛАЗА (§78). Отдельный путь от `render()` СОЗНАТЕЛЬНО: тот
  * считает метрику и эталон, и мешать в него тон-маппинг с суперсэмплингом значит
  * менять замер ради красоты. Здесь наоборот — ни метрики, ни эталона, только
@@ -540,6 +705,15 @@ static int render_rgb(scene *S, const tr3_camera *cam, int ss, const char *ppm) 
           if (dn > 0.0)
             for (int c = 0; c < 3; c++)
               d[c] /= dn;
+        }
+        if (g_nball > 0) {
+          /* С шарами кадр идёт через трассировку: она сама решает, что ближе —
+           * шар или геометрия, — и рекурсивно читает поле за отражением. */
+          double c3[3];
+          trace_rgb(S, o, d, 4, c3);
+          for (int c = 0; c < 3; c++)
+            acc[c] += c3[c];
+          continue;
         }
         int32_t k = hz_pray_hit(&S->g, o, d, 0.0, &t);
         if (k < 0) continue;
@@ -954,6 +1128,43 @@ int main(int argc, char **argv) {
            "кадр,с");
     fflush(stdout);
 
+    /* ШАРЫ (§79). Ставятся у точки прицела камеры, радиус — от размера сцены,
+     * чтобы не подбирать числа под кадр: `1/12` наибольшего горизонтального
+     * размера даёт шар, занимающий заметную, но не всю картинку. */
+    for (int i = 7; i < argc; i++) {
+      if (strncmp(argv[i], "ball=", 5) != 0) continue;
+      const char *w = argv[i] + 5;
+      double sx = base.hi[0] - base.lo[0], sz = base.hi[2] - base.lo[2];
+      double rr = ((sx > sz) ? sx : sz) / 18.0;
+      int mir = (strcmp(w, "mirror") == 0 || strcmp(w, "both") == 0);
+      int gls = (strcmp(w, "glass") == 0 || strcmp(w, "both") == 0);
+      /* Центр — НЕ у точки прицела: там стена, и шары в неё упирались. Берётся
+       * точка на 45 % пути от глаза к прицелу и поднимается — это середина
+       * открытого пространства кадра при любой камере, а не подобранные числа. */
+      double ctr[3];
+      for (int c = 0; c < 3; c++)
+        ctr[c] = eye[c] + 0.45 * (at[c] - eye[c]);
+      double up0 = rr * 1.1;
+      if (mir) {
+        g_ball[g_nball].c[0] = ctr[0];
+        g_ball[g_nball].c[1] = ctr[1] + up0;
+        g_ball[g_nball].c[2] = ctr[2] - (gls ? rr * 1.25 : 0.0);
+        g_ball[g_nball].r = rr;
+        g_ball[g_nball].kind = 0;
+        g_ball[g_nball].ior = 1.0;
+        g_nball++;
+      }
+      if (gls) {
+        g_ball[g_nball].c[0] = ctr[0];
+        g_ball[g_nball].c[1] = ctr[1] + up0;
+        g_ball[g_nball].c[2] = ctr[2] + (mir ? rr * 1.25 : 0.0);
+        g_ball[g_nball].r = rr;
+        g_ball[g_nball].kind = 1;
+        g_ball[g_nball].ior = 1.5;
+        g_nball++;
+      }
+      printf("== ШАРЫ: %d, радиус %.3f м, центр у точки прицела\n", g_nball, rr);
+    }
     int ssaa = 2;
     for (int i = 7; i < argc; i++)
       if (strncmp(argv[i], "ss=", 3) == 0) ssaa = (int)strtol(argv[i] + 3, NULL, 10);

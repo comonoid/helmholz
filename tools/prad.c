@@ -373,7 +373,7 @@ static void shade_ray(const sh_ctx *S, const double o[3], const double d[3], int
 
 int main(int argc, char **argv) {
   int city = 0, w = 512, ss = 2, nvis = 2, maxlev = 13, noself = 0, nopull = 0, disk = 0,
-      noclip = 0, oldpt = 0, flatn = 0, nospec = 0, noballs = 0, h = 0, spec = 0;
+      noclip = 0, oldpt = 0, flatn = 0, nospec = 0, noballs = 0, h = 0, spec = 0, nodiag = 0;
   double ballior = 1.5;
   double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0;
   for (int i = 1; i < argc; i++) {
@@ -403,6 +403,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "nospec") == 0) nospec = 1;
     if (strcmp(argv[i], "noballs") == 0) noballs = 1;
     if (strcmp(argv[i], "spec") == 0) spec = 1;
+    if (strcmp(argv[i], "nodiag") == 0) nodiag = 1;
   }
 
   /* САМОПРОВЕРКА ФОРМУЛЫ — ПЕРВОЙ, ДО ВСЯКОЙ СЦЕНЫ (А205). Ошибка знака или
@@ -869,34 +870,69 @@ int main(int argc, char **argv) {
   int64_t nspec = 0;
   if (L3 == NULL || rgb == NULL) return 1;
   t0 = now_s();
-#pragma omp parallel for schedule(dynamic, 16) reduction(+ : nspec)
-  for (int i = 0; i < n; i++) {
-    double acc[3] = {0.0, 0.0, 0.0}, accd[3] = {0.0, 0.0, 0.0};
-    for (int sy = 0; sy < ss; sy++)
-      for (int sx = 0; sx < ss; sx++) {
-        double o[3], d[3], v[3], vd[3];
-        tr3_camera_ray(&cam, i % w, i / w, o, d);
-        shade_ray(&SH, o, d, SH_DEPTH, v);
-        sh_ctx SD = SH;
-        SD.nospec = 1;
-        SD.nball = 0;
-        shade_ray(&SD, o, d, 0, vd);
-        for (int c = 0; c < 3; c++) {
-          acc[c] += v[c];
-          accd[c] += vd[c];
+  hz_pray_stat PST;
+  memset(&PST, 0, sizeof PST);
+#pragma omp parallel
+  {
+    memset(&hz_pray_st, 0, sizeof hz_pray_st);
+#pragma omp for schedule(dynamic, 16) reduction(+ : nspec)
+    for (int i = 0; i < n; i++) {
+      double acc[3] = {0.0, 0.0, 0.0}, accd[3] = {0.0, 0.0, 0.0};
+      for (int sy = 0; sy < ss; sy++)
+        for (int sx = 0; sx < ss; sx++) {
+          double o[3], d[3], v[3], vd[3];
+          tr3_camera_ray(&cam, i % w, i / w, o, d);
+          shade_ray(&SH, o, d, SH_DEPTH, v);
+          if (!nodiag) {
+            /* ДИАГНОСТИЧЕСКИЙ ЛУЧ: только ради доли недиффузных пикселей. Это
+             * ВТОРОЙ полный каст на пробу, и §90 меряет, сколько он стоит. */
+            sh_ctx SD = SH;
+            SD.nospec = 1;
+            SD.nball = 0;
+            shade_ray(&SD, o, d, 0, vd);
+          } else {
+            for (int c = 0; c < 3; c++)
+              vd[c] = v[c];
+          }
+          for (int c = 0; c < 3; c++) {
+            acc[c] += v[c];
+            accd[c] += vd[c];
+          }
         }
+      double wgt = 1.0 / (double)(ss * ss);
+      double s1 = 0.0, s2 = 0.0;
+      for (int c = 0; c < 3; c++) {
+        L3[(size_t)i * 3 + (size_t)c] = acc[c] * wgt;
+        s1 += acc[c];
+        s2 += accd[c];
       }
-    double wgt = 1.0 / (double)(ss * ss);
-    double s1 = 0.0, s2 = 0.0;
-    for (int c = 0; c < 3; c++) {
-      L3[(size_t)i * 3 + (size_t)c] = acc[c] * wgt;
-      s1 += acc[c];
-      s2 += accd[c];
+      /* Доля пикселей, где НЕдиффузная часть даёт больше 10 % — замер, а не отладка. */
+      if (s1 > 0.0 && fabs(s1 - s2) > 0.10 * s1) nspec++;
     }
-    /* Доля пикселей, где НЕдиффузная часть даёт больше 10 % — замер, а не отладка. */
-    if (s1 > 0.0 && fabs(s1 - s2) > 0.10 * s1) nspec++;
+    /* Счётчики потоко-локальны, поэтому горячий цикл их не сериализует; сводятся
+     * они ОДИН раз на поток, здесь. */
+#pragma omp critical
+    {
+      PST.nray += hz_pray_st.nray;
+      PST.ncell += hz_pray_st.ncell;
+      PST.ncand += hz_pray_st.ncand;
+      PST.ninside += hz_pray_st.ninside;
+      PST.nedge += hz_pray_st.nedge;
+    }
   }
   double tframe = now_s() - t0;
+  {
+    double pr = (double)(int64_t)n * ss * ss;
+    printf("== ПРОФИЛЬ КАДРА: лучей %lld (первичных %.0f, прочих %.2f на первичный); "
+           "ячеек сетки %.1f на луч; кандидатов %.1f на луч; тестов края %.1f на луч; "
+           "РЁБЕРНЫХ тестов %.0f на луч\n",
+           (long long)PST.nray, pr, (double)PST.nray / pr - 1.0,
+           (double)PST.ncell / (double)PST.nray, (double)PST.ncand / (double)PST.nray,
+           (double)PST.ninside / (double)PST.nray, (double)PST.nedge / (double)PST.nray);
+    printf("   %.2f млн лучей/с, %.0f нс на луч (16 ядер), %.1f нс на рёберный тест\n",
+           1e-6 * (double)PST.nray / tframe, 1e9 * tframe / (double)PST.nray,
+           1e9 * tframe / (double)(PST.nedge > 0 ? PST.nedge : 1));
+  }
   printf("== ЗЕРКАЛЬНОСТЬ: пикселей с недиффузным вкладом выше 10 %% — %.1f %%\n",
          100.0 * (double)nspec / (double)n);
 

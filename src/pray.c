@@ -134,6 +134,8 @@ int hz_pray_build(hz_pray *g, const hz_polyset *ps, double target) {
   return 0;
 }
 
+_Thread_local hz_pray_stat hz_pray_st;
+
 /* Пересечение луча с полигоном: плоскость, затем край. */
 static int poly_hit(const hz_polyset *ps, int32_t k, const double o[3], const double d[3],
                     double *tout) {
@@ -148,6 +150,8 @@ static int poly_hit(const hz_polyset *ps, int32_t k, const double o[3], const do
   double u = q[0] * P->eu[0] + q[1] * P->eu[1] + q[2] * P->eu[2];
   double v = q[0] * P->ev[0] + q[1] * P->ev[1] + q[2] * P->ev[2];
   if (u < P->uvlo[0] || u > P->uvhi[0] || v < P->uvlo[1] || v > P->uvhi[1]) return 0;
+  hz_pray_st.ninside++;
+  hz_pray_st.nedge += ps->loop[P->l0 + P->nloop] - ps->loop[P->l0];
   if (!hz_poly_inside(ps, P, u, v)) return 0;
   *tout = t;
   return 1;
@@ -224,8 +228,11 @@ int32_t hz_pray_hit(const hz_pray *g, const double o[3], const double d[3], doub
   walk_init(g, o, d, tmin, &w);
   int32_t best = -1;
   double bt = 1e300;
+  hz_pray_st.nray++;
   while (w.alive) {
     int64_t c = ((int64_t)w.c[2] * g->nc[1] + w.c[1]) * g->nc[0] + w.c[0];
+    hz_pray_st.ncell++;
+    hz_pray_st.ncand += g->start[c + 1] - g->start[c];
     for (int32_t i = g->start[c]; i < g->start[c + 1]; i++) {
       double t;
       if (!poly_hit(g->ps, g->idx[i], o, d, &t)) continue;
@@ -251,6 +258,7 @@ int hz_pray_occluded(const hz_pray *g, const double o[3], const double d[3], dou
                      double tmax) {
   ray_walk w;
   walk_init(g, o, d, tmin, &w);
+  hz_pray_st.nray++;
   while (w.alive) {
     int64_t c = ((int64_t)w.c[2] * g->nc[1] + w.c[1]) * g->nc[0] + w.c[0];
     for (int32_t i = g->start[c]; i < g->start[c + 1]; i++) {

@@ -608,6 +608,26 @@ int main(int argc, char **argv) {
          (double)S.n / ((double)L.nnd * log2((double)L.nnd + 2.0)));
   /* ПОДПИСЬ ЗАМКНУТОСТИ: `Σf` по листу с предками обязана быть единицей. Хвост
    * по площади, а не среднее (А194) — среднее печатается справочно. */
+  {
+    /* СКОЛЬКО ЭЛЕМЕНТОВ НЕ ВИДЯТ НИЧЕГО. Такой элемент чёрен на картинке при
+     * любом свете, и это дефект, а не тень: он не получает энергии вовсе. */
+    double *sfz = malloc((size_t)L.nnd * sizeof *sfz);
+    if (sfz == NULL) return 1;
+    hz_links_sf(&S, &L, sfz);
+    int64_t nz = 0;
+    double az = 0.0, atot4 = 0.0;
+    for (int32_t k = 0; k < L.nnd; k++) {
+      if (L.nd[k].level != 0) continue;
+      atot4 += L.nd[k].area_surf;
+      if (sfz[k] < 0.01) {
+        nz++;
+        az += L.nd[k].area_surf;
+      }
+    }
+    printf("== ЭЛЕМЕНТЫ БЕЗ СВЕТА (Σf < 0.01): %lld штук, %.2f %% площади\n", (long long)nz,
+           (atot4 > 0.0) ? 100.0 * az / atot4 : 0.0);
+    free(sfz);
+  }
   printf("== Σf ПО ЛИСТУ (с предками; в замкнутой сцене = 1): p10 %.3f, p50 %.3f, p90 %.3f; "
          "среднее %.3f, min %.3f, max %.3f; площади с Σf<0.9 — %.1f %%\n",
          S.sf_p10, S.sf_p50, S.sf_p90, S.sf_mean, S.sf_min, S.sf_max, 100.0 * S.sf_lowfrac);

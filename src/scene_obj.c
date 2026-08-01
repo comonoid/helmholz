@@ -509,91 +509,269 @@ int hz_obj_add_quad(hz_objmesh *m, const char *mtlname, const double c[3], const
  * пополам не даёт отношению сторон расти, тогда как деление на четыре плодит
  * иглы на вытянутых треугольниках. Материал и нормали углов наследуются;
  * новая вершина получает нормаль как среднее концов делимого ребра. */
+/* --- СОГЛАСОВАННОЕ РАЗБИЕНИЕ (§103) ----------------------------------------
+ *
+ * Прежняя редакция делила ТРЕУГОЛЬНИК по его длинной стороне. Сосед, с которым
+ * эта сторона общая, не делился, и новая вершина повисала ПОСРЕДИ его ребра —
+ * T-стык. *ЗАМЕРЕНО (§102):* доля рёбер с одним владельцем `12.63 % → 44.85 %`
+ * при удвоении числа треугольников. Диагноз дал пользователь по картинке
+ * («у них ребро должно быть общее»), и он оказался верен.
+ *
+ * ЗДЕСЬ — КРАСНО-ЗЕЛЁНОЕ ИЗМЕЛЬЧЕНИЕ С ЗАМЫКАНИЕМ, схема стандартная:
+ *   1. помечаются рёбра длиннее `smax`;
+ *   2. ЗАМЫКАНИЕ: пока есть треугольник ровно с ДВУМЯ помеченными рёбрами,
+ *      помечается и третье. После этого помечено 0, 1 или 3;
+ *   3. на помеченное ребро заводится ОДНА середина, общая обоим владельцам —
+ *      отсюда согласованность ПО ПОСТРОЕНИЮ, а не по совпадению;
+ *   4. перестройка: 3 → четыре треугольника, 1 → два, 0 → без изменений.
+ *
+ * Ключ — ТАБЛИЦА РЁБЕР: ребро делится ОДИН раз. Именно её и не было. */
+typedef struct {
+  int64_t key;
+  int32_t id;
+} so_ekey;
+
+static int so_cmp_ekey(const void *a, const void *b) {
+  int64_t x = ((const so_ekey *)a)->key, y = ((const so_ekey *)b)->key;
+  return (x < y) ? -1 : ((x > y) ? 1 : 0);
+}
+
+static int64_t so_ekey_of(int32_t a, int32_t b) {
+  int64_t lo = (a < b) ? a : b, hi = (a < b) ? b : a;
+  return lo * 4294967296LL + hi;
+}
+
+/* Найти номер ребра двоичным поиском в отсортированной таблице. */
+static int32_t so_efind(const so_ekey *tab, int32_t n, int64_t key) {
+  int32_t lo = 0, hi = n - 1;
+  while (lo <= hi) {
+    int32_t mid = lo + (hi - lo) / 2;
+    if (tab[mid].key == key) return tab[mid].id;
+    if (tab[mid].key < key)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return -1;
+}
+
 int hz_obj_subdivide(hz_objmesh *m, double smax) {
   if (!(smax > 0.0) || m->nt <= 0) return 0;
   const double s2 = smax * smax;
-  for (;;) {
-    int32_t nsplit = 0;
-    for (int32_t t = 0; t < m->nt; t++) {
-      const int32_t *fv = m->f + (size_t)t * 3;
-      int e = -1;
-      double best = s2;
+  for (int pass = 0; pass < 32; pass++) {
+    /* --- таблица рёбер --- */
+    int64_t ne = (int64_t)m->nt * 3;
+    so_ekey *tab = malloc((size_t)ne * sizeof *tab);
+    if (tab == NULL) return 2;
+    for (int32_t t = 0; t < m->nt; t++)
+      for (int i = 0; i < 3; i++)
+        tab[(size_t)t * 3 + (size_t)i].key = so_ekey_of(
+            m->f[(size_t)t * 3 + (size_t)i], m->f[(size_t)t * 3 + (size_t)((i + 1) % 3)]);
+    qsort(tab, (size_t)ne, sizeof *tab, so_cmp_ekey);
+    int32_t nedge = 0;
+    for (int64_t i = 0; i < ne;) {
+      int64_t j = i;
+      while (j < ne && tab[j].key == tab[i].key)
+        j++;
+      tab[nedge].key = tab[i].key;
+      tab[nedge].id = nedge;
+      nedge++;
+      i = j;
+    }
+    signed char *mark = calloc((size_t)nedge, 1);
+    int32_t *mid = malloc((size_t)nedge * sizeof *mid);
+    int32_t *te = malloc((size_t)m->nt * 3 * sizeof *te);
+    if (mark == NULL || mid == NULL || te == NULL) {
+      free(tab);
+      free(mark);
+      free(mid);
+      free(te);
+      return 2;
+    }
+    for (int32_t e = 0; e < nedge; e++)
+      mid[e] = -1;
+    /* номера рёбер треугольника и пометка длинных */
+    int64_t nlong = 0;
+    for (int32_t t = 0; t < m->nt; t++)
       for (int i = 0; i < 3; i++) {
-        const double *a = m->v + 3 * (size_t)fv[i];
-        const double *b = m->v + 3 * (size_t)fv[(i + 1) % 3];
+        int32_t a = m->f[(size_t)t * 3 + (size_t)i];
+        int32_t b = m->f[(size_t)t * 3 + (size_t)((i + 1) % 3)];
+        int32_t e = so_efind(tab, nedge, so_ekey_of(a, b));
+        te[(size_t)t * 3 + (size_t)i] = e;
+        if (e < 0 || mark[e]) continue;
+        const double *pa = m->v + 3 * (size_t)a, *pb = m->v + 3 * (size_t)b;
         double d = 0.0;
         for (int c = 0; c < 3; c++)
-          d += (b[c] - a[c]) * (b[c] - a[c]);
-        if (d > best) {
-          best = d;
-          e = i;
+          d += (pb[c] - pa[c]) * (pb[c] - pa[c]);
+        if (d > s2) {
+          mark[e] = 1;
+          nlong++;
         }
       }
-      if (e < 0) continue;
-      size_t i0 = (size_t)e, i1 = (size_t)((e + 1) % 3), i2 = (size_t)((e + 2) % 3);
-      double *nv = realloc(m->v, ((size_t)m->nv + 1) * 3 * sizeof *nv);
-      if (nv == NULL) return 2;
-      m->v = nv;
-      int32_t vm = m->nv;
-      for (int c = 0; c < 3; c++)
-        m->v[3 * (size_t)vm + (size_t)c] =
-            0.5 * (m->v[3 * (size_t)m->f[(size_t)t * 3 + i0] + (size_t)c] +
-                   m->v[3 * (size_t)m->f[(size_t)t * 3 + i1] + (size_t)c]);
-      m->nv++;
-      int32_t nm = -1;
-      if (m->vn != NULL && m->fn != NULL) {
-        int32_t a0 = m->fn[(size_t)t * 3 + i0], a1 = m->fn[(size_t)t * 3 + i1];
-        if (a0 >= 0 && a1 >= 0) {
-          double *nn = realloc(m->vn, ((size_t)m->nvn + 1) * 3 * sizeof *nn);
-          if (nn == NULL) return 2;
-          m->vn = nn;
-          double q[3], l = 0.0;
-          for (int c = 0; c < 3; c++) {
-            q[c] = 0.5 * (m->vn[3 * (size_t)a0 + (size_t)c] + m->vn[3 * (size_t)a1 + (size_t)c]);
-            l += q[c] * q[c];
-          }
-          l = sqrt(l);
-          for (int c = 0; c < 3; c++)
-            m->vn[3 * (size_t)m->nvn + (size_t)c] = (l > 0.0) ? q[c] / l : q[c];
-          nm = m->nvn;
-          m->nvn++;
-        }
-      }
-      int32_t *nf = realloc(m->f, ((size_t)m->nt + 1) * 3 * sizeof *nf);
-      if (nf == NULL) return 2;
-      m->f = nf;
-      int32_t *nfm = realloc(m->fm, ((size_t)m->nt + 1) * sizeof *nfm);
-      if (nfm == NULL) return 2;
-      m->fm = nfm;
-      if (m->fn != NULL) {
-        int32_t *nfn = realloc(m->fn, ((size_t)m->nt + 1) * 3 * sizeof *nfn);
-        if (nfn == NULL) return 2;
-        m->fn = nfn;
-      }
-      int32_t v0 = m->f[(size_t)t * 3 + i0], v1 = m->f[(size_t)t * 3 + i1];
-      int32_t v2 = m->f[(size_t)t * 3 + i2];
-      int32_t k = m->nt;
-      m->f[(size_t)t * 3 + 0] = v0;
-      m->f[(size_t)t * 3 + 1] = vm;
-      m->f[(size_t)t * 3 + 2] = v2;
-      m->f[(size_t)k * 3 + 0] = vm;
-      m->f[(size_t)k * 3 + 1] = v1;
-      m->f[(size_t)k * 3 + 2] = v2;
-      m->fm[k] = m->fm[t];
-      if (m->fn != NULL) {
-        int32_t n0 = m->fn[(size_t)t * 3 + i0], n1 = m->fn[(size_t)t * 3 + i1];
-        int32_t n2 = m->fn[(size_t)t * 3 + i2];
-        m->fn[(size_t)t * 3 + 0] = n0;
-        m->fn[(size_t)t * 3 + 1] = nm;
-        m->fn[(size_t)t * 3 + 2] = n2;
-        m->fn[(size_t)k * 3 + 0] = nm;
-        m->fn[(size_t)k * 3 + 1] = n1;
-        m->fn[(size_t)k * 3 + 2] = n2;
-      }
-      m->nt++;
-      nsplit++;
+    if (nlong == 0) {
+      free(tab);
+      free(mark);
+      free(mid);
+      free(te);
+      break;
     }
-    if (nsplit == 0) break;
+    /* --- ЗАМЫКАНИЕ: у треугольника не может остаться ровно два помеченных --- */
+    for (;;) {
+      int64_t add = 0;
+      for (int32_t t = 0; t < m->nt; t++) {
+        int c = 0, miss = -1;
+        for (int i = 0; i < 3; i++) {
+          int32_t e = te[(size_t)t * 3 + (size_t)i];
+          if (e >= 0 && mark[e])
+            c++;
+          else
+            miss = i;
+        }
+        if (c == 2 && miss >= 0) {
+          int32_t e = te[(size_t)t * 3 + (size_t)miss];
+          if (e >= 0 && !mark[e]) {
+            mark[e] = 1;
+            add++;
+          }
+        }
+      }
+      if (add == 0) break;
+    }
+    /* --- середины: ОДНА на ребро --- */
+    int32_t nnew = 0;
+    for (int32_t e = 0; e < nedge; e++)
+      if (mark[e]) nnew++;
+    double *nv = realloc(m->v, ((size_t)m->nv + (size_t)nnew) * 3 * sizeof *nv);
+    if (nv == NULL) {
+      free(tab);
+      free(mark);
+      free(mid);
+      free(te);
+      return 2;
+    }
+    m->v = nv;
+    int32_t v0 = m->nv;
+    for (int32_t e = 0; e < nedge; e++) {
+      if (!mark[e]) continue;
+      int32_t a = (int32_t)(tab[e].key / 4294967296LL), b = (int32_t)(tab[e].key % 4294967296LL);
+      for (int c = 0; c < 3; c++)
+        m->v[3 * (size_t)m->nv + (size_t)c] =
+            0.5 * (m->v[3 * (size_t)a + (size_t)c] + m->v[3 * (size_t)b + (size_t)c]);
+      mid[e] = m->nv;
+      m->nv++;
+    }
+    (void)v0;
+    /* --- перестройка --- */
+    int32_t cap = 0;
+    for (int32_t t = 0; t < m->nt; t++) {
+      int c = 0;
+      for (int i = 0; i < 3; i++) {
+        int32_t e = te[(size_t)t * 3 + (size_t)i];
+        if (e >= 0 && mark[e]) c++;
+      }
+      cap += (c == 3) ? 4 : ((c == 1) ? 2 : 1);
+    }
+    int32_t *nf = malloc((size_t)cap * 3 * sizeof *nf);
+    int32_t *nm = malloc((size_t)cap * sizeof *nm);
+    if (nf == NULL || nm == NULL) {
+      free(tab);
+      free(mark);
+      free(mid);
+      free(te);
+      free(nf);
+      free(nm);
+      return 2;
+    }
+    int32_t nt2 = 0;
+    for (int32_t t = 0; t < m->nt; t++) {
+      int32_t a = m->f[(size_t)t * 3 + 0], b = m->f[(size_t)t * 3 + 1], c = m->f[(size_t)t * 3 + 2];
+      int32_t e0 = te[(size_t)t * 3 + 0], e1 = te[(size_t)t * 3 + 1], e2 = te[(size_t)t * 3 + 2];
+      int m0 = (e0 >= 0 && mark[e0]), m1 = (e1 >= 0 && mark[e1]), m2 = (e2 >= 0 && mark[e2]);
+      int cnt = m0 + m1 + m2;
+      int32_t mtl = m->fm[t];
+      int32_t tri[4][3];
+      int ntri = 0;
+      if (cnt == 0) {
+        tri[0][0] = a;
+        tri[0][1] = b;
+        tri[0][2] = c;
+        ntri = 1;
+      } else if (cnt == 3) {
+        int32_t p = mid[e0], q = mid[e1], r = mid[e2];
+        tri[0][0] = a;
+        tri[0][1] = p;
+        tri[0][2] = r;
+        tri[1][0] = p;
+        tri[1][1] = b;
+        tri[1][2] = q;
+        tri[2][0] = r;
+        tri[2][1] = q;
+        tri[2][2] = c;
+        tri[3][0] = p;
+        tri[3][1] = q;
+        tri[3][2] = r;
+        ntri = 4;
+      } else { /* ровно одно: зелёный разрез от середины к противолежащей */
+        int32_t x0, x1, x2, p;
+        if (m0) {
+          x0 = a;
+          x1 = b;
+          x2 = c;
+          p = mid[e0];
+        } else if (m1) {
+          x0 = b;
+          x1 = c;
+          x2 = a;
+          p = mid[e1];
+        } else {
+          x0 = c;
+          x1 = a;
+          x2 = b;
+          p = mid[e2];
+        }
+        tri[0][0] = x0;
+        tri[0][1] = p;
+        tri[0][2] = x2;
+        tri[1][0] = p;
+        tri[1][1] = x1;
+        tri[1][2] = x2;
+        ntri = 2;
+      }
+      for (int k = 0; k < ntri; k++) {
+        for (int i = 0; i < 3; i++)
+          nf[(size_t)nt2 * 3 + (size_t)i] = tri[k][i];
+        nm[nt2] = mtl;
+        nt2++;
+      }
+    }
+    free(m->f);
+    free(m->fm);
+    m->f = nf;
+    m->fm = nm;
+    m->nt = nt2;
+    /* Нормали вершин при разбиении не переносятся: у них своя индексация, а
+     * согласованность важнее гладкости. Но `fn` НЕЛЬЗЯ просто обнулить: код
+     * ниже по цепочке проверяет `m->vn`, а разыменовывает `m->fn`
+     * (`polygon.c`), и рассогласование пары даёт падение. Поэтому массив
+     * заводится по новому размеру и заполняется `-1` — «нормали у угла нет». */
+    {
+      int32_t *nfn = malloc((size_t)nt2 * 3 * sizeof *nfn);
+      if (nfn == NULL) {
+        free(tab);
+        free(mark);
+        free(mid);
+        free(te);
+        return 2;
+      }
+      for (int64_t q = 0; q < (int64_t)nt2 * 3; q++)
+        nfn[q] = -1;
+      free(m->fn);
+      m->fn = nfn;
+    }
+    free(tab);
+    free(mark);
+    free(mid);
+    free(te);
   }
   return 0;
 }

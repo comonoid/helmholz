@@ -72,7 +72,7 @@ static int cmp_d(const void *a, const void *b) {
  * Сверх того есть явный флаг материала `flat`.
  */
 #define SH_DEPTH                                                                                   \
-  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает \
+  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает                                 \
      * стоимость; глубже вклад падает как произведение долей */
 
 /* ТОЧНЫЙ ФРЕНЕЛЬ ПО НЕПОЛЯРИЗОВАННОМУ СВЕТУ. Приближение Шлика не нужно: точная
@@ -373,7 +373,8 @@ static void shade_ray(const sh_ctx *S, const double o[3], const double d[3], int
 
 int main(int argc, char **argv) {
   int city = 0, w = 512, ss = 2, nvis = 2, maxlev = 13, noself = 0, nopull = 0, disk = 0,
-      noclip = 0, oldpt = 0, flatn = 0, nospec = 0, noballs = 0, h = 0, spec = 0, nodiag = 0;
+      noclip = 0, oldpt = 0, flatn = 0, nospec = 0, noballs = 0, h = 0, spec = 0, nodiag = 0,
+      ceillight = 0, novis = 0;
   double ballior = 1.5;
   double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0;
   for (int i = 1; i < argc; i++) {
@@ -404,6 +405,9 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "noballs") == 0) noballs = 1;
     if (strcmp(argv[i], "spec") == 0) spec = 1;
     if (strcmp(argv[i], "nodiag") == 0) nodiag = 1;
+    /* База §91 и НК9: прежний потолочный источник; видимость тождественно 1. */
+    if (strcmp(argv[i], "ceillight") == 0) ceillight = 1;
+    if (strcmp(argv[i], "novis") == 0) novis = 1;
   }
 
   /* САМОПРОВЕРКА ФОРМУЛЫ — ПЕРВОЙ, ДО ВСЯКОЙ СЦЕНЫ (А205). Ошибка знака или
@@ -434,6 +438,33 @@ int main(int argc, char **argv) {
     fprintf(stderr, "нет сцены\n");
     return 1;
   }
+  /* ЛАМПЫ — ДО СЕГМЕНТАЦИИ (§91). Восемь площадок под потолком вместо прежнего
+   * светящегося ПОТОЛКА целиком: тот был 37.72 м² и теней не давал по
+   * построению. Числа берутся из `scene_cfg.h`, а не выдумываются здесь. */
+  int lampmtl = -1;
+  /* ВЫСОТА ЛАМП — ДОЛЯ ГАБАРИТА, А НЕ АБСОЛЮТНОЕ ЧИСЛО. `HZ_CFG_LAMP_Y = 1.95`
+   * заведено под `prender` и к этой сцене не привязано; лампа обязана висеть НИЖЕ
+   * потолка настолько, чтобы сегментация не слила её с ним в одну плоскость
+   * (допуск `dseg`), иначе светиться начнёт весь потолок — что и вышло первым
+   * прогоном: участков осталось 993, светящихся элементов 0. */
+  double lampy = m.hi[1] - 4.0 * dseg;
+  if (!city) {
+    const double ln[3] = {0.0, -1.0, 0.0}, leu[3] = {1.0, 0.0, 0.0};
+    for (int i = 0; i < HZ_CFG_LAMP_NX; i++)
+      for (int j = 0; j < HZ_CFG_LAMP_NZ; j++) {
+        double lc[3];
+        lc[0] = m.lo[0] + ((double)i + 0.5) / HZ_CFG_LAMP_NX * (m.hi[0] - m.lo[0]);
+        lc[1] = lampy;
+        lc[2] = m.lo[2] + ((double)j + 0.5) / HZ_CFG_LAMP_NZ * (m.hi[2] - m.lo[2]);
+        lampmtl = hz_obj_add_quad(&m, "hz_lamp", lc, ln, leu, HZ_CFG_LAMP_SIDE / 2.0,
+                                  HZ_CFG_LAMP_SIDE / 2.0);
+        if (lampmtl < 0) return 1;
+      }
+    printf("== ЛАМПЫ: %d штук на высоте %.2f м, сторона %.2f м, материал %d; габарит зала "
+           "y = %.2f…%.2f\n",
+           HZ_CFG_LAMP_NX * HZ_CFG_LAMP_NZ, lampy, HZ_CFG_LAMP_SIDE, lampmtl, m.lo[1], m.hi[1]);
+  }
+
   hz_pseglist sg;
   if (hz_seg_planar(&sg, &m, dseg) != 0) return 1;
   hz_polyset ps;
@@ -501,6 +532,7 @@ int main(int argc, char **argv) {
   lkc.disk = disk;
   lkc.noclip = noclip;
   lkc.oldpt = oldpt;
+  lkc.novis = novis;
   hz_linkset S;
   t0 = now_s();
   if (hz_links_build(&S, &sc, &lkc) != 0) {
@@ -685,24 +717,38 @@ int main(int argc, char **argv) {
   if (Le == NULL || rho == NULL || E == NULL) return 1;
   int64_t nsrc = 0;
   double asrc = 0.0;
-  double ytop = m.hi[1] - 0.05 * (m.hi[1] - m.lo[1]);
   for (int32_t k = 0; k < L.nnd; k++) {
     rho[k] = 0.5;
-    /* ИСТОЧНИК ТОЛЬКО НА НУЛЕВОМ УРОВНЕ. Прежде критерий применялся к каждому
-     * уровню независимо (2 узла на нулевом против 11 по лестнице), а подъём
-     * затем перезаписывал `B` у всех внутренних узлов — излучение грубых просто
-     * выбрасывалось. На грубые уровни оно теперь приходит подъёмом, который и
-     * так есть. */
-    if (L.nd[k].level == 0 && L.nd[k].n[1] < -0.9 && L.nd[k].cy > ytop) {
+    /* ИСТОЧНИК — ПО МАТЕРИАЛУ, А НЕ ПО ГЕОГРАФИИ (§91). Прежний критерий
+     * «смотрит вниз и выше `ytop`» объявлял источником ВЕСЬ ПОТОЛОК, 37.72 м²;
+     * теперь светятся ровно полигоны материала лампы, и потолок закрыт — он
+     * обычная отражающая поверхность. Только нулевой уровень: на грубые
+     * излучение приходит подъёмом. */
+    int32_t lp = (L.nd[k].level == 0 && k < L.np) ? -1 : -2;
+    if (lp == -1) {
+      for (int32_t q = 0; q < L.np; q++)
+        if (L.lab[q] == k) {
+          lp = q;
+          break;
+        }
+    }
+    int32_t ltr = (lp >= 0 && ps.p[lp].ntri > 0) ? ps.tri[ps.p[lp].t0] : -1;
+    int islamp = (ltr >= 0 && m.fm != NULL && m.fm[ltr] == lampmtl && lampmtl >= 0);
+    /* БАЗА ДЛЯ СРАВНЕНИЯ: прежняя оснастка «светится весь потолок». Без неё
+     * рост разброса сравнивался бы с НЕИЗМЕРЕННЫМ числом. */
+    if (ceillight)
+      islamp = (L.nd[k].level == 0 && L.nd[k].n[1] < -0.9 &&
+                L.nd[k].cy > m.hi[1] - 0.05 * (m.hi[1] - m.lo[1]));
+    if (islamp) {
       Le[k] = HZ_CFG_LAMP_LE;
       rho[k] = 0.0;
       nsrc++;
       asrc += L.nd[k].area_surf;
     }
   }
-  printf("== ИСТОЧНИК (оснастка): светящихся узлов уровня 0 — %lld выше y = %.2f, "
-         "площадь %.3f м²\n",
-         (long long)nsrc, ytop, asrc);
+  printf("== ИСТОЧНИК: светящихся элементов %lld, суммарная площадь %.3f м² (было: ПОТОЛОК, "
+         "37.720 м²)\n",
+         (long long)nsrc, asrc);
 
   const int maxit = 200;
   double *rh = calloc((size_t)maxit, sizeof *rh);
@@ -727,6 +773,26 @@ int main(int argc, char **argv) {
     if (L.nd[k].level == 0) flux0 += E[k] * L.nd[k].area_surf;
   printf("== ПОТОК: Σ B·A по уровню 0 = %.6e Вт/ср%s%s\n", flux0, noself ? " [noself]" : "",
          nopull ? " [nopull]" : "");
+  /* РАЗБРОС РАДИАНСА ПО ЭЛЕМЕНТАМ — числовая мера того, появилась ли
+   * неоднородность освещения. Сплошной потолочный источник давал почти
+   * равномерное поле; компактные лампы обязаны его расслоить. */
+  {
+    double *br = malloc((size_t)L.nnd * sizeof *br);
+    if (br == NULL) return 1;
+    int32_t nbr = 0;
+    for (int32_t k = 0; k < L.nnd; k++)
+      if (L.nd[k].level == 0 && Le[k] <= 0.0) br[nbr++] = E[k];
+    qsort(br, (size_t)nbr, sizeof *br, cmp_d);
+    double q10 = br[(size_t)(0.10 * nbr)], q50 = br[(size_t)(0.50 * nbr)];
+    double q90 = br[(size_t)(0.90 * nbr)];
+    int64_t dark = 0;
+    for (int32_t k = 0; k < nbr; k++)
+      if (br[k] < 0.10 * q50) dark++;
+    printf("== РАЗБРОС РАДИАНСА (несветящиеся элементы, %d шт): p10 %.3e, p50 %.3e, p90 %.3e; "
+           "p90/p10 = %.1f; темнее 10 %% медианы — %.1f %%\n",
+           nbr, q10, q50, q90, (q10 > 0.0) ? q90 / q10 : 0.0, 100.0 * (double)dark / (double)nbr);
+    free(br);
+  }
 
   /* --- СРЕЗ И КАРТИНКА --- */
   int32_t *cut = malloc((size_t)L.np * sizeof *cut);

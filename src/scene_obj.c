@@ -430,3 +430,71 @@ int hz_obj_parse(hz_objmesh *m, const char *buf, double scale, const char *objpa
   }
   return 0;
 }
+
+int hz_obj_add_quad(hz_objmesh *m, const char *mtlname, const double c[3], const double n[3],
+                    const double eu[3], double hu, double hv) {
+  int mi = mtl_add(m, mtlname, strlen(mtlname), 0.05);
+  if (mi < 0) return -1;
+  double nn = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  if (!(nn > 0.0) || !(hu > 0.0) || !(hv > 0.0)) return -1;
+  double un[3], ev[3], eul = 0.0;
+  for (int a = 0; a < 3; a++)
+    un[a] = n[a] / nn;
+  double dp = eu[0] * un[0] + eu[1] * un[1] + eu[2] * un[2];
+  for (int a = 0; a < 3; a++) {
+    ev[a] = eu[a] - dp * un[a];
+    eul += ev[a] * ev[a];
+  }
+  eul = sqrt(eul);
+  if (!(eul > 0.0)) return -1;
+  double e1[3], e2[3];
+  for (int a = 0; a < 3; a++)
+    e1[a] = ev[a] / eul;
+  /* `e2 = n × e1`, чтобы обход шёл против часовой стрелки со стороны нормали. */
+  e2[0] = un[1] * e1[2] - un[2] * e1[1];
+  e2[1] = un[2] * e1[0] - un[0] * e1[2];
+  e2[2] = un[0] * e1[1] - un[1] * e1[0];
+
+  double *nv = realloc(m->v, (size_t)(m->nv + 4) * 3 * sizeof *nv);
+  if (nv == NULL) return -1;
+  m->v = nv;
+  int32_t *nf = realloc(m->f, (size_t)(m->nt + 2) * 3 * sizeof *nf);
+  if (nf == NULL) return -1;
+  m->f = nf;
+  int32_t *nm = realloc(m->fm, (size_t)(m->nt + 2) * sizeof *nm);
+  if (nm == NULL) return -1;
+  m->fm = nm;
+  /* Нормалей вершин у лампы НЕТ СОЗНАТЕЛЬНО: она плоская, и подгонка `n0/nu/nv`
+   * даст `nu = nv = 0` точно (§89.3). Если массив нормалей в сцене есть, углам
+   * лампы ставится `-1` — «нормали нет». */
+  if (m->fn != NULL) {
+    int32_t *nfn = realloc(m->fn, (size_t)(m->nt + 2) * 3 * sizeof *nfn);
+    if (nfn == NULL) return -1;
+    m->fn = nfn;
+    for (int i = 0; i < 6; i++)
+      m->fn[(size_t)m->nt * 3 + (size_t)i] = -1;
+  }
+  const double su[4] = {-1.0, 1.0, 1.0, -1.0}, sv[4] = {-1.0, -1.0, 1.0, 1.0};
+  int32_t v0 = m->nv;
+  for (int k = 0; k < 4; k++)
+    for (int a = 0; a < 3; a++)
+      m->v[(size_t)(v0 + k) * 3 + (size_t)a] = c[a] + su[k] * hu * e1[a] + sv[k] * hv * e2[a];
+  m->nv += 4;
+  int32_t t0 = m->nt;
+  const int32_t idx[6] = {0, 1, 2, 0, 2, 3};
+  for (int i = 0; i < 6; i++)
+    m->f[(size_t)t0 * 3 + (size_t)i] = v0 + idx[i];
+  m->fm[t0] = mi;
+  m->fm[t0 + 1] = mi;
+  m->nt += 2;
+  /* ГАБАРИТ — ПО ВЕРШИНАМ, а не по `c ± (hu+hv)`: площадка ПЛОСКАЯ, вдоль
+   * нормали протяжённости нет вовсе, и раздувание коробки по всем осям подняло
+   * потолок сцены с 2.07 до 2.19 м, сорвав замер базы (§91.2). */
+  for (int k = 0; k < 4; k++)
+    for (int a = 0; a < 3; a++) {
+      double p = m->v[(size_t)(v0 + k) * 3 + (size_t)a];
+      if (m->lo[a] > p) m->lo[a] = p;
+      if (m->hi[a] < p) m->hi[a] = p;
+    }
+  return mi;
+}

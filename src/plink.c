@@ -711,7 +711,7 @@ int hz_links_build(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg) {
       }
       continue;
     }
-    double v = lk_vis(sc, ia, xa, ib, xb, nvis, &S->nray);
+    double v = cfg->novis ? 1.0 : lk_vis(sc, ia, xa, ib, xb, nvis, &S->nray);
     if (!(v > 0.0)) {
       S->nzero++;
       continue;

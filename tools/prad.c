@@ -29,6 +29,7 @@
 #include "poly_seg.h"
 #include "polygon.h"
 #include "pray.h"
+#include "pvert.h"
 #include "scene_cfg.h"
 #include "scene_obj.h"
 #include "transport/cam3.h"
@@ -391,7 +392,7 @@ int main(int argc, char **argv) {
       ceillight = 0, novis = 0, hemi = 0, ptleaf = 0, nozb = 0;
   double ballior = 1.5;
   double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0, segcap = 0.5, trimax = 0.0;
-  int flatfield = 0;
+  int flatfield = 0, vertR = 0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "city") == 0) city = 1;
     if (strncmp(argv[i], "w=", 2) == 0) w = (int)strtol(argv[i] + 2, NULL, 10);
@@ -434,6 +435,8 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "tri=", 4) == 0) trimax = strtod(argv[i] + 4, NULL);
     /* НК16 §98: без восстановления непрерывности — вернуть лоскуты. */
     if (strcmp(argv[i], "flatfield") == 0) flatfield = 1;
+    /* §100: неизвестные НА ВЕРШИНАХ, разрешение полукуба вершины. */
+    if (strncmp(argv[i], "vert=", 5) == 0) vertR = (int)strtol(argv[i] + 5, NULL, 10);
   }
 
   /* САМОПРОВЕРКА ФОРМУЛЫ — ПЕРВОЙ, ДО ВСЯКОЙ СЦЕНЫ (А205). Ошибка знака или
@@ -794,7 +797,8 @@ int main(int argc, char **argv) {
          "37.720 м²)\n",
          (long long)nsrc, asrc);
 
-  const int maxit = 200;
+  const int maxit0 = 200;
+  const int maxit = maxit0;
   double *rh = calloc((size_t)maxit, sizeof *rh);
   if (rh == NULL) return 1;
   t0 = now_s();
@@ -915,7 +919,141 @@ int main(int argc, char **argv) {
 
   /* ПОДГОНКА НЕПРЕРЫВНОГО ПОЛЯ (§98). Три прохода: значения в сварных вершинах,
    * наименьшие квадраты по краю, сдвиг под сохранение среднего. */
-  if (!flatfield) {
+  /* НЕИЗВЕСТНЫЕ НА ВЕРШИНАХ (§100): своя сборка и своё решение. Поле по
+   * элементу получается ЛИНЕЙНЫМ ИЗ РЕШЕНИЯ, а не подгонкой к нему, и сдвиг под
+   * сохранение среднего не нужен — среднее и есть решение. */
+  if (vertR > 0) {
+    hz_vset VS;
+    if (hz_vset_build(&VS, &ps) != 0) return 1;
+    printf("== ВЕРШИНЫ: %d различных; с ОДНИМ владельцем %lld, с несколькими %lld\n", VS.nv,
+           (long long)VS.n_one, (long long)VS.n_many);
+    hz_linkset SV;
+    t0 = now_s();
+    if (hz_vert_build(&SV, &VS, &sc, &lkc, vertR) != 0) return 1;
+    double tvb = now_s() - t0;
+    printf("== СВЯЗИ ВЕРШИН: %lld за %.1f с; пикселей %lld, мимо %lld (%.1f %%), установок "
+           "треугольника %lld\n",
+           (long long)SV.n, tvb, (long long)SV.nray, (long long)SV.nzero,
+           100.0 * (double)SV.nzero / (double)(SV.nray ? SV.nray : 1), (long long)SV.nrefine);
+    double *Lev = calloc((size_t)VS.nv, sizeof *Lev);
+    double *rhv = calloc((size_t)VS.nv, sizeof *rhv);
+    double *wv = calloc((size_t)VS.nv, sizeof *wv);
+    double *Bv = calloc((size_t)VS.nv, sizeof *Bv);
+    double *Bp = calloc((size_t)ps.np, sizeof *Bp);
+    double *Bn = calloc((size_t)L.nnd, sizeof *Bn);
+    double *rhv2 = calloc((size_t)maxit0, sizeof *rhv2);
+    if (Lev == NULL || rhv == NULL || wv == NULL || Bv == NULL || Bp == NULL || Bn == NULL ||
+        rhv2 == NULL)
+      return 1;
+    /* Излучение и альбедо вершины — средние по владельцам, взвешенные площадью. */
+    for (int32_t k = 0; k < ps.np; k++) {
+      int32_t nd = L.lab[k];
+      double a = ps.p[k].area;
+      for (int32_t b = ps.loop[ps.p[k].l0]; b < ps.loop[ps.p[k].l0 + ps.p[k].nloop]; b++) {
+        int32_t v = VS.id[b];
+        Lev[v] += Le[nd] * a;
+        rhv[v] += rho[nd] * a;
+        wv[v] += a;
+      }
+    }
+    for (int32_t v = 0; v < VS.nv; v++)
+      if (wv[v] > 0.0) {
+        Lev[v] /= wv[v];
+        rhv[v] /= wv[v];
+      }
+    t0 = now_s();
+    int itv = hz_vert_solve(&SV, &VS, &ps, &L, Lev, rhv, Bv, Bp, Bn, 1e-4, maxit0, rhv2);
+    printf("== РЕШЕНИЕ НА ВЕРШИНАХ: %d итераций за %.3f с; сжатие", itv, now_s() - t0);
+    for (int i2 = 1; i2 < itv && i2 < 8; i2++)
+      printf(" %.3f", (rhv2[i2 - 1] > 0.0) ? rhv2[i2] / rhv2[i2 - 1] : 0.0);
+    printf("\n");
+    /* Поле по элементу — ЛИНЕЙНОЕ ИЗ РЕШЕНИЯ: наименьшие квадраты по вершинам,
+     * БЕЗ сдвига под среднее. */
+    for (int32_t k = 0; k < ps.np; k++) {
+      const hz_poly *p = &ps.p[k];
+      double G[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, R2[3] = {0, 0, 0};
+      int32_t b0 = ps.loop[p->l0], b1 = ps.loop[p->l0 + p->nloop];
+      for (int32_t b = b0; b < b1; b++) {
+        double bs[3] = {1.0, ps.bv[2 * b], ps.bv[2 * b + 1]};
+        for (int i2 = 0; i2 < 3; i2++) {
+          for (int j2 = 0; j2 < 3; j2++)
+            G[i2][j2] += bs[i2] * bs[j2];
+          R2[i2] += bs[i2] * Bv[VS.id[b]];
+        }
+      }
+      double c[3] = {Bp[k], 0.0, 0.0};
+      double sp = 0.0;
+      if (b1 - b0 >= 3 && hz_solve3x3(G, R2, c) == 0)
+        sp = fabs(c[1]) * (p->uvhi[0] - p->uvlo[0]) + fabs(c[2]) * (p->uvhi[1] - p->uvlo[1]);
+      if (!(b1 - b0 >= 3) || sp > 4.0 * Bp[k]) {
+        c[0] = Bp[k];
+        c[1] = 0.0;
+        c[2] = 0.0;
+      }
+      for (int i2 = 0; i2 < 3; i2++)
+        pfit[3 * (size_t)k + (size_t)i2] = c[i2];
+      E[L.lab[k]] = Bp[k];
+    }
+    /* Σf ПО ВЕРШИНАМ — доля полусферы, накрытая геометрией из вершины. У вершины
+     * она НИЖЕ, чем у центра элемента: часть полусферы занимают её собственные
+     * владельцы, которые в полукуб не рисуются (правило §88 на вершине). */
+    {
+      double *sfv = calloc((size_t)VS.nv, sizeof *sfv);
+      if (sfv == NULL) return 1;
+      for (int64_t l = 0; l < SV.n; l++)
+        sfv[SV.l[l].i] += SV.l[l].f;
+      qsort(sfv, (size_t)VS.nv, sizeof *sfv, cmp_d);
+      printf("== Σf ПО ВЕРШИНАМ: p10 %.3f, p50 %.3f, p90 %.3f\n", sfv[(size_t)(0.10 * VS.nv)],
+             sfv[(size_t)(0.50 * VS.nv)], sfv[(size_t)(0.90 * VS.nv)]);
+      free(sfv);
+    }
+    /* СКАЧОК В ОБЩЕЙ ВЕРШИНЕ: сравниваются ВОССТАНОВЛЕННЫЕ значения РАЗНЫХ
+     * владельцев в одной точке. Прежняя редакция сравнивала `Bv[id]` с
+     * `Bv[id]` — ложный ноль, узор Ш7/А4/А28, и я его же сегодня трижды ловил. */
+    {
+      double *vmin = malloc((size_t)VS.nv * sizeof *vmin);
+      double *vmax2 = malloc((size_t)VS.nv * sizeof *vmax2);
+      if (vmin == NULL || vmax2 == NULL) return 1;
+      for (int32_t v = 0; v < VS.nv; v++) {
+        vmin[v] = 1e300;
+        vmax2[v] = -1e300;
+      }
+      for (int32_t k = 0; k < ps.np; k++) {
+        const double *cf = pfit + 3 * (size_t)k;
+        for (int32_t b = ps.loop[ps.p[k].l0]; b < ps.loop[ps.p[k].l0 + ps.p[k].nloop]; b++) {
+          double val = cf[0] + cf[1] * ps.bv[2 * b] + cf[2] * ps.bv[2 * b + 1];
+          int32_t v = VS.id[b];
+          if (val < vmin[v]) vmin[v] = val;
+          if (val > vmax2[v]) vmax2[v] = val;
+        }
+      }
+      double jmax = 0.0, jsum = 0.0, bref = 0.0;
+      int64_t njn = 0;
+      for (int32_t v = 0; v < VS.nv; v++) {
+        if (VS.nown[v] < 2) continue;
+        double d = vmax2[v] - vmin[v];
+        if (d > jmax) jmax = d;
+        jsum += d;
+        njn++;
+        if (Bv[v] > bref) bref = Bv[v];
+      }
+      printf("== СКАЧОК В ОБЩЕЙ ВЕРШИНЕ (между владельцами, по восстановленному полю): "
+             "максимум %.3e, средний %.3e при уровне %.3e\n",
+             jmax, (njn > 0) ? jsum / (double)njn : 0.0, bref);
+      free(vmin);
+      free(vmax2);
+    }
+    hz_linkset SVf = SV;
+    hz_links_free(&SVf);
+    hz_vset_free(&VS);
+    free(Lev);
+    free(rhv);
+    free(wv);
+    free(Bv);
+    free(Bp);
+    free(Bn);
+    free(rhv2);
+  } else if (!flatfield) {
     /* ЕДИНЫЙ НОМЕР ВЕРШИНЫ. `bw` — номер в СВОЕЙ таблице сварки полигонизатора,
      * а не в крае; у части позиций его нет (`-1`), и такой позиции даётся
      * СОБСТВЕННЫЙ номер. Иначе она выпадает из подгонки, опорных точек остаётся

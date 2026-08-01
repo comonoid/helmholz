@@ -52,7 +52,7 @@ static int cmp_d(const void *a, const void *b) {
 
 int main(int argc, char **argv) {
   int city = 0, w = 512, ss = 2, nvis = 2, maxlev = 13, noself = 0, nopull = 0, disk = 0,
-      noclip = 0;
+      noclip = 0, oldpt = 0;
   double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "city") == 0) city = 1;
@@ -71,6 +71,8 @@ int main(int argc, char **argv) {
     /* НК3 и НК4 §87: диск вместо точной формы; точная форма без отсечения. */
     if (strcmp(argv[i], "disk") == 0) disk = 1;
     if (strcmp(argv[i], "noclip") == 0) noclip = 1;
+    /* НК5 §88: опорная точка = центр площади, как до правки. */
+    if (strcmp(argv[i], "oldpt") == 0) oldpt = 1;
   }
 
   /* САМОПРОВЕРКА ФОРМУЛЫ — ПЕРВОЙ, ДО ВСЯКОЙ СЦЕНЫ (А205). Ошибка знака или
@@ -153,6 +155,7 @@ int main(int argc, char **argv) {
   sc.L = &L;
   sc.g = &g;
   sc.ps = &ps;
+  sc.m = &m;
   hz_linkcfg lkc;
   memset(&lkc, 0, sizeof lkc);
   lkc.eps = eps * linkmul;
@@ -160,6 +163,7 @@ int main(int argc, char **argv) {
   lkc.noself = noself;
   lkc.disk = disk;
   lkc.noclip = noclip;
+  lkc.oldpt = oldpt;
   hz_linkset S;
   t0 = now_s();
   if (hz_links_build(&S, &sc, &lkc) != 0) {
@@ -194,11 +198,19 @@ int main(int argc, char **argv) {
    * и есть центр площади, так что тест сводится к подсчёту пересечений луча
    * `v = 0, u > 0` с краем. Площадь считается, а не только число полигонов:
    * вклад в перенос идёт площадью. */
+  double *ptn = malloc(3 * (size_t)L.nnd * sizeof *ptn);
+  if (ptn == NULL || hz_links_points(ptn, &L, &ps, &m, oldpt) != 0) return 1;
   {
     double aout = 0.0, atot3 = 0.0;
     int32_t nout = 0;
     for (int32_t k = 0; k < ps.np; k++) {
       const hz_poly *p = &ps.p[k];
+      /* Точка ПЕРЕНОСА в местных (u,v) полигона; до §88 это было тождественно
+       * начало рамы, то есть центр площади. */
+      const double *xp = ptn + 3 * L.lab[k];
+      double du[3] = {xp[0] - p->org[0], xp[1] - p->org[1], xp[2] - p->org[2]};
+      double pu = du[0] * p->eu[0] + du[1] * p->eu[1] + du[2] * p->eu[2];
+      double pv = du[0] * p->ev[0] + du[1] * p->ev[1] + du[2] * p->ev[2];
       int cross = 0;
       for (int32_t li = 0; li < p->nloop; li++) {
         int32_t b0 = ps.loop[p->l0 + li], b1 = ps.loop[p->l0 + li + 1];
@@ -206,9 +218,11 @@ int main(int argc, char **argv) {
           int32_t e2 = (e + 1 < b1) ? e + 1 : b0;
           double u1 = ps.bv[2 * e], v1 = ps.bv[2 * e + 1];
           double u2 = ps.bv[2 * e2], v2 = ps.bv[2 * e2 + 1];
+          v1 -= pv;
+          v2 -= pv;
           if ((v1 > 0.0) == (v2 > 0.0)) continue;
           double t = v1 / (v1 - v2);
-          if (u1 + t * (u2 - u1) > 0.0) cross++;
+          if (u1 + t * (u2 - u1) > pu) cross++;
         }
       }
       atot3 += p->area;
@@ -217,7 +231,7 @@ int main(int argc, char **argv) {
         aout += p->area;
       }
     }
-    printf("== ОПОРНАЯ ТОЧКА ВНЕ СВОЕГО ПОЛИГОНА: %d из %d полигонов (%.1f %% ПЛОЩАДИ)\n", nout,
+    printf("== ОПОРНАЯ ТОЧКА ПЕРЕНОСА ВНЕ СВОЕГО ПОЛИГОНА: %d из %d (%.1f %% ПЛОЩАДИ)\n", nout,
            ps.np, (atot3 > 0.0) ? 100.0 * aout / atot3 : 0.0);
     fflush(stdout);
   }
@@ -267,7 +281,7 @@ int main(int argc, char **argv) {
         double d[3], o[3];
         for (int c = 0; c < 3; c++) {
           d[c] = sn * cos(ph) * eu[c] + sn * sin(ph) * ev[c] + cs * N->n[c];
-          o[c] = ((c == 0) ? N->cx : (c == 1) ? N->cy : N->cz) + 1e-5 * N->n[c];
+          o[c] = ptn[3 * k + c] + 1e-5 * N->n[c];
         }
         double th = 0.0;
         if (hz_pray_hit(&g, o, d, 0.0, &th) >= 0) {
@@ -303,20 +317,23 @@ int main(int argc, char **argv) {
      * величин: где потеря — в дроблении, в заслонении или в коэффициенте. */
     {
       const int NS = 32;
-      double bn[32], bv[32];
+      double bn[32], bv[32], bs[32];
       int32_t bnode[32];
-      int nb = hz_links_sf_brute(&sc, (L.np / NS > 0) ? L.np / NS : 1, nvis, bn, bv, bnode, NS);
+      int nb = hz_links_sf_brute(&sc, (L.np / NS > 0) ? L.np / NS : 1, nvis, oldpt, bn, bv, bs,
+                                 bnode, NS);
       if (nb > 0) {
-        double an = 0.0, av = 0.0, ah = 0.0, ar2 = 0.0;
+        double an = 0.0, av = 0.0, ah = 0.0, as = 0.0, ar2 = 0.0;
         for (int i2 = 0; i2 < nb; i2++) {
           an += bn[i2];
           av += bv[i2];
           ah += sfn[bnode[i2]];
+          as += bs[i2];
         }
         (void)ar2;
         printf("== ЭТАЛОН ПЕРЕБОРОМ (%d листьев из %d): Σf перебором без видимости %.3f, "
-               "с видимостью %.3f; та же выборка иерархией %.3f\n",
-               nb, L.np, an / nb, av / nb, ah / nb);
+               "с видимостью %.3f, с видимостью БЕЗ САМОЗАТЕНЕНИЯ %.3f; та же выборка "
+               "иерархией %.3f\n",
+               nb, L.np, an / nb, av / nb, as / nb, ah / nb);
       }
     }
     free(sfn);
@@ -432,6 +449,7 @@ int main(int argc, char **argv) {
   if (hz_ppm_write_rgb(path, rgb, w, w) != 0) return 1;
   printf("== КАДР: %s, %d×%d, суперсэмплинг %d×%d, за %.2f с\n", path, w, w, ss, ss, tframe);
 
+  free(ptn);
   free(L3);
   free(rgb);
   free(cut);

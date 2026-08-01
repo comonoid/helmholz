@@ -90,6 +90,9 @@ typedef struct {
 typedef struct {
   const hz_lod *L;
   const hz_pray *g; /* сетка лучей по геометрии сцены — только для видимости */
+  /* МЕШ — ради опорной точки ПЕРЕНОСА (§88): без вершин треугольников ближайшую
+   * к центру площади точку поверхности не взять. */
+  const hz_objmesh *m;
   /* ПОЛИГОНЫ — ради ТОЧНОГО форм-фактора (§87). Узел уровня 0 есть участок
    * сегментации, и у него ЕСТЬ край; у внутренних узлов края нет, там остаётся
    * диск. `NULL` — считать всё диском. */
@@ -104,6 +107,7 @@ typedef struct {
   int noself; /* без самопар `(a,a)` */
   int disk;   /* НК3: точечно-дисковый коэффициент вместо точного */
   int noclip; /* НК4: точный форм-фактор БЕЗ отсечения полуплоскостью */
+  int oldpt;  /* НК5: опорная точка = центр площади, как до §88 */
 } hz_linkcfg;
 
 /* Собрать связи. `eps` — тот же угловой допуск, что у среза; `nvis` — проб
@@ -139,8 +143,15 @@ void hz_links_sf(const hz_linkset *S, const hz_lod *L, double *sf);
  * теряет ли энергию ДРОБЛЕНИЕ или сам КОЭФФИЦИЕНТ. `sf_novis` — без видимости,
  * `sf_vis` — с ней; порознь, потому что заслонение есть законная причина
  * недобора, а пропущенная пара — нет. Возвращает число заполненных мест. */
-int hz_links_sf_brute(const hz_scene *sc, int stride, int nvis, double *sf_novis, double *sf_vis,
-                      int32_t *node, int cap);
+int hz_links_sf_brute(const hz_scene *sc, int stride, int nvis, int oldpt, double *sf_novis,
+                      double *sf_vis, double *sf_selfok, int32_t *node, int cap);
+
+/* ОПОРНЫЕ ТОЧКИ ПЕРЕНОСА для всех узлов, `pt` — на `3·L->nnd`. Отдельны от центра
+ * площади узла СОЗНАТЕЛЬНО (§88, А210): срезу камеры центр площади законен, а
+ * переносу он для 37.4 % площади зала лежал ВНЕ поверхности. `oldpt = 1` вернёт
+ * центр площади — это НК5. */
+int hz_links_points(double *pt, const hz_lod *L, const hz_polyset *ps, const hz_objmesh *m,
+                    int oldpt);
 void hz_links_free(hz_linkset *S);
 
 /* Решить `E = E₀ + F·(ρE)` итерациями. `Le`, `rho` — по полигонам среза; `E` —

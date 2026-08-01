@@ -54,6 +54,100 @@ static void lk_kids_free(lk_kids *K) {
   memset(K, 0, sizeof *K);
 }
 
+/* --- опорная точка ПЕРЕНОСА ------------------------------------------------- */
+
+/* ЗАЧЕМ ОТДЕЛЬНАЯ ТОЧКА (§88, А210). Узел несёт ЦЕНТР ПЛОЩАДИ, и срезу камеры
+ * его довольно — там нужна оценка расстояния. Переносу он не годится: участок
+ * сегментации бывает невыпуклым и несвязным, и центр площади тогда лежит ВНЕ
+ * поверхности. Замерено на зале: 37.4 % ПЛОЩАДИ, и видимость из таких точек
+ * давала `Σf = 0.34` там, где ссылка лучами требует `0.98`.
+ *
+ * ЦЕНТР ПЛОЩАДИ В УЗЛЕ ПРИ ЭТОМ НЕ ТРОГАЕТСЯ: на нём сняты все замеры среза, и
+ * правка обесценила бы точку отсчёта (класс А1).
+ *
+ * ВЫБОР — ЦЕНТР САМОГО КРУПНОГО ТРЕУГОЛЬНИКА УЧАСТКА, и он выбран ЗАМЕРОМ, а не
+ * рассуждением. Первым правилом была «ближайшая к центру площади точка
+ * поверхности» — она сохраняла первый момент, и А215 назвала её риск заранее:
+ * у невыпуклого участка ближайшая точка ложится на КРОМКУ. Прогон это
+ * подтвердил жёстче предсказанного: доля площади с точкой вне полигона упала
+ * лишь 37.4 -> 34.4 %, а первая процентиль расстояния до попадания РУХНУЛА
+ * `2.31e-3 -> 1.07e-4` м, то есть лучи стали упираться в геометрию мгновенно —
+ * точка села на стык. Центр треугольника строго внутренний по построению и от
+ * кромки отстоит соразмерно самому треугольнику. Первый момент при этом
+ * приносится в жертву сознательно: точка на стыке мерит не тот свет вовсе, а
+ * смещение момента ограничено размером элемента.
+ *
+ * Проекция на плоскость полигона с двумерным тестом принадлежности была бы
+ * дешевле и НЕВЕРНА: треугольники отстоят от общей плоскости на `dmax`, и точка
+ * внутри края лежала бы на ПЛОСКОСТИ, а не на поверхности (А218, тот же класс,
+ * что Г40/Г44). */
+/* Точки переноса для ВСЕХ узлов лестницы. Уровень 0 — ближайшая к центру площади
+ * точка объединения треугольников участка; внутренний узел — точка того из его
+ * полигонов, чья ближе к центру площади узла. `pt` — на `3·nnd`. */
+int hz_links_points(double *pt, const hz_lod *L, const hz_polyset *ps, const hz_objmesh *m,
+                    int oldpt) {
+  const int32_t nn = L->nnd;
+  for (int32_t k = 0; k < nn; k++) {
+    pt[3 * k] = L->nd[k].cx;
+    pt[3 * k + 1] = L->nd[k].cy;
+    pt[3 * k + 2] = L->nd[k].cz;
+  }
+  if (ps == NULL || m == NULL || oldpt) return 0;
+  double *pt0 = malloc(3 * (size_t)(ps->np > 0 ? ps->np : 1) * sizeof *pt0);
+  if (pt0 == NULL) return 1;
+  for (int32_t k = 0; k < ps->np; k++) {
+    const hz_poly *p = &ps->p[k];
+    pt0[3 * k] = p->org[0];
+    pt0[3 * k + 1] = p->org[1];
+    pt0[3 * k + 2] = p->org[2];
+    double best = -1.0;
+    for (int32_t t = p->t0; t < p->t0 + p->ntri; t++) {
+      int32_t tr = ps->tri[t];
+      const double *a = m->v + 3 * m->f[3 * tr];
+      const double *b = m->v + 3 * m->f[3 * tr + 1];
+      const double *c = m->v + 3 * m->f[3 * tr + 2];
+      double u[3], v[3], x[3];
+      for (int i = 0; i < 3; i++) {
+        u[i] = b[i] - a[i];
+        v[i] = c[i] - a[i];
+      }
+      x[0] = u[1] * v[2] - u[2] * v[1];
+      x[1] = u[2] * v[0] - u[0] * v[2];
+      x[2] = u[0] * v[1] - u[1] * v[0];
+      double ar2 = x[0] * x[0] + x[1] * x[1] + x[2] * x[2];
+      if (ar2 > best) {
+        best = ar2;
+        for (int i = 0; i < 3; i++)
+          pt0[3 * k + i] = (a[i] + b[i] + c[i]) / 3.0;
+      }
+    }
+  }
+  double *bd = malloc((size_t)nn * sizeof *bd);
+  if (bd == NULL) {
+    free(pt0);
+    return 1;
+  }
+  for (int32_t k = 0; k < nn; k++)
+    bd[k] = 1e300;
+  for (int32_t lev = 0; lev < L->nlev; lev++)
+    for (int32_t k = 0; k < L->np && k < ps->np; k++) {
+      int32_t nd = L->lab[(size_t)lev * (size_t)L->np + (size_t)k];
+      if (nd < 0 || nd >= nn) continue;
+      double d2 = 0.0;
+      double q[3] = {L->nd[nd].cx, L->nd[nd].cy, L->nd[nd].cz};
+      for (int i = 0; i < 3; i++)
+        d2 += (pt0[3 * k + i] - q[i]) * (pt0[3 * k + i] - q[i]);
+      if (d2 < bd[nd]) {
+        bd[nd] = d2;
+        for (int i = 0; i < 3; i++)
+          pt[3 * nd + i] = pt0[3 * k + i];
+      }
+    }
+  free(bd);
+  free(pt0);
+  return 0;
+}
+
 /* --- геометрия связи -------------------------------------------------------- */
 
 /* КОЭФФИЦИЕНТ ТОЧКА-ДИСК. Внутренний узел лестницы полигона не несёт — у него есть
@@ -65,8 +159,9 @@ static void lk_kids_free(lk_kids *K) {
  *
  *     F = cosθ_i · cosθ_j · A_j / (π r² + A_j)
  */
-static double lk_coef(const hz_lodnode *A, const hz_lodnode *B) {
-  double d[3] = {B->cx - A->cx, B->cy - A->cy, B->cz - A->cz};
+static double lk_coef(const hz_lodnode *A, const double xa[3], const hz_lodnode *B,
+                      const double xb[3]) {
+  double d[3] = {xb[0] - xa[0], xb[1] - xa[1], xb[2] - xa[2]};
   double r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
   if (!(r2 > 0.0)) return 0.0;
   double r = sqrt(r2);
@@ -192,8 +287,8 @@ double hz_links_ff_selftest(double *f_big, double *f_unit, double *ref_unit) {
 
 /* Угловой размер `B` из `A` — та же величина, что в срезе камеры, только вместо
  * глаза стоит элемент. Один допуск на всю схему. */
-static double lk_subtend(const hz_lodnode *A, const hz_lodnode *B) {
-  double d[3] = {B->cx - A->cx, B->cy - A->cy, B->cz - A->cz};
+static double lk_subtend(const double xa[3], const hz_lodnode *B, const double xb[3]) {
+  double d[3] = {xb[0] - xa[0], xb[1] - xa[1], xb[2] - xa[2]};
   double r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
   if (!(r2 > 0.0)) return 1e300;
   return sqrt(B->area_surf / r2);
@@ -203,8 +298,9 @@ static double lk_subtend(const hz_lodnode *A, const hz_lodnode *B) {
  * касательной плоскости на долю радиуса объемлющей сферы. Это грубее, чем пробы по
  * краю полигона, и намеренно: у внутреннего узла края нет вовсе, а у листа он есть,
  * но связь и так есть осреднение по паре площадей. */
-static double lk_vis(const hz_scene *sc, const hz_lodnode *A, const hz_lodnode *B, int nvis,
-                     int64_t *nray) {
+static double lk_vis(const hz_scene *sc, int32_t ia, const double xa[3], int32_t ib,
+                     const double xb[3], int nvis, int64_t *nray) {
+  const hz_lodnode *A = &sc->L->nd[ia], *B = &sc->L->nd[ib];
   double eu[3], ev[3];
   int ax = 0;
   for (int c = 1; c < 3; c++)
@@ -228,13 +324,13 @@ static double lk_vis(const hz_scene *sc, const hz_lodnode *A, const hz_lodnode *
       double sv = (((double)v + 0.5) / nvis - 0.5) * 1.2 * A->rad;
       double tu = (((double)v + 0.5) / nvis - 0.5) * 1.2 * B->rad;
       double tv = (((double)u + 0.5) / nvis - 0.5) * 1.2 * B->rad;
-      double xa[3] = {A->cx + su * eu[0] + sv * ev[0], A->cy + su * eu[1] + sv * ev[1],
-                      A->cz + su * eu[2] + sv * ev[2]};
-      double xb[3] = {B->cx + tu * eu[0] + tv * ev[0], B->cy + tu * eu[1] + tv * ev[1],
-                      B->cz + tu * eu[2] + tv * ev[2]};
+      double pa[3] = {xa[0] + su * eu[0] + sv * ev[0], xa[1] + su * eu[1] + sv * ev[1],
+                      xa[2] + su * eu[2] + sv * ev[2]};
+      double pb[3] = {xb[0] + tu * eu[0] + tv * ev[0], xb[1] + tu * eu[1] + tv * ev[1],
+                      xb[2] + tu * eu[2] + tv * ev[2]};
       double d[3], len = 0.0;
       for (int c = 0; c < 3; c++) {
-        d[c] = xb[c] - xa[c];
+        d[c] = pb[c] - pa[c];
         len += d[c] * d[c];
       }
       len = sqrt(len);
@@ -242,11 +338,28 @@ static double lk_vis(const hz_scene *sc, const hz_lodnode *A, const hz_lodnode *
       double eps = 1e-6 * (1.0 + len), xo[3];
       for (int c = 0; c < 3; c++) {
         d[c] /= len;
-        xo[c] = xa[c] + eps * A->n[c];
+        xo[c] = pa[c] + eps * A->n[c];
       }
       tot++;
       (*nray)++;
-      if (!hz_pray_occluded(sc->g, xo, d, 0.0, len * (1.0 - 1e-5))) hit++;
+      /* ЭЛЕМЕНТ НЕ ЗАТЕНЯЕТ САМ СЕБЯ. Попадание в полигон, ПРИНАДЛЕЖАЩИЙ узлу
+       * приёмника или узлу излучателя, заслонением не считается: внутри одного
+       * элемента геометрия представлена плоской, и её подэлементный рельеф
+       * (`dmax` участка, на зале до 0.045 м) относится к ОТКЛИКУ поверхности, а
+       * не к взаимной видимости элементов. Без этого правила `Σf` перебором
+       * давало `0.327` при ссылке лучами `0.980`; с ним — `1.058` (§88.2).
+       * Проверяется через `lab`: полигон `ph` принадлежит узлу `nd` уровня
+       * `lev`, если `lab[lev·np + ph] == nd`. */
+      double th = 0.0;
+      int32_t ph = hz_pray_hit(sc->g, xo, d, 0.0, &th);
+      int blocked = (ph >= 0 && th < len * (1.0 - 1e-5));
+      if (blocked && sc->L != NULL && ph < sc->L->np) {
+        const hz_lod *LL = sc->L;
+        int32_t la = LL->lab[(size_t)LL->nd[ia].level * (size_t)LL->np + (size_t)ph];
+        int32_t lb = LL->lab[(size_t)LL->nd[ib].level * (size_t)LL->np + (size_t)ph];
+        if (la == ia || lb == ib) blocked = 0;
+      }
+      if (!blocked) hit++;
     }
   return (tot > 0) ? (double)hit / (double)tot : 0.0;
 }
@@ -375,10 +488,10 @@ static void lk_closure(hz_linkset *S, const hz_lod *L) {
 /* Точный форм-фактор от опорной точки узла `A` к полигону `p`: сумма по ВСЕМ
  * петлям края. Внешняя петля даёт плюс, дыра (обход по часовой) — минус, и
  * особого случая для дыр не нужно. Отрицательный итог значит «отвёрнут». */
-static double lk_coef_poly(const hz_lodnode *A, const hz_polyset *ps, int32_t ip, int noclip,
-                           double *w1, double *w2) {
+static double lk_coef_poly(const hz_lodnode *A, const double xa[3], const hz_polyset *ps,
+                           int32_t ip, int noclip, double *w1, double *w2) {
   const hz_poly *p = &ps->p[ip];
-  double x[3] = {A->cx, A->cy, A->cz};
+  double x[3] = {xa[0], xa[1], xa[2]};
   double s = 0.0;
   for (int32_t li = 0; li < p->nloop; li++) {
     int32_t b0 = ps->loop[p->l0 + li], b1 = ps->loop[p->l0 + li + 1];
@@ -405,8 +518,8 @@ static double lk_coef_poly(const hz_lodnode *A, const hz_polyset *ps, int32_t ip
  * всякого дробления — тем же точным форм-фактором и той же видимостью. Если
  * перебор даёт около единицы, а иерархия `0.65`, потеря в дроблении; если и
  * перебор даёт `0.65`, дело в коэффициенте либо в точечной коллокации. */
-int hz_links_sf_brute(const hz_scene *sc, int stride, int nvis, double *sf_novis, double *sf_vis,
-                      int32_t *node, int cap) {
+int hz_links_sf_brute(const hz_scene *sc, int stride, int nvis, int oldpt, double *sf_novis,
+                      double *sf_vis, double *sf_selfok, int32_t *node, int cap) {
   const hz_lod *L = sc->L;
   if (sc->ps == NULL || stride < 1) return 0;
   if (nvis < 1) nvis = 2;
@@ -421,10 +534,13 @@ int hz_links_sf_brute(const hz_scene *sc, int stride, int nvis, double *sf_novis
   double *w1 = malloc(3 * (size_t)(mxv + 2) * sizeof *w1);
   double *w2 = malloc(3 * (size_t)(mxv + 2) * sizeof *w2);
   int32_t *p2n = malloc((size_t)sc->ps->np * sizeof *p2n);
-  if (w1 == NULL || w2 == NULL || p2n == NULL) {
+  double *pt = malloc(3 * (size_t)L->nnd * sizeof *pt);
+  if (w1 == NULL || w2 == NULL || p2n == NULL || pt == NULL ||
+      hz_links_points(pt, L, sc->ps, sc->m, oldpt) != 0) {
     free(w1);
     free(w2);
     free(p2n);
+    free(pt);
     return 0;
   }
   for (int32_t k = 0; k < L->np && k < sc->ps->np; k++)
@@ -435,22 +551,47 @@ int hz_links_sf_brute(const hz_scene *sc, int stride, int nvis, double *sf_novis
     if (L->nd[k].level != 0) continue;
     if (seen++ % stride != 0) continue;
     const hz_lodnode *A = &L->nd[k];
-    double s0 = 0.0, s1 = 0.0;
+    double s0 = 0.0, s1 = 0.0, s2 = 0.0;
     for (int32_t j = 0; j < sc->ps->np; j++) {
       if (p2n[j] == k) continue;
-      double f = lk_coef_poly(A, sc->ps, j, 0, w1, w2);
+      double f = lk_coef_poly(A, pt + 3 * k, sc->ps, j, 0, w1, w2);
       if (!(f > 0.0)) continue;
       s0 += f;
-      s1 += f * lk_vis(sc, A, &L->nd[p2n[j]], nvis, &dummy);
+      s1 += f * lk_vis(sc, k, pt + 3 * k, p2n[j], pt + 3 * p2n[j], nvis, &dummy);
+      /* ТРЕТЬЯ СУММА: то же, но ПЕРВОЕ попадание в СВОЙ участок приёмника или в
+       * сам излучатель считается НЕ заслонением. Внутри одного элемента
+       * геометрия представлена плоской, и её подэлементный рельеф (до `dmax`,
+       * на зале 0.045 м) относится к отклику поверхности, а не к взаимной
+       * видимости элементов. Разность второй и третьей сумм и есть цена того,
+       * что элемент затеняет сам себя. */
+      double xa2[3] = {pt[3 * k], pt[3 * k + 1], pt[3 * k + 2]};
+      double xb2[3] = {pt[3 * p2n[j]], pt[3 * p2n[j] + 1], pt[3 * p2n[j] + 2]};
+      double dd[3], ln = 0.0;
+      for (int c = 0; c < 3; c++) {
+        dd[c] = xb2[c] - xa2[c];
+        ln += dd[c] * dd[c];
+      }
+      ln = sqrt(ln);
+      if (!(ln > 0.0)) continue;
+      double ori[3];
+      for (int c = 0; c < 3; c++) {
+        dd[c] /= ln;
+        ori[c] = xa2[c] + 1e-6 * (1.0 + ln) * A->n[c];
+      }
+      double th = 0.0;
+      int32_t ph = hz_pray_hit(sc->g, ori, dd, 0.0, &th);
+      if (ph < 0 || th >= ln * (1.0 - 1e-5) || ph == k || ph == j) s2 += f;
     }
     sf_novis[n] = s0;
     sf_vis[n] = s1;
+    sf_selfok[n] = s2;
     node[n] = k;
     n++;
   }
   free(w1);
   free(w2);
   free(p2n);
+  free(pt);
   return n;
 }
 
@@ -470,6 +611,17 @@ int hz_links_build(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg) {
    * доходит до 1684 вершин, а `-Wvla` запрещает массив переменной длины. */
   int32_t *np2poly = NULL;
   double *w1 = NULL, *w2 = NULL;
+  lk_queue q;
+  memset(&q, 0, sizeof q);
+  int64_t *cnt = NULL;
+  /* ОПОРНЫЕ ТОЧКИ ПЕРЕНОСА (§88). Строятся до всего: на них держатся и
+   * отбраковка, и критерий дробления, и видимость, и коэффициент. */
+  double *pt = malloc(3 * (size_t)L->nnd * sizeof *pt);
+  if (pt == NULL || hz_links_points(pt, L, sc->ps, sc->m, cfg->oldpt) != 0) {
+    free(pt);
+    lk_kids_free(&K);
+    return 2;
+  }
   if (sc->ps != NULL && !cfg->disk) {
     np2poly = malloc((size_t)L->nnd * sizeof *np2poly);
     if (np2poly == NULL) {
@@ -489,13 +641,7 @@ int hz_links_build(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg) {
     }
     w1 = malloc(3 * (size_t)(mxv + 2) * sizeof *w1);
     w2 = malloc(3 * (size_t)(mxv + 2) * sizeof *w2);
-    if (w1 == NULL || w2 == NULL) {
-      free(np2poly);
-      free(w1);
-      free(w2);
-      lk_kids_free(&K);
-      return 2;
-    }
+    if (w1 == NULL || w2 == NULL) goto fail;
   }
 
   /* КОРНИ — узлы САМОГО ГРУБОГО уровня, реально занятые. Иерархия начинается
@@ -504,16 +650,10 @@ int hz_links_build(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg) {
    * вместо `O(n²)` — дальние пары остаются наверху. */
   int32_t top = L->nlev - 1;
   int32_t *isroot = calloc((size_t)L->nnd, sizeof *isroot);
-  if (isroot == NULL) {
-    lk_kids_free(&K);
-    return 2;
-  }
+  if (isroot == NULL) goto fail;
   for (int32_t k = 0; k < L->np; k++)
     isroot[L->lab[(size_t)top * (size_t)L->np + (size_t)k]] = 1;
 
-  lk_queue q;
-  memset(&q, 0, sizeof q);
-  int64_t *cnt = NULL;
   for (int32_t a = 0; a < L->nnd; a++) {
     if (!isroot[a]) continue;
     for (int32_t b = 0; b < L->nnd; b++)
@@ -548,7 +688,8 @@ int hz_links_build(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg) {
       continue;
     }
     const hz_lodnode *A = &L->nd[ia], *B = &L->nd[ib];
-    double f = lk_coef(A, B);
+    const double *xa = pt + 3 * ia, *xb = pt + 3 * ib;
+    double f = lk_coef(A, xa, B, xb);
     if (!(f > 0.0)) { /* отвёрнуты друг от друга — связи нет по ориентации */
       S->nzero++;
       if (L->nd[ia].level > 0 || L->nd[ib].level > 0) S->nzero_coarse++;
@@ -557,7 +698,7 @@ int hz_links_build(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg) {
     /* ДРОБИТЬ ИЛИ ЗАВОДИТЬ. Дробится тот, чей угловой размер больше: у пары
      * «стена и стул» дробить надо стену, а не стул. Если у него нет детей —
      * дробить нечем, связь заводится как есть. */
-    double sa = lk_subtend(B, A), sb = lk_subtend(A, B);
+    double sa = lk_subtend(xb, A, xa), sb = lk_subtend(xa, B, xb);
     int32_t big = (sa > sb) ? ia : ib;
     double smax = (sa > sb) ? sa : sb;
     int32_t c0 = K.start[big], c1 = K.start[big + 1];
@@ -570,7 +711,7 @@ int hz_links_build(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg) {
       }
       continue;
     }
-    double v = lk_vis(sc, A, B, nvis, &S->nray);
+    double v = lk_vis(sc, ia, xa, ib, xb, nvis, &S->nray);
     if (!(v > 0.0)) {
       S->nzero++;
       continue;
@@ -581,7 +722,7 @@ int hz_links_build(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg) {
      * где у излучателя ЕСТЬ край, то есть на нулевом уровне. */
     double fc = f;
     if (np2poly != NULL && np2poly[ib] >= 0) {
-      fc = lk_coef_poly(A, sc->ps, np2poly[ib], cfg->noclip, w1, w2);
+      fc = lk_coef_poly(A, xa, sc->ps, np2poly[ib], cfg->noclip, w1, w2);
       S->nlink_leaf++;
       S->wleaf += fc * v;
     }
@@ -601,6 +742,7 @@ int hz_links_build(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg) {
   free(np2poly);
   free(w1);
   free(w2);
+  free(pt);
   lk_kids_free(&K);
   lk_closure(S, L);
   return 0;
@@ -611,6 +753,7 @@ fail:
   free(np2poly);
   free(w1);
   free(w2);
+  free(pt);
   lk_kids_free(&K);
   return 2;
 }

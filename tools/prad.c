@@ -77,7 +77,7 @@ static int cmp_d(const void *a, const void *b) {
  * Сверх того есть явный флаг материала `flat`.
  */
 #define SH_DEPTH                                                                                   \
-  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает                                 \
+  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает \
      * стоимость; глубже вклад падает как произведение долей */
 
 /* ТОЧНЫЙ ФРЕНЕЛЬ ПО НЕПОЛЯРИЗОВАННОМУ СВЕТУ. Приближение Шлика не нужно: точная
@@ -916,32 +916,60 @@ int main(int argc, char **argv) {
   /* ПОДГОНКА НЕПРЕРЫВНОГО ПОЛЯ (§98). Три прохода: значения в сварных вершинах,
    * наименьшие квадраты по краю, сдвиг под сохранение среднего. */
   if (!flatfield) {
-    double *vs = calloc((size_t)ps.nbv, sizeof *vs);
-    double *vw = calloc((size_t)ps.nbv, sizeof *vw);
-    if (vs == NULL || vw == NULL) return 1;
-    int64_t nweld = 0, nfree = 0;
+    /* ЕДИНЫЙ НОМЕР ВЕРШИНЫ. `bw` — номер в СВОЕЙ таблице сварки полигонизатора,
+     * а не в крае; у части позиций его нет (`-1`), и такой позиции даётся
+     * СОБСТВЕННЫЙ номер. Иначе она выпадает из подгонки, опорных точек остаётся
+     * меньше трёх, система вырождается и линейная функция улетает: замерено
+     * отклонение среднего `4.9` против `5.6e-17` (А252). */
+    int32_t nwtab = 0;
+    for (int32_t b = 0; b < ps.nbv; b++)
+      if (ps.bw != NULL && ps.bw[b] + 1 > nwtab) nwtab = ps.bw[b] + 1;
+    if (nwtab < 0) nwtab = 0;
+    int32_t nid = nwtab + ps.nbv;
+    int32_t *vid = malloc((size_t)ps.nbv * sizeof *vid);
+    double *vs = calloc((size_t)nid, sizeof *vs);
+    double *vw = calloc((size_t)nid, sizeof *vw);
+    int32_t *own = calloc((size_t)nid, sizeof *own);
+    if (vid == NULL || vs == NULL || vw == NULL || own == NULL) return 1;
+    int64_t nfree = 0;
+    for (int32_t b = 0; b < ps.nbv; b++) {
+      if (ps.bw != NULL && ps.bw[b] >= 0) {
+        vid[b] = ps.bw[b];
+      } else {
+        vid[b] = nwtab + b;
+        nfree++;
+      }
+    }
     for (int32_t k = 0; k < ps.np; k++) {
       const hz_poly *p = &ps.p[k];
       double B = E[cut[k]] * p->area;
       for (int32_t b = ps.loop[p->l0]; b < ps.loop[p->l0 + p->nloop]; b++) {
-        int32_t w2 = (ps.bw != NULL && ps.bw[b] >= 0 && ps.bw[b] < ps.nbv) ? ps.bw[b] : b;
-        if (w2 == b)
-          nfree++;
-        else
-          nweld++;
-        vs[w2] += B;
-        vw[w2] += p->area;
+        vs[vid[b]] += B;
+        vw[vid[b]] += p->area;
+        own[vid[b]]++;
       }
     }
-    double worst = 0.0;
+    /* СКОЛЬКО ВЛАДЕЛЬЦЕВ У ВЕРШИНЫ — вот настоящая мера сварки: вершина с одним
+     * владельцем ничего не соединяет, и разрыв на ней остаётся по построению. */
+    int64_t nown1 = 0, nownm = 0, ndist = 0;
+    for (int32_t q = 0; q < nid; q++) {
+      if (own[q] == 1) {
+        nown1++;
+        ndist++;
+      } else if (own[q] > 1) {
+        nownm++;
+        ndist++;
+      }
+    }
+    double worst = 0.0, vmax = 0.0;
+    int64_t nsing = 0;
     for (int32_t k = 0; k < ps.np; k++) {
       const hz_poly *p = &ps.p[k];
       double G[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, R[3] = {0, 0, 0};
       int32_t b0 = ps.loop[p->l0], b1 = ps.loop[p->l0 + p->nloop];
       for (int32_t b = b0; b < b1; b++) {
-        int32_t w2 = (ps.bw != NULL && ps.bw[b] >= 0 && ps.bw[b] < ps.nbv) ? ps.bw[b] : b;
-        if (!(vw[w2] > 0.0)) continue;
-        double val = vs[w2] / vw[w2];
+        if (!(vw[vid[b]] > 0.0)) continue;
+        double val = vs[vid[b]] / vw[vid[b]];
         double bs[3] = {1.0, ps.bv[2 * b], ps.bv[2 * b + 1]};
         for (int i2 = 0; i2 < 3; i2++) {
           for (int j2 = 0; j2 < 3; j2++)
@@ -950,15 +978,32 @@ int main(int argc, char **argv) {
         }
       }
       double c[3] = {E[cut[k]], 0.0, 0.0};
-      if (hz_solve3x3(G, R, c) == 0 && p->mom[0] > 0.0) {
+      int okfit = (b1 - b0 >= 3) && hz_solve3x3(G, R, c) == 0;
+      if (okfit && p->mom[0] > 0.0) {
         /* СДВИГ ПОД СОХРАНЕНИЕ СРЕДНЕГО: среднее по площади есть
-         * `(a·mom[0] + b·mom[1] + c·mom[2]) / mom[0]`. */
+         * `(a·mom[0] + b·mom[1] + c·mom[2]) / mom[0]`, и моменты для этого и
+         * заведены (`polygon.h`). */
         double avg = (c[0] * p->mom[0] + c[1] * p->mom[1] + c[2] * p->mom[2]) / p->mom[0];
         c[0] += E[cut[k]] - avg;
-        double chk = (c[0] * p->mom[0] + c[1] * p->mom[1] + c[2] * p->mom[2]) / p->mom[0];
-        double e2 = fabs(chk - E[cut[k]]);
-        if (e2 > worst) worst = e2;
+        /* СТОРОЖ ВЫРОЖДЕНИЯ: у вытянутого или почти коллинеарного края система
+         * плохо обусловлена, и подгонка улетает. Проверяется по РАЗМАХУ функции
+         * на габарите элемента: больше самого радианса — значит не подгонка, а
+         * численный мусор, и берётся постоянная. Порог не магический: он есть
+         * условие «поправка не больше самой величины». */
+        double sp = fabs(c[1]) * (p->uvhi[0] - p->uvlo[0]) + fabs(c[2]) * (p->uvhi[1] - p->uvlo[1]);
+        if (sp > E[cut[k]] && E[cut[k]] > 0.0) {
+          nsing++;
+          c[0] = E[cut[k]];
+          c[1] = 0.0;
+          c[2] = 0.0;
+        } else {
+          double chk = (c[0] * p->mom[0] + c[1] * p->mom[1] + c[2] * p->mom[2]) / p->mom[0];
+          double e2 = fabs(chk - E[cut[k]]);
+          if (e2 > worst) worst = e2;
+          if (sp > vmax) vmax = sp;
+        }
       } else {
+        nsing++;
         c[0] = E[cut[k]];
         c[1] = 0.0;
         c[2] = 0.0;
@@ -966,11 +1011,16 @@ int main(int argc, char **argv) {
       for (int i2 = 0; i2 < 3; i2++)
         pfit[3 * (size_t)k + (size_t)i2] = c[i2];
     }
-    printf("== НЕПРЕРЫВНОЕ ПОЛЕ: сварных вершин края %lld, несварных %lld; худшее отклонение "
-           "среднего по элементу %.3e\n",
-           (long long)nweld, (long long)nfree, worst);
+    printf("== НЕПРЕРЫВНОЕ ПОЛЕ: позиций края %d, различных вершин %lld (с ОДНИМ владельцем "
+           "%lld, с несколькими %lld), без сварного номера %lld\n",
+           ps.nbv, (long long)ndist, (long long)nown1, (long long)nownm, (long long)nfree);
+    printf("   подгонка: вырожденных элементов %lld из %d (%.1f %%); худшее отклонение "
+           "среднего %.3e; наибольший размах %.3e\n",
+           (long long)nsing, ps.np, 100.0 * (double)nsing / (double)ps.np, worst, vmax);
+    free(vid);
     free(vs);
     free(vw);
+    free(own);
   }
 
   /* ДЕМОНСТРАЦИОННЫЕ ТЕЛА: зеркальный и стеклянный шары над столом. В зале

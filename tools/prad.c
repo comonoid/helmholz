@@ -46,6 +46,11 @@ static double now_s(void) {
   return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
+static int cmp_i64(const void *a, const void *b) {
+  int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+  return (x < y) ? -1 : ((x > y) ? 1 : 0);
+}
+
 static int cmp_i32(const void *a, const void *b) {
   int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
   return (x < y) ? -1 : ((x > y) ? 1 : 0);
@@ -78,7 +83,7 @@ static int cmp_d(const void *a, const void *b) {
  * Сверх того есть явный флаг материала `flat`.
  */
 #define SH_DEPTH                                                                                   \
-  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает \
+  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает                                 \
      * стоимость; глубже вклад падает как произведение долей */
 
 /* ТОЧНЫЙ ФРЕНЕЛЬ ПО НЕПОЛЯРИЗОВАННОМУ СВЕТУ. Приближение Шлика не нужно: точная
@@ -608,6 +613,51 @@ int main(int argc, char **argv) {
          (double)S.n / ((double)L.nnd * log2((double)L.nnd + 2.0)));
   /* ПОДПИСЬ ЗАМКНУТОСТИ: `Σf` по листу с предками обязана быть единицей. Хвост
    * по площади, а не среднее (А194) — среднее печатается справочно. */
+  {
+    /* РЁБРА КРАЯ ПОЛИГОНОВ: сколько принадлежит ДВУМ участкам. Если границы
+     * участков совпадают, внутреннее ребро края обязано быть у двоих. Если
+     * большинство одиночные — участки не соседи по краю, и непрерывность
+     * невозможна в принципе (тезис пользователя 08-02). */
+    int64_t ne2 = 0;
+    for (int32_t k = 0; k < ps.np; k++)
+      ne2 += ps.loop[ps.p[k].l0 + ps.p[k].nloop] - ps.loop[ps.p[k].l0];
+    int64_t *ek = malloc((size_t)ne2 * sizeof *ek);
+    if (ek == NULL) return 1;
+    int64_t q2 = 0;
+    for (int32_t k = 0; k < ps.np; k++) {
+      const hz_poly *p = &ps.p[k];
+      for (int32_t li = 0; li < p->nloop; li++) {
+        int32_t b0 = ps.loop[p->l0 + li], b1 = ps.loop[p->l0 + li + 1];
+        for (int32_t b = b0; b < b1; b++) {
+          int32_t c2 = (b + 1 < b1) ? b + 1 : b0;
+          int64_t a = (ps.bw != NULL) ? ps.bw[b] : b, d = (ps.bw != NULL) ? ps.bw[c2] : c2;
+          int64_t lo2 = a < d ? a : d, hi2 = a < d ? d : a;
+          ek[q2++] = lo2 * 4294967296LL + hi2;
+        }
+      }
+    }
+    qsort(ek, (size_t)q2, sizeof *ek, cmp_i64);
+    int64_t s1 = 0, s2 = 0, sm = 0, st = 0;
+    for (int64_t i2 = 0; i2 < q2;) {
+      int64_t j2 = i2;
+      while (j2 < q2 && ek[j2] == ek[i2])
+        j2++;
+      int64_t c3 = j2 - i2;
+      st++;
+      if (c3 == 1)
+        s1++;
+      else if (c3 == 2)
+        s2++;
+      else
+        sm++;
+      i2 = j2;
+    }
+    printf("== РЁБРА КРАЯ УЧАСТКОВ: %lld различных; с ОДНИМ владельцем %lld (%.1f %%), с двумя "
+           "%lld, больше двух %lld\n",
+           (long long)st, (long long)s1, 100.0 * (double)s1 / (double)st, (long long)s2,
+           (long long)sm);
+    free(ek);
+  }
   {
     /* СКОЛЬКО ЭЛЕМЕНТОВ НЕ ВИДЯТ НИЧЕГО. Такой элемент чёрен на картинке при
      * любом свете, и это дефект, а не тень: он не получает энергии вовсе. */

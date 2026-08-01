@@ -182,6 +182,9 @@ typedef struct {
   const int32_t *cut;
   const double *B, *E0, *Ev, *Le;
   const sh_ball *ball;
+  /* Линейное поле по элементу (§98): `a + b·u + c·v` на полигон; `NULL` —
+   * кусочно-постоянное чтение, как было. */
+  const double *pfit;
   int nball, flatn, nospec, spec;
 } sh_ctx;
 
@@ -239,7 +242,13 @@ static void shade_surface(const sh_ctx *S, int32_t k, const double x[3], const d
     mod = 1.0 + ed / e0;
     if (mod < 0.0) mod = 0.0;
   }
-  double Bk = S->B[nd] * mod;
+  double Bk = S->B[nd];
+  if (S->pfit != NULL) {
+    const double *cf = S->pfit + 3 * (size_t)k;
+    double lin = cf[0] + cf[1] * uu + cf[2] * vv;
+    if (lin > 0.0) Bk = lin; /* отрицательного радианса не бывает */
+  }
+  Bk *= mod;
   for (int c = 0; c < 3; c++) {
     double a = (mt != NULL) ? mt->kd3[c] : 0.5;
     out[c] = Bk * a / 0.5; /* правило Т1: цвет — с мелкого полигона */
@@ -382,6 +391,7 @@ int main(int argc, char **argv) {
       ceillight = 0, novis = 0, hemi = 0, ptleaf = 0, nozb = 0;
   double ballior = 1.5;
   double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0, segcap = 0.5, trimax = 0.0;
+  int flatfield = 0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "city") == 0) city = 1;
     if (strncmp(argv[i], "w=", 2) == 0) w = (int)strtol(argv[i] + 2, NULL, 10);
@@ -422,6 +432,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "nozb") == 0) nozb = 1;
     /* §97: длина стороны треугольника, метры; `0` — без разбиения (НК15). */
     if (strncmp(argv[i], "tri=", 4) == 0) trimax = strtod(argv[i] + 4, NULL);
+    /* НК16 §98: без восстановления непрерывности — вернуть лоскуты. */
+    if (strcmp(argv[i], "flatfield") == 0) flatfield = 1;
   }
 
   /* САМОПРОВЕРКА ФОРМУЛЫ — ПЕРВОЙ, ДО ВСЯКОЙ СЦЕНЫ (А205). Ошибка знака или
@@ -832,6 +844,19 @@ int main(int argc, char **argv) {
   int32_t ncut = hz_lod_cut(&L, eye, eps, 1, cut);
   printf("== СРЕЗ: %d элементов\n", ncut);
 
+  /* НЕПРЕРЫВНОЕ ПОЛЕ ВДОЛЬ ГРАНИЦЫ (§98). Решение остаётся кусочно-постоянным;
+   * непрерывным делается ПРЕДСТАВЛЕНИЕ: значение в СВАРНОЙ вершине края есть
+   * средневзвешенное радиансов владельцев, затем по элементу подгоняется
+   * `a + b·u + c·v`, а среднее по площади принудительно возвращается к радиансу
+   * элемента через `mom[6]` — те самые моменты, что заведены как матрица системы
+   * (`polygon.h`). Поэтому восстановление энергии не создаёт и не теряет.
+   *
+   * ЭТО ВОССТАНОВЛЕНИЕ, А НЕ НОВАЯ ДИСКРЕТИЗАЦИЯ, и тени от него станут МЯГЧЕ,
+   * а не резче: лечатся ШВЫ, а не разрешение. Неизвестные на вершинах В САМОМ
+   * ОПЕРАТОРЕ — отдельный шаг. */
+  double *pfit = calloc(3 * (size_t)ps.np, sizeof *pfit);
+  if (pfit == NULL) return 1;
+
   /* ВЕКТОР ОБЛУЧЁННОСТИ — один проход после сходимости (§89, А222). */
   double *Efield = malloc((size_t)L.nnd * sizeof *Efield);
   double *Evec = malloc(3 * (size_t)L.nnd * sizeof *Evec);
@@ -888,6 +913,66 @@ int main(int argc, char **argv) {
     free(ang);
   }
 
+  /* ПОДГОНКА НЕПРЕРЫВНОГО ПОЛЯ (§98). Три прохода: значения в сварных вершинах,
+   * наименьшие квадраты по краю, сдвиг под сохранение среднего. */
+  if (!flatfield) {
+    double *vs = calloc((size_t)ps.nbv, sizeof *vs);
+    double *vw = calloc((size_t)ps.nbv, sizeof *vw);
+    if (vs == NULL || vw == NULL) return 1;
+    int64_t nweld = 0, nfree = 0;
+    for (int32_t k = 0; k < ps.np; k++) {
+      const hz_poly *p = &ps.p[k];
+      double B = E[cut[k]] * p->area;
+      for (int32_t b = ps.loop[p->l0]; b < ps.loop[p->l0 + p->nloop]; b++) {
+        int32_t w2 = (ps.bw != NULL && ps.bw[b] >= 0 && ps.bw[b] < ps.nbv) ? ps.bw[b] : b;
+        if (w2 == b)
+          nfree++;
+        else
+          nweld++;
+        vs[w2] += B;
+        vw[w2] += p->area;
+      }
+    }
+    double worst = 0.0;
+    for (int32_t k = 0; k < ps.np; k++) {
+      const hz_poly *p = &ps.p[k];
+      double G[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}}, R[3] = {0, 0, 0};
+      int32_t b0 = ps.loop[p->l0], b1 = ps.loop[p->l0 + p->nloop];
+      for (int32_t b = b0; b < b1; b++) {
+        int32_t w2 = (ps.bw != NULL && ps.bw[b] >= 0 && ps.bw[b] < ps.nbv) ? ps.bw[b] : b;
+        if (!(vw[w2] > 0.0)) continue;
+        double val = vs[w2] / vw[w2];
+        double bs[3] = {1.0, ps.bv[2 * b], ps.bv[2 * b + 1]};
+        for (int i2 = 0; i2 < 3; i2++) {
+          for (int j2 = 0; j2 < 3; j2++)
+            G[i2][j2] += bs[i2] * bs[j2];
+          R[i2] += bs[i2] * val;
+        }
+      }
+      double c[3] = {E[cut[k]], 0.0, 0.0};
+      if (hz_solve3x3(G, R, c) == 0 && p->mom[0] > 0.0) {
+        /* СДВИГ ПОД СОХРАНЕНИЕ СРЕДНЕГО: среднее по площади есть
+         * `(a·mom[0] + b·mom[1] + c·mom[2]) / mom[0]`. */
+        double avg = (c[0] * p->mom[0] + c[1] * p->mom[1] + c[2] * p->mom[2]) / p->mom[0];
+        c[0] += E[cut[k]] - avg;
+        double chk = (c[0] * p->mom[0] + c[1] * p->mom[1] + c[2] * p->mom[2]) / p->mom[0];
+        double e2 = fabs(chk - E[cut[k]]);
+        if (e2 > worst) worst = e2;
+      } else {
+        c[0] = E[cut[k]];
+        c[1] = 0.0;
+        c[2] = 0.0;
+      }
+      for (int i2 = 0; i2 < 3; i2++)
+        pfit[3 * (size_t)k + (size_t)i2] = c[i2];
+    }
+    printf("== НЕПРЕРЫВНОЕ ПОЛЕ: сварных вершин края %lld, несварных %lld; худшее отклонение "
+           "среднего по элементу %.3e\n",
+           (long long)nweld, (long long)nfree, worst);
+    free(vs);
+    free(vw);
+  }
+
   /* ДЕМОНСТРАЦИОННЫЕ ТЕЛА: зеркальный и стеклянный шары над столом. В зале
    * `d = 1.0` у всех материалов, и без них преломление показать не на чем. */
   sh_ball balls[2];
@@ -926,6 +1011,7 @@ int main(int argc, char **argv) {
   SH.flatn = flatn;
   SH.nospec = nospec;
   SH.spec = spec;
+  SH.pfit = flatfield ? NULL : pfit;
 
   /* НК6 ПО ЛУЧАМ, А НЕ ПО БАЙТАМ КАРТИНКИ. Первый прогон контроля сравнивал
    * PPM, и это была моя ошибка: тональная компрессия нормируется по 99.5-й

@@ -167,6 +167,8 @@ void hz_poly_free(hz_polyset *ps);
  * Моменты берутся ЗАМКНУТОЙ ФОРМОЙ (для прямоугольника ∫u² = A·hu²/3), а не
  * через треугольники: у такого полигона исходных треугольников нет, `ntri = 0`.
  * `hu`, `hv` — ПОЛУразмеры вдоль eu и ev = n × eu. */
+int hz_solve3x3(double G[3][3], const double r[3], double out[3]);
+
 int hz_poly_add_quad(hz_polyset *ps, const double c[3], const double n[3], const double eu[3],
                      double hu, double hv, int32_t mtl);
 

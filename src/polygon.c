@@ -1000,3 +1000,35 @@ int hz_poly_build_ex(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg,
   pb_free(&w);
   return 0;
 }
+
+/* Решение системы 3×3 методом Гаусса с выбором главного элемента. Заведено для
+ * подгонки линейного поля по элементу (§98): та же система, что у моментов. */
+int hz_solve3x3(double G[3][3], const double r[3], double out[3]) {
+  double A[3][4];
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 3; j++)
+      A[i][j] = G[i][j];
+    A[i][3] = r[i];
+  }
+  for (int c = 0; c < 3; c++) {
+    int p = c;
+    for (int i = c + 1; i < 3; i++)
+      if (fabs(A[i][c]) > fabs(A[p][c])) p = i;
+    if (!(fabs(A[p][c]) > 1e-300)) return 1;
+    if (p != c)
+      for (int j = 0; j < 4; j++) {
+        double t = A[c][j];
+        A[c][j] = A[p][j];
+        A[p][j] = t;
+      }
+    for (int i = 0; i < 3; i++) {
+      if (i == c) continue;
+      double f = A[i][c] / A[c][c];
+      for (int j = c; j < 4; j++)
+        A[i][j] -= f * A[c][j];
+    }
+  }
+  for (int i = 0; i < 3; i++)
+    out[i] = A[i][3] / A[i][i];
+  return 0;
+}

@@ -80,7 +80,17 @@ int main(int argc, char **argv) {
   if (hz_seg_planar(&sg, &m, dseg) != 0) return 1;
   hz_polyset ps;
   if (hz_poly_build(&ps, &m, &sg) != 0) return 1;
-  printf("== СЦЕНА: %s, треугольников %d, участков %d\n", city ? "ГОРОД" : "зал", m.nt, sg.nseg);
+  {
+    int32_t mxl = 0;
+    for (int32_t k = 0; k < ps.np; k++) {
+      int32_t nb = ps.loop[ps.p[k].l0 + ps.p[k].nloop] - ps.loop[ps.p[k].l0];
+      if (nb > mxl) mxl = nb;
+    }
+    printf("== СЦЕНА: %s, треугольников %d, участков %d; вершин края %d (на полигон %.1f, "
+           "максимум %d)\n",
+           city ? "ГОРОД" : "зал", m.nt, sg.nseg, ps.nbv, (double)ps.nbv / (double)(ps.np ? ps.np : 1),
+           mxl);
+  }
 
   tr3_camera cam;
   double eyeh[3] = HZ_CFG_HALL_EYE, ath[3] = HZ_CFG_HALL_AT;

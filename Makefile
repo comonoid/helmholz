@@ -160,7 +160,7 @@ build/psimp: tools/psimp.c $(PGEOM) | build
 # Полный набор полигональной модели: развёртка, луч, прямой свет, разрезы,
 # огрубление. Стенды Ш5…Ш8 и §10 собираются из него.
 PFULL = src/scene_obj.c src/poly_seg.c src/polygon.c src/pedge.c src/prast.c src/psweep.c \
-        src/pray.c src/pdirect.c src/pcut.c src/pmerge.c src/pvfit.c src/plod.c src/lodio.c src/image.c \
+        src/pray.c src/pdirect.c src/pcut.c src/pmerge.c src/pvfit.c src/plod.c src/lodio.c src/plink.c src/image.c \
         src/cut/surf.c src/cut/poly3.c src/cut/qef.c \
         src/transport/dirs3.c src/transport/quad.c src/transport/cam3.c src/transport/ray3.c \
         src/octree.c
@@ -184,6 +184,10 @@ build/pcoarse: tools/pcoarse.c $(PFULL) | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pcoarse.c $(PFULL) -lm'
 
 # plod — иерархическое огрубление и срез LOD (§56, О16).
+# РЕНДЕРЕР БЕЗ СВИПА (§84, §85): лестница -> связи -> решение -> картинка.
+build/prad: tools/prad.c $(PFULL) | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/prad.c $(PFULL) -lm'
+
 # ОТДЕЛЬНОЕ ИМЯ ДЛЯ РАБОТЫ ПОВЕРХ ИДУЩЕЙ ОЧЕРЕДИ. Пересборка build/plod, пока
 # очередь запускает его по одному прогону, дала бы РАЗНЫЕ версии на разных
 # конфигурациях замера — этот дефект уже кусался (затёртый эталон, §36).

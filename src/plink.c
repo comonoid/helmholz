@@ -76,6 +76,120 @@ static double lk_coef(const hz_lodnode *A, const hz_lodnode *B) {
   return ci * cj * B->area_surf / (LK_PI * r2 + B->area_surf);
 }
 
+/* ТОЧНЫЙ ФОРМ-ФАКТОР ТОЧКА–МНОГОУГОЛЬНИК (§87), контурный интеграл Ламберта:
+ *
+ *     F = (1/2π) · Σ_рёбра  β_k · (n_i · e_k),
+ *     β_k = ∠(R_k, R_{k+1}),   e_k = (R_k × R_{k+1}) / |R_k × R_{k+1}|,
+ *
+ * где `R_k` — вершины края излучателя ОТНОСИТЕЛЬНО приёмной точки. Замкнутая
+ * форма, точная при любой близости; квадратуры нет. Заменяет точечно-дисковую
+ * оценку там, где та применялась хуже всего, — на листьях, где `√A_j / r ≈ 1`.
+ *
+ * ОТСЕЧЕНИЕ ПОЛУПЛОСКОСТЬЮ ПРИЁМНИКА ОБЯЗАТЕЛЬНО: формула точна лишь для части
+ * излучателя НАД касательной плоскостью, а пересекающий её полигон даёт вклад
+ * частично отрицательный. Рёбра, легшие в саму плоскость, вклад дают и он
+ * законен — это дуга горизонта, входящая в проектированный телесный угол (А209).
+ *
+ * ПРИЁМНИК ОСТАЁТСЯ ТОЧКОЙ. Ошибка приёмной стороны этим не лечится, и её
+ * остаток обязан быть виден как перебор `Σf` у близких пар. */
+static double lk_ff_loop(const double *R, int n, const double nv[3]) {
+  double s = 0.0;
+  for (int k = 0; k < n; k++) {
+    const double *a = R + 3 * k, *b = R + 3 * ((k + 1) % n);
+    double c[3] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    double cl = sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+    if (!(cl > 0.0)) continue;
+    double la = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+    double lb = sqrt(b[0] * b[0] + b[1] * b[1] + b[2] * b[2]);
+    if (!(la > 0.0) || !(lb > 0.0)) continue;
+    double ct = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (la * lb);
+    if (ct > 1.0) ct = 1.0;
+    if (ct < -1.0) ct = -1.0;
+    double beta = acos(ct);
+    s += beta * (nv[0] * c[0] + nv[1] * c[1] + nv[2] * c[2]) / cl;
+  }
+  /* ЗНАК. Внешняя петля полигона обходится против часовой стрелки В ЕГО
+   * СОБСТВЕННОЙ раме (`polygon.h`, `eu × ev = n`), а приёмник смотрит на лицевую
+   * сторону, то есть видит ту же петлю ПО часовой. Классическая запись формулы
+   * ждёт обход против часовой ИЗ ПРИЁМНИКА, отсюда минус. Установлено
+   * самопроверкой: без него оба аналитических случая выходили с точностью до
+   * 15-й цифры, но отрицательными. */
+  return -s / (2.0 * LK_PI);
+}
+
+/* Отсечение петли полуплоскостью `nv·R > 0` по Сазерленду–Ходжмену. Возвращает
+ * число вершин на выходе; `out` обязан вмещать `n + 1`. */
+static int lk_clip_half(const double *R, int n, const double nv[3], double *out) {
+  int m = 0;
+  for (int k = 0; k < n; k++) {
+    const double *a = R + 3 * k, *b = R + 3 * ((k + 1) % n);
+    double da = nv[0] * a[0] + nv[1] * a[1] + nv[2] * a[2];
+    double db = nv[0] * b[0] + nv[1] * b[1] + nv[2] * b[2];
+    if (da > 0.0) {
+      for (int c = 0; c < 3; c++)
+        out[3 * m + c] = a[c];
+      m++;
+    }
+    if ((da > 0.0) != (db > 0.0)) {
+      double t = da / (da - db);
+      for (int c = 0; c < 3; c++)
+        out[3 * m + c] = a[c] + t * (b[c] - a[c]);
+      m++;
+    }
+  }
+  return m;
+}
+
+/* Вклад ОДНОЙ петли края, заданной в местных `(u,v)` полигона. Мир —
+ * `org + u·eu + v·ev` (`polygon.h`), приёмник вычитается, дальше отсечение и
+ * контурная сумма. `w1`, `w2` — рабочие буферы на `3·(nv+1)` каждый. */
+static double lk_ff_loop_uv(const double x[3], const double nrec[3], const double org[3],
+                            const double eu[3], const double ev[3], const double *uv, int nv,
+                            double *w1, double *w2) {
+  if (nv < 3) return 0.0;
+  for (int k = 0; k < nv; k++)
+    for (int c = 0; c < 3; c++)
+      w1[3 * k + c] = org[c] + uv[2 * k] * eu[c] + uv[2 * k + 1] * ev[c] - x[c];
+  int m = lk_clip_half(w1, nv, nrec, w2);
+  if (m < 3) return 0.0;
+  return lk_ff_loop(w2, m, nrec);
+}
+
+/* САМОПРОВЕРКА ФОРМУЛЫ НА АНАЛИТИКЕ (А205). Проверять контурный интеграл СЦЕНОЙ
+ * нельзя: ошибка в `2π`, потерянный косинус или перевёрнутый обход дали бы такое
+ * же правдоподобное `Σf`, и отличить их было бы нечем. Здесь два случая с
+ * известным ответом. Квадрат полуширины `a` на оси приёмника, на высоте `h`:
+ *
+ *     F = (4/π) · X/√(1+X²) · atan(X/√(1+X²)),   X = a/h
+ *
+ * (четыре угловых прямоугольника Хауэлла B-1). При `X → ∞` это ровно `1` —
+ * излучатель закрывает всю полусферу. */
+double hz_links_ff_selftest(double *f_big, double *f_unit, double *ref_unit) {
+  double x[3] = {0.0, 0.0, 0.0}, nrec[3] = {0.0, 0.0, 1.0};
+  /* Излучатель смотрит ВНИЗ, на приёмника: `n_j = (0,0,−1)`, и рама берётся с
+   * `eu × ev = n_j`, как у настоящего полигона. */
+  double eu[3] = {1.0, 0.0, 0.0}, ev[3] = {0.0, -1.0, 0.0};
+  double w1[15], w2[18], worst = 0.0;
+  const double h = 1.0;
+  for (int cs = 0; cs < 2; cs++) {
+    double a = (cs == 0) ? 1e6 : 1.0;
+    double org[3] = {0.0, 0.0, h};
+    double uv[8] = {-a, -a, a, -a, a, a, -a, a}; /* против часовой в раме (eu,ev) */
+    double f = lk_ff_loop_uv(x, nrec, org, eu, ev, uv, 4, w1, w2);
+    double X = a / h, t = X / sqrt(1.0 + X * X);
+    double ref = (4.0 / LK_PI) * t * atan(t);
+    if (cs == 0) {
+      *f_big = f;
+    } else {
+      *f_unit = f;
+      *ref_unit = ref;
+    }
+    double e = fabs(f - ref);
+    if (e > worst) worst = e;
+  }
+  return worst;
+}
+
 /* Угловой размер `B` из `A` — та же величина, что в срезе камеры, только вместо
  * глаза стоит элемент. Один допуск на всю схему. */
 static double lk_subtend(const hz_lodnode *A, const hz_lodnode *B) {
@@ -190,6 +304,20 @@ static int lk_cmp_sf(const void *a, const void *b) {
 
 /* `Σ_j f_ij` по ЛИСТУ с учётом предков: грубая связь приносит энергию всем
  * потомкам, значит и в сумму листа входит. Проценты — по ПЛОЩАДИ (А194). */
+void hz_links_sf(const hz_linkset *S, const hz_lod *L, double *sf) {
+  const int32_t nn = L->nnd;
+  for (int32_t k = 0; k < nn; k++)
+    sf[k] = 0.0;
+  for (int64_t l = 0; l < S->n; l++)
+    sf[S->l[l].i] += S->l[l].f;
+  for (int32_t lev = L->nlev - 1; lev >= 1; lev--)
+    for (int32_t k = 0; k < nn; k++) {
+      if (L->nd[k].level != lev - 1) continue;
+      int32_t p = L->nd[k].parent;
+      if (p >= 0 && p < nn) sf[k] += sf[p];
+    }
+}
+
 static void lk_closure(hz_linkset *S, const hz_lod *L) {
   const int32_t nn = L->nnd;
   double *sf = calloc((size_t)(nn > 0 ? nn : 1), sizeof *sf);
@@ -199,14 +327,7 @@ static void lk_closure(hz_linkset *S, const hz_lod *L) {
     free(v);
     return;
   }
-  for (int64_t l = 0; l < S->n; l++)
-    sf[S->l[l].i] += S->l[l].f;
-  for (int32_t lev = L->nlev - 1; lev >= 1; lev--)
-    for (int32_t k = 0; k < nn; k++) {
-      if (L->nd[k].level != lev - 1) continue;
-      int32_t p = L->nd[k].parent;
-      if (p >= 0 && p < nn) sf[k] += sf[p];
-    }
+  hz_links_sf(S, L, sf);
   int32_t m = 0;
   double atot = 0.0, sum = 0.0, alow = 0.0;
   S->sf_min = 1e300;
@@ -251,12 +372,131 @@ static void lk_closure(hz_linkset *S, const hz_lod *L) {
   free(v);
 }
 
-int hz_links_build(hz_linkset *S, const hz_scene *sc, double eps, int nvis, int noself) {
+/* Точный форм-фактор от опорной точки узла `A` к полигону `p`: сумма по ВСЕМ
+ * петлям края. Внешняя петля даёт плюс, дыра (обход по часовой) — минус, и
+ * особого случая для дыр не нужно. Отрицательный итог значит «отвёрнут». */
+static double lk_coef_poly(const hz_lodnode *A, const hz_polyset *ps, int32_t ip, int noclip,
+                           double *w1, double *w2) {
+  const hz_poly *p = &ps->p[ip];
+  double x[3] = {A->cx, A->cy, A->cz};
+  double s = 0.0;
+  for (int32_t li = 0; li < p->nloop; li++) {
+    int32_t b0 = ps->loop[p->l0 + li], b1 = ps->loop[p->l0 + li + 1];
+    int nv = (int)(b1 - b0);
+    if (nv < 3) continue;
+    if (noclip) {
+      /* НК4: без отсечения. Часть излучателя под касательной плоскостью даёт
+       * вклад со своим знаком, и величина перестаёт быть форм-фактором. */
+      for (int k = 0; k < nv; k++)
+        for (int c = 0; c < 3; c++)
+          w1[3 * k + c] = p->org[c] + ps->bv[2 * (b0 + k)] * p->eu[c] +
+                          ps->bv[2 * (b0 + k) + 1] * p->ev[c] - x[c];
+      s += lk_ff_loop(w1, nv, A->n);
+    } else {
+      s += lk_ff_loop_uv(x, A->n, p->org, p->eu, p->ev, ps->bv + 2 * b0, nv, w1, w2);
+    }
+  }
+  return (s > 0.0) ? s : 0.0;
+}
+
+/* ЭТАЛОН ПОЛНЫМ ПЕРЕБОРОМ (§87.4). Отвечает на вопрос, которого не различают ни
+ * `Σf`, ни ссылка лучами по отдельности: ТЕРЯЕТ ЛИ ЭНЕРГИЮ ИЕРАРХИЯ или сам
+ * коэффициент. Для выборки листьев `Σf` считается по ВСЕМ листьям сцены без
+ * всякого дробления — тем же точным форм-фактором и той же видимостью. Если
+ * перебор даёт около единицы, а иерархия `0.65`, потеря в дроблении; если и
+ * перебор даёт `0.65`, дело в коэффициенте либо в точечной коллокации. */
+int hz_links_sf_brute(const hz_scene *sc, int stride, int nvis, double *sf_novis, double *sf_vis,
+                      int32_t *node, int cap) {
+  const hz_lod *L = sc->L;
+  if (sc->ps == NULL || stride < 1) return 0;
+  if (nvis < 1) nvis = 2;
+  int32_t mxv = 3;
+  for (int32_t k = 0; k < sc->ps->np; k++) {
+    const hz_poly *p = &sc->ps->p[k];
+    for (int32_t li = 0; li < p->nloop; li++) {
+      int32_t nv = sc->ps->loop[p->l0 + li + 1] - sc->ps->loop[p->l0 + li];
+      if (nv > mxv) mxv = nv;
+    }
+  }
+  double *w1 = malloc(3 * (size_t)(mxv + 2) * sizeof *w1);
+  double *w2 = malloc(3 * (size_t)(mxv + 2) * sizeof *w2);
+  int32_t *p2n = malloc((size_t)sc->ps->np * sizeof *p2n);
+  if (w1 == NULL || w2 == NULL || p2n == NULL) {
+    free(w1);
+    free(w2);
+    free(p2n);
+    return 0;
+  }
+  for (int32_t k = 0; k < L->np && k < sc->ps->np; k++)
+    p2n[k] = L->lab[k];
+  int n = 0, seen = 0;
+  int64_t dummy = 0;
+  for (int32_t k = 0; k < L->nnd && n < cap; k++) {
+    if (L->nd[k].level != 0) continue;
+    if (seen++ % stride != 0) continue;
+    const hz_lodnode *A = &L->nd[k];
+    double s0 = 0.0, s1 = 0.0;
+    for (int32_t j = 0; j < sc->ps->np; j++) {
+      if (p2n[j] == k) continue;
+      double f = lk_coef_poly(A, sc->ps, j, 0, w1, w2);
+      if (!(f > 0.0)) continue;
+      s0 += f;
+      s1 += f * lk_vis(sc, A, &L->nd[p2n[j]], nvis, &dummy);
+    }
+    sf_novis[n] = s0;
+    sf_vis[n] = s1;
+    node[n] = k;
+    n++;
+  }
+  free(w1);
+  free(w2);
+  free(p2n);
+  return n;
+}
+
+int hz_links_build(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg) {
   memset(S, 0, sizeof *S);
+  const double eps = cfg->eps;
+  const int noself = cfg->noself;
+  int nvis = cfg->nvis;
   if (nvis < 1) nvis = 2;
   const hz_lod *L = sc->L;
   lk_kids K;
   if (lk_kids_build(&K, L) != 0) return 2;
+
+  /* КАРТА «УЗЕЛ УРОВНЯ 0 → ПОЛИГОН». Нулевой уровень лестницы и есть участки
+   * сегментации, соответствие взаимно однозначно и читается из нулевой строки
+   * `lab`. Рабочие буферы отсечения — в куче и один раз на сборку (А208): край
+   * доходит до 1684 вершин, а `-Wvla` запрещает массив переменной длины. */
+  int32_t *np2poly = NULL;
+  double *w1 = NULL, *w2 = NULL;
+  if (sc->ps != NULL && !cfg->disk) {
+    np2poly = malloc((size_t)L->nnd * sizeof *np2poly);
+    if (np2poly == NULL) {
+      lk_kids_free(&K);
+      return 2;
+    }
+    for (int32_t k = 0; k < L->nnd; k++)
+      np2poly[k] = -1;
+    int32_t mxv = 3;
+    for (int32_t k = 0; k < L->np && k < sc->ps->np; k++) {
+      np2poly[L->lab[k]] = k;
+      const hz_poly *p = &sc->ps->p[k];
+      for (int32_t li = 0; li < p->nloop; li++) {
+        int32_t nv = sc->ps->loop[p->l0 + li + 1] - sc->ps->loop[p->l0 + li];
+        if (nv > mxv) mxv = nv;
+      }
+    }
+    w1 = malloc(3 * (size_t)(mxv + 2) * sizeof *w1);
+    w2 = malloc(3 * (size_t)(mxv + 2) * sizeof *w2);
+    if (w1 == NULL || w2 == NULL) {
+      free(np2poly);
+      free(w1);
+      free(w2);
+      lk_kids_free(&K);
+      return 2;
+    }
+  }
 
   /* КОРНИ — узлы САМОГО ГРУБОГО уровня, реально занятые. Иерархия начинается
    * сверху и дробится вниз: пара грубых узлов либо порождает связь, либо
@@ -273,26 +513,21 @@ int hz_links_build(hz_linkset *S, const hz_scene *sc, double eps, int nvis, int 
 
   lk_queue q;
   memset(&q, 0, sizeof q);
+  int64_t *cnt = NULL;
   for (int32_t a = 0; a < L->nnd; a++) {
     if (!isroot[a]) continue;
     for (int32_t b = 0; b < L->nnd; b++)
       if (isroot[b] && (a != b || !noself)) {
         if (lk_qpush(&q, a, b) != 0) {
           free(isroot);
-          free(q.p);
-          lk_kids_free(&K);
-          return 2;
+          goto fail;
         }
       }
   }
   free(isroot);
 
-  int64_t *cnt = calloc((size_t)L->nnd, sizeof *cnt);
-  if (cnt == NULL) {
-    free(q.p);
-    lk_kids_free(&K);
-    return 2;
-  }
+  cnt = calloc((size_t)L->nnd, sizeof *cnt);
+  if (cnt == NULL) goto fail;
 
   for (int64_t k = 0; k < q.n; k++) {
     int32_t ia = q.p[k].a, ib = q.p[k].b;
@@ -309,12 +544,7 @@ int hz_links_build(hz_linkset *S, const hz_scene *sc, double eps, int nvis, int 
       S->nrefine++;
       for (int32_t u = s0; u < s1; u++)
         for (int32_t v = s0; v < s1; v++)
-          if (lk_qpush(&q, K.ch[u], K.ch[v]) != 0) {
-            free(q.p);
-            free(cnt);
-            lk_kids_free(&K);
-            return 2;
-          }
+          if (lk_qpush(&q, K.ch[u], K.ch[v]) != 0) goto fail;
       continue;
     }
     const hz_lodnode *A = &L->nd[ia], *B = &L->nd[ib];
@@ -336,12 +566,7 @@ int hz_links_build(hz_linkset *S, const hz_scene *sc, double eps, int nvis, int 
       for (int32_t c = c0; c < c1; c++) {
         int32_t ch = K.ch[c];
         int rc = (big == ia) ? lk_qpush(&q, ch, ib) : lk_qpush(&q, ia, ch);
-        if (rc != 0) {
-          free(q.p);
-          free(cnt);
-          lk_kids_free(&K);
-          return 2;
-        }
+        if (rc != 0) goto fail;
       }
       continue;
     }
@@ -350,21 +575,44 @@ int hz_links_build(hz_linkset *S, const hz_scene *sc, double eps, int nvis, int 
       S->nzero++;
       continue;
     }
-    if (lk_push(S, ia, ib, f * v) != 0) {
-      free(q.p);
-      free(cnt);
-      lk_kids_free(&K);
-      return 2;
+    /* КОЭФФИЦИЕНТ СВЯЗИ. Дробление и отбраковка выше СОЗНАТЕЛЬНО остались на
+     * диске (§87): набор связей обязан выйти тем же, и тогда сдвиг `Σf`
+     * приписывается коэффициенту, и больше нечему. Точная форма ставится там,
+     * где у излучателя ЕСТЬ край, то есть на нулевом уровне. */
+    double fc = f;
+    if (np2poly != NULL && np2poly[ib] >= 0) {
+      fc = lk_coef_poly(A, sc->ps, np2poly[ib], cfg->noclip, w1, w2);
+      S->nlink_leaf++;
+      S->wleaf += fc * v;
     }
+    if (lk_push(S, ia, ib, fc * v) != 0) goto fail;
     cnt[ia]++;
   }
   for (int32_t k = 0; k < L->nnd; k++)
     if (cnt[k] > S->nmax_node) S->nmax_node = cnt[k];
+  {
+    double wtot = 0.0;
+    for (int64_t k = 0; k < S->n; k++)
+      wtot += S->l[k].f;
+    S->wleaf = (wtot > 0.0) ? S->wleaf / wtot : 0.0;
+  }
   free(cnt);
   free(q.p);
+  free(np2poly);
+  free(w1);
+  free(w2);
   lk_kids_free(&K);
   lk_closure(S, L);
   return 0;
+
+fail:
+  free(cnt);
+  free(q.p);
+  free(np2poly);
+  free(w1);
+  free(w2);
+  lk_kids_free(&K);
+  return 2;
 }
 
 void hz_links_free(hz_linkset *S) {

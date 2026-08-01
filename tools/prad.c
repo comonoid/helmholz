@@ -51,7 +51,8 @@ static int cmp_d(const void *a, const void *b) {
 }
 
 int main(int argc, char **argv) {
-  int city = 0, w = 512, ss = 2, nvis = 2, maxlev = 13, noself = 0, nopull = 0;
+  int city = 0, w = 512, ss = 2, nvis = 2, maxlev = 13, noself = 0, nopull = 0, disk = 0,
+      noclip = 0;
   double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "city") == 0) city = 1;
@@ -67,6 +68,25 @@ int main(int argc, char **argv) {
      * это негативный контроль НК1, обязанный ПРОВАЛИТЬСЯ почернением. */
     if (strcmp(argv[i], "noself") == 0) noself = 1;
     if (strcmp(argv[i], "nopull") == 0) nopull = 1;
+    /* НК3 и НК4 §87: диск вместо точной формы; точная форма без отсечения. */
+    if (strcmp(argv[i], "disk") == 0) disk = 1;
+    if (strcmp(argv[i], "noclip") == 0) noclip = 1;
+  }
+
+  /* САМОПРОВЕРКА ФОРМУЛЫ — ПЕРВОЙ, ДО ВСЯКОЙ СЦЕНЫ (А205). Ошибка знака или
+   * нормировки пришла бы потом в виде правдоподобного `Σf`, и отличить её было
+   * бы нечем. Допуск `1e-9` — не порог качества, а запас на округление double в
+   * `acos` и в эталонной формуле; фактическая невязка на пять порядков меньше. */
+  {
+    double fb = 0.0, fu = 0.0, ru = 0.0;
+    double worst = hz_links_ff_selftest(&fb, &fu, &ru);
+    printf("== САМОПРОВЕРКА ФОРМ-ФАКТОРА: огромный квадрат %.15f; квадрат a=h %.15f против "
+           "эталона %.15f; худшая невязка %.3e\n",
+           fb, fu, ru, worst);
+    if (!(worst < 1e-9)) {
+      fprintf(stderr, "форм-фактор не сходится с аналитикой — дальше идти нельзя\n");
+      return 1;
+    }
   }
   double dseg = city ? 0.05 : 0.045;
 
@@ -88,8 +108,8 @@ int main(int argc, char **argv) {
     }
     printf("== СЦЕНА: %s, треугольников %d, участков %d; вершин края %d (на полигон %.1f, "
            "максимум %d)\n",
-           city ? "ГОРОД" : "зал", m.nt, sg.nseg, ps.nbv, (double)ps.nbv / (double)(ps.np ? ps.np : 1),
-           mxl);
+           city ? "ГОРОД" : "зал", m.nt, sg.nseg, ps.nbv,
+           (double)ps.nbv / (double)(ps.np ? ps.np : 1), mxl);
   }
 
   tr3_camera cam;
@@ -132,9 +152,17 @@ int main(int argc, char **argv) {
   hz_scene sc;
   sc.L = &L;
   sc.g = &g;
+  sc.ps = &ps;
+  hz_linkcfg lkc;
+  memset(&lkc, 0, sizeof lkc);
+  lkc.eps = eps * linkmul;
+  lkc.nvis = nvis;
+  lkc.noself = noself;
+  lkc.disk = disk;
+  lkc.noclip = noclip;
   hz_linkset S;
   t0 = now_s();
-  if (hz_links_build(&S, &sc, eps * linkmul, nvis, noself) != 0) {
+  if (hz_links_build(&S, &sc, &lkc) != 0) {
     fprintf(stderr, "отказ сборки связей\n");
     return 1;
   }
@@ -145,6 +173,9 @@ int main(int argc, char **argv) {
          (long long)S.nray, (long long)S.nmax_node);
   printf("   из отброшенных на ГРУБОМ уровне (обрубило поддерево): %lld\n",
          (long long)S.nzero_coarse);
+  printf("   с излучателем-листом %lld связей (%.1f %%), несут %.1f %% суммы коэффициентов\n",
+         (long long)S.nlink_leaf, 100.0 * (double)S.nlink_leaf / (double)(S.n ? S.n : 1),
+         100.0 * S.wleaf);
   printf("   на узел в среднем %.1f; связей / (n log n) = %.2f\n",
          (double)S.n / (double)(L.nnd ? L.nnd : 1),
          (double)S.n / ((double)L.nnd * log2((double)L.nnd + 2.0)));
@@ -154,6 +185,42 @@ int main(int argc, char **argv) {
          "среднее %.3f, min %.3f, max %.3f; площади с Σf<0.9 — %.1f %%\n",
          S.sf_p10, S.sf_p50, S.sf_p90, S.sf_mean, S.sf_min, S.sf_max, 100.0 * S.sf_lowfrac);
   fflush(stdout);
+
+  /* ЛЕЖИТ ЛИ ОПОРНАЯ ТОЧКА НА СВОЁМ ПОЛИГОНЕ. Опорная точка узла есть ЦЕНТР
+   * ПЛОЩАДИ (`plod.h`), а участок сегментации бывает невыпуклым и даже
+   * несвязным — центр площади тогда лежит ВНЕ его, в воздухе или внутри мебели.
+   * Из такой точки видимость меряется не оттуда, откуда светит поверхность.
+   * Проверка — принадлежность `(0,0)` петлям края в местных `(u,v)`: начало рамы
+   * и есть центр площади, так что тест сводится к подсчёту пересечений луча
+   * `v = 0, u > 0` с краем. Площадь считается, а не только число полигонов:
+   * вклад в перенос идёт площадью. */
+  {
+    double aout = 0.0, atot3 = 0.0;
+    int32_t nout = 0;
+    for (int32_t k = 0; k < ps.np; k++) {
+      const hz_poly *p = &ps.p[k];
+      int cross = 0;
+      for (int32_t li = 0; li < p->nloop; li++) {
+        int32_t b0 = ps.loop[p->l0 + li], b1 = ps.loop[p->l0 + li + 1];
+        for (int32_t e = b0; e < b1; e++) {
+          int32_t e2 = (e + 1 < b1) ? e + 1 : b0;
+          double u1 = ps.bv[2 * e], v1 = ps.bv[2 * e + 1];
+          double u2 = ps.bv[2 * e2], v2 = ps.bv[2 * e2 + 1];
+          if ((v1 > 0.0) == (v2 > 0.0)) continue;
+          double t = v1 / (v1 - v2);
+          if (u1 + t * (u2 - u1) > 0.0) cross++;
+        }
+      }
+      atot3 += p->area;
+      if ((cross & 1) == 0) {
+        nout++;
+        aout += p->area;
+      }
+    }
+    printf("== ОПОРНАЯ ТОЧКА ВНЕ СВОЕГО ПОЛИГОНА: %d из %d полигонов (%.1f %% ПЛОЩАДИ)\n", nout,
+           ps.np, (atot3 > 0.0) ? 100.0 * aout / atot3 : 0.0);
+    fflush(stdout);
+  }
 
   /* ЗАМКНУТОСТЬ СЦЕНЫ — НЕЗАВИСИМАЯ ССЫЛКА ДЛЯ `Σf`. Само по себе `Σf < 1` ещё
    * не значит потери: если сцена не замкнута, это ПРАВИЛЬНЫЙ ответ. Меряется
@@ -165,6 +232,14 @@ int main(int argc, char **argv) {
   {
     const int NCLO = 64; /* лучей на узел: 993·64 ≈ 64 тыс., доли секунды */
     double amiss = 0.0, atot2 = 0.0, worst = 1.0;
+    double *hitd = malloc((size_t)L.np * (size_t)NCLO * sizeof *hitd);
+    int64_t nhd = 0;
+    if (hitd == NULL) return 1;
+    double *sfn = malloc((size_t)L.nnd * sizeof *sfn);
+    double *dev = malloc((size_t)L.nnd * sizeof *dev);
+    if (sfn == NULL || dev == NULL) return 1;
+    hz_links_sf(&S, &L, sfn);
+    int32_t nd2 = 0;
     for (int32_t k = 0; k < L.nnd; k++) {
       if (L.nd[k].level != 0) continue;
       const hz_lodnode *N = &L.nd[k];
@@ -194,16 +269,58 @@ int main(int argc, char **argv) {
           d[c] = sn * cos(ph) * eu[c] + sn * sin(ph) * ev[c] + cs * N->n[c];
           o[c] = ((c == 0) ? N->cx : (c == 1) ? N->cy : N->cz) + 1e-5 * N->n[c];
         }
-        if (hz_pray_occluded(&g, o, d, 0.0, 1e6)) hit++;
+        double th = 0.0;
+        if (hz_pray_hit(&g, o, d, 0.0, &th) >= 0) {
+          hit++;
+          hitd[nhd++] = th;
+        }
       }
       double frac = (double)hit / NCLO;
       atot2 += N->area_surf;
       amiss += N->area_surf * (1.0 - frac);
       if (frac < worst) worst = frac;
+      /* СО ЗНАКОМ, а не по модулю (А206): ссылка лучами есть оценка СВЕРХУ —
+       * `hz_pray_occluded` засчитывает и удар в изнанку односторонней
+       * поверхности, которую связь законно отбраковывает. Систематический сдвиг
+       * в минус потому законен, и его надо видеть отдельно от разброса. */
+      dev[nd2++] = sfn[k] - frac;
     }
     printf("== ЗАМКНУТОСТЬ (лучами, независимо от Σf): в геометрию упирается %.3f "
            "косинусного телесного угла по площади; худший узел %.3f\n",
            (atot2 > 0.0) ? 1.0 - amiss / atot2 : 0.0, worst);
+    qsort(hitd, (size_t)nhd, sizeof *hitd, cmp_d);
+    printf("   расстояния до попадания, м: p01 %.2e, p10 %.3f, p50 %.3f, p90 %.3f\n",
+           hitd[(size_t)(0.01 * (double)nhd)], hitd[(size_t)(0.10 * (double)nhd)],
+           hitd[(size_t)(0.50 * (double)nhd)], hitd[(size_t)(0.90 * (double)nhd)]);
+    free(hitd);
+    qsort(dev, (size_t)nd2, sizeof *dev, cmp_d);
+    printf("== СВЕРКА Σf СО ССЫЛКОЙ ЛУЧАМИ (Σf − доля лучей, СО ЗНАКОМ): "
+           "p10 %+.3f, p50 %+.3f, p90 %+.3f; |p50| %.3f\n",
+           dev[(size_t)(0.10 * nd2)], dev[(size_t)(0.50 * nd2)], dev[(size_t)(0.90 * nd2)],
+           fabs(dev[(size_t)(0.50 * nd2)]));
+    /* ЭТАЛОН ПЕРЕБОРОМ — на выборке листьев, без иерархии. Три числа в одной
+     * строке отвечают на вопрос, который поодиночке не различает ни одна из
+     * величин: где потеря — в дроблении, в заслонении или в коэффициенте. */
+    {
+      const int NS = 32;
+      double bn[32], bv[32];
+      int32_t bnode[32];
+      int nb = hz_links_sf_brute(&sc, (L.np / NS > 0) ? L.np / NS : 1, nvis, bn, bv, bnode, NS);
+      if (nb > 0) {
+        double an = 0.0, av = 0.0, ah = 0.0, ar2 = 0.0;
+        for (int i2 = 0; i2 < nb; i2++) {
+          an += bn[i2];
+          av += bv[i2];
+          ah += sfn[bnode[i2]];
+        }
+        (void)ar2;
+        printf("== ЭТАЛОН ПЕРЕБОРОМ (%d листьев из %d): Σf перебором без видимости %.3f, "
+               "с видимостью %.3f; та же выборка иерархией %.3f\n",
+               nb, L.np, an / nb, av / nb, ah / nb);
+      }
+    }
+    free(sfn);
+    free(dev);
     fflush(stdout);
   }
 

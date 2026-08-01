@@ -169,6 +169,8 @@ static int mtl_add(hz_objmesh *m, const char *name, size_t n, double kd) {
   memcpy(m->mtl[m->nmtl].name, name, n);
   m->mtl[m->nmtl].name[n] = '\0';
   m->mtl[m->nmtl].kd = kd;
+  for (int c = 0; c < 3; c++)
+    m->mtl[m->nmtl].kd3[c] = kd;
   m->nmtl++;
   return (int)(m->nmtl - 1);
 }
@@ -201,8 +203,12 @@ static void mtl_load(hz_objmesh *m, const char *objpath, const char *name, size_
       double c0 = strtod(p + 2, &e);
       double c1 = strtod(e, &e);
       double c2 = strtod(e, &e);
-      /* ОДИН КАНАЛ — СРЕДНЕЕ, а не яркость: сохраняется доля энергии (заголовок). */
+      /* ОДИН КАНАЛ — СРЕДНЕЕ, а не яркость: сохраняется доля энергии (заголовок).
+       * Три канала хранятся рядом и нужны только картинке (§78). */
       m->mtl[cur].kd = (c0 + c1 + c2) / 3.0;
+      m->mtl[cur].kd3[0] = c0;
+      m->mtl[cur].kd3[1] = c1;
+      m->mtl[cur].kd3[2] = c2;
     }
     p = skip_line(p);
   }

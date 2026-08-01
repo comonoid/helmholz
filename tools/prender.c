@@ -50,6 +50,12 @@
 /* Проб видимости в ЭТАЛОНЕ. Переменная, а не константа: у ОГРУБЛЁННОЙ сцены
  * полигоны крупные, сетка лучей отсекает плохо, и эталон дорожает в разы. */
 static int NVIS_REF = 6;
+/* ЭТАЛОН СЧИТАЕТСЯ НЕ ВСЕГДА (§78). Он нужен МЕТРИКЕ — сравнить поле полигонов с
+ * точным прямым светом в точке попадания, — и стоит `пиксели × источники × пробы`,
+ * то есть на городе больше самого решения. Для КАРТИНКИ он не нужен вовсе.
+ * Величина `0` не «отключает проверку», а говорит: этот прогон даёт изображение, а
+ * не замер, и метрики в нём не будет. */
+static int WANT_REF = 1;
 /* Проб видимости в ПРОВЕРЯЕМОМ прогоне. Параметр, а не константа, и это
  * вынужденно: при 2×2 = 4 пробах полутень квантуется на пять ступеней, то есть
  * площадной источник §2 ведёт себя как четыре точечных. Тогда выигрыш разрезов
@@ -79,6 +85,14 @@ typedef struct {
   double *Edir;  /* 3·np: поле ТОЛЬКО прямого света */
   int32_t src[16];
   int nsrc, ncut;
+  /* ЦВЕТ И ДЕТАЛЬ БЕРУТСЯ С МЕЛКОГО ПРЕДСТАВЛЕНИЯ (§78, правило Т1). Поле `E`
+   * считается на ОГРУБЛЁННЫХ элементах — это дорого и потому огрублено; альбедо
+   * применяется при ЧТЕНИИ, поэтому его можно брать с какой угодно мелкой сетки
+   * даром. Раньше картинка брала `rho` ЭЛЕМЕНТА, то есть среднее по слитым
+   * полигонам, и вся материальная деталь стиралась вместе с геометрией — хотя
+   * стираться она не обязана вовсе. */
+  const hz_pray *gfine;
+  const double *albf; /* 3·np мелкого набора: RGB-альбедо */
   double t_solve, t_direct, t_frame;
   int64_t nfrag, nray, nover;
   int nbounce;
@@ -113,6 +127,34 @@ static int add_lamps(hz_polyset *ps, const double lo[3], const double hi[3], int
       k++;
     }
   return 0;
+}
+
+/* ИСТОЧНИК ДЛЯ ГОРОДА: ОДНА БОЛЬШАЯ ИЗЛУЧАЮЩАЯ ПЛОЩАДКА НАД СЦЕНОЙ (§78).
+ *
+ * Лампы под потолком для города бессмысленны, а честного неба у нас нет. Взята
+ * простейшая вещь, которую УЖЕ умеет замкнутая форма прямого света: площадной
+ * источник — квадрат размером со сцену, поднятый над ней и смотрящий вниз. Это
+ * пасмурное небо в первом приближении: свет приходит со всей верхней полусферы,
+ * теней с резким краем нет, и спорить о положении солнца не приходится.
+ *
+ * ВЫСОТА — ПОЛОВИНА ГОРИЗОНТАЛЬНОГО РАЗМЕРА СЦЕНЫ НАД ЕЁ ВЕРХОМ. Число не
+ * подобрано под картинку: при такой высоте площадка видна из середины сцены под
+ * углом около `90°`, то есть закрывает верхнюю полусферу примерно так, как её
+ * закрывает небо. Ниже — площадка начнёт светить как потолок, выше — как точечное
+ * солнце, и оба случая пришлось бы обосновывать отдельно.
+ *
+ * ЯРКОСТЬ та же, что у ламп зала: сравнивать картинки между сценами всё равно
+ * нельзя, а масштаб радианса в метрике сокращается. */
+static int add_sky(hz_polyset *ps, const double lo[3], const double hi[3], int32_t *out) {
+  const double n[3] = {0.0, -1.0, 0.0}, eu[3] = {1.0, 0.0, 0.0};
+  double c[3];
+  double sx = 0.5 * (hi[0] - lo[0]), sz = 0.5 * (hi[2] - lo[2]);
+  double span = (sx > sz) ? sx : sz;
+  c[0] = 0.5 * (lo[0] + hi[0]);
+  c[1] = hi[1] + span;
+  c[2] = 0.5 * (lo[2] + hi[2]);
+  out[0] = ps->np;
+  return hz_poly_add_quad(ps, c, n, eu, sx, sz, 0);
 }
 
 /* КОНТРОЛЬ ДИАГНОЗА: дробление полигона ПРОСТРАНСТВЕННОЙ СЕТКОЙ шага `L`.
@@ -319,7 +361,12 @@ static int scene_from(scene *S, const hz_objmesh *m, const hz_pseglist *sg, cons
                       const double hi[3], int nsrc) {
   memset(S, 0, sizeof *S);
   if (hz_poly_build(&S->ps, m, sg) != 0) return 1;
-  if (add_lamps(&S->ps, lo, hi, S->src, nsrc, 0.0) != 0) return 1;
+  /* `nsrc < 0` — ГОРОД: одна площадка-небо вместо решётки ламп (§78). */
+  if (nsrc < 0) {
+    if (add_sky(&S->ps, lo, hi, S->src) != 0) return 1;
+    nsrc = 1;
+  } else if (add_lamps(&S->ps, lo, hi, S->src, nsrc, 0.0) != 0)
+    return 1;
   S->nsrc = nsrc;
   if (hz_ptrans_init(&S->t, &S->ps, m) != 0) return 1;
   S->srcLe = calloc((size_t)S->ps.np, sizeof *S->srcLe);
@@ -440,6 +487,113 @@ static int cmp_d(const void *a, const void *b) {
   return (x < y) ? -1 : ((x > y) ? 1 : 0);
 }
 
+/* ЦВЕТНОЙ КАДР ДЛЯ ГЛАЗА (§78). Отдельный путь от `render()` СОЗНАТЕЛЬНО: тот
+ * считает метрику и эталон, и мешать в него тон-маппинг с суперсэмплингом значит
+ * менять замер ради красоты. Здесь наоборот — ни метрики, ни эталона, только
+ * изображение.
+ *
+ * ТРИ ОТЛИЧИЯ ОТ ПРЕЖНЕЙ КАРТИНКИ, И ВСЕ ТРИ БЫЛИ ПРОСТО НЕ СДЕЛАНЫ:
+ *   1. ЦВЕТ. `hz_ppm_write` гнал яркость через ЛОЖНУЮ РАСКРАСКУ (`colormap`), то
+ *      есть фиолетово-оранжевую шкалу для чтения полей. Для глаза нужен честный
+ *      серый с гаммой, а лучше — цвет материала.
+ *   2. АЛЬБЕДО С МЕЛКОГО ПРЕДСТАВЛЕНИЯ, а не с элемента (правило Т1).
+ *   3. СУПЕРСЭМПЛИНГ: край элемента — ступенька в один пиксель, и без сглаживания
+ *      она видна на любой сцене.
+ * Тон-маппинг: деление на 99.5-й процентиль яркости и гамма `2.2`. Процентиль, а
+ * не максимум, — иначе одна яркая лампа гасит весь кадр. */
+static int render_rgb(scene *S, const tr3_camera *cam, int ss, const char *ppm) {
+  const int W = cam->w, H = cam->h;
+  int n = W * H;
+  double *L3 = calloc((size_t)n * 3, sizeof *L3);
+  unsigned char *rgb = malloc((size_t)n * 3);
+  if (L3 == NULL || rgb == NULL) {
+    free(L3);
+    free(rgb);
+    return 1;
+  }
+  if (ss < 1) ss = 1;
+#pragma omp parallel for schedule(dynamic, 16)
+  for (int i = 0; i < n; i++) {
+    int px = i % W, py = i / W;
+    double acc[3] = {0.0, 0.0, 0.0};
+    for (int sy = 0; sy < ss; sy++)
+      for (int sx = 0; sx < ss; sx++) {
+        double o[3], d[3], t;
+        /* Подпиксель: камера умеет только целые пиксели, поэтому смещение
+         * вносится долей пикселя в НАПРАВЛЕНИИ — этого довольно для сглаживания
+         * края и не требует правки оператора камеры. */
+        tr3_camera_ray(cam, px, py, o, d);
+        if (ss > 1) {
+          /* Шаг пикселя по обеим осям берётся у самой камеры — соседними лучами,
+           * а не выводом её внутренней формулы: так подпиксельное смещение
+           * остаётся верным при любом операторе камеры. */
+          double ox[3], dx[3], oy[3], dy[3];
+          tr3_camera_ray(cam, (px + 1 < W) ? px + 1 : px - 1, py, ox, dx);
+          tr3_camera_ray(cam, px, (py + 1 < H) ? py + 1 : py - 1, oy, dy);
+          double fx = ((double)sx + 0.5) / (double)ss - 0.5;
+          double fy = ((double)sy + 0.5) / (double)ss - 0.5;
+          if (px + 1 >= W) fx = -fx;
+          if (py + 1 >= H) fy = -fy;
+          for (int c = 0; c < 3; c++)
+            d[c] += fx * (dx[c] - d[c]) + fy * (dy[c] - d[c]);
+          double dn = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+          if (dn > 0.0)
+            for (int c = 0; c < 3; c++)
+              d[c] /= dn;
+        }
+        int32_t k = hz_pray_hit(&S->g, o, d, 0.0, &t);
+        if (k < 0) continue;
+        const hz_poly *P = &S->ps.p[k];
+        double q[3] = {0.0, 0.0, 0.0};
+        for (int a = 0; a < 3; a++)
+          q[a] = o[a] + t * d[a] - P->org[a];
+        double u = q[0] * P->eu[0] + q[1] * P->eu[1] + q[2] * P->eu[2];
+        double v = q[0] * P->ev[0] + q[1] * P->ev[1] + q[2] * P->ev[2];
+        const double *ce = S->t.E + (size_t)k * 3;
+        double Etot = ce[0] + ce[1] * u + ce[2] * v;
+        if (Etot < 0.0) Etot = 0.0;
+        double alb[3] = {S->t.rho[k], S->t.rho[k], S->t.rho[k]};
+        if (S->gfine != NULL && S->albf != NULL) {
+          double tf = 0.0;
+          int32_t kf = hz_pray_hit(S->gfine, o, d, 0.0, &tf);
+          if (kf >= 0)
+            for (int c = 0; c < 3; c++)
+              alb[c] = S->albf[(size_t)kf * 3 + (size_t)c];
+        }
+        for (int c = 0; c < 3; c++)
+          acc[c] += S->srcLe[k] + alb[c] * Etot / M_PI;
+      }
+    double w = 1.0 / (double)(ss * ss);
+    for (int c = 0; c < 3; c++)
+      L3[(size_t)i * 3 + (size_t)c] = acc[c] * w;
+  }
+  /* Нормировка по 99.5-му процентилю ЯРКОСТИ, общая для трёх каналов: канальная
+   * нормировка увела бы цвет. */
+  double *lum = malloc((size_t)n * sizeof *lum);
+  if (lum == NULL) {
+    free(L3);
+    free(rgb);
+    return 1;
+  }
+  for (int i = 0; i < n; i++)
+    lum[i] = 0.2126 * L3[3 * i] + 0.7152 * L3[3 * i + 1] + 0.0722 * L3[3 * i + 2];
+  qsort(lum, (size_t)n, sizeof *lum, cmp_d);
+  double mx = lum[(size_t)((double)n * 0.995)];
+  free(lum);
+  if (!(mx > 0.0)) mx = 1.0;
+  for (int i = 0; i < 3 * n; i++) {
+    double x = L3[i] / mx;
+    if (x < 0.0) x = 0.0;
+    if (x > 1.0) x = 1.0;
+    x = pow(x, 1.0 / 2.2);
+    rgb[i] = (unsigned char)(255.0 * x + 0.5);
+  }
+  int rc = hz_ppm_write_rgb(ppm, rgb, W, H);
+  free(L3);
+  free(rgb);
+  return rc;
+}
+
 /* Кадр: луч в пиксель, радианс из поля; заодно эталон и метрика. */
 static int render(scene *S, const tr3_camera *cam, imgstat *out, const char *ppm, const char *pfm) {
   const int W = cam->w, H = cam->h;
@@ -488,7 +642,7 @@ static int render(scene *S, const tr3_camera *cam, imgstat *out, const char *ppm
     double Eind = Etot - Edf;
     if (Eind < 0.0) Eind = 0.0;
     int cls = 0;
-    double Ede = direct_exact(S, k, x, &cls);
+    double Ede = WANT_REF ? direct_exact(S, k, x, &cls) : 0.0;
     klass[i] = (int8_t)cls;
     if (Etot < 0.0) Etot = 0.0;
     Lt[i] = S->srcLe[k] + S->t.rho[k] * Etot / M_PI;
@@ -661,13 +815,25 @@ int main(int argc, char **argv) {
   double tol = (argc > 4) ? strtod(argv[4], NULL) : 0.05;
   if (argc > 5) NVIS_RUN = atoi(argv[5]);
 
+  /* ВЫБОР СЦЕНЫ (§78). До сих пор `prender` держал зал жёстко, и городская
+   * картинка была недостижима не по существу, а по обвязке. */
+  int city = 0;
+  for (int i = 1; i < argc; i++)
+    if (strcmp(argv[i], "city") == 0) city = 1;
   hz_objmesh base;
-  if (hz_obj_load(&base, HZ_CFG_HALL_OBJ, HZ_CFG_HALL_SCALE) != 0) {
-    fprintf(stderr, "нет %s\n", HZ_CFG_HALL_OBJ);
+  if (hz_obj_load(&base, city ? HZ_CFG_CITY_OBJ : HZ_CFG_HALL_OBJ,
+                  city ? HZ_CFG_CITY_SCALE : HZ_CFG_HALL_SCALE) != 0) {
+    fprintf(stderr, "нет сцены\n");
     return 1;
   }
   tr3_camera cam;
-  double eye[3] = HZ_CFG_HALL_EYE, at[3] = HZ_CFG_HALL_AT, up[3] = HZ_CFG_UP;
+  double eyeh[3] = HZ_CFG_HALL_EYE, ath[3] = HZ_CFG_HALL_AT;
+  double eyec[3] = HZ_CFG_CITY_EYE, atc[3] = HZ_CFG_CITY_AT;
+  double eye[3], at[3], up[3] = HZ_CFG_UP;
+  for (int c = 0; c < 3; c++) {
+    eye[c] = city ? eyec[c] : eyeh[c];
+    at[c] = city ? atc[c] : ath[c];
+  }
   if (tr3_camera_look(&cam, eye, at, up, HZ_CFG_FOV_DEG * M_PI / 180.0, IMGW, IMGH) != 0) return 1;
   tr3_dirs d;
   if (tr3_dirs_product(&d, 4, 4) != 0) return 1;
@@ -737,10 +903,28 @@ int main(int argc, char **argv) {
    * отношения не имеющей. Перестановка сохраняет набор выбранных уровней и рвёт
    * только связь «грубее там, где дальше». */
   if (argc > 6 && argv[6][0] == 'o') {
-    const char *lodf = (argc > 7) ? argv[7] : "build/lod/hall_r.lod";
+    const char *lodf = NULL;
+    for (int i = 7; i < argc; i++)
+      if (strncmp(argv[i], "lod=", 4) == 0) lodf = argv[i] + 4;
+    if (lodf == NULL) lodf = city ? "build/lod/city_r.lod" : "build/lod/hall_r.lod";
+    /* КАРТИНКА, А НЕ ЗАМЕР: эталон стоит `пиксели × источники × пробы` и на городе
+     * дороже самого решения, а изображению не нужен вовсе (§78). Включается
+     * словом `ref`, и тогда прогон становится замером. */
+    WANT_REF = 0;
+    for (int i = 7; i < argc; i++)
+      if (strcmp(argv[i], "ref") == 0) WANT_REF = 1;
     NVIS_REF = 4;
-    IMGW = 256;
-    IMGH = 256;
+    /* РАЗРЕШЕНИЕ И ПРОБЫ ВИДИМОСТИ — параметрами (§78). Умолчание 256² и четыре
+     * пробы годились для ЗАМЕРА (их выбирала цена эталона), но для картинки дают
+     * ступенчатый край и квантованную полутень: площадной источник при четырёх
+     * пробах ведёт себя как четыре точечных. */
+    IMGW = 512;
+    for (int i = 7; i < argc; i++) {
+      if (strncmp(argv[i], "w=", 2) == 0) IMGW = (int)strtol(argv[i] + 2, NULL, 10);
+      if (strncmp(argv[i], "vis=", 4) == 0) NVIS_RUN = (int)strtol(argv[i] + 4, NULL, 10);
+    }
+    if (IMGW < 64) IMGW = 64;
+    IMGH = IMGW;
     if (tr3_camera_look(&cam, eye, at, up, HZ_CFG_FOV_DEG * M_PI / 180.0, IMGW, IMGH) != 0)
       return 1;
     const double eps_px = (HZ_CFG_FOV_DEG * M_PI / 180.0) / (double)IMGH;
@@ -770,9 +954,37 @@ int main(int argc, char **argv) {
            "кадр,с");
     fflush(stdout);
 
+    int ssaa = 2;
+    for (int i = 7; i < argc; i++)
+      if (strncmp(argv[i], "ss=", 3) == 0) ssaa = (int)strtol(argv[i] + 3, NULL, 10);
     int32_t *sel = malloc((size_t)L.np * sizeof *sel);
     int32_t *lev_of = malloc((size_t)L.np * sizeof *lev_of);
     if (sel == NULL || lev_of == NULL) return 1;
+
+    /* МЕЛКОЕ ПРЕДСТАВЛЕНИЕ ДЛЯ ЦВЕТА (§78, правило Т1): строится ОДИН раз и живёт
+     * всю ветвь. Поле берётся с огрублённых элементов, альбедо — отсюда, и потому
+     * материальная деталь не зависит от того, насколько огрублена геометрия. */
+    hz_polyset psfine;
+    hz_pray gfine;
+    double *albf = NULL;
+    int havefine = 0;
+    if (hz_poly_build(&psfine, &base, &sgf) == 0) {
+      if (hz_pray_build(&gfine, &psfine, 4.0) == 0) {
+        albf = malloc((size_t)psfine.np * 3 * sizeof *albf);
+        if (albf != NULL) {
+          for (int32_t k = 0; k < psfine.np; k++) {
+            /* Материал берётся у ПЕРВОГО треугольника полигона: сегментация
+             * плоская, и внутри участка материал, как правило, один. */
+            int32_t t = (psfine.p[k].ntri > 0) ? psfine.tri[psfine.p[k].t0] : -1;
+            int32_t mi = (t >= 0 && base.fm != NULL) ? base.fm[t] : 0;
+            for (int c = 0; c < 3; c++)
+              albf[(size_t)k * 3 + (size_t)c] =
+                  (mi >= 0 && mi < base.nmtl) ? base.mtl[mi].kd3[c] : 0.5;
+          }
+          havefine = 1;
+        }
+      }
+    }
 
     /* Ветвь: по выбору узлов `sel` построить сцену, решить, снять кадр. */
     for (int pass = 0; pass < L.nlev + 2; pass++) {
@@ -782,29 +994,37 @@ int main(int argc, char **argv) {
         for (int32_t k = 0; k < L.np; k++)
           sel[k] = L.lab[k];
         snprintf(tag, sizeof tag, "уровень 0 (мелкий)");
-        snprintf(img, sizeof img, "img/o22_lev0.ppm");
+        snprintf(img, sizeof img, "img/o22_%s_lev0.ppm", city ? "city" : "hall");
       } else if (pass == 1) {
         /* СРЕЗ. */
-        if (hz_lod_cut(&L, eye, L.eps, sel) <= 0) return 1;
+        /* Критерий по ПОЛНОМУ смещению (§76.4): множитель sin отпускал допуск для
+         * поверхностей, видимых в лоб, и стоил порядка по качеству. */
+        if (hz_lod_cut(&L, eye, L.eps, 1, sel) <= 0) return 1;
         for (int32_t k = 0; k < L.np; k++)
           lev_of[k] = L.nd[sel[k]].level;
         snprintf(tag, sizeof tag, "СРЕЗ по камере");
-        snprintf(img, sizeof img, "img/o22_cut.ppm");
+        snprintf(img, sizeof img, "img/o22_%s_cut.ppm", city ? "city" : "hall");
       } else {
         int lev = pass - 1;
         if (lev >= L.nlev) break;
         for (int32_t k = 0; k < L.np; k++)
           sel[k] = L.lab[(size_t)lev * (size_t)L.np + (size_t)k];
         snprintf(tag, sizeof tag, "однородный уровень %d", lev);
-        snprintf(img, sizeof img, "img/o22_uni%d.ppm", lev);
+        snprintf(img, sizeof img, "img/o22_%s_uni%d.ppm", city ? "city" : "hall", lev);
       }
       hz_pseglist so;
       if (hz_lod_seglist(&L, &base, &sgf, sel, &so) != 0) return 1;
       scene C;
-      if (scene_from(&C, &base, &so, base.lo, base.hi, 8) != 0) return 1;
+      if (scene_from(&C, &base, &so, base.lo, base.hi, city ? -1 : 8) != 0) return 1;
       if (solve(&C, &d, h, 1e-4) != 0) return 1;
+      if (havefine) {
+        C.gfine = &gfine;
+        C.albf = albf;
+      }
       imgstat sc;
-      if (render(&C, &cam, &sc, img, NULL) != 0) return 1;
+      if (render(&C, &cam, &sc, NULL, NULL) != 0) return 1;
+      /* Цветной кадр — отдельным путём, суперсэмплинг 2×2 (§78). */
+      if (render_rgb(&C, &cam, ssaa, img) != 0) return 1;
       printf("   %-30s %7d %9.3e %9.3e %8.2f%% %8.2f%% %7.2f\n", tag, C.ps.np, sc.p50, sc.p99,
              sc.frac1, sc.frac10, sc.t_frame);
       fflush(stdout);
@@ -835,7 +1055,7 @@ int main(int argc, char **argv) {
       hz_pseglist so;
       if (hz_lod_seglist(&L, &base, &sgf, sel, &so) != 0) return 1;
       scene C;
-      if (scene_from(&C, &base, &so, base.lo, base.hi, 8) != 0) return 1;
+      if (scene_from(&C, &base, &so, base.lo, base.hi, city ? -1 : 8) != 0) return 1;
       if (solve(&C, &d, h, 1e-4) != 0) return 1;
       imgstat sc;
       if (render(&C, &cam, &sc, "img/o22_perm.ppm", NULL) != 0) return 1;
@@ -846,6 +1066,11 @@ int main(int argc, char **argv) {
     }
     free(sel);
     free(lev_of);
+    if (havefine) {
+      hz_pray_free(&gfine);
+      hz_poly_free(&psfine);
+      free(albf);
+    }
     hz_lod_free(&L);
     hz_seg_free(&sgf);
     tr3_dirs_free(&d);

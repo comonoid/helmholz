@@ -358,6 +358,21 @@ static double lk_vis(const hz_scene *sc, int32_t ia, const double xa[3], int32_t
         int32_t la = LL->lab[(size_t)LL->nd[ia].level * (size_t)LL->np + (size_t)ph];
         int32_t lb = LL->lab[(size_t)LL->nd[ib].level * (size_t)LL->np + (size_t)ph];
         if (la == ia || lb == ib) blocked = 0;
+        /* КОМПЛАНАРНАЯ ПОВЕРХНОСТЬ НЕ ЗАСЛОНЯЕТ, ХОТЯ БЫ И ЧУЖОЙ УЗЕЛ (§93).
+         * Правило §88 привязывало исключение к НОМЕРУ УЗЛА, и пока пол был одним
+         * элементом, этого хватало. С ограничением размера (§92) пол стал
+         * тринадцатью узлами, соседние куски начали затенять друг друга, и `Σf`
+         * упало `0.842 → 0.531`. Плоская поверхность себя не затеняет ФИЗИЧЕСКИ,
+         * и привязывать правило надо к ГЕОМЕТРИИ, а не к разбиению (А236).
+         * Допуск по расстоянию — `delta0` лестницы, то есть тот же, по которому
+         * участок и признан плоским; своего порога здесь не заводится. */
+        if (blocked && sc->ps != NULL) {
+          const hz_poly *ph_p = &sc->ps->p[ph];
+          const hz_lodnode *R = &LL->nd[ia];
+          double cs = ph_p->n[0] * R->n[0] + ph_p->n[1] * R->n[1] + ph_p->n[2] * R->n[2];
+          double dd = fabs(ph_p->off - R->off);
+          if (cs > 0.999 && dd < LL->delta0) blocked = 0;
+        }
       }
       if (!blocked) hit++;
     }

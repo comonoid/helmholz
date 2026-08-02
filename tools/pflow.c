@@ -22,6 +22,7 @@
  * поверхности — величина, от разбиения не зависящая, — а не поэлементные поля.
  */
 
+#include "plod.h"
 #include "poly_seg.h"
 #include "polygon.h"
 #include "psweep.h"
@@ -227,6 +228,7 @@ int main(int argc, char **argv) {
    * вернуться к прежнему проценту; не вернулась — поправка ни при чём. */
   int noqn = 0;
   int skyf = 0; /* §130: замерить долю неба и сверить с хранимым оператором */
+  int lod = 0;  /* §131: перенос по срезу лестницы вместо всех участков */
   /* §128: направлений за шаг свёртки. `0` читается как число потоков OpenMP —
    * иначе параллелизм по направлениям простаивает. */
   int nfold = 0;
@@ -247,6 +249,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "oven") == 0) oven = 1;
     if (strcmp(argv[i], "noqn") == 0) noqn = 1;
     if (strcmp(argv[i], "skyf") == 0) skyf = 1;
+    if (strcmp(argv[i], "lod") == 0) lod = 1;
     if (strncmp(argv[i], "nfold=", 6) == 0) nfold = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "osub=", 5) == 0) osub = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "w=", 2) == 0) imgw = (int)strtol(argv[i] + 2, NULL, 10);
@@ -290,6 +293,64 @@ int main(int argc, char **argv) {
   double t_geo = now_s() - t0;
   printf("== СЦЕНА: %s, треугольников %d, полигонов %d; разбор %.1f с, геометрия %.1f с\n",
          city ? "ГОРОД" : "зал", m.nt, ps.np, t_load, t_geo);
+
+  /* ---------------------------------------------- LOD В ПЕРЕНОСЕ (§131) ---
+   *
+   * Перенос до сих пор шёл по ВСЕМ участкам нулевого уровня — `446 013` у
+   * города, — хотя лестница построена и срез камеры даёт `152 618`. Это `2.9×`
+   * по числу примитивов, лежавшие нетронутыми.
+   *
+   * Машинерия готова целиком: `hz_lod_seglist` превращает срез в обычную
+   * разметку треугольников, а `hz_poly_build` строит по ней полигоны. Ниже по
+   * течению ничто не меняется — развёртка не знает, с какого уровня пришли
+   * элементы.
+   *
+   * ЦЕНА НАЗВАНА ЗАРАНЕЕ: лестница строится `≈100` с, и это ПРЕДРАСЧЁТ, который
+   * при изменении геометрии придётся повторять. Здесь мерится только выигрыш на
+   * переносе; окупаемость — отдельный счёт. */
+  hz_lod L;
+  hz_pseglist sgc;
+  hz_polyset psc;
+  int lod_on = 0;
+  if (lod) {
+    double tl = now_s();
+    hz_lodcfg lc;
+    memset(&lc, 0, sizeof lc);
+    lc.delta0 = dseg;
+    const double eps = (HZ_CFG_FOV_DEG * M_PI / 180.0) / 1920.0;
+    lc.eps = eps;
+    lc.maxlev = 9;
+    lc.radmul = 4.0;
+    lc.base = 1.4142;
+    if (hz_lod_build_merge(&L, &m, &sg, &ps, &lc) != 0) {
+      fprintf(stderr, "отказ лестницы\n");
+      return 1;
+    }
+    double t_lad = now_s() - tl;
+    double eyeh[3] = HZ_CFG_HALL_EYE, eyec[3] = HZ_CFG_CITY_EYE;
+    const double *ey = city ? eyec : eyeh;
+    double eye[3] = {ey[0], ey[1], ey[2]};
+    int32_t *cut = malloc((size_t)L.np * sizeof *cut);
+    if (cut == NULL) return 1;
+    tl = now_s();
+    int32_t ncut = hz_lod_cut(&L, eye, eps, 1, cut);
+    if (hz_lod_seglist(&L, &m, &sg, cut, &sgc) != 0) return 1;
+    if (hz_poly_build(&psc, &m, &sgc) != 0) return 1;
+    free(cut);
+    printf("== LOD В ПЕРЕНОСЕ: лестница %d уровней, %d узлов за %.1f с; срез %d узлов, "
+           "полигонов среза %d (было %d, то есть %.2f×) за %.1f с\n",
+           L.nlev, L.nnd, t_lad, ncut, psc.np, ps.np, (double)ps.np / (double)psc.np, now_s() - tl);
+    /* ПОЛИГОНЫ СРЕЗА ЗАМЕЩАЮТ ИСХОДНЫЕ ЦЕЛИКОМ. Ниже по течению ничего не
+     * меняется: развёртка не знает, с какого уровня пришёл элемент. */
+    hz_poly_free(&ps);
+    ps = psc;
+    lod_on = 1;
+  }
+  if (lod_on && mvr > 0.0) {
+    fprintf(stderr, "lod и mvr вместе не поддержаны: после правки меша лестницу надо строить "
+                    "заново, и это отдельный замер\n");
+    return 1;
+  }
 
   hz_ptrans tr;
   if (hz_ptrans_init(&tr, &ps, &m) != 0) return 1;

@@ -175,9 +175,52 @@ static uint64_t pf_key(const double p[3]) {
   return h;
 }
 
+/* ПЕЧЬ — ЕДИНСТВЕННЫЙ ЭТАЛОН, НЕ ЗАВИСЯЩИЙ НИ ОТ ОДНОЙ ИЗ ДВУХ СХЕМ (§126).
+ *
+ * Замкнутая коробка, у всех граней одно альбедо `ρ` и одно собственное излучение
+ * `Le`. Точное решение известно замкнутой формой и не требует ни геометрии, ни
+ * видимости: в замкнутой полости `Σf = 1` у каждой площадки, поэтому
+ *
+ *     B = Le + ρ·B   ⇒   B = Le/(1 − ρ)
+ *
+ * во всех точках. При `Le = 1`, `ρ = 0.5` это ровно `2`. Расхождение схемы с этим
+ * числом есть ЕЁ ошибка, а не спор двух подозреваемых: сегодня хранимый оператор
+ * и итерации разошлись на городе в `1.93` раза, и без внешнего эталона нельзя
+ * сказать, кто из них неправ.
+ *
+ * Грани смотрят ВНУТРЬ (нормаль к центру), иначе полость не замкнута для
+ * переноса. `nsub` — на сколько делить сторону: одна грань из одного полигона
+ * проверяет физику, из многих — ещё и разбиение. */
+static int pf_oven(hz_objmesh *m, double side, int nsub) {
+  memset(m, 0, sizeof *m);
+  for (int a = 0; a < 3; a++) {
+    m->lo[a] = 1e300;
+    m->hi[a] = -1e300;
+  }
+  const double q = side / (double)nsub, hq = 0.5 * q, s2 = 0.5 * side;
+  for (int ax = 0; ax < 3; ax++)
+    for (int sgn = -1; sgn <= 1; sgn += 2) {
+      double n[3] = {0, 0, 0}, eu[3] = {0, 0, 0};
+      n[ax] = -(double)sgn; /* внутрь коробки */
+      eu[(ax + 1) % 3] = 1.0;
+      for (int i = 0; i < nsub; i++)
+        for (int j = 0; j < nsub; j++) {
+          double c[3];
+          c[ax] = (double)sgn * s2;
+          c[(ax + 1) % 3] = -s2 + ((double)i + 0.5) * q;
+          c[(ax + 2) % 3] = -s2 + ((double)j + 0.5) * q;
+          if (hz_obj_add_quad(m, "oven", c, n, eu, hq, hq) < 0) return 1;
+        }
+    }
+  return 0;
+}
+
 int main(int argc, char **argv) {
   int city = 0, nmu = 2, nphi = 4, nb = 21, layout = HZ_LAYOUT_RUNS, imgw = 960, imgh = 540;
   int fold = 0; /* §125: угловая квадратура едет на итерации, а не вложена в неё */
+  int oven = 0; /* §126: печь — аналитический эталон B = Le/(1−ρ) */
+  int osub = 4; /* делений стороны печи */
+  double oside = 4.0;
   double h = 0.5, rho = 0.5, sky = HZ_CFG_SKY_LE;
   /* Изменение сцены: шар радиуса `mvr` вокруг `mvc` сдвигается на `mvd`. */
   double mvr = 0.0, mvc[3] = {0.0, 0.0, 0.0}, mvd[3] = {0.0, 0.0, 0.0};
@@ -191,6 +234,8 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "sky=", 4) == 0) sky = strtod(argv[i] + 4, NULL);
     if (strcmp(argv[i], "list") == 0) layout = HZ_LAYOUT_LIST;
     if (strcmp(argv[i], "fold") == 0) fold = 1;
+    if (strcmp(argv[i], "oven") == 0) oven = 1;
+    if (strncmp(argv[i], "osub=", 5) == 0) osub = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "w=", 2) == 0) imgw = (int)strtol(argv[i] + 2, NULL, 10);
     if (strncmp(argv[i], "ih=", 3) == 0) imgh = (int)strtol(argv[i] + 3, NULL, 10);
     if (strncmp(argv[i], "mvr=", 4) == 0) mvr = strtod(argv[i] + 4, NULL);
@@ -202,8 +247,11 @@ int main(int argc, char **argv) {
 
   double t0 = now_s();
   hz_objmesh m;
-  if (hz_obj_load(&m, city ? HZ_CFG_CITY_OBJ : HZ_CFG_HALL_OBJ,
-                  city ? HZ_CFG_CITY_SCALE : HZ_CFG_HALL_SCALE) != 0) {
+  if (oven) {
+    if (pf_oven(&m, oside, osub) != 0) return 1;
+    sky = 0.0; /* печь замкнута: неба в ней нет */
+  } else if (hz_obj_load(&m, city ? HZ_CFG_CITY_OBJ : HZ_CFG_HALL_OBJ,
+                         city ? HZ_CFG_CITY_SCALE : HZ_CFG_HALL_SCALE) != 0) {
     fprintf(stderr, "нет сцены\n");
     return 1;
   }
@@ -215,7 +263,11 @@ int main(int argc, char **argv) {
   const double dseg = city ? 0.05 : 0.045;
   t0 = now_s();
   hz_pseglist sg;
-  if (hz_seg_planar_cap(&sg, &m, dseg, city ? 0.0 : 0.5) != 0) return 1;
+  /* ПРЕДЕЛ ГАБАРИТА — ПО СЦЕНЕ, А НЕ ПО УМОЛЧАНИЮ (А285). У печи грань крупная,
+   * и залские `0.5` м раздробили бы её в участок на треугольник — сторож ниже
+   * это и поймал при первом же прогоне. */
+  const double scap = (city || oven) ? 0.0 : 0.5;
+  if (hz_seg_planar_cap(&sg, &m, dseg, scap) != 0) return 1;
   if (sg.nseg >= m.nt) {
     fprintf(stderr, "сегментация выродилась: участков %d при %d треугольниках\n", sg.nseg, m.nt);
     return 1;
@@ -232,7 +284,9 @@ int main(int argc, char **argv) {
    * сравнивать потоки нельзя. Собственного излучения нет: источник — небо. */
   for (int32_t k = 0; k < ps.np; k++) {
     tr.rho[k] = rho;
-    tr.Le[k] = 0.0;
+    /* В печи светятся ВСЕ грани: тогда точное решение есть `Le/(1−ρ)` без
+     * всякой геометрии, и сверять можно прямо с ним. */
+    tr.Le[k] = oven ? 1.0 : 0.0;
   }
 
   tr3_dirs d;
@@ -323,6 +377,21 @@ int main(int argc, char **argv) {
            (long long)st.nfrag, st.t_raster, st.t_reduce, dt);
     fflush(stdout);
   }
+  if (oven) {
+    /* СВЕРКА С ЗАМКНУТОЙ ФОРМОЙ: `B = Le/(1−ρ)` в каждой точке. Хвост, а не
+     * среднее (§4): среднее скрыло бы, что часть граней недобирает. */
+    double ex = 1.0 / (1.0 - rho), wm = 0.0, sw2 = 0.0, sa = 0.0;
+    for (int32_t k = 0; k < ps.np; k++) {
+      double b = hz_ptrans_lout(&tr, k, 0.0, 0.0);
+      double e = fabs(b - ex) / ex;
+      if (e > wm) wm = e;
+      sw2 += e * ps.p[k].area;
+      sa += ps.p[k].area;
+    }
+    printf("== ПЕЧЬ: точное B = Le/(1−ρ) = %.6f; ошибка по площади %.3e, ХУДШАЯ %.3e; "
+           "полигонов %d\n",
+           ex, (sa > 0.0) ? sw2 / sa : 0.0, wm, ps.np);
+  }
   printf("== ВСЕГО НА ПЕРЕНОС: %.1f с на %d отскоков (%.2f с на отскок, %.3f с на направление)\n",
          ttot, nb, ttot / (double)(nb > 0 ? nb : 1),
          ttot / (double)((nb > 0 ? nb : 1) * (d.n > 0 ? d.n : 1)));
@@ -354,7 +423,7 @@ int main(int argc, char **argv) {
     hz_ptrans_free(&tr);
     hz_poly_free(&ps);
     hz_seg_free(&sg);
-    if (hz_seg_planar_cap(&sg, &m, dseg, city ? 0.0 : 0.5) != 0) return 1;
+    if (hz_seg_planar_cap(&sg, &m, dseg, scap) != 0) return 1;
     if (hz_poly_build(&ps, &m, &sg) != 0) return 1;
     if (hz_ptrans_init(&tr, &ps, &m) != 0) return 1;
     for (int32_t k = 0; k < ps.np; k++) {

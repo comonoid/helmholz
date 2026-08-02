@@ -313,3 +313,12 @@ check-simd: | build
 	  gcc $(CFLAGS) -o build/simd_omp tools/ompinfo.c && ./build/simd_omp'
 
 .PHONY: all test check check-fp check-simd
+
+# pvis — §110, шаг О43: наследуется ли видимость вниз по лестнице LOD. Замер
+# ставится на ГОРОДЕ с камерой ВНУТРИ УЛИЦЫ; на зале он слеп по построению.
+build/pvis: tools/pvis.c $(PFULL) | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pvis.c $(PFULL) -lm'
+
+# ОТДЕЛЬНОЕ ИМЯ ДЛЯ РАБОТЫ ПОВЕРХ ИДУЩЕГО ПРОГОНА — тот же довод, что у `plodx`.
+build/pvisx: tools/pvis.c $(PFULL) | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pvis.c $(PFULL) -lm'

@@ -59,7 +59,8 @@ int hz_hcube_init(hz_hcube *h, int R) {
   h->dir = malloc(3 * (size_t)np * sizeof *h->dir);
   h->depth = malloc((size_t)np * sizeof *h->depth);
   h->id = malloc((size_t)np * sizeof *h->id);
-  if (h->dff == NULL || h->dir == NULL || h->depth == NULL || h->id == NULL) {
+  h->src = malloc((size_t)np * sizeof *h->src);
+  if (h->dff == NULL || h->dir == NULL || h->depth == NULL || h->id == NULL || h->src == NULL) {
     hz_hcube_free(h);
     return 2;
   }
@@ -101,6 +102,7 @@ void hz_hcube_free(hz_hcube *h) {
   free(h->dir);
   free(h->depth);
   free(h->id);
+  free(h->src);
   memset(h, 0, sizeof *h);
 }
 
@@ -108,7 +110,7 @@ void hz_hcube_free(hz_hcube *h) {
  * (приёмник в начале, нормаль по `z`). Отсечение делается ПО ПЛОСКОСТИ ГРАНИ
  * `w = p·f > 0`: без него точки позади камеры грани дают зеркальные призраки. */
 static void hc_tri_face(hz_hcube *h, const hc_face *F, int base, const double v0[3],
-                        const double v1[3], const double v2[3], int32_t pid, int *tb) {
+                        const double v1[3], const double v2[3], int32_t pid, int32_t nid, int *tb) {
   /* Инициализация не косметика: цикл отсечения пишет от 0 до 4 вершин, и
    * анализатор обязан видеть, что чтения ниже покрыты записями. */
   double P[4][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
@@ -184,6 +186,7 @@ static void hc_tri_face(hz_hcube *h, const hc_face *F, int base, const double v0
         if (d < h->depth[o]) {
           h->depth[o] = d;
           h->id[o] = pid;
+          h->src[o] = nid;
         }
       }
   }
@@ -194,6 +197,7 @@ void hz_hcube_draw(hz_hcube *h, const hz_objmesh *m, const int32_t *tri2poly, co
   for (int i = 0; i < h->npix; i++) {
     h->depth[i] = 1e300;
     h->id[i] = -1;
+    h->src[i] = -1;
   }
   /* Рама полукуба: `z` — нормаль, `x`,`y` — любая ортонормированная пара. */
   double ez[3], ex[3], ey[3], nn = 0.0;
@@ -244,7 +248,7 @@ void hz_hcube_draw(hz_hcube *h, const hz_objmesh *m, const int32_t *tri2poly, co
     }
     if (!above) continue; /* целиком под касательной плоскостью — не виден */
     for (int k = 0; k < 5; k++)
-      hc_tri_face(h, &fc[k], base[k], q[0], q[1], q[2], pid, NULL);
+      hc_tri_face(h, &fc[k], base[k], q[0], q[1], q[2], pid, -1, NULL);
   }
 }
 
@@ -273,6 +277,7 @@ typedef struct {
   int32_t *stamp;
   int32_t mark;
   int nozb;
+  int32_t cur; /* узел, чьи треугольники рисуются сейчас — пишется в `src` (§110) */
   hz_hcube_stat *st;
   /* плитки: максимум глубины и признак «пересчитать» */
   double *tmax;
@@ -381,12 +386,18 @@ static void hc_draw_tri(hc_walk *W, int32_t tr) {
      * грань на КАЖДЫЙ треугольник, отчего буфер глубины пересчитывался целиком
      * и дерево вышло медленнее прямого перебора (12.5 с против 8.3). */
     int tb[4] = {F->w, -1, F->h, -1};
-    hc_tri_face(W->h, F, W->base[k], q[0], q[1], q[2], pid, W->nozb ? NULL : tb);
+    hc_tri_face(W->h, F, W->base[k], q[0], q[1], q[2], pid, W->cur, W->nozb ? NULL : tb);
     if (!W->nozb && tb[1] >= tb[0]) hc_mark_dirty(W, k, tb[0], tb[1], tb[2], tb[3]);
   }
 }
 
 static void hc_walk_node(hc_walk *W, int32_t nid) {
+  /* НАСЛЕДСТВО РОДИТЕЛЯ — ПЕРВЫМ, ДО ВСЯКОЙ ГЕОМЕТРИИ (§110): весь смысл спуска в
+   * том, что непосещённое поддерево стоит `O(1)`, а не разбор восьми углов. */
+  if (W->h->desc != NULL && !W->h->desc[nid]) {
+    W->st->ncull_keep++;
+    return;
+  }
   const hz_ptnode *N = &W->t->nd[nid];
   W->st->nnode++;
   /* коробка в раме полукуба: габарит восьми углов */
@@ -421,8 +432,11 @@ static void hc_walk_node(hc_walk *W, int32_t nid) {
   }
   /* Треугольники есть у ЛЮБОГО узла, а не только у листа: те, что не влезли
    * целиком ни в одного ребёнка, остаются здесь (см. `ptree.c`). */
-  for (int32_t i = 0; i < N->ntri; i++)
-    hc_draw_tri(W, W->t->ref[N->t0 + i]);
+  if (W->h->draw == NULL || W->h->draw[nid]) {
+    W->cur = nid;
+    for (int32_t i = 0; i < N->ntri; i++)
+      hc_draw_tri(W, W->t->ref[N->t0 + i]);
+  }
   if (N->child < 0) return;
   /* СПЕРЕДИ НАЗАД: дети по возрастанию расстояния от приёмной точки. */
   int ord[8];
@@ -462,6 +476,7 @@ void hz_hcube_draw_tree(hz_hcube *h, const hz_objmesh *m, const int32_t *tri2pol
   for (int i = 0; i < h->npix; i++) {
     h->depth[i] = 1e300;
     h->id[i] = -1;
+    h->src[i] = -1;
   }
   hc_face fc[5];
   hc_faces(h->R, fc);
@@ -525,4 +540,33 @@ void hz_hcube_draw_tree(hz_hcube *h, const hz_objmesh *m, const int32_t *tri2pol
   W.tmax = tmax;
   W.dirty = dirty;
   hc_walk_node(&W, 0);
+}
+
+void hz_hcube_mark(const hz_hcube *h, unsigned char *draw) {
+  for (int i = 0; i < h->npix; i++)
+    if (h->src[i] >= 0) draw[h->src[i]] = 1;
+}
+
+void hz_hcube_close(const hz_ptree *t, const unsigned char *draw, unsigned char *desc) {
+  for (int32_t i = 0; i < t->nnd; i++)
+    desc[i] = draw[i];
+  /* ОБРАТНЫМ ПРОХОДОМ: у `hz_ptree` дети всегда имеют больший номер, чем
+   * родитель (`ptree.c`: `c0 = t->nnd; N->child = c0; t->nnd += 8`), поэтому к
+   * моменту разбора узла его поддерево уже замкнуто. */
+  for (int32_t i = t->nnd - 1; i >= 0; i--) {
+    int32_t c = t->nd[i].child;
+    if (c < 0) continue;
+    for (int k = 0; k < 8; k++)
+      if (desc[c + k]) {
+        desc[i] = 1;
+        break;
+      }
+  }
+}
+
+double hz_hcube_sf(const hz_hcube *h) {
+  double s = 0.0;
+  for (int i = 0; i < h->npix; i++)
+    if (h->id[i] >= 0) s += (double)h->dff[i];
+  return s;
 }

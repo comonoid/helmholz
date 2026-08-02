@@ -4,8 +4,20 @@
 #include "pmerge.h"
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+/* ЦЕНА УРОВНЯ ПЕЧАТАЕТСЯ, А НЕ УГАДЫВАЕТСЯ. Прогон города 08-02 просидел полтора
+ * часа без единой строки, и узнать, на каком уровне, было нечем; профиль пришлось
+ * снимать с живого процесса. Вывод идёт в `stderr` — он не буферизуется, значит
+ * виден и при перенаправлении в файл. */
+static double lod_now_s(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
 
 /* --- малая линейная алгебра и минимаксная плоскость --------------------------
  * Дублирует по устройству решатель из `pmerge.c` и делает это СОЗНАТЕЛЬНО: там
@@ -963,7 +975,10 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
     mc.bands = L->bands;
     hz_pseglist so;
     hz_mergestat st;
+    double tlev = lod_now_s();
     if (hz_merge(&so, m, &cs, &cp, &mc, &st) != 0) break;
+    fprintf(stderr, "   лестница: уровень %d, допуск %.4f м: %d -> %d участков за %.1f с\n", lev,
+            dlev, cs.nseg, so.nseg, lod_now_s() - tlev);
     for (int q = 0; q < 12; q++)
       L->dih_hist[q] += st.dih_hist[q];
     L->ndih_conv += st.ndih_conv;

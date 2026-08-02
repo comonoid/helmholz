@@ -220,6 +220,9 @@ int main(int argc, char **argv) {
   int fold = 0; /* §125: угловая квадратура едет на итерации, а не вложена в неё */
   int oven = 0; /* §126: печь — аналитический эталон B = Le/(1−ρ) */
   int osub = 4; /* делений стороны печи */
+  /* НЕГАТИВНЫЙ КОНТРОЛЬ §127: поправку квадратуры выключить. Ошибка печи обязана
+   * вернуться к прежнему проценту; не вернулась — поправка ни при чём. */
+  int noqn = 0;
   double oside = 4.0;
   double h = 0.5, rho = 0.5, sky = HZ_CFG_SKY_LE;
   /* Изменение сцены: шар радиуса `mvr` вокруг `mvc` сдвигается на `mvd`. */
@@ -235,6 +238,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "list") == 0) layout = HZ_LAYOUT_LIST;
     if (strcmp(argv[i], "fold") == 0) fold = 1;
     if (strcmp(argv[i], "oven") == 0) oven = 1;
+    if (strcmp(argv[i], "noqn") == 0) noqn = 1;
     if (strncmp(argv[i], "osub=", 5) == 0) osub = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "w=", 2) == 0) imgw = (int)strtol(argv[i] + 2, NULL, 10);
     if (strncmp(argv[i], "ih=", 3) == 0) imgh = (int)strtol(argv[i] + 3, NULL, 10);
@@ -333,6 +337,32 @@ int main(int argc, char **argv) {
     }
     printf("== СВЁРНУТО: одно направление на итерацию, шаг обхода %d из %d; Σ весов %.4f\n", step1,
            d.n, wtot);
+  }
+
+  /* ПОПРАВКА КВАДРАТУРЫ ПО НОРМАЛИ (§127) — один раз на полигон, до переноса.
+   * `S(n) = Σ_{ω·n<0} w_ω|ω·n|` обязано равняться `π`; отношение и есть дефект
+   * набора направлений для этой ориентации. Стоит один проход по полигонам, то
+   * есть нисколько против растеризации. */
+  double *qn = NULL;
+  if (!noqn) {
+    qn = malloc((size_t)ps.np * sizeof *qn);
+    if (qn == NULL) return 1;
+    double qlo = 1e300, qhi = -1e300;
+    for (int32_t k = 0; k < ps.np; k++) {
+      const double *nn = ps.p[k].n;
+      double s = 0.0;
+      for (int j = 0; j < d.n; j++) {
+        double c = d.ox[j] * nn[0] + d.oy[j] * nn[1] + d.oz[j] * nn[2];
+        if (c < 0.0) s += d.w[j] * (-c);
+      }
+      qn[k] = s / 3.14159265358979323846;
+      if (qn[k] < qlo) qlo = qn[k];
+      if (qn[k] > qhi) qhi = qn[k];
+    }
+    tr.qn = qn;
+    printf("== ПОПРАВКА КВАДРАТУРЫ (§127): S(n)/π по полигонам от %.4f до %.4f "
+           "(обязано быть 1; отклонение и есть угловая ошибка набора)\n",
+           qlo, qhi);
   }
 
   printf("  отскок   Σ B·A, Вт/ср      dE      фрагментов    растр,с   редукция,с   всего,с\n");
@@ -666,6 +696,7 @@ int main(int argc, char **argv) {
   }
 
   free(sacc);
+  free(qn);
   tr3_dirs_free(&d);
   hz_ptrans_free(&tr);
   hz_poly_free(&ps);

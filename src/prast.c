@@ -288,6 +288,8 @@ int hz_fbuf_init(hz_fbuf *fb, int64_t npix, int64_t cap) {
 }
 
 void hz_fbuf_free(hz_fbuf *fb) {
+  free(fb->ord);
+  free(fb->rcnt);
   free(fb->start);
   free(fb->poly);
   free(fb->depth);
@@ -310,14 +312,42 @@ int hz_fbuf_build(hz_fbuf *fb, const hz_span *sp, int64_t nsp, int32_t W, int32_
   for (int64_t p = 0; p < npix; p++)
     fb->start[p + 1] += fb->start[p];
   fb->n = total;
+  /* ПОЛОСЫ ОБХОДЯТСЯ ПО ВОЗРАСТАНИЮ СТРОКИ, А НЕ В ПОРЯДКЕ ПОЛИГОНОВ (§129).
+   * Замерено профилем: раскладка занимала `42.7 %` — `7` млн фрагментов на
+   * направление ложились по `1.44` млн пикселей вразброс, и каждая запись
+   * промахивалась мимо кэша. Полосы приходят сгруппированными по ПОЛИГОНУ, то
+   * есть строки идут вперемешку; счётная сортировка по `j` стоит один проход по
+   * полосам плюс `H` корзин (их тысяча, а не миллион) и делает запись почти
+   * последовательной. Величина при этом не меняется вовсе: порядок фрагментов
+   * внутри пикселя всё равно задаёт сортировка по глубине следом. */
+  if (fb->ord == NULL || fb->ordcap < nsp) {
+    int32_t *no = realloc(fb->ord, (size_t)(nsp > 0 ? nsp : 1) * sizeof *no);
+    if (no == NULL) return 2;
+    fb->ord = no;
+    fb->ordcap = nsp;
+  }
+  if (fb->rcnt == NULL || fb->rcap < H + 1) {
+    int32_t *nr = realloc(fb->rcnt, (size_t)(H + 1) * sizeof *nr);
+    if (nr == NULL) return 2;
+    fb->rcnt = nr;
+    fb->rcap = H + 1;
+  }
+  memset(fb->rcnt, 0, (size_t)(H + 1) * sizeof *fb->rcnt);
+  for (int64_t s = 0; s < nsp; s++)
+    fb->rcnt[sp[s].j + 1]++;
+  for (int32_t j = 0; j < H; j++)
+    fb->rcnt[j + 1] += fb->rcnt[j];
+  for (int64_t s = 0; s < nsp; s++)
+    fb->ord[fb->rcnt[sp[s].j]++] = (int32_t)s;
   /* Курсор поверх `start`: восстанавливается сдвигом, отдельный массив на
    * миллионы пикселей не нужен. Заполняем в start[p], потом сдвигаем обратно. */
-  for (int64_t s = 0; s < nsp; s++) {
-    int64_t base = (int64_t)sp[s].j * W;
-    for (int32_t i = sp[s].i0; i <= sp[s].i1; i++) {
+  for (int64_t q = 0; q < nsp; q++) {
+    const hz_span *S = &sp[fb->ord[q]];
+    int64_t base = (int64_t)S->j * W;
+    for (int32_t i = S->i0; i <= S->i1; i++) {
       int32_t f = fb->start[base + i]++;
-      fb->poly[f] = sp[s].poly;
-      fb->depth[f] = sp[s].t0 + sp[s].ti * (double)i;
+      fb->poly[f] = S->poly;
+      fb->depth[f] = S->t0 + S->ti * (double)i;
     }
   }
   for (int64_t p = npix; p > 0; p--)

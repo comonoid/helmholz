@@ -91,6 +91,11 @@ typedef struct {
   double *depth;  /* nfrag */
   int64_t n, cap;
   int32_t W, H;
+  /* §129: порядок полос по возрастанию строки и корзины счётной сортировки.
+   * Держатся у буфера, а не выделяются на каждый вызов. */
+  int32_t *ord, *rcnt;
+  int64_t ordcap;
+  int32_t rcap;
 } hz_fbuf;
 
 int hz_fbuf_init(hz_fbuf *fb, int64_t npix, int64_t cap);

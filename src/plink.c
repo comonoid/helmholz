@@ -783,7 +783,7 @@ void hz_links_free(hz_linkset *S) {
 /* --- решение ---------------------------------------------------------------- */
 
 int hz_links_solve(const hz_linkset *S, const hz_lod *L, const double *Le, const double *rho,
-                   double *B, double tol, int maxit, double *reshist, int nopull) {
+                   double *B, double tol, int maxit, double *reshist, int nopull, int warm) {
   const int32_t nn = L->nnd;
   double *acc = malloc((size_t)nn * sizeof *acc);
   double *ar = malloc((size_t)nn * sizeof *ar);
@@ -801,7 +801,9 @@ int hz_links_solve(const hz_linkset *S, const hz_lod *L, const double *Le, const
   /* Площадь узла для взвешивания при подъёме. У узла она уже посчитана. */
   for (int32_t k = 0; k < nn; k++) {
     ar[k] = L->nd[k].area_surf;
-    B[k] = Le[k];
+    /* НАЧАЛЬНОЕ ПРИБЛИЖЕНИЕ БОЛЬШЕ НЕ НАВЯЗЫВАЕТСЯ (§117). При `warm` берётся то,
+     * что положил вызывающий, — константа, прошлый кадр, что угодно. */
+    if (!warm) B[k] = Le[k];
   }
   int it = 0;
   for (; it < maxit; it++) {

@@ -1039,9 +1039,67 @@ int main(int argc, char **argv) {
   const int maxit = maxit0;
   double *rh = calloc((size_t)maxit, sizeof *rh);
   if (rh == NULL) return 1;
+  /* НАЧАЛЬНОЕ ПРИБЛИЖЕНИЕ — ПРЕДМЕТ ЗАМЕРА, А НЕ УМОЛЧАНИЕ (§117).
+   * Вопрос, ради которого заведено: можно ли вместо хранимого оператора
+   * подставить КОНСТАНТУ и заплатить за это лишь кратным числом итераций.
+   * `init=le` — прежнее поведение (`B = Le`, то есть свет есть только у ламп);
+   * `init=const:X` — всюду `X`; `init=mean` — всюду среднее решённое поле
+   *   ПРОШЛОГО прогона, прочитанное из `build/binit.bin` (то есть настоящий
+   *   тёплый старт, а не его имитация);
+   * `init=zero` — нули. Эталон сравнения — `le`. */
+  /* ДОПУСК ОСТАНОВА — ПАРАМЕТР, потому что он и проверяется (§117): решение не
+   * имеет права зависеть от начального приближения, и если зависит, виноват
+   * допуск, а не приближение. */
+  double stol = 1e-4;
+  for (int i = 1; i < argc; i++)
+    if (strncmp(argv[i], "tol=", 4) == 0) stol = strtod(argv[i] + 4, NULL);
+  int warm = 0;
+  double initc = 0.0;
+  for (int i = 1; i < argc; i++) {
+    if (strncmp(argv[i], "init=", 5) != 0) continue;
+    const char *s = argv[i] + 5;
+    if (strcmp(s, "le") == 0) {
+      warm = 0;
+    } else if (strcmp(s, "zero") == 0) {
+      warm = 1;
+      initc = 0.0;
+      for (int32_t k = 0; k < L.nnd; k++)
+        E[k] = 0.0;
+    } else if (strncmp(s, "const:", 6) == 0) {
+      warm = 1;
+      initc = strtod(s + 6, NULL);
+      for (int32_t k = 0; k < L.nnd; k++)
+        E[k] = initc;
+    } else if (strcmp(s, "prev") == 0) {
+      warm = 1;
+      FILE *fp = fopen("build/binit.bin", "rb");
+      int32_t nn0 = 0;
+      int ok = (fp != NULL && fread(&nn0, sizeof nn0, 1, fp) == 1 && nn0 == L.nnd &&
+                fread(E, sizeof *E, (size_t)L.nnd, fp) == (size_t)L.nnd);
+      if (fp != NULL) fclose(fp);
+      if (!ok) {
+        fprintf(stderr, "init=prev: нет годного build/binit.bin (узлов %d) — прогон отменён\n",
+                L.nnd);
+        return 1;
+      }
+    }
+  }
+  printf("== НАЧАЛЬНОЕ ПРИБЛИЖЕНИЕ: %s\n",
+         warm ? "задано вызывающим (см. init=)" : "B = Le (прежнее умолчание)");
   t0 = now_s();
-  int it = hz_links_solve(&S, &L, Le, rho, E, 1e-4, maxit, rh, nopull);
+  int it = hz_links_solve(&S, &L, Le, rho, E, stol, maxit, rh, nopull, warm);
   double tsolve = now_s() - t0;
+  /* Решённое поле — на диск, чтобы СЛЕДУЮЩИЙ прогон мог стартовать с него.
+   * Тёплый старт обязан быть настоящим, а не смоделированным. */
+  {
+    FILE *fp = fopen("build/binit.bin", "wb");
+    if (fp != NULL) {
+      int32_t nn0 = L.nnd;
+      fwrite(&nn0, sizeof nn0, 1, fp);
+      fwrite(E, sizeof *E, (size_t)L.nnd, fp);
+      fclose(fp);
+    }
+  }
   printf("== РЕШЕНИЕ: %d итераций за %.3f с (%.1f мкс на итерацию)%s\n", it, tsolve,
          1e6 * tsolve / (double)(it > 0 ? it : 1), nopull ? " [НК1: подъём выключен]" : "");
   printf("   невязки:");

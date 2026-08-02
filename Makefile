@@ -185,6 +185,9 @@ build/pcoarse: tools/pcoarse.c $(PFULL) | build
 
 # plod — иерархическое огрубление и срез LOD (§56, О16).
 # РЕНДЕРЕР БЕЗ СВИПА (§84, §85): лестница -> связи -> решение -> картинка.
+build/scenechk: tools/scenechk.c src/scene_obj.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/scenechk.c src/scene_obj.c -lm'
+
 build/prad: tools/prad.c $(PFULL) | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/prad.c $(PFULL) -lm'
 

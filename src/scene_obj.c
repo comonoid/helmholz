@@ -526,6 +526,25 @@ int hz_obj_add_quad(hz_objmesh *m, const char *mtlname, const double c[3], const
  *   4. перестройка: 3 → четыре треугольника, 1 → два, 0 → без изменений.
  *
  * Ключ — ТАБЛИЦА РЁБЕР: ребро делится ОДИН раз. Именно её и не было. */
+/* Нормаль середины ребра: среднее двух углов ТОГО ЖЕ треугольника. Заводится
+ * новая запись в `vn`; дублирование между треугольниками намеренно — у соседа
+ * по жёсткой кромке нормали другие, и усреднять через кромку нельзя. */
+static int32_t so_midnorm(hz_objmesh *m, int32_t a, int32_t b) {
+  if (m->vn == NULL || a < 0 || b < 0) return -1;
+  double *nn = realloc(m->vn, ((size_t)m->nvn + 1) * 3 * sizeof *nn);
+  if (nn == NULL) return -1;
+  m->vn = nn;
+  double q[3], l = 0.0;
+  for (int c = 0; c < 3; c++) {
+    q[c] = 0.5 * (m->vn[3 * (size_t)a + (size_t)c] + m->vn[3 * (size_t)b + (size_t)c]);
+    l += q[c] * q[c];
+  }
+  l = sqrt(l);
+  for (int c = 0; c < 3; c++)
+    m->vn[3 * (size_t)m->nvn + (size_t)c] = (l > 0.0) ? q[c] / l : q[c];
+  return m->nvn++;
+}
+
 typedef struct {
   int64_t key;
   int32_t id;
@@ -673,13 +692,21 @@ int hz_obj_subdivide(hz_objmesh *m, double smax) {
     }
     int32_t *nf = malloc((size_t)cap * 3 * sizeof *nf);
     int32_t *nm = malloc((size_t)cap * sizeof *nm);
-    if (nf == NULL || nm == NULL) {
+    /* НОРМАЛИ УГЛОВ ПЕРЕНОСЯТСЯ ЧЕРЕЗ РАЗБИЕНИЕ. Прежняя редакция заполняла `fn`
+     * значением `-1`, и интерполяция нормали выключалась целиком: замерено, угол
+     * к плоской нормали `p50 1.26° -> 0.00`. Нормаль середины ребра считается
+     * ДЛЯ КАЖДОГО ТРЕУГОЛЬНИКА отдельно, как среднее его же двух углов: у соседа
+     * по ребру нормали могут быть другими (так представляется жёсткая кромка), и
+     * усреднять через кромку нельзя. */
+    int32_t *nfn2 = (m->fn != NULL) ? malloc((size_t)cap * 3 * sizeof *nfn2) : NULL;
+    if (nf == NULL || nm == NULL || (m->fn != NULL && nfn2 == NULL)) {
       free(tab);
       free(mark);
       free(mid);
       free(te);
       free(nf);
       free(nm);
+      free(nfn2);
       return 2;
     }
     int32_t nt2 = 0;
@@ -689,57 +716,102 @@ int hz_obj_subdivide(hz_objmesh *m, double smax) {
       int m0 = (e0 >= 0 && mark[e0]), m1 = (e1 >= 0 && mark[e1]), m2 = (e2 >= 0 && mark[e2]);
       int cnt = m0 + m1 + m2;
       int32_t mtl = m->fm[t];
-      int32_t tri[4][3];
+      int32_t tri[4][3], trn[4][3];
       int ntri = 0;
+      /* нормали углов треугольника и середин его помеченных рёбер */
+      int32_t na = -1, nb = -1, nc = -1, p0 = -1, p1 = -1, p2 = -1;
+      if (m->fn != NULL) {
+        na = m->fn[(size_t)t * 3 + 0];
+        nb = m->fn[(size_t)t * 3 + 1];
+        nc = m->fn[(size_t)t * 3 + 2];
+        if (m0) p0 = so_midnorm(m, na, nb);
+        if (m1) p1 = so_midnorm(m, nb, nc);
+        if (m2) p2 = so_midnorm(m, nc, na);
+      }
       if (cnt == 0) {
         tri[0][0] = a;
         tri[0][1] = b;
         tri[0][2] = c;
+        trn[0][0] = na;
+        trn[0][1] = nb;
+        trn[0][2] = nc;
         ntri = 1;
       } else if (cnt == 3) {
         int32_t p = mid[e0], q = mid[e1], r = mid[e2];
         tri[0][0] = a;
         tri[0][1] = p;
         tri[0][2] = r;
+        trn[0][0] = na;
+        trn[0][1] = p0;
+        trn[0][2] = p2;
         tri[1][0] = p;
         tri[1][1] = b;
         tri[1][2] = q;
+        trn[1][0] = p0;
+        trn[1][1] = nb;
+        trn[1][2] = p1;
         tri[2][0] = r;
         tri[2][1] = q;
         tri[2][2] = c;
+        trn[2][0] = p2;
+        trn[2][1] = p1;
+        trn[2][2] = nc;
         tri[3][0] = p;
         tri[3][1] = q;
         tri[3][2] = r;
+        trn[3][0] = p0;
+        trn[3][1] = p1;
+        trn[3][2] = p2;
         ntri = 4;
       } else { /* ровно одно: зелёный разрез от середины к противолежащей */
-        int32_t x0, x1, x2, p;
+        int32_t x0, x1, x2, p, n0g, n1g, n2g, pg;
         if (m0) {
           x0 = a;
           x1 = b;
           x2 = c;
           p = mid[e0];
+          n0g = na;
+          n1g = nb;
+          n2g = nc;
+          pg = p0;
         } else if (m1) {
           x0 = b;
           x1 = c;
           x2 = a;
           p = mid[e1];
+          n0g = nb;
+          n1g = nc;
+          n2g = na;
+          pg = p1;
         } else {
           x0 = c;
           x1 = a;
           x2 = b;
           p = mid[e2];
+          n0g = nc;
+          n1g = na;
+          n2g = nb;
+          pg = p2;
         }
         tri[0][0] = x0;
         tri[0][1] = p;
         tri[0][2] = x2;
+        trn[0][0] = n0g;
+        trn[0][1] = pg;
+        trn[0][2] = n2g;
         tri[1][0] = p;
         tri[1][1] = x1;
         tri[1][2] = x2;
+        trn[1][0] = pg;
+        trn[1][1] = n1g;
+        trn[1][2] = n2g;
         ntri = 2;
       }
       for (int k = 0; k < ntri; k++) {
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < 3; i++) {
           nf[(size_t)nt2 * 3 + (size_t)i] = tri[k][i];
+          if (nfn2 != NULL) nfn2[(size_t)nt2 * 3 + (size_t)i] = trn[k][i];
+        }
         nm[nt2] = mtl;
         nt2++;
       }
@@ -749,29 +821,122 @@ int hz_obj_subdivide(hz_objmesh *m, double smax) {
     m->f = nf;
     m->fm = nm;
     m->nt = nt2;
-    /* Нормали вершин при разбиении не переносятся: у них своя индексация, а
-     * согласованность важнее гладкости. Но `fn` НЕЛЬЗЯ просто обнулить: код
-     * ниже по цепочке проверяет `m->vn`, а разыменовывает `m->fn`
-     * (`polygon.c`), и рассогласование пары даёт падение. Поэтому массив
-     * заводится по новому размеру и заполняется `-1` — «нормали у угла нет». */
-    {
-      int32_t *nfn = malloc((size_t)nt2 * 3 * sizeof *nfn);
-      if (nfn == NULL) {
-        free(tab);
-        free(mark);
-        free(mid);
-        free(te);
-        return 2;
-      }
-      for (int64_t q = 0; q < (int64_t)nt2 * 3; q++)
-        nfn[q] = -1;
-      free(m->fn);
-      m->fn = nfn;
-    }
+    free(m->fn);
+    m->fn = nfn2;
     free(tab);
     free(mark);
     free(mid);
     free(te);
   }
+  return 0;
+}
+
+/* СШИВКА ВЕРШИН В ПРЕДЕЛАХ ε (§104.2, предложение пользователя 08-02).
+ *
+ * ЗАЧЕМ. *ЗАМЕРЕНО:* у зала `44 420` рёбер края участков суть ОТКРЫТЫЕ края
+ * входа — панели смыкаются геометрически, но не сшиты топологически, с зазорами
+ * порядка миллиметра-сантиметра. При ε = 1 см партнёр находится у `92.2 %` из
+ * них. Пока панели не сшиты, непрерывное поле вдоль их стыка невозможно: сшивать
+ * не с чем.
+ *
+ * СЕТКА ЯЧЕЕК СО СТОРОНОЙ ε И ПРОСМОТРОМ 27 СОСЕДЕЙ. Просмотр соседей
+ * обязателен: две точки на расстоянии меньше ε могут лежать по разные стороны
+ * границы ячейки, и без него сшивка зависела бы от положения сетки, а не от
+ * геометрии.
+ *
+ * ОПАСНОСТЬ НАЗВАНА ДО ПРИМЕНЕНИЯ: ε = 1 см есть масштаб настоящей детали
+ * (ножка стула ~2 см), и на нём можно срастить раздельные тела. Поэтому
+ * возвращаются ЗАМЕРЫ: сколько вершин слито и сколько треугольников выродилось
+ * (у выродившегося два индекса совпали — он и был тоньше ε). */
+int hz_obj_weld(hz_objmesh *m, double eps, int64_t *nmerged, int64_t *ndegen) {
+  if (nmerged != NULL) *nmerged = 0;
+  if (ndegen != NULL) *ndegen = 0;
+  if (!(eps > 0.0) || m->nv <= 0) return 0;
+  int32_t *rep = malloc((size_t)m->nv * sizeof *rep);
+  if (rep == NULL) return 2;
+  /* хеш положения → список вершин; ёмкость с запасом вдвое */
+  int64_t ns = 4;
+  while (ns < 2 * (int64_t)m->nv)
+    ns *= 2;
+  int32_t *head = malloc((size_t)ns * sizeof *head);
+  int32_t *next = malloc((size_t)m->nv * sizeof *next);
+  int64_t *ckey = malloc((size_t)ns * sizeof *ckey);
+  if (head == NULL || next == NULL || ckey == NULL) {
+    free(rep);
+    free(head);
+    free(next);
+    free(ckey);
+    return 2;
+  }
+  for (int64_t i = 0; i < ns; i++) {
+    head[i] = -1;
+    ckey[i] = INT64_MIN;
+  }
+  const double inv = 1.0 / eps;
+  int64_t merged = 0;
+  for (int32_t v = 0; v < m->nv; v++) {
+    const double *p = m->v + 3 * (size_t)v;
+    int64_t c0[3];
+    for (int a = 0; a < 3; a++)
+      c0[a] = (int64_t)floor(p[a] * inv);
+    int32_t found = -1;
+    for (int dz = -1; dz <= 1 && found < 0; dz++)
+      for (int dy = -1; dy <= 1 && found < 0; dy++)
+        for (int dx = -1; dx <= 1 && found < 0; dx++) {
+          int64_t k0 = c0[0] + dx, k1 = c0[1] + dy, k2 = c0[2] + dz;
+          int64_t key = (k0 * 73856093LL) ^ (k1 * 19349663LL) ^ (k2 * 83492791LL);
+          int64_t s = (key & (ns - 1));
+          while (ckey[s] != INT64_MIN && ckey[s] != key)
+            s = (s + 1) & (ns - 1);
+          if (ckey[s] != key) continue;
+          for (int32_t u = head[s]; u >= 0 && found < 0; u = next[u]) {
+            const double *q = m->v + 3 * (size_t)u;
+            double d = 0.0;
+            for (int a = 0; a < 3; a++)
+              d += (q[a] - p[a]) * (q[a] - p[a]);
+            if (d <= eps * eps) found = u;
+          }
+        }
+    if (found >= 0) {
+      rep[v] = rep[found];
+      merged++;
+      continue;
+    }
+    rep[v] = v;
+    int64_t key = ((c0[0] * 73856093LL) ^ (c0[1] * 19349663LL) ^ (c0[2] * 83492791LL));
+    int64_t s = (key & (ns - 1));
+    while (ckey[s] != INT64_MIN && ckey[s] != key)
+      s = (s + 1) & (ns - 1);
+    ckey[s] = key;
+    next[v] = head[s];
+    head[s] = v;
+  }
+  /* переиндексация граней и выбрасывание выродившихся */
+  int32_t nt2 = 0;
+  int64_t degen = 0;
+  for (int32_t t = 0; t < m->nt; t++) {
+    int32_t a = rep[m->f[(size_t)t * 3 + 0]];
+    int32_t b = rep[m->f[(size_t)t * 3 + 1]];
+    int32_t c = rep[m->f[(size_t)t * 3 + 2]];
+    if (a == b || b == c || a == c) {
+      degen++;
+      continue;
+    }
+    m->f[(size_t)nt2 * 3 + 0] = a;
+    m->f[(size_t)nt2 * 3 + 1] = b;
+    m->f[(size_t)nt2 * 3 + 2] = c;
+    m->fm[nt2] = m->fm[t];
+    if (m->fn != NULL)
+      for (int i = 0; i < 3; i++)
+        m->fn[(size_t)nt2 * 3 + (size_t)i] = m->fn[(size_t)t * 3 + (size_t)i];
+    nt2++;
+  }
+  m->nt = nt2;
+  if (nmerged != NULL) *nmerged = merged;
+  if (ndegen != NULL) *ndegen = degen;
+  free(rep);
+  free(head);
+  free(next);
+  free(ckey);
   return 0;
 }

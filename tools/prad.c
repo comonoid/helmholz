@@ -83,7 +83,7 @@ static int cmp_d(const void *a, const void *b) {
  * Сверх того есть явный флаг материала `flat`.
  */
 #define SH_DEPTH                                                                                   \
-  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает                                 \
+  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает \
      * стоимость; глубже вклад падает как произведение долей */
 
 /* ТОЧНЫЙ ФРЕНЕЛЬ ПО НЕПОЛЯРИЗОВАННОМУ СВЕТУ. Приближение Шлика не нужно: точная
@@ -396,7 +396,8 @@ int main(int argc, char **argv) {
       noclip = 0, oldpt = 0, flatn = 0, nospec = 0, noballs = 0, h = 0, spec = 0, nodiag = 0,
       ceillight = 0, novis = 0, hemi = 0, ptleaf = 0, nozb = 0;
   double ballior = 1.5;
-  double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0, segcap = 0.5, trimax = 0.0;
+  double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0, segcap = 0.5, trimax = 0.0,
+         weldeps = 0.0;
   int flatfield = 0, vertR = 0, noshift = 0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "city") == 0) city = 1;
@@ -438,6 +439,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "nozb") == 0) nozb = 1;
     /* §97: длина стороны треугольника, метры; `0` — без разбиения (НК15). */
     if (strncmp(argv[i], "tri=", 4) == 0) trimax = strtod(argv[i] + 4, NULL);
+    /* §104.2: сшивка вершин в пределах ε, метры; `0` — без сшивки. */
+    if (strncmp(argv[i], "weld=", 5) == 0) weldeps = strtod(argv[i] + 5, NULL);
     /* НК16 §98: без восстановления непрерывности — вернуть лоскуты. */
     if (strcmp(argv[i], "flatfield") == 0) flatfield = 1;
     /* §100: неизвестные НА ВЕРШИНАХ, разрешение полукуба вершины. */
@@ -500,6 +503,18 @@ int main(int argc, char **argv) {
     printf("== ЛАМПЫ: %d штук на высоте %.2f м, сторона %.2f м, материал %d; габарит зала "
            "y = %.2f…%.2f\n",
            HZ_CFG_LAMP_NX * HZ_CFG_LAMP_NZ, lampy, HZ_CFG_LAMP_SIDE, lampmtl, m.lo[1], m.hi[1]);
+  }
+
+  /* СШИВКА ВЕРШИН — ПЕРВОЙ, ДО ВСЕГО (§104.2). Порядок важен: сшивать надо ДО
+   * разбиения, иначе середины рёбер лягут на несшитые панели, и склеивать будет
+   * уже поздно. */
+  if (weldeps > 0.0) {
+    int64_t nmg = 0, ndg = 0;
+    int32_t nv0 = m.nv, nt0w = m.nt;
+    if (hz_obj_weld(&m, weldeps, &nmg, &ndg) != 0) return 1;
+    printf("== СШИВКА (ε = %.0e м): вершин %d -> %d (слито %lld), треугольников %d -> %d "
+           "(выродилось %lld)\n",
+           weldeps, nv0, m.nv, (long long)nmg, nt0w, m.nt, (long long)ndg);
   }
 
   /* РАЗБИЕНИЕ КРУПНЫХ ТРЕУГОЛЬНИКОВ — ДО ЛАМП И ДО СЕГМЕНТАЦИИ (§97), чтобы вся

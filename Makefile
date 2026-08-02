@@ -322,3 +322,7 @@ build/pvis: tools/pvis.c $(PFULL) | build
 # ОТДЕЛЬНОЕ ИМЯ ДЛЯ РАБОТЫ ПОВЕРХ ИДУЩЕГО ПРОГОНА — тот же довод, что у `plodx`.
 build/pvisx: tools/pvis.c $(PFULL) | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pvis.c $(PFULL) -lm'
+
+# pflow — §123: перенос БЕЗ оператора, только итерации (parast + psweep).
+build/pflow: tools/pflow.c $(PFULL) | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pflow.c $(PFULL) -lm'

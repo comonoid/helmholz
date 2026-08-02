@@ -293,7 +293,11 @@ static void grow_box(double rlo[3], double rhi[3], const double bb[6]) {
  * одного элемента не появится ни при каком решателе. `smax` ограничивает габарит
  * участка по каждой оси; `0` — прежнее поведение, без ограничения. Отвергнутый
  * кандидат НЕ теряется: внешний цикл заводит для него новое зерно. */
-int hz_seg_planar_cap(hz_pseglist *s, const hz_objmesh *m, double delta, double smax) {
+/* ПОТРЕУГОЛЬНЫЙ предел размера (§107): `tcap[t]` метров для треугольника `t`,
+ * `NULL` — общий `smax` для всех. Заведён для дробления ПО ОШИБКЕ ПОЛЯ: поле
+ * гладкое везде, кроме границ теней, и мельчить надо только там. */
+int hz_seg_planar_cap2(hz_pseglist *s, const hz_objmesh *m, double delta, double smax,
+                       const double *tcap) {
   memset(s, 0, sizeof *s);
   s->delta = delta;
   const int32_t nt = m->nt;
@@ -535,6 +539,7 @@ int hz_seg_planar_cap(hz_pseglist *s, const hz_objmesh *m, double delta, double 
        * Дефект был латентным: при крупных треугольниках слияние через границу
        * материала не проходило по планарности, при мелких прошло. */
       int32_t seedm = (m->fm != NULL) ? m->fm[sd] : 0;
+      double scap = (tcap != NULL) ? tcap[sd] : smax;
       double org[3];
       for (int a = 0; a < 3; a++)
         org[a] = w.ord[oi].c[a];
@@ -580,7 +585,7 @@ int hz_seg_planar_cap(hz_pseglist *s, const hz_objmesh *m, double delta, double 
                   hz_obj_tri(m, c, q);
                   if (tri_dev(q, fit.n, fit.off) > delta) continue;
                   if (m->fm != NULL && m->fm[c] != seedm) continue;
-                  if (!fits_cap(rlo, rhi, w.bb + (size_t)c * 6, smax)) continue;
+                  if (!fits_cap(rlo, rhi, w.bb + (size_t)c * 6, scap)) continue;
                   label[c] = r;
                   grow_box(rlo, rhi, w.bb + (size_t)c * 6);
                   fit_add(&fit, q, w.gn + (size_t)c * 3, w.ar[c]);
@@ -605,7 +610,7 @@ int hz_seg_planar_cap(hz_pseglist *s, const hz_objmesh *m, double delta, double 
           hz_obj_tri(m, c, q);
           if (tri_dev(q, fit.n, fit.off) > delta) continue;
           if (m->fm != NULL && m->fm[c] != seedm) continue;
-          if (!fits_cap(rlo, rhi, w.bb + (size_t)c * 6, smax)) continue;
+          if (!fits_cap(rlo, rhi, w.bb + (size_t)c * 6, scap)) continue;
           label[c] = r;
           grow_box(rlo, rhi, w.bb + (size_t)c * 6);
           fit_add(&fit, q, w.gn + (size_t)c * 3, w.ar[c]);
@@ -712,4 +717,8 @@ int hz_seg_planar_cap(hz_pseglist *s, const hz_objmesh *m, double delta, double 
 
 int hz_seg_planar(hz_pseglist *s, const hz_objmesh *m, double delta) {
   return hz_seg_planar_cap(s, m, delta, 0.0);
+}
+
+int hz_seg_planar_cap(hz_pseglist *s, const hz_objmesh *m, double delta, double smax) {
+  return hz_seg_planar_cap2(s, m, delta, smax, NULL);
 }

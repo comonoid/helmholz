@@ -83,7 +83,7 @@ static int cmp_d(const void *a, const void *b) {
  * Сверх того есть явный флаг материала `flat`.
  */
 #define SH_DEPTH                                                                                   \
-  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает \
+  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает                                 \
      * стоимость; глубже вклад падает как произведение долей */
 
 /* ТОЧНЫЙ ФРЕНЕЛЬ ПО НЕПОЛЯРИЗОВАННОМУ СВЕТУ. Приближение Шлика не нужно: точная
@@ -398,7 +398,8 @@ int main(int argc, char **argv) {
   double ballior = 1.5;
   double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0, segcap = 0.5, trimax = 0.0,
          weldeps = 0.0;
-  int flatfield = 0, vertR = 0, noshift = 0;
+  int flatfield = 0, vertR = 0, noshift = 0, usecap = 0;
+  double refineq = 0.0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "city") == 0) city = 1;
     if (strncmp(argv[i], "w=", 2) == 0) w = (int)strtol(argv[i] + 2, NULL, 10);
@@ -441,6 +442,10 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "tri=", 4) == 0) trimax = strtod(argv[i] + 4, NULL);
     /* §104.2: сшивка вершин в пределах ε, метры; `0` — без сшивки. */
     if (strncmp(argv[i], "weld=", 5) == 0) weldeps = strtod(argv[i] + 5, NULL);
+    /* §107: первый проход пишет потреугольный предел, второй его читает. Два
+     * процесса вместо перестройки конвейера — механизм тот же, риска меньше. */
+    if (strncmp(argv[i], "refine=", 7) == 0) refineq = strtod(argv[i] + 7, NULL);
+    if (strcmp(argv[i], "usecap") == 0) usecap = 1;
     /* НК16 §98: без восстановления непрерывности — вернуть лоскуты. */
     if (strcmp(argv[i], "flatfield") == 0) flatfield = 1;
     /* §100: неизвестные НА ВЕРШИНАХ, разрешение полукуба вершины. */
@@ -526,7 +531,25 @@ int main(int argc, char **argv) {
   }
 
   hz_pseglist sg;
-  if (hz_seg_planar_cap(&sg, &m, dseg, segcap) != 0) return 1;
+  /* ПОТРЕУГОЛЬНЫЙ ПРЕДЕЛ РАЗМЕРА (§107), если его записал прошлый проход. */
+  double *tcap = NULL;
+  if (usecap) {
+    FILE *fc = fopen("build/tcap.bin", "rb");
+    if (fc != NULL) {
+      int32_t nt3 = 0;
+      if (fread(&nt3, sizeof nt3, 1, fc) == 1 && nt3 == m.nt) {
+        tcap = malloc((size_t)m.nt * sizeof *tcap);
+        if (tcap == NULL || fread(tcap, sizeof *tcap, (size_t)m.nt, fc) != (size_t)m.nt) {
+          free(tcap);
+          tcap = NULL;
+        }
+      }
+      fclose(fc);
+    }
+    printf("== ПРЕДЕЛ ИЗ ПРОШЛОГО ПРОХОДА: %s\n", (tcap != NULL) ? "прочитан" : "НЕ прочитан");
+  }
+  if (hz_seg_planar_cap2(&sg, &m, dseg, segcap, tcap) != 0) return 1;
+  free(tcap);
   hz_polyset ps;
   if (hz_poly_build(&ps, &m, &sg) != 0) return 1;
   {
@@ -1406,6 +1429,70 @@ int main(int argc, char **argv) {
         if (E[cut[k]] > bref) bref = E[cut[k]];
       printf("   СКАЧОК В ОБЩЕЙ ВЕРШИНЕ: максимум %.3e, средний %.3e при уровне %.3e\n", jmax,
              (njn > 0) ? jsum / (double)njn : 0.0, bref);
+      /* ДРОБЛЕНИЕ ПО ОШИБКЕ ПОЛЯ (§107). Мера ошибки — РАЗМАХ поля по краю
+       * элемента: именно его линейная функция не передаёт, если не дробить.
+       * Порог берётся долей от МЕДИАНЫ поля по сцене, а не абсолютом: сцена может
+       * быть любой яркости, а видит глаз относительное. */
+      if (refineq > 0.0) {
+        double *med = malloc((size_t)ps.np * sizeof *med);
+        double *spread = malloc((size_t)ps.np * sizeof *spread);
+        if (med == NULL || spread == NULL) return 1;
+        for (int32_t k = 0; k < ps.np; k++) {
+          const hz_poly *p = &ps.p[k];
+          double lo3 = 1e300, hi3 = -1e300;
+          for (int32_t b = ps.loop[p->l0]; b < ps.loop[p->l0 + p->nloop]; b++) {
+            double v3 = (vw[vid[b]] > 0.0) ? vs[vid[b]] / vw[vid[b]] : E[cut[k]];
+            if (v3 < lo3) lo3 = v3;
+            if (v3 > hi3) hi3 = v3;
+          }
+          spread[k] = (hi3 > lo3) ? hi3 - lo3 : 0.0;
+          med[k] = E[cut[k]];
+        }
+        qsort(med, (size_t)ps.np, sizeof *med, cmp_d);
+        double lev = med[ps.np / 2];
+        /* ПОРОГ БЕРЁТСЯ ИЗ РАСПРЕДЕЛЕНИЯ, А НЕ ИЗ ДОГАДКИ. Первая редакция брала
+         * долю от медианы поля и пометила 97.1 % элементов — критерий не
+         * различал ничего. Теперь `refineq` читается как ДОЛЯ ЭЛЕМЕНТОВ, которую
+         * согласны раздробить, а порог есть соответствующая процентиль размаха.
+         * Величина берётся из БЮДЖЕТА (во сколько раз согласны увеличить
+         * сборку), а не из воздуха. */
+        double *ss2 = malloc((size_t)ps.np * sizeof *ss2);
+        if (ss2 == NULL) return 1;
+        for (int32_t k = 0; k < ps.np; k++)
+          ss2[k] = spread[k];
+        qsort(ss2, (size_t)ps.np, sizeof *ss2, cmp_d);
+        printf("   размах поля по элементу: p50 %.3e, p80 %.3e, p90 %.3e, p99 %.3e при медиане "
+               "поля %.3e\n",
+               ss2[(size_t)(0.50 * ps.np)], ss2[(size_t)(0.80 * ps.np)],
+               ss2[(size_t)(0.90 * ps.np)], ss2[(size_t)(0.99 * ps.np)], lev);
+        double thr = ss2[(size_t)((1.0 - refineq) * (double)(ps.np - 1))];
+        free(ss2);
+        double *tc = malloc((size_t)m.nt * sizeof *tc);
+        if (tc == NULL) return 1;
+        for (int32_t t = 0; t < m.nt; t++)
+          tc[t] = segcap;
+        int64_t nmark = 0;
+        for (int32_t k = 0; k < ps.np; k++) {
+          if (!(spread[k] > thr)) continue;
+          nmark++;
+          for (int32_t t = ps.p[k].t0; t < ps.p[k].t0 + ps.p[k].ntri; t++)
+            tc[ps.tri[t]] = 0.5 * segcap;
+        }
+        FILE *fo = fopen("build/tcap.bin", "wb");
+        if (fo != NULL) {
+          int32_t nt4 = m.nt;
+          fwrite(&nt4, sizeof nt4, 1, fo);
+          fwrite(tc, sizeof *tc, (size_t)m.nt, fo);
+          fclose(fo);
+        }
+        printf("== ДРОБЛЕНИЕ ПО ОШИБКЕ ПОЛЯ: медиана поля %.3e, порог %.3e; помечено %lld из %d "
+               "элементов (%.1f %%); предел им %.3f м вместо %.3f\n",
+               lev, thr, (long long)nmark, ps.np, 100.0 * (double)nmark / (double)ps.np,
+               0.5 * segcap, segcap);
+        free(med);
+        free(spread);
+        free(tc);
+      }
       free(vmn);
       free(vmx);
     }

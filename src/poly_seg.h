@@ -74,6 +74,13 @@ int hz_seg_planar(hz_pseglist *s, const hz_objmesh *m, double delta);
  * планарность — оставлял плоский пол ОДНИМ элементом на 557 536 пикселей кадра,
  * и тень внутри такого элемента не появится ни при каком решателе. */
 int hz_seg_planar_cap(hz_pseglist *s, const hz_objmesh *m, double delta, double smax);
+
+/* То же с ПОТРЕУГОЛЬНЫМ пределом размера (§107): `tcap[t]` метров на треугольник,
+ * `NULL` — общий `smax`. Нужен для дробления ПО ОШИБКЕ ПОЛЯ: поле гладкое всюду,
+ * кроме границ теней, и мельчить надо только там, иначе рост числа элементов
+ * умножает квадратичную сборку на десятки. */
+int hz_seg_planar_cap2(hz_pseglist *s, const hz_objmesh *m, double delta, double smax,
+                       const double *tcap);
 void hz_seg_free(hz_pseglist *s);
 
 #endif

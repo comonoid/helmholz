@@ -90,7 +90,7 @@ static void pf_cam_make(pf_cam *c, const double eye[3], const double at[3], cons
 
 /* Одна вершина в раму камеры: `(правая, верхняя, вперёд)`. */
 static void pf_view(const pf_cam *c, const double p[3], double v[3]) {
-  double d[3];
+  double d[3] = {0, 0, 0};
   for (int a = 0; a < 3; a++)
     d[a] = p[a] - c->eye[a];
   v[0] = d[0] * c->rt[0] + d[1] * c->rt[1] + d[2] * c->rt[2];
@@ -177,6 +177,7 @@ static uint64_t pf_key(const double p[3]) {
 
 int main(int argc, char **argv) {
   int city = 0, nmu = 2, nphi = 4, nb = 21, layout = HZ_LAYOUT_RUNS, imgw = 960, imgh = 540;
+  int fold = 0; /* §125: угловая квадратура едет на итерации, а не вложена в неё */
   double h = 0.5, rho = 0.5, sky = HZ_CFG_SKY_LE;
   /* Изменение сцены: шар радиуса `mvr` вокруг `mvc` сдвигается на `mvd`. */
   double mvr = 0.0, mvc[3] = {0.0, 0.0, 0.0}, mvd[3] = {0.0, 0.0, 0.0};
@@ -189,6 +190,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "rho=", 4) == 0) rho = strtod(argv[i] + 4, NULL);
     if (strncmp(argv[i], "sky=", 4) == 0) sky = strtod(argv[i] + 4, NULL);
     if (strcmp(argv[i], "list") == 0) layout = HZ_LAYOUT_LIST;
+    if (strcmp(argv[i], "fold") == 0) fold = 1;
     if (strncmp(argv[i], "w=", 2) == 0) imgw = (int)strtol(argv[i] + 2, NULL, 10);
     if (strncmp(argv[i], "ih=", 3) == 0) imgh = (int)strtol(argv[i] + 3, NULL, 10);
     if (strncmp(argv[i], "mvr=", 4) == 0) mvr = strtod(argv[i] + 4, NULL);
@@ -239,15 +241,75 @@ int main(int argc, char **argv) {
          "небо %.2f\n",
          d.n, nmu, nphi, h, nb, rho, sky);
 
+  /* СВЁРНУТАЯ СХЕМА (§125): угловая квадратура НЕ вложена в итерацию, а едет на
+   * ней. На каждой итерации берётся ОДНО направление, следующее по списку;
+   * накопленная сумма делится на накопленный вес, то есть оценка есть
+   * средневзвешенное по УЖЕ ПОСЕЩЁННЫМ направлениям. После полного цикла по
+   * списку она совпадает с обычной квадратурой ТОЧНО, а до того даёт грубое, но
+   * несмещённое приближение — и первые итерации, где поле всё равно сырое, не
+   * платят полную угловую цену.
+   *
+   * Порядок обхода — с шагом, взаимно простым с длиной списка: соседние итерации
+   * берут далёкие друг от друга направления, иначе первые оценки все смотрели бы
+   * в одну сторону. Случайности здесь нет и не нужно: прогон обязан повторяться. */
+  double *sacc = NULL;
+  double wvis = 0.0, wtot = 0.0;
+  tr3_dirs d1;
+  int step1 = 1;
+  if (fold) {
+    sacc = calloc(3 * (size_t)ps.np, sizeof *sacc);
+    if (sacc == NULL) return 1;
+    memset(&d1, 0, sizeof d1);
+    d1.n = 1;
+    for (int k = 0; k < d.n; k++)
+      wtot += d.w[k];
+    /* Шаг: наибольшее целое ниже d.n/φ, взаимно простое с d.n (аддитивная
+     * рекурсия Вейля — стандартный способ обойти список «вразброс»). */
+    step1 = (int)((double)d.n * 0.6180339887498949);
+    if (step1 < 1) step1 = 1;
+    while (step1 > 1) {
+      int a = step1, b2 = d.n;
+      while (b2 != 0) {
+        int t2 = a % b2;
+        a = b2;
+        b2 = t2;
+      }
+      if (a == 1) break;
+      step1--;
+    }
+    printf("== СВЁРНУТО: одно направление на итерацию, шаг обхода %d из %d; Σ весов %.4f\n", step1,
+           d.n, wtot);
+  }
+
   printf("  отскок   Σ B·A, Вт/ср      dE      фрагментов    растр,с   редукция,с   всего,с\n");
   double ttot = 0.0;
   for (int b = 0; b < nb; b++) {
     hz_pstats st;
     memset(&st, 0, sizeof st);
     double tb = now_s();
-    if (hz_psweep_bounce(&tr, &d, h, 0, sky, layout, &st) != 0) {
-      fprintf(stderr, "отказ отскока %d\n", b);
-      return 1;
+    if (!fold) {
+      if (hz_psweep_bounce(&tr, &d, h, 0, sky, layout, &st) != 0) {
+        fprintf(stderr, "отказ итерации %d\n", b);
+        return 1;
+      }
+    } else {
+      int k = (int)(((int64_t)b * step1) % d.n);
+      d1.ox = d.ox + k;
+      d1.oy = d.oy + k;
+      d1.oz = d.oz + k;
+      d1.w = d.w + k;
+      hz_psweep_zero(&tr);
+      if (hz_psweep_gather(&tr, &d1, h, 0, sky, layout, &st) != 0) {
+        fprintf(stderr, "отказ итерации %d\n", b);
+        return 1;
+      }
+      wvis += d.w[k];
+      double sc = wtot / wvis;
+      for (int32_t q = 0; q < 3 * ps.np; q++) {
+        sacc[q] += tr.acc[q];
+        tr.acc[q] = sacc[q] * sc;
+      }
+      hz_psweep_solve(&tr, &st);
     }
     double dt = now_s() - tb;
     ttot += dt;
@@ -534,6 +596,7 @@ int main(int argc, char **argv) {
     free(t2p);
   }
 
+  free(sacc);
   tr3_dirs_free(&d);
   hz_ptrans_free(&tr);
   hz_poly_free(&ps);

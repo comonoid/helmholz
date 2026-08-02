@@ -777,6 +777,7 @@ fail:
 
 void hz_links_free(hz_linkset *S) {
   free(S->l);
+  free(S->fsky);
   memset(S, 0, sizeof *S);
 }
 
@@ -967,6 +968,12 @@ int hz_links_build_hemi(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg
   double epx = 2.0 / (double)R;
   if (eps < epx) eps = epx;
 
+  S->fsky = calloc((size_t)L->nnd, sizeof *S->fsky);
+  if (S->fsky == NULL) {
+    free(pt);
+    free(t2p);
+    return 2;
+  }
   hz_ptree T;
   if (hz_ptree_build(&T, sc->m, cfg->ptleaf, 0) != 0) {
     free(pt);
@@ -986,12 +993,23 @@ int hz_links_build_hemi(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg
     hz_link *loc = NULL;
     int64_t nloc = 0, cloc = 0;
     int ok = (acc != NULL && touch != NULL && stamp != NULL && hz_hcube_init(&h, R) == 0);
+    /* ПРИЁМНИКИ: либо листья (`recv == NULL`, прежнее поведение), либо
+     * переданный список узлов СРЕЗА (§119). Их число задаётся кадром, а не
+     * сценой, и только тогда сборка выходо-ограничена. */
+    const int32_t nrec = (cfg->recv != NULL) ? cfg->nrecv : L->np;
 #pragma omp for schedule(dynamic, 8)
-    for (int32_t k = 0; k < L->np; k++) {
+    for (int32_t k = 0; k < nrec; k++) {
       if (!ok) continue;
-      int32_t nd = L->lab[k]; /* лист-приёмник */
-      hz_hcube_draw_tree(&h, sc->m, t2p, &T, pt + 3 * nd, L->nd[nd].n, k, stamp, k + 1, cfg->nozb,
-                         &hst);
+      int32_t nd = (cfg->recv != NULL) ? cfg->recv[k] : L->lab[k];
+      /* САМОЗАТЕНЕНИЕ (§88). У ЛИСТА не рисуется ровно его полигон. У узла СРЕЗА
+       * полигонов много, и «пропустить один» неверно; поэтому там не
+       * пропускается ничего при рисовании, а отбрасывается пиксель, чей элемент
+       * совпал с приёмником (ниже, `e == nd`). Разница содержательная:
+       * собственная поверхность грубого приёмника при этом ЗАСЛОНЯЕТ дальние —
+       * у изогнутого элемента это верно, у плоского даёт прежний результат. */
+      int32_t skip = (cfg->recv != NULL) ? -1 : k;
+      hz_hcube_draw_tree(&h, sc->m, t2p, &T, pt + 3 * nd, L->nd[nd].n, skip, stamp, k + 1,
+                         cfg->nozb, &hst);
       int32_t nt2 = 0;
       for (int i = 0; i < h.npix; i++) {
         double w = h.dff[i];
@@ -999,10 +1017,29 @@ int hz_links_build_hemi(hz_linkset *S, const hz_scene *sc, const hz_linkcfg *cfg
         npix++;
         if (h.id[i] < 0) {
           nmiss++;
+          S->fsky[nd] += w; /* пиксель в небо — источник наружной сцены (§119) */
           continue;
         }
         int32_t e = hc_pick(L, h.id[i], h.depth[i], eps);
-        if (e < 0 || e == nd) continue;
+        if (e < 0) continue;
+        /* САМ СЕБЯ НЕ ОСВЕЩАЕТ — И У ГРУБОГО ПРИЁМНИКА ЭТО НЕ ОДИН УЗЕЛ.
+         * `hc_pick` поднимается по критерию `√A/r < ε`, а собственная
+         * поверхность приёмника лежит на `r ≈ 0`, поэтому подъём там
+         * останавливается сразу и возвращает ЛИСТ, а не сам приёмник. Проверка
+         * `e == nd` такой пиксель пропустила бы, и узел получал бы свет от себя.
+         * Поэтому отбрасывается весь ПОДДЕРЕВО приёмника. */
+        {
+          int32_t a = e, self = 0;
+          while (a >= 0) {
+            if (a == nd) {
+              self = 1;
+              break;
+            }
+            if (L->nd[a].level >= L->nd[nd].level) break;
+            a = L->nd[a].parent;
+          }
+          if (self) continue;
+        }
         if (!(acc[e] > 0.0)) touch[nt2++] = e;
         acc[e] += w;
       }

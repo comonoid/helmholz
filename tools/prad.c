@@ -83,7 +83,7 @@ static int cmp_d(const void *a, const void *b) {
  * Сверх того есть явный флаг материала `flat`.
  */
 #define SH_DEPTH                                                                                   \
-  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает                                 \
+  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает \
      * стоимость; глубже вклад падает как произведение долей */
 
 /* ТОЧНЫЙ ФРЕНЕЛЬ ПО НЕПОЛЯРИЗОВАННОМУ СВЕТУ. Приближение Шлика не нужно: точная
@@ -396,6 +396,7 @@ int main(int argc, char **argv) {
       noclip = 0, oldpt = 0, flatn = 0, nospec = 0, noballs = 0, h = 0, spec = 0, nodiag = 0,
       ceillight = 0, novis = 0, hemi = 0, ptleaf = 0, nozb = 0;
   double ballior = 1.5;
+  int capset = 0;
   double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0, segcap = 0.5, trimax = 0.0,
          weldeps = 0.0;
   int flatfield = 0, vertR = 0, noshift = 0, usecap = 0;
@@ -432,7 +433,10 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "ceillight") == 0) ceillight = 1;
     if (strcmp(argv[i], "novis") == 0) novis = 1;
     /* §92: ограничение габарита элемента переноса, метры; `0` — без него. */
-    if (strncmp(argv[i], "cap=", 4) == 0) segcap = strtod(argv[i] + 4, NULL);
+    if (strncmp(argv[i], "cap=", 4) == 0) {
+      segcap = strtod(argv[i] + 4, NULL);
+      capset = 1;
+    }
     /* §94: сборка ПОЛУКУБОМ разрешения `hemi`; `0` — прежняя, попарная. */
     if (strncmp(argv[i], "hemi=", 5) == 0) hemi = (int)strtol(argv[i] + 5, NULL, 10);
     /* §95: порог листа дерева (НК13 — большое значение) и НК12 — без буфера. */
@@ -548,7 +552,24 @@ int main(int argc, char **argv) {
     }
     printf("== ПРЕДЕЛ ИЗ ПРОШЛОГО ПРОХОДА: %s\n", (tcap != NULL) ? "прочитан" : "НЕ прочитан");
   }
+  /* ПРЕДЕЛ ГАБАРИТА УЧАСТКА — ЧИСЛО ЗАЛА (А285). `0.5` м осмысленно там, где меш
+   * перед этим раздроблен до стороны `0.25` м (`tri=0.25`). У города грань —
+   * единичный квадрат, предел `0.5` м мельче ВХОДНОГО треугольника, и
+   * сегментация выдаёт по участку на треугольник: `6 704 264` вместо `446 013`.
+   * Именно это, а не `group_plane`, стоило двух часов лестницы 08-02. Умолчание
+   * поэтому зависит от сцены; `cap=` по-прежнему перекрывает его вручную. */
+  if (city && !capset) segcap = 0.0;
   if (hz_seg_planar_cap2(&sg, &m, dseg, segcap, tcap) != 0) return 1;
+  /* СТОРОЖ ВЫРОЖДЕНИЯ (А285): участок на треугольник значит, что сегментация не
+   * сработала вовсе, и всё, что ниже, мерит вход, а не сцену. Отказ здесь, а не
+   * выяснение через два часа профилировщиком. */
+  if (sg.nseg >= m.nt) {
+    fprintf(stderr,
+            "участков %d при %d треугольниках — сегментация выродилась; предел габарита "
+            "%.2f м мельче входного треугольника\n",
+            sg.nseg, m.nt, segcap);
+    return 1;
+  }
   free(tcap);
   hz_polyset ps;
   if (hz_poly_build(&ps, &m, &sg) != 0) return 1;
@@ -618,6 +639,31 @@ int main(int argc, char **argv) {
   lkc.novis = novis;
   lkc.ptleaf = ptleaf;
   lkc.nozb = nozb;
+  /* ПРИЁМНИКИ НА УЗЛАХ СРЕЗА (§119, А241). Срез считается ДО сборки: раньше он
+   * брался после решения, только ради картинки, и потому приёмники оставались
+   * листьями — то есть их число задавала СЦЕНА (у города 446 013), а не кадр.
+   * `leafrecv` возвращает прежнее поведение — это контроль эквивалентности. */
+  int leafrecv = 0;
+  for (int i = 1; i < argc; i++)
+    if (strcmp(argv[i], "leafrecv") == 0) leafrecv = 1;
+  int32_t *cut0 = malloc((size_t)L.np * sizeof *cut0);
+  int32_t *rec0 = malloc((size_t)L.nnd * sizeof *rec0);
+  unsigned char *seen0 = calloc((size_t)L.nnd, 1);
+  if (cut0 == NULL || rec0 == NULL || seen0 == NULL) return 1;
+  int32_t ncut0 = hz_lod_cut(&L, eye, eps, 1, cut0), nrec0 = 0;
+  for (int32_t k = 0; k < L.np; k++) {
+    int32_t nd = cut0[k];
+    if (nd >= 0 && nd < L.nnd && !seen0[nd]) {
+      seen0[nd] = 1;
+      rec0[nrec0++] = nd;
+    }
+  }
+  printf("== ПРИЁМНИКИ: %s — %d штук (срез %d узлов, листьев %d)\n",
+         leafrecv ? "ЛИСТЬЯ [leafrecv]" : "узлы СРЕЗА", leafrecv ? L.np : nrec0, ncut0, L.np);
+  if (!leafrecv) {
+    lkc.recv = rec0;
+    lkc.nrecv = nrec0;
+  }
   hz_linkset S;
   t0 = now_s();
   int brc = (hemi > 0) ? hz_links_build_hemi(&S, &sc, &lkc, hemi) : hz_links_build(&S, &sc, &lkc);
@@ -1030,6 +1076,29 @@ int main(int argc, char **argv) {
       nsrc++;
       asrc += L.nd[k].area_surf;
     }
+  }
+  /* НЕБО КАК ИСТОЧНИК НАРУЖНОЙ СЦЕНЫ (§119). Ламп у города нет и быть не должно:
+   * ручная разметка сцены — тот самый случай, когда §4 требует остановиться.
+   * Небо разметки не требует: доля полусферы, не упёршаяся в геометрию, ЗАМЕРЕНА
+   * тем же полукубом (`S.fsky`). Первый отскок вносится как собственное
+   * излучение `Le = ρ·f_неба·L_неба`; дальнейшие даёт та же итерация, потому что
+   * решатель считает `B = Le + ρ·Σf·B`. Замкнутой сцены это не касается: там
+   * `f_неба ≡ 0`. */
+  if (city && S.fsky != NULL) {
+    double smax2 = 0.0, ssum = 0.0;
+    int64_t nsky = 0;
+    for (int32_t k = 0; k < L.nnd; k++) {
+      double f = S.fsky[k];
+      if (f > 0.0) {
+        nsky++;
+        ssum += f;
+        if (f > smax2) smax2 = f;
+      }
+      Le[k] = rho[k] * f * HZ_CFG_SKY_LE;
+    }
+    printf("== ИСТОЧНИК ГОРОДА — НЕБО: элементов с видимым небом %lld, доля полусферы "
+           "средняя %.4f, максимум %.4f; L_неба = %.2f\n",
+           (long long)nsky, (nsky > 0) ? ssum / (double)nsky : 0.0, smax2, HZ_CFG_SKY_LE);
   }
   printf("== ИСТОЧНИК: светящихся элементов %lld, суммарная площадь %.3f м² (было: ПОТОЛОК, "
          "37.720 м²)\n",

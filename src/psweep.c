@@ -36,7 +36,10 @@ int hz_ptrans_init(hz_ptrans *t, const hz_polyset *ps, const hz_objmesh *m) {
   return 0;
 }
 
+static void pw_pool_free(hz_ptrans *t);
+
 void hz_ptrans_free(hz_ptrans *t) {
+  pw_pool_free(t);
   free(t->rho);
   free(t->Le);
   free(t->E);
@@ -183,6 +186,8 @@ static void reduce_abuf(const hz_ptrans *t, const hz_pview *v, const double *nwt
 
 /* --- поток --------------------------------------------------------------- */
 
+/* Черновик одного потока: полосы, буфер фрагментов, накопитель. Живёт у
+ * переноса между вызовами (§128). */
 typedef struct {
   hz_span *sp;
   double *nwt; /* n·ω на полигон: считается раз на направление */
@@ -192,6 +197,11 @@ typedef struct {
   double *acc;
   hz_pstats st;
 } pw_thread;
+
+/* ГАБАРИТ СЦЕНЫ — ОДИН РАЗ НА ПЕРЕНОС (§128). Профиль дал `3.2 %` на то, что
+ * он пересчитывался по всему краю на КАЖДОЕ направление, хотя от направления не
+ * зависит вовсе. Кэш живёт у переноса и вместе с ним и умирает. */
+static void scene_box_cached(hz_ptrans *t, double lo[3], double hi[3]);
 
 static void scene_box(const hz_polyset *ps, double lo[3], double hi[3]) {
   for (int a = 0; a < 3; a++) {
@@ -272,7 +282,7 @@ int hz_psweep_gather(hz_ptrans *t, const tr3_dirs *d, double h, int nthr, double
                      hz_pstats *st) {
   const hz_polyset *ps = t->ps;
   double lo[3], hi[3];
-  scene_box(ps, lo, hi);
+  scene_box_cached(t, lo, hi);
   if (!(lo[0] <= hi[0])) return 1;
 
   int nt = nthr;
@@ -305,17 +315,47 @@ int hz_psweep_gather(hz_ptrans *t, const tr3_dirs *d, double h, int nthr, double
   if (cap > 2000000000LL) cap = 2000000000LL;
 
   int rc = 0;
-  pw_thread *w = calloc((size_t)nt, sizeof *w);
-  if (w == NULL) return 2;
-  for (int i = 0; i < nt; i++) {
-    w[i].acc = calloc((size_t)t->np * 3, sizeof *w[i].acc);
-    w[i].nwt = calloc((size_t)t->np, sizeof *w[i].nwt);
-    if (w[i].nwt == NULL) rc = 2;
-    if (w[i].acc == NULL) rc = 2;
-    if (layout == HZ_LAYOUT_LIST) {
-      if (hz_abuf_init(&w[i].ab, maxpix, cap) != 0) rc = 2;
-    } else {
-      if (hz_fbuf_init(&w[i].fb, maxpix, cap) != 0) rc = 2;
+  /* ЧЕРНОВИК ПЕРЕИСПОЛЬЗУЕТСЯ, ПОКА СОВПАДАЮТ ПАРАМЕТРЫ (§128). Совпадение
+   * проверяется по ВСЕМ, от которых зависит раскладка: число потоков, число
+   * полигонов, пиксели, ёмкость и сама раскладка. Не совпало — черновик
+   * выбрасывается целиком и заводится заново, а не подгоняется по месту. */
+  int reuse = (t->pool != NULL && t->pool_nt == nt && t->pool_np == t->np &&
+               t->pool_maxpix == maxpix && t->pool_cap == cap && t->pool_layout == layout);
+  if (!reuse && t->pool != NULL) {
+    pw_thread *o = t->pool;
+    for (int i = 0; i < t->pool_nt; i++) {
+      free(o[i].acc);
+      free(o[i].nwt);
+      free(o[i].sp);
+      if (t->pool_layout == HZ_LAYOUT_LIST)
+        hz_abuf_free(&o[i].ab);
+      else
+        hz_fbuf_free(&o[i].fb);
+    }
+    free(o);
+    t->pool = NULL;
+  }
+  pw_thread *w;
+  if (reuse) {
+    w = t->pool;
+    for (int i = 0; i < nt; i++) {
+      memset(w[i].acc, 0, (size_t)t->np * 3 * sizeof *w[i].acc);
+      memset(w[i].nwt, 0, (size_t)t->np * sizeof *w[i].nwt);
+      w[i].nsp = 0;
+    }
+  } else {
+    w = calloc((size_t)nt, sizeof *w);
+    if (w == NULL) return 2;
+    for (int i = 0; i < nt; i++) {
+      w[i].acc = calloc((size_t)t->np * 3, sizeof *w[i].acc);
+      w[i].nwt = calloc((size_t)t->np, sizeof *w[i].nwt);
+      if (w[i].nwt == NULL) rc = 2;
+      if (w[i].acc == NULL) rc = 2;
+      if (layout == HZ_LAYOUT_LIST) {
+        if (hz_abuf_init(&w[i].ab, maxpix, cap) != 0) rc = 2;
+      } else {
+        if (hz_fbuf_init(&w[i].fb, maxpix, cap) != 0) rc = 2;
+      }
     }
   }
 
@@ -344,21 +384,34 @@ int hz_psweep_gather(hz_ptrans *t, const tr3_dirs *d, double h, int nthr, double
         t->acc[k] += w[i].acc[k];
     }
   }
-  for (int i = 0; i < nt; i++) {
-    free(w[i].acc);
-    free(w[i].nwt);
-    free(w[i].sp);
-    hz_fbuf_free(&w[i].fb);
-    hz_abuf_free(&w[i].ab);
+  /* ЧЕРНОВИК ОСТАЁТСЯ У ПЕРЕНОСА (§128) — освобождает его `hz_ptrans_free`.
+   * При отказе выделения он не сохраняется: половинчатый черновик хуже, чем
+   * его отсутствие, и следующий вызов должен завести всё заново. */
+  if (rc == 0) {
+    t->pool = w;
+    t->pool_nt = nt;
+    t->pool_np = t->np;
+    t->pool_maxpix = maxpix;
+    t->pool_cap = cap;
+    t->pool_layout = layout;
+  } else {
+    for (int i = 0; i < nt; i++) {
+      free(w[i].acc);
+      free(w[i].nwt);
+      free(w[i].sp);
+      hz_fbuf_free(&w[i].fb);
+      hz_abuf_free(&w[i].ab);
+    }
+    free(w);
+    t->pool = NULL;
   }
-  free(w);
   return rc;
 }
 
 int hz_psweep_direct(hz_ptrans *t, const double w[3], double Eperp, double h, hz_pstats *st) {
   const hz_polyset *ps = t->ps;
   double lo[3], hi[3];
-  scene_box(ps, lo, hi);
+  scene_box_cached(t, lo, hi);
   hz_pview v;
   if (hz_pview_make(&v, w, lo, hi, h) != 0) return 1;
   double area = 0.0;
@@ -488,4 +541,32 @@ int hz_psweep_bounce(hz_ptrans *t, const tr3_dirs *d, double h, int nthr, double
   if (rc != 0) return rc;
   hz_psweep_solve(t, st);
   return 0;
+}
+
+/* Освобождение черновика потоков (§128). Отдельной функцией, потому что зовётся
+ * из двух мест: при смене параметров и при разрушении переноса. */
+static void pw_pool_free(hz_ptrans *t) {
+  if (t->pool == NULL) return;
+  pw_thread *o = t->pool;
+  for (int i = 0; i < t->pool_nt; i++) {
+    free(o[i].acc);
+    free(o[i].nwt);
+    free(o[i].sp);
+    hz_fbuf_free(&o[i].fb);
+    hz_abuf_free(&o[i].ab);
+  }
+  free(o);
+  t->pool = NULL;
+  t->pool_nt = 0;
+}
+
+static void scene_box_cached(hz_ptrans *t, double lo[3], double hi[3]) {
+  if (!t->box_ok) {
+    scene_box(t->ps, t->box_lo, t->box_hi);
+    t->box_ok = 1;
+  }
+  for (int a = 0; a < 3; a++) {
+    lo[a] = t->box_lo[a];
+    hi[a] = t->box_hi[a];
+  }
 }

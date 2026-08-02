@@ -34,6 +34,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 static double now_s(void) {
   struct timespec ts;
@@ -223,6 +226,9 @@ int main(int argc, char **argv) {
   /* НЕГАТИВНЫЙ КОНТРОЛЬ §127: поправку квадратуры выключить. Ошибка печи обязана
    * вернуться к прежнему проценту; не вернулась — поправка ни при чём. */
   int noqn = 0;
+  /* §128: направлений за шаг свёртки. `0` читается как число потоков OpenMP —
+   * иначе параллелизм по направлениям простаивает. */
+  int nfold = 0;
   double oside = 4.0;
   double h = 0.5, rho = 0.5, sky = HZ_CFG_SKY_LE;
   /* Изменение сцены: шар радиуса `mvr` вокруг `mvc` сдвигается на `mvd`. */
@@ -239,6 +245,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "fold") == 0) fold = 1;
     if (strcmp(argv[i], "oven") == 0) oven = 1;
     if (strcmp(argv[i], "noqn") == 0) noqn = 1;
+    if (strncmp(argv[i], "nfold=", 6) == 0) nfold = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "osub=", 5) == 0) osub = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "w=", 2) == 0) imgw = (int)strtol(argv[i] + 2, NULL, 10);
     if (strncmp(argv[i], "ih=", 3) == 0) imgh = (int)strtol(argv[i] + 3, NULL, 10);
@@ -310,7 +317,7 @@ int main(int argc, char **argv) {
    * Порядок обхода — с шагом, взаимно простым с длиной списка: соседние итерации
    * берут далёкие друг от друга направления, иначе первые оценки все смотрели бы
    * в одну сторону. Случайности здесь нет и не нужно: прогон обязан повторяться. */
-  double *sacc = NULL;
+  double *sacc = NULL, *fox = NULL, *foy = NULL, *foz = NULL, *fw = NULL;
   double wvis = 0.0, wtot = 0.0;
   tr3_dirs d1;
   int step1 = 1;
@@ -318,7 +325,19 @@ int main(int argc, char **argv) {
     sacc = calloc(3 * (size_t)ps.np, sizeof *sacc);
     if (sacc == NULL) return 1;
     memset(&d1, 0, sizeof d1);
-    d1.n = 1;
+    if (nfold < 1) {
+      nfold = 1;
+#ifdef _OPENMP
+      nfold = omp_get_max_threads();
+#endif
+    }
+    if (nfold > d.n) nfold = d.n;
+    d1.n = nfold;
+    fox = malloc((size_t)nfold * sizeof *fox);
+    foy = malloc((size_t)nfold * sizeof *foy);
+    foz = malloc((size_t)nfold * sizeof *foz);
+    fw = malloc((size_t)nfold * sizeof *fw);
+    if (fox == NULL || foy == NULL || foz == NULL || fw == NULL) return 1;
     for (int k = 0; k < d.n; k++)
       wtot += d.w[k];
     /* Шаг: наибольшее целое ниже d.n/φ, взаимно простое с d.n (аддитивная
@@ -335,8 +354,8 @@ int main(int argc, char **argv) {
       if (a == 1) break;
       step1--;
     }
-    printf("== СВЁРНУТО: одно направление на итерацию, шаг обхода %d из %d; Σ весов %.4f\n", step1,
-           d.n, wtot);
+    printf("== СВЁРНУТО: %d направлений на итерацию, шаг обхода %d из %d; Σ весов %.4f\n", nfold,
+           step1, d.n, wtot);
   }
 
   /* ПОПРАВКА КВАДРАТУРЫ ПО НОРМАЛИ (§127) — один раз на полигон, до переноса.
@@ -377,17 +396,29 @@ int main(int argc, char **argv) {
         return 1;
       }
     } else {
-      int k = (int)(((int64_t)b * step1) % d.n);
-      d1.ox = d.ox + k;
-      d1.oy = d.oy + k;
-      d1.oz = d.oz + k;
-      d1.w = d.w + k;
+      /* НАПРАВЛЕНИЙ ЗА ШАГ — ПО ЧИСЛУ ПОТОКОВ, А НЕ ОДНО (§128, замерено).
+       * Параллелизм в `psweep` устроен ПО НАПРАВЛЕНИЯМ (`psweep.c:323`), поэтому
+       * одно направление на итерацию оставляет пятнадцать потоков из шестнадцати
+       * стоять на барьере: профиль дал `40.4 %` в `gomp_barrier_wait_end`.
+       * Свёртка при этом не теряется — за шаг берётся `nfold` направлений из
+       * той же последовательности Вейля, а не весь набор. */
+      for (int q = 0; q < nfold; q++) {
+        int k = (int)((((int64_t)b * nfold + q) * step1) % d.n);
+        fox[q] = d.ox[k];
+        foy[q] = d.oy[k];
+        foz[q] = d.oz[k];
+        fw[q] = d.w[k];
+        wvis += d.w[k];
+      }
+      d1.ox = fox;
+      d1.oy = foy;
+      d1.oz = foz;
+      d1.w = fw;
       hz_psweep_zero(&tr);
       if (hz_psweep_gather(&tr, &d1, h, 0, sky, layout, &st) != 0) {
         fprintf(stderr, "отказ итерации %d\n", b);
         return 1;
       }
-      wvis += d.w[k];
       double sc = wtot / wvis;
       for (int32_t q = 0; q < 3 * ps.np; q++) {
         sacc[q] += tr.acc[q];
@@ -697,6 +728,10 @@ int main(int argc, char **argv) {
 
   free(sacc);
   free(qn);
+  free(fox);
+  free(foy);
+  free(foz);
+  free(fw);
   tr3_dirs_free(&d);
   hz_ptrans_free(&tr);
   hz_poly_free(&ps);

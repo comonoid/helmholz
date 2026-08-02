@@ -81,7 +81,7 @@ typedef struct {
 /* Полосы всего набора для одного направления. `*sp`/`*cap` — растущий буфер
  * вызывающего (переиспользуется между направлениями), `*nsp` — сколько вышло. */
 int hz_prast_spans(hz_span **sp, int64_t *nsp, int64_t *cap, const hz_pview *v,
-                   const hz_polyset *ps, hz_rstats *st);
+                   const hz_polyset *ps, const unsigned char *live, hz_rstats *st);
 
 /* --- раскладка 1: СПЛОШНЫЕ пробеги --------------------------------------- */
 

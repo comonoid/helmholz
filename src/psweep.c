@@ -221,7 +221,7 @@ static int gather_dir(const hz_ptrans *t, const hz_pview *v, pw_thread *w, doubl
     w->nwt[k] = n[0] * v->w[0] + n[1] * v->w[1] + n[2] * v->w[2];
   }
   double t0 = now_s();
-  if (hz_prast_spans(&w->sp, &w->nsp, &w->cap, v, t->ps, &rs) != 0) return 2;
+  if (hz_prast_spans(&w->sp, &w->nsp, &w->cap, v, t->ps, t->live, &rs) != 0) return 2;
   double t1 = now_s();
   int rc;
   if (layout == HZ_LAYOUT_LIST)
@@ -369,7 +369,7 @@ int hz_psweep_direct(hz_ptrans *t, const double w[3], double Eperp, double h, hz
   int64_t cap = (int64_t)(4.0 * area / (h * h)) + 1024;
   if (hz_fbuf_init(&th.fb, (int64_t)v.W * v.H, cap) != 0) return 2;
   hz_rstats rs;
-  int rc = hz_prast_spans(&th.sp, &th.nsp, &th.cap, &v, ps, &rs);
+  int rc = hz_prast_spans(&th.sp, &th.nsp, &th.cap, &v, ps, t->live, &rs);
   if (rc == 0) rc = hz_fbuf_build(&th.fb, th.sp, th.nsp, v.W, v.H);
   if (rc != 0) {
     free(th.sp);

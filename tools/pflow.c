@@ -98,9 +98,88 @@ static void pf_view(const pf_cam *c, const double p[3], double v[3]) {
   v[2] = d[0] * c->fwd[0] + d[1] * c->fwd[1] + d[2] * c->fwd[2];
 }
 
+/* ПЕРЕМЕСТИТЬ ТЕЛО В САМОМ МЕШЕ (§124). Не маска и не пропуск при рисовании:
+ * маска оставила бы всю переднюю часть конвейера нетронутой, и «быстро» вышло бы
+ * по построению (возражение пользователя 08-02, и оно верное). Здесь меняется
+ * ВХОД: треугольники, чей центр попал в шар, получают СОБСТВЕННЫЕ вершины и
+ * сдвигаются, после чего сегментация и полигоны строятся заново с нуля.
+ *
+ * Вершины дублируются, а не двигаются на месте, потому что они общие: сдвиг
+ * вершины утащил бы за собой соседние треугольники и порвал бы поверхность по
+ * границе выделенного тела. Существующие треугольники сохраняют свои номера —
+ * новые вершины ДОПИСЫВАЮТСЯ, — и потому неизменённые участки сегментируются
+ * так же, что и даёт право переносить на них прежнее поле. */
+static int pf_move_body(hz_objmesh *m, const double c[3], double r, const double dv[3],
+                        int32_t *nmoved) {
+  int32_t nsel = 0;
+  for (int32_t t = 0; t < m->nt; t++) {
+    double p[3][3], g[3] = {0, 0, 0};
+    hz_obj_tri(m, t, p);
+    for (int i = 0; i < 3; i++)
+      for (int a = 0; a < 3; a++)
+        g[a] += p[i][a] / 3.0;
+    double d2 = 0.0;
+    for (int a = 0; a < 3; a++)
+      d2 += (g[a] - c[a]) * (g[a] - c[a]);
+    if (d2 <= r * r) nsel++;
+  }
+  *nmoved = nsel;
+  if (nsel == 0) return 0;
+  double *nv = realloc(m->v, 3 * (size_t)(m->nv + 3 * nsel) * sizeof *nv);
+  if (nv == NULL) return 2;
+  m->v = nv;
+  int32_t base = m->nv;
+  for (int32_t t = 0; t < m->nt; t++) {
+    double p[3][3], g[3] = {0, 0, 0};
+    hz_obj_tri(m, t, p);
+    for (int i = 0; i < 3; i++)
+      for (int a = 0; a < 3; a++)
+        g[a] += p[i][a] / 3.0;
+    double d2 = 0.0;
+    for (int a = 0; a < 3; a++)
+      d2 += (g[a] - c[a]) * (g[a] - c[a]);
+    if (d2 > r * r) continue;
+    for (int i = 0; i < 3; i++) {
+      for (int a = 0; a < 3; a++)
+        m->v[3 * (size_t)base + (size_t)a] = p[i][a] + dv[a];
+      m->f[3 * (size_t)t + (size_t)i] = base;
+      base++;
+    }
+  }
+  m->nv = base;
+  for (int32_t k = 0; k < m->nv; k++)
+    for (int a = 0; a < 3; a++) {
+      double x = m->v[3 * (size_t)k + (size_t)a];
+      if (x < m->lo[a]) m->lo[a] = x;
+      if (x > m->hi[a]) m->hi[a] = x;
+    }
+  return 0;
+}
+
+/* ПЕРЕНОС ПОЛЯ НА НОВЫЙ НАБОР ПОЛИГОНОВ — ПО ПОЛОЖЕНИЮ, А НЕ ПО НОМЕРУ.
+ * Номера после пересегментации не совпадают, а опорная точка неизменённого
+ * участка совпадает ПОБИТОВО: те же треугольники в том же порядке дают тот же
+ * центр площади. Поэтому ключ — координаты `org`, а несовпавшие полигоны
+ * стартуют с нуля. Доля совпавших ПЕЧАТАЕТСЯ: без неё «тёплый старт» неотличим
+ * от холодного. */
+static uint64_t pf_key(const double p[3]) {
+  uint64_t h = 0xcbf29ce484222325ULL;
+  for (int a = 0; a < 3; a++) {
+    double x = p[a];
+    if (!(x < 0.0) && !(x > 0.0)) x = 0.0;
+    uint64_t b;
+    memcpy(&b, &x, sizeof b);
+    h ^= b;
+    h *= 0x100000001b3ULL;
+  }
+  return h;
+}
+
 int main(int argc, char **argv) {
   int city = 0, nmu = 2, nphi = 4, nb = 21, layout = HZ_LAYOUT_RUNS, imgw = 960, imgh = 540;
   double h = 0.5, rho = 0.5, sky = HZ_CFG_SKY_LE;
+  /* Изменение сцены: шар радиуса `mvr` вокруг `mvc` сдвигается на `mvd`. */
+  double mvr = 0.0, mvc[3] = {0.0, 0.0, 0.0}, mvd[3] = {0.0, 0.0, 0.0};
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "city") == 0) city = 1;
     if (strncmp(argv[i], "nmu=", 4) == 0) nmu = (int)strtol(argv[i] + 4, NULL, 10);
@@ -112,6 +191,11 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "list") == 0) layout = HZ_LAYOUT_LIST;
     if (strncmp(argv[i], "w=", 2) == 0) imgw = (int)strtol(argv[i] + 2, NULL, 10);
     if (strncmp(argv[i], "ih=", 3) == 0) imgh = (int)strtol(argv[i] + 3, NULL, 10);
+    if (strncmp(argv[i], "mvr=", 4) == 0) mvr = strtod(argv[i] + 4, NULL);
+    if (strncmp(argv[i], "mvc=", 4) == 0)
+      sscanf(argv[i] + 4, "%lf,%lf,%lf", &mvc[0], &mvc[1], &mvc[2]);
+    if (strncmp(argv[i], "mvd=", 4) == 0)
+      sscanf(argv[i] + 4, "%lf,%lf,%lf", &mvd[0], &mvd[1], &mvd[2]);
   }
 
   double t0 = now_s();
@@ -183,6 +267,110 @@ int main(int argc, char **argv) {
   printf("== ЭТАЛОН ХРАНИМЫМ ОПЕРАТОРОМ (§120, тот же город, ρ = 0.5, небо 1.0): "
          "поток 2.398505e+05 Вт/ср, сборка 3102.6 с\n");
 
+  /* ------------------------------- ИЗМЕНЕНИЕ СЦЕНЫ И ТЁПЛЫЙ СТАРТ (§124) --
+   *
+   * Вопрос: «можно ли относительно немного считать, когда сцена не сильно
+   * меняется». Проверяется ЧЕСТНО — правкой самого меша и полным повтором
+   * переднего края, а не пропуском полигонов при рисовании. */
+  if (mvr > 0.0) {
+    int32_t np0 = ps.np;
+    double *org0 = malloc(3 * (size_t)np0 * sizeof *org0);
+    double *E0 = malloc(3 * (size_t)np0 * sizeof *E0);
+    if (org0 == NULL || E0 == NULL) return 1;
+    for (int32_t k = 0; k < np0; k++)
+      for (int a = 0; a < 3; a++) {
+        org0[3 * (size_t)k + (size_t)a] = ps.p[k].org[a];
+        E0[3 * (size_t)k + (size_t)a] = tr.E[3 * (size_t)k + (size_t)a];
+      }
+
+    int32_t nmoved = 0;
+    double t_mv = now_s();
+    if (pf_move_body(&m, mvc, mvr, mvd, &nmoved) != 0) return 1;
+    t_mv = now_s() - t_mv;
+
+    double t_re = now_s();
+    hz_ptrans_free(&tr);
+    hz_poly_free(&ps);
+    hz_seg_free(&sg);
+    if (hz_seg_planar_cap(&sg, &m, dseg, city ? 0.0 : 0.5) != 0) return 1;
+    if (hz_poly_build(&ps, &m, &sg) != 0) return 1;
+    if (hz_ptrans_init(&tr, &ps, &m) != 0) return 1;
+    for (int32_t k = 0; k < ps.np; k++) {
+      tr.rho[k] = rho;
+      tr.Le[k] = 0.0;
+    }
+    t_re = now_s() - t_re;
+    printf("== СЦЕНА ИЗМЕНЕНА: тело радиуса %.1f м сдвинуто на (%.1f, %.1f, %.1f), "
+           "треугольников тронуто %d (%.3f %%); правка меша %.2f с, передний край заново %.1f с; "
+           "полигонов %d -> %d\n",
+           mvr, mvd[0], mvd[1], mvd[2], nmoved, 100.0 * (double)nmoved / (double)m.nt, t_mv, t_re,
+           np0, ps.np);
+
+    /* Перенос поля по ПОЛОЖЕНИЮ опорной точки. */
+    int64_t nsl = 4;
+    while (nsl < 2 * (int64_t)np0 + 8)
+      nsl *= 2;
+    uint64_t *key = calloc((size_t)nsl, sizeof *key);
+    int32_t *val = malloc((size_t)nsl * sizeof *val);
+    if (key == NULL || val == NULL) return 1;
+    for (int64_t i = 0; i < nsl; i++)
+      val[i] = -1;
+    uint64_t msk = (uint64_t)nsl - 1;
+    for (int32_t k = 0; k < np0; k++) {
+      uint64_t kk = pf_key(org0 + 3 * (size_t)k) + 1;
+      uint64_t i = kk & msk;
+      while (key[i] != 0 && key[i] != kk)
+        i = (i + 1) & msk;
+      key[i] = kk;
+      val[i] = k;
+    }
+    int32_t nmatch = 0;
+    for (int32_t k = 0; k < ps.np; k++) {
+      uint64_t kk = pf_key(ps.p[k].org) + 1;
+      uint64_t i = kk & msk;
+      while (key[i] != 0 && key[i] != kk)
+        i = (i + 1) & msk;
+      if (key[i] == kk && val[i] >= 0) {
+        for (int a = 0; a < 3; a++)
+          tr.E[3 * (size_t)k + (size_t)a] = E0[3 * (size_t)val[i] + (size_t)a];
+        nmatch++;
+      }
+    }
+    printf("== ПОЛЕ ПЕРЕНЕСЕНО: совпало опорных точек %d из %d (%.2f %%)\n", nmatch, ps.np,
+           100.0 * (double)nmatch / (double)(ps.np > 0 ? ps.np : 1));
+
+    /* ДОПУСК ОСТАНОВА — ИМЕНОВАННЫЙ И ОДИН НА ОБА ПРОГОНА, иначе «тёплый
+     * быстрее» получилось бы выбором допуска, а не свойством схемы. */
+    const double TOLW = 1e-6;
+    for (int pass = 0; pass < 2; pass++) {
+      if (pass == 1)
+        for (int32_t k = 0; k < 3 * ps.np; k++)
+          tr.E[k] = 0.0; /* холодный: с нуля */
+      int it = 0;
+      double tw = now_s();
+      for (; it < 200; it++) {
+        hz_pstats st;
+        memset(&st, 0, sizeof st);
+        if (hz_psweep_bounce(&tr, &d, h, 0, sky, layout, &st) != 0) return 1;
+        if (st.dE < TOLW) {
+          it++;
+          break;
+        }
+      }
+      double dtw = now_s() - tw;
+      double flux = 0.0;
+      for (int32_t k = 0; k < ps.np; k++)
+        flux += hz_ptrans_lout(&tr, k, 0.0, 0.0) * ps.p[k].area;
+      printf("== %s СТАРТ: %d итераций за %.1f с до dE < %.0e; поток %.6e\n",
+             (pass == 0) ? "ТЁПЛЫЙ" : "ХОЛОДНЫЙ", it, dtw, TOLW, flux);
+      fflush(stdout);
+    }
+    free(key);
+    free(val);
+    free(org0);
+    free(E0);
+  }
+
   /* ------------------------------------------------------------------ КАДР */
   {
     double eyeh[3] = HZ_CFG_HALL_EYE, ath[3] = HZ_CFG_HALL_AT;
@@ -240,8 +428,8 @@ int main(int argc, char **argv) {
       if (nc < 3) continue;
       for (int f = 1; f + 1 < nc; f++) {
         const int id[3] = {0, f, f + 1};
-        double sx[3], sy[3], iw[3];
-        double wx[3][3];
+        double sx[3] = {0, 0, 0}, sy[3] = {0, 0, 0}, iw[3] = {0, 0, 0};
+        double wx[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
         for (int i = 0; i < 3; i++) {
           double z = cw[id[i]][2];
           iw[i] = 1.0 / z;

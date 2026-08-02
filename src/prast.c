@@ -85,7 +85,7 @@ static void sort_cross(pe_cross *c, int32_t n) {
 }
 
 int hz_prast_spans(hz_span **spp, int64_t *nsp, int64_t *cap, const hz_pview *v,
-                   const hz_polyset *ps, hz_rstats *st) {
+                   const hz_polyset *ps, const unsigned char *live, hz_rstats *st) {
   memset(st, 0, sizeof *st);
   *nsp = 0;
   const int32_t W = v->W, H = v->H;
@@ -124,6 +124,9 @@ int hz_prast_spans(hz_span **spp, int64_t *nsp, int64_t *cap, const hz_pview *v,
   for (int32_t k = 0; k < ps->np; k++) {
     const hz_poly *P = &ps->p[k];
     if (P->nloop == 0) continue;
+    /* ПОЛИГОНА БОЛЬШЕ НЕТ (§124): разрушенная геометрия не рисуется вовсе —
+     * значит и не заслоняет, и не светит. `live == NULL` — все живы. */
+    if (live != NULL && !live[k]) continue;
     double nw = P->n[0] * v->w[0] + P->n[1] * v->w[1] + P->n[2] * v->w[2];
     /* Точный ноль: полигон РЕБРОМ к направлению — ни излучает вдоль него, ни
      * принимает, а глубина была бы делением на ноль. Порога нет и не нужно:

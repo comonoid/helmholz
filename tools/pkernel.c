@@ -142,7 +142,7 @@ int main(int argc, char **argv) {
       if (hz_pview_make(&v, w, lo, hi, hh) != 0) continue;
       int64_t nsp = 0;
       hz_rstats rs;
-      if (hz_prast_spans(&sp, &nsp, &cap, &v, &ps, &rs) != 0) continue;
+      if (hz_prast_spans(&sp, &nsp, &cap, &v, &ps, NULL, &rs) != 0) continue;
       double cov = 0.0;
       for (int64_t s = 0; s < nsp; s++) {
         const hz_poly *P = &ps.p[sp[s].poly];

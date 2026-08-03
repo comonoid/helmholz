@@ -39,6 +39,16 @@
 #include <omp.h>
 #endif
 
+/* Прямой ход солнца: коллимированный пучок кладётся в `acc` между обнулением и
+ * подгонкой. Вынесено функцией, потому что точек вызова две — свёрнутый ход и
+ * несвёрнутый, — и разъезжаться им нельзя. */
+static int sun_add(hz_ptrans *tr, const double sundir[3], double h) {
+  double sw[3] = {sundir[0], sundir[1], sundir[2]};
+  hz_pstats sd;
+  memset(&sd, 0, sizeof sd);
+  return hz_psweep_direct(tr, sw, HZ_CFG_SUN_LE, h, &sd);
+}
+
 static double now_s(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -792,7 +802,19 @@ int main(int argc, char **argv) {
     memset(&st, 0, sizeof st);
     double tb = now_s();
     if (!fold) {
-      if (hz_psweep_bounce(&tr, &d, h, 0, sky, layout, &st) != 0) {
+      if (sunmode > 0) {
+        /* Отскок разбирается на части ровно ради того, чтобы солнце легло в
+         * `acc` ДО подгонки: `hz_psweep_bounce` решает внутри, и добавление
+         * после него потребовало бы ВТОРОГО решения по всем полигонам
+         * (замерный долг §142 — прибавка `+18.6 %` была именно этим). */
+        hz_psweep_zero(&tr);
+        if (hz_psweep_gather(&tr, &d, h, 0, sky, layout, &st) != 0) {
+          fprintf(stderr, "отказ итерации %d\n", b);
+          return 1;
+        }
+        if (sun_add(&tr, sundir, h) != 0) return 1;
+        hz_psweep_solve(&tr, &st);
+      } else if (hz_psweep_bounce(&tr, &d, h, 0, sky, layout, &st) != 0) {
         fprintf(stderr, "отказ итерации %d\n", b);
         return 1;
       }
@@ -858,6 +880,7 @@ int main(int argc, char **argv) {
           tr.acc[q] = s * sc;
         }
       }
+      if (sunmode > 0 && sun_add(&tr, sundir, h) != 0) return 1;
       hz_psweep_solve(&tr, &st);
     }
     /* З3 (§137): СОЛНЦЕ ДВУМЯ СПОСОБАМИ.
@@ -871,13 +894,6 @@ int main(int argc, char **argv) {
      *
      * Оба кладутся в `acc` ДО решения, между обнулением и подгонкой, поэтому
      * двойного учёта нет: в развёртке этого источника не существует. */
-    if (sunmode > 0) {
-      double sw[3] = {sundir[0], sundir[1], sundir[2]};
-      hz_pstats sd;
-      memset(&sd, 0, sizeof sd);
-      if (hz_psweep_direct(&tr, sw, HZ_CFG_SUN_LE, h, &sd) != 0) return 1;
-      hz_psweep_solve(&tr, &st);
-    }
     double dt = now_s() - tb;
     ttot += dt;
     /* ПОТОК ПО ВСЕЙ ПОВЕРХНОСТИ — величина, не зависящая от разбиения, и потому

@@ -98,7 +98,7 @@ static int solve3s(double A[3][3], double b[3]) {
  *
  * `*pk` / `*pu` / `*pv` — предыдущий фрагмент вдоль луча; на входе первого
  * фрагмента `*pk < 0`. */
-static inline void frag_step(const hz_ptrans *t, const hz_pview *v, const double *nwt, double wq,
+static inline void frag_step(hz_ptrans *t, const hz_pview *v, const double *nwt, double wq,
                              double h2, double Lsky, double *acc, const double r[3], int32_t k,
                              double depth, int32_t *pk, double *pu, double *pv, int64_t *npair) {
   const hz_poly *P = &t->ps->p[k];
@@ -123,6 +123,12 @@ static inline void frag_step(const hz_ptrans *t, const hz_pview *v, const double
     }
     if (L > 0.0) {
       double c = wq * h2 * L;
+      if (t->pair_cap > 0 && t->pair_n < t->pair_cap && *pk >= 0) {
+        t->pair_k[t->pair_n] = k;
+        t->pair_j[t->pair_n] = *pk;
+        t->pair_w[t->pair_n] = c;
+        t->pair_n++;
+      }
       acc[(size_t)k * 3 + 0] += c;
       acc[(size_t)k * 3 + 1] += c * u;
       acc[(size_t)k * 3 + 2] += c * vv;
@@ -138,7 +144,7 @@ static inline void frag_step(const hz_ptrans *t, const hz_pview *v, const double
 
 /* Начало луча идёт ПРИРАЩЕНИЕМ вдоль строки, а не пересчётом на пиксель: заодно
  * из внутреннего цикла уходит целочисленное деление `px % W`. */
-static void reduce_fbuf(const hz_ptrans *t, const hz_pview *v, const double *nwt, const hz_fbuf *fb,
+static void reduce_fbuf(hz_ptrans *t, const hz_pview *v, const double *nwt, const hz_fbuf *fb,
                         double wq, double Lsky, double *acc, hz_pstats *st) {
   const double h2 = v->h * v->h;
   for (int32_t j = 0; j < fb->H; j++) {
@@ -162,7 +168,7 @@ static void reduce_fbuf(const hz_ptrans *t, const hz_pview *v, const double *nwt
 
 /* --- редукция, раскладка ОДНОСВЯЗНЫХ СПИСКОВ -------------------------------- */
 
-static void reduce_abuf(const hz_ptrans *t, const hz_pview *v, const double *nwt, const hz_abuf *ab,
+static void reduce_abuf(hz_ptrans *t, const hz_pview *v, const double *nwt, const hz_abuf *ab,
                         double wq, double Lsky, double *acc, hz_pstats *st) {
   const double h2 = v->h * v->h;
   for (int32_t j = 0; j < ab->H; j++) {
@@ -223,7 +229,7 @@ static void scene_box(const hz_polyset *ps, double lo[3], double hi[3]) {
 }
 
 /* Одно направление целиком: полосы -> раскладка -> сортировка -> редукция. */
-static int gather_dir(const hz_ptrans *t, const hz_pview *v, pw_thread *w, double wq, double Lsky,
+static int gather_dir(hz_ptrans *t, const hz_pview *v, pw_thread *w, double wq, double Lsky,
                       int layout) {
   hz_rstats rs;
   for (int32_t k = 0; k < t->np; k++) {

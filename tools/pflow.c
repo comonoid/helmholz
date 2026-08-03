@@ -232,6 +232,7 @@ int main(int argc, char **argv) {
   const char *fsave = NULL, *fcmp = NULL; /* §132: поле на диск и сверка */
   int shells = 0;                         /* §133: замер цены каскада по оболочкам */
   double szmul = 0.0;                     /* §136: второй предел среза, в допусках ε */
+  int link1 = 0;                          /* §137 З1: связность направлений по парам */
   /* §128: направлений за шаг свёртки. `0` читается как число потоков OpenMP —
    * иначе параллелизм по направлениям простаивает. */
   int nfold = 0;
@@ -257,6 +258,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "cmp=", 4) == 0) fcmp = argv[i] + 4;
     if (strcmp(argv[i], "shells") == 0) shells = 1;
     if (strncmp(argv[i], "sz=", 3) == 0) szmul = strtod(argv[i] + 3, NULL);
+    if (strcmp(argv[i], "link1") == 0) link1 = 1;
     if (strncmp(argv[i], "nfold=", 6) == 0) nfold = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "osub=", 5) == 0) osub = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "w=", 2) == 0) imgw = (int)strtol(argv[i] + 2, NULL, 10);
@@ -453,6 +455,123 @@ int main(int argc, char **argv) {
     printf("== ПОПРАВКА КВАДРАТУРЫ (§127): S(n)/π по полигонам от %.4f до %.4f "
            "(обязано быть 1; отклонение и есть угловая ошибка набора)\n",
            qlo, qhi);
+  }
+
+  /* З1 (§137, правлено §138): СВЯЗНОСТЬ НАПРАВЛЕНИЙ ПО ПАРАМ «приёмник ←
+   * излучатель», а НЕ по пикселям — рама растра строится от направления, и «тот
+   * же пиксель» у разных `ω` не определён (А307).
+   *
+   * Печатается КРИВАЯ по угловому расстоянию, а не одно число: порога `0.5` в
+   * приёмке нет (А308), решение принимается по кривой. Соседство берётся по
+   * ОБЕИМ осям набора порознь и выражается углом в градусах (А309).
+   * Негативный контроль — противоположное направление: совпадение обязано
+   * рухнуть, иначе хеш считает не то. */
+  if (link1) {
+    const int64_t PCAP = 40000000; /* пар на направление; при переполнении — доклад */
+    tr.pair_k = malloc((size_t)PCAP * sizeof *tr.pair_k);
+    tr.pair_j = malloc((size_t)PCAP * sizeof *tr.pair_j);
+    tr.pair_w = malloc((size_t)PCAP * sizeof *tr.pair_w);
+    if (tr.pair_k == NULL || tr.pair_j == NULL || tr.pair_w == NULL) {
+      free(tr.pair_k);
+      free(tr.pair_j);
+      free(tr.pair_w);
+      return 1;
+    }
+    /* ПОЛЕ СПЕРВА ЗАЖИГАЕТСЯ, иначе пар нет вовсе: на первой итерации `B ≡ 0`,
+     * весь свет идёт от неба, а небесные фрагменты в пары не входят (у них нет
+     * излучателя-поверхности). Три отскока полным набором дают поле, на котором
+     * связность уже осмысленна. */
+    for (int b = 0; b < 3; b++) {
+      hz_pstats s0;
+      memset(&s0, 0, sizeof s0);
+      if (hz_psweep_bounce(&tr, &d, h, 0, sky, layout, &s0) != 0) return 1;
+    }
+    /* Опорное направление — первое; сравниваемые: соседнее по `μ`, соседнее по
+     * `φ`, через одно по `φ`, и противоположное (контроль). */
+    int base_i = 0;
+    int cand[4] = {1, nphi * 2, nphi * 4, d.n - 1};
+    int64_t nsl = 4;
+    while (nsl < 4 * PCAP / 8)
+      nsl *= 2;
+    uint64_t *key = calloc((size_t)nsl, sizeof *key);
+    double *val = calloc((size_t)nsl, sizeof *val);
+    if (key == NULL || val == NULL) {
+      free(key);
+      free(val);
+      free(tr.pair_k);
+      free(tr.pair_j);
+      free(tr.pair_w);
+      return 1;
+    }
+    uint64_t msk = (uint64_t)nsl - 1;
+    double wbase = 0.0;
+    tr3_dirs dz;
+    memset(&dz, 0, sizeof dz);
+    dz.n = 1;
+    for (int pass = 0; pass < 5; pass++) {
+      int k = (pass == 0) ? base_i : cand[pass - 1];
+      /* Сторож только для СРАВНИВАЕМЫХ: опорное имеет номер 0 и отбрасываться
+       * не должно — первая редакция на этом и дала ноль пар. */
+      if (k < 0 || k >= d.n || (pass > 0 && k == base_i)) continue;
+      dz.ox = d.ox + k;
+      dz.oy = d.oy + k;
+      dz.oz = d.oz + k;
+      dz.w = d.w + k;
+      tr.pair_n = 0;
+      tr.pair_cap = PCAP;
+      hz_psweep_zero(&tr);
+      hz_pstats s1;
+      memset(&s1, 0, sizeof s1);
+      if (hz_psweep_gather(&tr, &dz, h, 1, sky, layout, &s1) != 0) return 1;
+      if (pass == 0) {
+        for (int64_t q = 0; q < tr.pair_n; q++) {
+          uint64_t kk = ((uint64_t)(uint32_t)tr.pair_k[q] << 32) | (uint32_t)tr.pair_j[q];
+          uint64_t i = (kk * 0x9E3779B97F4A7C15ULL) & msk;
+          while (key[i] != 0 && key[i] != kk + 1)
+            i = (i + 1) & msk;
+          key[i] = kk + 1;
+          val[i] += tr.pair_w[q];
+          wbase += tr.pair_w[q];
+        }
+        printf("== З1: опорное направление, пар %lld, суммарный вес %.6e%s\n", (long long)tr.pair_n,
+               wbase, (tr.pair_n >= PCAP) ? "  [ЁМКОСТЬ ИСЧЕРПАНА]" : "");
+        printf("   к чему сравнивается   угол, °   пар   совпало по счёту   совпало ПО ВЕСУ\n");
+        continue;
+      }
+      double dot = d.ox[base_i] * d.ox[k] + d.oy[base_i] * d.oy[k] + d.oz[base_i] * d.oz[k];
+      if (dot > 1.0) dot = 1.0;
+      if (dot < -1.0) dot = -1.0;
+      double ang = acos(dot) * 180.0 / M_PI;
+      int64_t nhit = 0;
+      double whit = 0.0, wall = 0.0;
+      for (int64_t q = 0; q < tr.pair_n; q++) {
+        uint64_t kk = ((uint64_t)(uint32_t)tr.pair_k[q] << 32) | (uint32_t)tr.pair_j[q];
+        uint64_t i = (kk * 0x9E3779B97F4A7C15ULL) & msk;
+        while (key[i] != 0 && key[i] != kk + 1)
+          i = (i + 1) & msk;
+        wall += tr.pair_w[q];
+        if (key[i] == kk + 1) {
+          nhit++;
+          whit += tr.pair_w[q];
+        }
+      }
+      const char *nm = (pass == 1)   ? "соседнее по mu"
+                       : (pass == 2) ? "соседнее по phi"
+                       : (pass == 3) ? "через одно по phi"
+                                     : "ПРОТИВОПОЛОЖНОЕ [НК]";
+      printf("   %-21s %7.2f  %9lld   %14.4f   %14.4f\n", nm, ang, (long long)tr.pair_n,
+             (double)nhit / (double)(tr.pair_n ? tr.pair_n : 1), whit / (wall > 0.0 ? wall : 1.0));
+      fflush(stdout);
+    }
+    free(key);
+    free(val);
+    free(tr.pair_k);
+    free(tr.pair_j);
+    free(tr.pair_w);
+    tr.pair_k = NULL;
+    tr.pair_j = NULL;
+    tr.pair_w = NULL;
+    tr.pair_cap = 0;
   }
 
   /* ЦЕНА КАСКАДА ПО ОБОЛОЧКАМ — АРИФМЕТИКА ПО ГОТОВЫМ ДАННЫМ (§133, пункт 1).

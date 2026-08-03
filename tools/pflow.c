@@ -234,6 +234,7 @@ int main(int argc, char **argv) {
   double szmul = 0.0;                     /* §136: второй предел среза, в допусках ε */
   int link1 = 0;                          /* §137 З1: связность направлений по парам */
   int sunmode = 0;                        /* §137 З3: 1 — отдельный проход, 2 — на ординату */
+  int sunord = -1;                        /* §142 нег. контроль: солнце ТОЧНО на ординату */
   int slots = 0, slots1 = 0;              /* §137 З2: заменять вклад ячейки; `slots1` — НК */
   /* §128: направлений за шаг свёртки. `0` читается как число потоков OpenMP —
    * иначе параллелизм по направлениям простаивает. */
@@ -262,6 +263,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "sz=", 3) == 0) szmul = strtod(argv[i] + 3, NULL);
     if (strcmp(argv[i], "link1") == 0) link1 = 1;
     if (strncmp(argv[i], "sun=", 4) == 0) sunmode = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "sunord=", 7) == 0) sunord = (int)strtol(argv[i] + 7, NULL, 10);
     if (strcmp(argv[i], "slots") == 0) slots = 1;
     if (strcmp(argv[i], "slots1") == 0) {
       slots = 1;
@@ -387,22 +389,46 @@ int main(int argc, char **argv) {
    * ординатная схема, не выделяющая источник. Вес подобран так, чтобы полный
    * поток совпал с прямым проходом: `E⊥` есть облучённость площадки поперёк
    * пучка, а ордината несёт радианс, поэтому делится на её вес. */
-  int sun_ord = -1;
-  if (sunmode == 2) {
-    double sw[3] = HZ_CFG_SUN_DIR;
-    double sn = sqrt(sw[0] * sw[0] + sw[1] * sw[1] + sw[2] * sw[2]);
+  double sundir[3] = HZ_CFG_SUN_DIR;
+  double sunmiss = 0.0;
+  if (sunmode > 0) {
+    /* Истинное направление солнца. `sunord=K` кладёт его ТОЧНО на ординату K —
+     * это негативный контроль §142: промах обнуляется, и оба способа обязаны
+     * совпасть побитово. */
+    if (sunord >= 0) {
+      if (sunord >= d.n) {
+        fprintf(stderr, "sunord=%d вне набора из %d ординат\n", sunord, d.n);
+        return 1;
+      }
+      sundir[0] = d.ox[sunord];
+      sundir[1] = d.oy[sunord];
+      sundir[2] = d.oz[sunord];
+    }
+    double sn = sqrt(sundir[0] * sundir[0] + sundir[1] * sundir[1] + sundir[2] * sundir[2]);
     for (int c = 0; c < 3; c++)
-      sw[c] /= sn;
+      sundir[c] /= sn;
+    /* Способ 2 — «солнце на ближайшую ординату»: тот же поток `Eperp` идёт тем
+     * же кодом, но ВДОЛЬ ОРДИНАТЫ, а не вдоль истинного луча. Отличие между
+     * способами ровно одно — вектор направления, поэтому расхождение мерит
+     * угловой промах, а не разницу двух кусков кода (А311). */
     double best = -2.0;
+    int sun_ord = -1;
     for (int k = 0; k < d.n; k++) {
-      double dp = d.ox[k] * sw[0] + d.oy[k] * sw[1] + d.oz[k] * sw[2];
+      double dp = d.ox[k] * sundir[0] + d.oy[k] * sundir[1] + d.oz[k] * sundir[2];
       if (dp > best) {
         best = dp;
         sun_ord = k;
       }
     }
-    printf("== З3: солнце на ординату %d, угол промаха %.2f°, вес ординаты %.4f\n", sun_ord,
-           acos(best > 1.0 ? 1.0 : best) * 180.0 / M_PI, d.w[sun_ord]);
+    sunmiss = acos(best > 1.0 ? 1.0 : best) * 180.0 / M_PI;
+    if (sunmode == 2) {
+      sundir[0] = d.ox[sun_ord];
+      sundir[1] = d.oy[sun_ord];
+      sundir[2] = d.oz[sun_ord];
+    }
+    printf("== З3: солнце способом %d, ближайшая ордината %d из %d, промах %.3f°, "
+           "направление (%.4f %.4f %.4f)\n",
+           sunmode, sun_ord, d.n, sunmiss, sundir[0], sundir[1], sundir[2]);
   }
   printf("== НАПРАВЛЕНИЙ: %d (nmu %d × nphi %d); шаг растра %.2f м; отскоков %d; ρ %.2f; "
          "небо %.2f\n",
@@ -845,11 +871,8 @@ int main(int argc, char **argv) {
      *
      * Оба кладутся в `acc` ДО решения, между обнулением и подгонкой, поэтому
      * двойного учёта нет: в развёртке этого источника не существует. */
-    if (sunmode == 1) {
-      double sw[3] = HZ_CFG_SUN_DIR;
-      double sn = sqrt(sw[0] * sw[0] + sw[1] * sw[1] + sw[2] * sw[2]);
-      for (int c = 0; c < 3; c++)
-        sw[c] /= sn;
+    if (sunmode > 0) {
+      double sw[3] = {sundir[0], sundir[1], sundir[2]};
       hz_pstats sd;
       memset(&sd, 0, sizeof sd);
       if (hz_psweep_direct(&tr, sw, HZ_CFG_SUN_LE, h, &sd) != 0) return 1;

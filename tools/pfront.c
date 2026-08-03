@@ -1284,6 +1284,80 @@ int main(int argc, char **argv) {
     signed char *xg = NULL;
     int64_t xcap = 0;
 
+    /* ГРАНИ РАСКЛАДЫВАЮТСЯ ПО ПОЛОСАМ ОДИН РАЗ (пункт 12 реестра, §178).
+     *
+     * До этой правки каждая полоса перебирала ВСЮ сцену, и при шестнадцати
+     * полосах выходило `32` прохода по `6.7` млн граней. Между тем грань узка
+     * по `v` и попадает почти всегда в ОДНУ полосу: замер пункта 11 показал,
+     * что стадия упирается в ПАМЯТЬ, а значит лишние проходы — это прямо
+     * лишнее время, и убрать их дороже по отдаче, чем сузить тип или взять
+     * видеокарту.
+     *
+     * Раскладка — та же счётная сортировка по потокам, что и для строк:
+     * счёт в свой на поток массив полос, редукция, заполнение без атомарных
+     * операций. Ссылок выходит чуть больше числа граней (грань на стыке полос
+     * попадает в обе), и это число печатается — если оно окажется много больше
+     * `nlit`, значит полосы выбраны неудачно, и это будет видно, а не скрыто. */
+    int nbtot = (rows + PF_BAND - 1) / PF_BAND;
+    int64_t *boff = calloc((size_t)nbtot + 2, sizeof *boff);
+    int64_t *btc = calloc((size_t)nth * (size_t)(nbtot + 1) + 1, sizeof *btc);
+    int32_t *bface = NULL;
+    int64_t nbref = 0;
+    if (boff == NULL || btc == NULL) return 2;
+    {
+      double t_b0 = now_s();
+      for (int pass = 0; pass < 2; pass++) {
+#pragma omp parallel
+        {
+          int tid = omp_get_thread_num();
+          int64_t *c = btc + (size_t)tid * (size_t)(nbtot + 1);
+#pragma omp for schedule(static)
+          for (int32_t t = 0; t < m.nt; t++) {
+            if (!(v_dot(fn + 3 * (size_t)t, w) < 0.0)) continue;
+            const double *A = m.v + 3 * (size_t)m.f[(size_t)t * 3 + 0];
+            const double *B = m.v + 3 * (size_t)m.f[(size_t)t * 3 + 1];
+            const double *C = m.v + 3 * (size_t)m.f[(size_t)t * 3 + 2];
+            double da = v_dot(w, A), db2 = v_dot(w, B), dc = v_dot(w, C);
+            double dface = da > db2 ? (da > dc ? da : dc) : (db2 > dc ? db2 : dc);
+            if (dface > shi_) continue;
+            double va = v_dot(bb, A), vb = v_dot(bb, B), vc = v_dot(bb, C);
+            double vmin = va < vb ? (va < vc ? va : vc) : (vb < vc ? vb : vc);
+            double vmax = va > vb ? (va > vc ? va : vc) : (vb > vc ? vb : vc);
+            if (vmax < vlo || vmin > vhi) continue;
+            int r0 = (int)floor((vmin - vlo) / dv), r1 = (int)floor((vmax - vlo) / dv);
+            if (r0 < 0) r0 = 0;
+            if (r1 >= rows) r1 = rows - 1;
+            for (int b = r0 / PF_BAND; b <= r1 / PF_BAND; b++) {
+              if (pass == 0)
+                c[b]++;
+              else
+                bface[c[b]++] = t;
+            }
+          }
+        }
+        if (pass == 0) {
+          int64_t acc = 0;
+          for (int b = 0; b < nbtot; b++) {
+            boff[b] = acc;
+            for (int q = 0; q < nth; q++) {
+              int64_t n = btc[(size_t)q * (size_t)(nbtot + 1) + (size_t)b];
+              btc[(size_t)q * (size_t)(nbtot + 1) + (size_t)b] = acc;
+              acc += n;
+            }
+          }
+          boff[nbtot] = acc;
+          nbref = acc;
+          bface = malloc((size_t)(nbref > 0 ? nbref : 1) * sizeof *bface);
+          if (bface == NULL) return 2;
+        }
+      }
+      printf("   РАСКЛАДКА ГРАНЕЙ ПО ПОЛОСАМ (пункт 12): %lld ссылок на %lld освещённых граней "
+             "(%.2f на грань) за %.2f с\n",
+             (long long)nbref, (long long)nlitf, nlitf > 0 ? (double)nbref / (double)nlitf : 0.0,
+             now_s() - t_b0);
+      fflush(stdout);
+    }
+
     for (int rb = 0; rb < rows; rb += PF_BAND) {
       int rlo = rb, rhi = rb + PF_BAND < rows ? rb + PF_BAND : rows;
       int nr = rhi - rlo;
@@ -1312,8 +1386,9 @@ int main(int argc, char **argv) {
         int tid = omp_get_thread_num();
         int64_t *cnt = tcnt + (size_t)tid * (size_t)(nr + 1);
 #pragma omp for schedule(static)
-        for (int32_t t = 0; t < m.nt; t++) {
-          if (!(v_dot(fn + 3 * (size_t)t, w) < 0.0)) continue; /* грань не освещена */
+        for (int64_t bi = boff[rb / PF_BAND]; bi < boff[rb / PF_BAND + 1]; bi++) {
+          int32_t t = bface[bi];
+          /* «освещена» и «не дальше картинки» отобраны при раскладке (пункт 12) */
           const double *A = m.v + 3 * (size_t)m.f[(size_t)t * 3 + 0];
           const double *B = m.v + 3 * (size_t)m.f[(size_t)t * 3 + 1];
           const double *C = m.v + 3 * (size_t)m.f[(size_t)t * 3 + 2];
@@ -1371,8 +1446,8 @@ int main(int argc, char **argv) {
         int tid = omp_get_thread_num();
         int64_t *cur = tcnt + (size_t)tid * (size_t)(nr + 1);
 #pragma omp for schedule(static)
-        for (int32_t t = 0; t < m.nt; t++) {
-          if (!(v_dot(fn + 3 * (size_t)t, w) < 0.0)) continue;
+        for (int64_t bi = boff[rb / PF_BAND]; bi < boff[rb / PF_BAND + 1]; bi++) {
+          int32_t t = bface[bi];
           const double *A = m.v + 3 * (size_t)m.f[(size_t)t * 3 + 0];
           const double *B = m.v + 3 * (size_t)m.f[(size_t)t * 3 + 1];
           const double *C = m.v + 3 * (size_t)m.f[(size_t)t * 3 + 2];
@@ -1508,9 +1583,9 @@ int main(int argc, char **argv) {
     printf("   освещённых граней %lld из %d; пересечений строк %lld при %d строках (шаг строки "
            "%.4f м, полос %lld)\n",
            (long long)nlitf, m.nt, (long long)nxr_tot, rows, dv, (long long)nband);
-    printf("   ИЗ НИХ ОБХОД ГРАНЕЙ %.2f с (%d потоков, %d проходов по %d млн граней) — пункт 11 "
-           "реестра\n",
-           t_scan, nth, 2 * (int)nband, m.nt / 1000000);
+    printf("   ИЗ НИХ ОБХОД ГРАНЕЙ %.2f с (%d потоков, два прохода по %lld ссылкам вместо %d по "
+           "%d млн граней) — пункты 11 и 12 реестра\n",
+           t_scan, nth, (long long)nbref, 2 * (int)nband, m.nt / 1000000);
     fflush(stdout);
 
     free(xu);

@@ -233,6 +233,7 @@ int main(int argc, char **argv) {
   int shells = 0;                         /* §133: замер цены каскада по оболочкам */
   double szmul = 0.0;                     /* §136: второй предел среза, в допусках ε */
   int link1 = 0;                          /* §137 З1: связность направлений по парам */
+  int slots = 0, slots1 = 0;              /* §137 З2: заменять вклад ячейки; `slots1` — НК */
   /* §128: направлений за шаг свёртки. `0` читается как число потоков OpenMP —
    * иначе параллелизм по направлениям простаивает. */
   int nfold = 0;
@@ -259,6 +260,11 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "shells") == 0) shells = 1;
     if (strncmp(argv[i], "sz=", 3) == 0) szmul = strtod(argv[i] + 3, NULL);
     if (strcmp(argv[i], "link1") == 0) link1 = 1;
+    if (strcmp(argv[i], "slots") == 0) slots = 1;
+    if (strcmp(argv[i], "slots1") == 0) {
+      slots = 1;
+      slots1 = 1;
+    }
     if (strncmp(argv[i], "nfold=", 6) == 0) nfold = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "osub=", 5) == 0) osub = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "w=", 2) == 0) imgw = (int)strtol(argv[i] + 2, NULL, 10);
@@ -391,11 +397,23 @@ int main(int argc, char **argv) {
    * берут далёкие друг от друга направления, иначе первые оценки все смотрели бы
    * в одну сторону. Случайности здесь нет и не нужно: прогон обязан повторяться. */
   double *sacc = NULL, *fox = NULL, *foy = NULL, *foz = NULL, *fw = NULL;
+  int nslot = 1, nslot_used = 0;
+  int slot_hit[64] = {0};
+  double slot_w[64] = {0.0};
   double wvis = 0.0, wtot = 0.0;
   tr3_dirs d1;
   int step1 = 1;
   if (fold) {
-    sacc = calloc(3 * (size_t)ps.np, sizeof *sacc);
+    if (slots) {
+      nslot = (d.n + nfold - 1) / nfold;
+      if (nslot < 1) nslot = 1;
+      if (nslot > 64) nslot = 64;
+      /* НЕГАТИВНЫЙ КОНТРОЛЬ З2: одна ячейка. Тогда каждая итерация ЗАМЕЩАЕТ всё
+       * последними `nfold` направлениями, и угловой интеграл не набирается
+       * никогда — поле обязано испортиться, а не просто хуже сходиться. */
+      if (slots1) nslot = 1;
+    }
+    sacc = calloc((size_t)(slots ? nslot : 1) * 3 * (size_t)ps.np, sizeof *sacc);
     if (sacc == NULL) return 1;
     memset(&d1, 0, sizeof d1);
     if (nfold < 1) {
@@ -427,8 +445,11 @@ int main(int argc, char **argv) {
       if (a == 1) break;
       step1--;
     }
-    printf("== СВЁРНУТО: %d направлений на итерацию, шаг обхода %d из %d; Σ весов %.4f\n", nfold,
-           step1, d.n, wtot);
+    printf("== СВЁРНУТО: %d направлений на итерацию, шаг обхода %d из %d; Σ весов %.4f%s\n", nfold,
+           step1, d.n, wtot, slots ? "; ВКЛАД ЗАМЕНЯЕТСЯ (З2)" : "; вклад усредняется");
+    if (slots)
+      printf("   ячеек %d (задержка не более одного цикла, А314), память %.1f МБ\n", nslot,
+             (double)nslot * 3.0 * (double)ps.np * 8.0 / 1048576.0);
   }
 
   /* ПОПРАВКА КВАДРАТУРЫ ПО НОРМАЛИ (§127) — один раз на полигон, до переноса.
@@ -733,6 +754,7 @@ int main(int argc, char **argv) {
        * стоять на барьере: профиль дал `40.4 %` в `gomp_barrier_wait_end`.
        * Свёртка при этом не теряется — за шаг берётся `nfold` направлений из
        * той же последовательности Вейля, а не весь набор. */
+      double wit = 0.0;
       for (int q = 0; q < nfold; q++) {
         int k = (int)((((int64_t)b * nfold + q) * step1) % d.n);
         fox[q] = d.ox[k];
@@ -740,6 +762,7 @@ int main(int argc, char **argv) {
         foz[q] = d.oz[k];
         fw[q] = d.w[k];
         wvis += d.w[k];
+        wit += d.w[k];
       }
       d1.ox = fox;
       d1.oy = foy;
@@ -750,10 +773,41 @@ int main(int argc, char **argv) {
         fprintf(stderr, "отказ итерации %d\n", b);
         return 1;
       }
-      double sc = wtot / wvis;
-      for (int32_t q = 0; q < 3 * ps.np; q++) {
-        sacc[q] += tr.acc[q];
-        tr.acc[q] = sacc[q] * sc;
+      if (!slots) {
+        /* ПРЕЖНЕЕ: бегущая сумма. Пол ошибки `2e-2` (§125) — усредняются сборы,
+         * снятые при РАЗНОМ `B`, и старые пробы устаревают навсегда. */
+        double sc = wtot / wvis;
+        for (int32_t q = 0; q < 3 * ps.np; q++) {
+          sacc[q] += tr.acc[q];
+          tr.acc[q] = sacc[q] * sc;
+        }
+      } else {
+        /* З2 (§137): ВКЛАД ЯЧЕЙКИ ЗАМЕНЯЕТСЯ, А НЕ ПОДМЕШИВАЕТСЯ. Ячейка — на
+         * ИТЕРАЦИЮ ЦИКЛА, а не на направление (А310): задержка всё равно
+         * ограничена одним циклом, а память падает с `234` МБ до `15`.
+         * Ограниченность задержки существенна — на ней стоит сходимость
+         * асинхронной итерации (А314), поэтому число посещённых ячеек
+         * печатается, а не подразумевается. */
+        int sl = b % nslot;
+        double *S = sacc + (size_t)sl * 3 * (size_t)ps.np;
+        for (int32_t q = 0; q < 3 * ps.np; q++)
+          S[q] = tr.acc[q];
+        if (!slot_hit[sl]) {
+          slot_hit[sl] = 1;
+          slot_w[sl] = 0.0;
+          nslot_used++;
+        }
+        slot_w[sl] = wit;
+        double wv = 0.0;
+        for (int q = 0; q < nslot; q++)
+          if (slot_hit[q]) wv += slot_w[q];
+        double sc = wtot / (wv > 0.0 ? wv : 1.0);
+        for (int32_t q = 0; q < 3 * ps.np; q++) {
+          double s = 0.0;
+          for (int p = 0; p < nslot; p++)
+            if (slot_hit[p]) s += sacc[(size_t)p * 3 * (size_t)ps.np + (size_t)q];
+          tr.acc[q] = s * sc;
+        }
       }
       hz_psweep_solve(&tr, &st);
     }

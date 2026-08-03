@@ -231,6 +231,7 @@ int main(int argc, char **argv) {
   int lod = 0;  /* §131: перенос по срезу лестницы вместо всех участков */
   const char *fsave = NULL, *fcmp = NULL; /* §132: поле на диск и сверка */
   int shells = 0;                         /* §133: замер цены каскада по оболочкам */
+  double szmul = 0.0;                     /* §136: второй предел среза, в допусках ε */
   /* §128: направлений за шаг свёртки. `0` читается как число потоков OpenMP —
    * иначе параллелизм по направлениям простаивает. */
   int nfold = 0;
@@ -255,6 +256,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "save=", 5) == 0) fsave = argv[i] + 5;
     if (strncmp(argv[i], "cmp=", 4) == 0) fcmp = argv[i] + 4;
     if (strcmp(argv[i], "shells") == 0) shells = 1;
+    if (strncmp(argv[i], "sz=", 3) == 0) szmul = strtod(argv[i] + 3, NULL);
     if (strncmp(argv[i], "nfold=", 6) == 0) nfold = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "osub=", 5) == 0) osub = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "w=", 2) == 0) imgw = (int)strtol(argv[i] + 2, NULL, 10);
@@ -327,6 +329,7 @@ int main(int argc, char **argv) {
     lc.maxlev = 9;
     lc.radmul = 4.0;
     lc.base = 1.4142;
+    lc.szmul = szmul;
     if (hz_lod_build_merge(&L, &m, &sg, &ps, &lc) != 0) {
       fprintf(stderr, "отказ лестницы\n");
       return 1;
@@ -484,8 +487,8 @@ int main(int argc, char **argv) {
       /* Размер элемента — корень из площади: ровно та величина, которую обязан
        * разрешать шаг растра. Оболочка `s` берёт `h_s = h·2^s`, поэтому элемент
        * попадает в ту, где `h_s` впервые не крупнее его самого. */
-      double d = sqrt(ps.p[k].area);
-      int s = (d > h) ? (int)floor(log(d / h) / log(2.0)) : 0;
+      double dsz = sqrt(ps.p[k].area);
+      int s = (dsz > h) ? (int)floor(log(dsz / h) / log(2.0)) : 0;
       if (s < 0) s = 0;
       if (s >= KMAX) s = KMAX - 1;
       sh[k] = s;
@@ -514,9 +517,9 @@ int main(int argc, char **argv) {
       /* Пиксели — по НАИБОЛЬШЕЙ проекции габарита оболочки: экран каждого
        * направления не крупнее её. Оценка сверху, и она честная. */
       double e0 = hi[0] - lo[0], e1 = hi[1] - lo[1], e2 = hi[2] - lo[2];
-      double d1 = (e0 > e1) ? e0 : e1,
-             d2 = (e2 > ((e0 < e1) ? e0 : e1)) ? e2 : ((e0 < e1) ? e0 : e1);
-      double px = (d1 / hk + 2.0) * (d2 / hk + 2.0);
+      double q1 = (e0 > e1) ? e0 : e1,
+             q2 = (e2 > ((e0 < e1) ? e0 : e1)) ? e2 : ((e0 < e1) ? e0 : e1);
+      double px = (q1 / hk + 2.0) * (q2 / hk + 2.0);
       /* Сколько полигонов рисуется в этот экран: те, чья опорная точка попала в
        * габарит оболочки, растянутый вдоль всех осей (заслонители приходят
        * отовсюду вдоль `ω`, поэтому берётся полный габарит сцены по одной оси). */
@@ -536,9 +539,9 @@ int main(int argc, char **argv) {
     double now_px = 0.0;
     {
       double e0 = m.hi[0] - m.lo[0], e1 = m.hi[1] - m.lo[1], e2 = m.hi[2] - m.lo[2];
-      double d1 = (e0 > e1) ? e0 : e1,
-             d2 = (e2 > ((e0 < e1) ? e0 : e1)) ? e2 : ((e0 < e1) ? e0 : e1);
-      now_px = (d1 / h + 2.0) * (d2 / h + 2.0);
+      double q1 = (e0 > e1) ? e0 : e1,
+             q2 = (e2 > ((e0 < e1) ? e0 : e1)) ? e2 : ((e0 < e1) ? e0 : e1);
+      now_px = (q1 / h + 2.0) * (q2 / h + 2.0);
     }
     printf("== ИТОГ: пикселей по оболочкам %.0f против %.0f сейчас — **%.2f×**; "
            "полигонов рисуется суммарно %.0f против %d, избыточность %.2f\n",

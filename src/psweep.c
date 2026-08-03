@@ -90,6 +90,118 @@ static int solve3s(double A[3][3], double b[3]) {
   return 0;
 }
 
+/* --- §148: ФРОНТ С ШИРИНОЙ -------------------------------------------------- */
+
+/* Приёмник берёт излучённый радианс не в своей точке, а СРЕДНИЙ по кружку
+ * радиуса rho = theta*dd/h — это и есть угловая ширина фронта, переведённая в
+ * поперечное расплывание (А320). Три числа взяты из замеров §146/§147, а не
+ * назначены: слоёв пятнадцать (покрытие 90 % глубинной сложности, медиана 7),
+ * таблица огрублена вчетверо по стороне (медиана rho — одна клетка, p90 —
+ * шестнадцать, крупным радиусам мелкая таблица не нужна), а ниже двух клеток
+ * фильтр не зовётся вовсе (59 % переносов, и там расплывание меньше клетки). */
+
+typedef struct {
+  int32_t Wc, Hc;
+  double *sum; /* HZ_BLUR_LAYERS * Wc*Hc, интегральные таблицы */
+  double *cnt;
+} hz_blur;
+
+static void blur_free(hz_blur *B) {
+  free(B->sum);
+  free(B->cnt);
+  B->sum = NULL;
+  B->cnt = NULL;
+}
+
+/* Строится ОДНИМ проходом по фрагментам, а не пятнадцатью по кадру: иначе
+ * построение стоило бы дороже самой редукции (А330). */
+static int blur_build(hz_blur *B, hz_ptrans *t, const hz_pview *v, const double *nwt,
+                      const hz_fbuf *fb) {
+  B->Wc = (fb->W + (1 << HZ_BLUR_SHIFT) - 1) >> HZ_BLUR_SHIFT;
+  B->Hc = (fb->H + (1 << HZ_BLUR_SHIFT) - 1) >> HZ_BLUR_SHIFT;
+  size_t nc = (size_t)B->Wc * (size_t)B->Hc;
+  B->sum = calloc(nc * HZ_BLUR_LAYERS, sizeof *B->sum);
+  B->cnt = calloc(nc * HZ_BLUR_LAYERS, sizeof *B->cnt);
+  if (B->sum == NULL || B->cnt == NULL) {
+    blur_free(B);
+    return 1;
+  }
+  for (int32_t j = 0; j < fb->H; j++) {
+    double r[3];
+    hz_pview_origin(v, 0, j, r);
+    int64_t base = (int64_t)j * fb->W;
+    int32_t jc = j >> HZ_BLUR_SHIFT;
+    for (int32_t i = 0; i < fb->W; i++) {
+      int32_t b = fb->start[base + i], e = fb->start[base + i + 1];
+      int32_t nl = e - b;
+      if (nl > HZ_BLUR_LAYERS) nl = HZ_BLUR_LAYERS;
+      size_t cc = (size_t)jc * (size_t)B->Wc + (size_t)(i >> HZ_BLUR_SHIFT);
+      for (int32_t l = 0; l < nl; l++) {
+        int32_t k = fb->poly[b + l];
+        size_t o0 = (size_t)l * nc + cc;
+        /* СЧИТАЮТСЯ ВСЕ фрагменты слоя, а светят только лицевые. Иначе среднее
+         * в тени бралось бы по единственному найденному излучателю, и тень
+         * пропала бы вовсе — ложный ноль наоборот. */
+        B->cnt[o0] += 1.0;
+        if (nwt[k] <= 0.0) continue; /* изнанка вдоль omega заслоняет */
+        const hz_poly *P = &t->ps->p[k];
+        double q[3];
+        for (int a = 0; a < 3; a++)
+          q[a] = r[a] + fb->depth[b + l] * v->w[a] - P->org[a];
+        double u = q[0] * P->eu[0] + q[1] * P->eu[1] + q[2] * P->eu[2];
+        double vv = q[0] * P->ev[0] + q[1] * P->ev[1] + q[2] * P->ev[2];
+        B->sum[o0] += hz_ptrans_lout(t, k, u, vv);
+      }
+      for (int a = 0; a < 3; a++)
+        r[a] += v->h * v->ea[a];
+    }
+  }
+  /* Префиксные суммы по слою: чтение кружка любого радиуса — четыре обращения. */
+  for (int32_t l = 0; l < HZ_BLUR_LAYERS; l++) {
+    double *S = B->sum + (size_t)l * nc, *C = B->cnt + (size_t)l * nc;
+    for (int32_t jj = 0; jj < B->Hc; jj++) {
+      double rs = 0.0, rc2 = 0.0;
+      for (int32_t ii = 0; ii < B->Wc; ii++) {
+        size_t o = (size_t)jj * (size_t)B->Wc + (size_t)ii;
+        rs += S[o];
+        rc2 += C[o];
+        S[o] = rs + (jj > 0 ? S[o - (size_t)B->Wc] : 0.0);
+        C[o] = rc2 + (jj > 0 ? C[o - (size_t)B->Wc] : 0.0);
+      }
+    }
+  }
+  return 0;
+}
+
+/* -1 — в кружке нет ни одного излучателя, звать точечное чтение. */
+static double blur_read(const hz_blur *B, int32_t l, int32_t i, int32_t j, double rho) {
+  if (l >= HZ_BLUR_LAYERS) return -1.0;
+  size_t nc = (size_t)B->Wc * (size_t)B->Hc;
+  const double *S = B->sum + (size_t)l * nc, *C = B->cnt + (size_t)l * nc;
+  int32_t rc = (int32_t)rho >> HZ_BLUR_SHIFT;
+  int32_t ic = i >> HZ_BLUR_SHIFT, jc = j >> HZ_BLUR_SHIFT;
+  int32_t i0 = ic - rc - 1, i1 = ic + rc, j0 = jc - rc - 1, j1 = jc + rc;
+  if (i1 >= B->Wc) i1 = B->Wc - 1;
+  if (j1 >= B->Hc) j1 = B->Hc - 1;
+  if (i0 < -1) i0 = -1;
+  if (j0 < -1) j0 = -1;
+  double s = S[(size_t)j1 * (size_t)B->Wc + (size_t)i1],
+         cn = C[(size_t)j1 * (size_t)B->Wc + (size_t)i1];
+  if (i0 >= 0) {
+    s -= S[(size_t)j1 * (size_t)B->Wc + (size_t)i0];
+    cn -= C[(size_t)j1 * (size_t)B->Wc + (size_t)i0];
+  }
+  if (j0 >= 0) {
+    s -= S[(size_t)j0 * (size_t)B->Wc + (size_t)i1];
+    cn -= C[(size_t)j0 * (size_t)B->Wc + (size_t)i1];
+  }
+  if (i0 >= 0 && j0 >= 0) {
+    s += S[(size_t)j0 * (size_t)B->Wc + (size_t)i0];
+    cn += C[(size_t)j0 * (size_t)B->Wc + (size_t)i0];
+  }
+  return cn > 0.0 ? s / cn : -1.0;
+}
+
 /* --- ОДИН ФРАГМЕНТ: физика пары «излучатель -> приёмник» ---------------------
  *
  * Вынесено отдельно ровно потому, что редукция существует в ДВУХ раскладках
@@ -102,6 +214,7 @@ static int solve3s(double A[3][3], double b[3]) {
 static inline void frag_step(hz_ptrans *t, const hz_pview *v, const double *nwt, double wq,
                              double h2, double Lsky, double *acc, const double r[3], int32_t k,
                              double depth, int32_t *pk, double *pu, double *pv, double *pd,
+                             const hz_blur *B, int32_t px, int32_t py, int32_t lay,
                              int64_t *npair) {
   const hz_poly *P = &t->ps->p[k];
   /* `n·ω` НЕ пересчитывается на фрагмент: оно зависит только от (полигон,
@@ -122,6 +235,16 @@ static inline void frag_step(hz_ptrans *t, const hz_pview *v, const double *nwt,
       /* Излучает вдоль ω только лицевая сторона; изнанка ЗАСЛОНЯЕТ, и это и
        * есть тень — вычисленная, а не взятая из таблицы видимости. */
       L = (nwt[*pk] > 0.0) ? hz_ptrans_lout(t, *pk, *pu, *pv) : 0.0;
+      /* §148: ФРОНТ С ШИРИНОЙ. Радиус берётся из пройденного расстояния, и
+       * читается он ТАКЖЕ В ТЕНИ (nwt <= 0): именно там кромка и размывается,
+       * иначе правка была бы косметикой на освещённой стороне. */
+      if (B != NULL && t->blur_theta > 0.0 && lay > 0) {
+        double rho = t->blur_theta * (depth - *pd) / v->h;
+        if (rho >= HZ_BLUR_RMIN) {
+          double Lb = blur_read(B, lay - 1, px, py, rho);
+          if (Lb >= 0.0) L = Lb;
+        }
+      }
     }
     if (L > 0.0) {
       if (t->diag_theta > 0.0 && t->diag_hist != NULL && *pk >= 0) {
@@ -181,6 +304,10 @@ static void reduce_fbuf(hz_ptrans *t, const hz_pview *v, const double *nwt, cons
       t->diag_depth[bn]++;
     }
   }
+  hz_blur B;
+  memset(&B, 0, sizeof B);
+  const hz_blur *Bp = NULL;
+  if (t->blur_theta > 0.0 && blur_build(&B, t, v, nwt, fb) == 0) Bp = &B;
   for (int32_t j = 0; j < fb->H; j++) {
     double r[3];
     hz_pview_origin(v, 0, j, r);
@@ -192,12 +319,13 @@ static void reduce_fbuf(hz_ptrans *t, const hz_pview *v, const double *nwt, cons
         double pu = 0.0, pv = 0.0, pd = 0.0;
         for (int32_t f = b; f < e; f++)
           frag_step(t, v, nwt, wq, h2, Lsky, acc, r, fb->poly[f], fb->depth[f], &pk, &pu, &pv, &pd,
-                    &st->npair);
+                    Bp, i, j, f - b, &st->npair);
       }
       for (int a = 0; a < 3; a++)
         r[a] += v->h * v->ea[a];
     }
   }
+  blur_free(&B);
 }
 
 /* --- редукция, раскладка ОДНОСВЯЗНЫХ СПИСКОВ -------------------------------- */
@@ -215,7 +343,7 @@ static void reduce_abuf(hz_ptrans *t, const hz_pview *v, const double *nwt, cons
       double pu = 0.0, pv = 0.0, pd = 0.0;
       while (f >= 0) {
         frag_step(t, v, nwt, wq, h2, Lsky, acc, r, ab->poly[f], ab->depth[f], &pk, &pu, &pv, &pd,
-                  &st->npair);
+                  NULL, i, j, 0, &st->npair);
         f = ab->next[f];
       }
       for (int a = 0; a < 3; a++)

@@ -91,6 +91,8 @@ typedef struct {
    * `ρ = θ·Δd/h` в клетках растра. Если медиана ниже единицы, фильтр вырождается
    * в тождество, и «механизм не работает» будет неотличимо от «не проверено».
    * `diag_theta` — половинный угол корзины `sqrt(4/N_D)` (А324); 0 — выключено. */
+  /* §148: половинный угол корзины для ФИЛЬТРА; 0 — фильтр выключен. */
+  double blur_theta;
   double diag_theta;
   int64_t *diag_depth; /* HZ_PSW_RHOBINS корзин по длине цепочки фрагментов */
   int64_t *diag_hist;  /* HZ_PSW_RHOBINS корзин по удвоению ρ */
@@ -98,6 +100,10 @@ typedef struct {
 
 /* Границы корзин: 0.25 0.5 1 2 4 8 16 32 и «свыше». */
 #define HZ_PSW_RHOBINS 9
+
+#define HZ_BLUR_LAYERS 15
+#define HZ_BLUR_SHIFT 2
+#define HZ_BLUR_RMIN 2.0
 
 /* Альбедо берётся из материалов входа (`Kd`, один канал); Le обнуляется. */
 int hz_ptrans_init(hz_ptrans *t, const hz_polyset *ps, const hz_objmesh *m);

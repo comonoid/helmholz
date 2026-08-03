@@ -245,6 +245,7 @@ int main(int argc, char **argv) {
   int link1 = 0;                          /* §137 З1: связность направлений по парам */
   int sunmode = 0;                        /* §137 З3: 1 — отдельный проход, 2 — на ординату */
   int sunord = -1;
+  int blur = 0;                                                 /* §148: фронт с шириной */
   int diag = 0; /* §145 А326: распределение радиуса размытия */ /* §142 нег. контроль: солнце ТОЧНО
                                                                    на ординату */
   int slots = 0, slots1 = 0; /* §137 З2: заменять вклад ячейки; `slots1` — НК */
@@ -276,6 +277,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "link1") == 0) link1 = 1;
     if (strncmp(argv[i], "sun=", 4) == 0) sunmode = (int)strtol(argv[i] + 4, NULL, 10);
     if (strcmp(argv[i], "diag") == 0) diag = 1;
+    if (strcmp(argv[i], "blur") == 0) blur = 1;
     if (strncmp(argv[i], "sunord=", 7) == 0) sunord = (int)strtol(argv[i] + 7, NULL, 10);
     if (strcmp(argv[i], "slots") == 0) slots = 1;
     if (strcmp(argv[i], "slots1") == 0) {
@@ -802,6 +804,13 @@ int main(int argc, char **argv) {
    * на направление Omega = 4*pi/N_D, отсюда theta = sqrt(Omega/pi) = sqrt(4/N_D).
    * Не sqrt(4*pi/N_D): то диаметр, а множитель два в радиусе размытия — не
    * мелочь. При N_D = 64 выходит 0.250 рад = 14.3°. */
+  if (blur) {
+    tr.blur_theta = sqrt(4.0 / (double)d.n);
+    printf("== ФРОНТ С ШИРИНОЙ: theta = %.4f рад (%.2f град), слоёв %d, огрубление %dx, порог %.1f "
+           "клетки\n",
+           tr.blur_theta, tr.blur_theta * 180.0 / M_PI, HZ_BLUR_LAYERS, 1 << HZ_BLUR_SHIFT,
+           HZ_BLUR_RMIN);
+  }
   int64_t rhist[HZ_PSW_RHOBINS], dhist[HZ_PSW_RHOBINS];
   if (diag) {
     memset(rhist, 0, sizeof rhist);

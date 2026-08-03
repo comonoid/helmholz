@@ -442,6 +442,179 @@ static void psil_group_stat(const int32_t *const *S, const int64_t *n, int keff,
   o->zero = (np > 0) ? (double)nz / (double)np : 0.0;
 }
 
+/* ---- УГЛОВОЕ ОГРУБЛЕНИЕ КОНТУРА (§162, шаг О54) --------------------------
+ *
+ * Из множества рёбер строятся СВЯЗНЫЕ ЦЕПИ (общая вершина, разрез в вершинах
+ * степени ≠ 2), и каждая упрощается по Дугласу — Пекеру с ПЕРЕМЕННЫМ допуском
+ * `w(v) = α·(|v − центр| − R_блока)`: вершина выбрасывается, если отстоит от
+ * хорды меньше собственной полутени. Допуск берётся по БЛИЖАЙШЕМУ возможному
+ * приёмнику блока, а не по центру (А370) — иначе на ближних октавах он вдвое
+ * велик. Нового параметра здесь нет: `α` тот же, что отбирает рёбра. */
+typedef struct {
+  int32_t *ord;   /* рёбра объединения в порядке обхода цепей */
+  int32_t *coff;  /* nchord+1 границ хорд в `ord` */
+  int32_t *voct;  /* октава хорды (от центра блока) */
+  int64_t nchord; /* хорд после упрощения */
+  int64_t nchain; /* связных цепей — потолок при допуске ∞ */
+  int64_t ncollapse;
+  double nwalk; /* рёбер пройдено обходом — обязано совпасть с |U| (разбиение) */
+} psil_contour;
+
+static void psil_contour_build(psil_contour *C, const int32_t *ue, int64_t nu, const int32_t *ea,
+                               const int32_t *eb, const double *v, const double cen[3], double rblk,
+                               double alpha, int32_t *hkey, int32_t *hhead, int32_t *hnxt,
+                               int64_t hcap, int32_t *vseq, unsigned char *keep, int32_t *stk) {
+  C->nchord = C->nchain = C->ncollapse = 0;
+  C->nwalk = 0.0;
+  if (nu <= 0) return;
+  for (int64_t i = 0; i < hcap; i++)
+    hkey[i] = -1;
+  /* вершина -> список концов рёбер (2·i + j) */
+  for (int64_t i = 0; i < nu; i++)
+    for (int j = 0; j < 2; j++) {
+      int32_t vv = (j == 0) ? ea[ue[i]] : eb[ue[i]];
+      uint64_t h = (uint64_t)(uint32_t)vv * 0x9E3779B97F4A7C15ULL;
+      int64_t s = (int64_t)(h >> 40) & (hcap - 1);
+      while (hkey[s] >= 0 && hkey[s] != vv)
+        s = (s + 1) & (hcap - 1);
+      if (hkey[s] < 0) {
+        hkey[s] = vv;
+        hhead[s] = -1;
+      }
+      hnxt[2 * i + j] = hhead[s];
+      hhead[s] = (int32_t)(2 * i + j);
+    }
+  unsigned char *used = keep + nu + 1; /* хвост общего буфера: nu байт */
+  for (int64_t i = 0; i < nu; i++)
+    used[i] = 0;
+  int64_t nord = 0;
+  /* Обход: сначала от вершин степени ≠ 2 (концы и ветвления, А372), затем
+   * оставшиеся замкнутые циклы. */
+  for (int pass = 0; pass < 2; pass++) {
+    for (int64_t i0 = 0; i0 < nu; i0++) {
+      for (int j0 = 0; j0 < 2; j0++) {
+        if (used[i0]) continue;
+        int32_t vstart = (j0 == 0) ? ea[ue[i0]] : eb[ue[i0]];
+        if (pass == 0) {
+          /* степень стартовой вершины */
+          uint64_t h = (uint64_t)(uint32_t)vstart * 0x9E3779B97F4A7C15ULL;
+          int64_t s = (int64_t)(h >> 40) & (hcap - 1);
+          while (hkey[s] >= 0 && hkey[s] != vstart)
+            s = (s + 1) & (hcap - 1);
+          int deg = 0;
+          for (int32_t p = hhead[s]; p >= 0; p = hnxt[p])
+            deg++;
+          if (deg == 2) continue;
+        }
+        /* пройти цепь */
+        int64_t vn = 0, e0 = nord;
+        vseq[vn++] = vstart;
+        int64_t ce = i0;
+        int32_t cv = vstart;
+        for (;;) {
+          used[ce] = 1;
+          C->ord[nord++] = ue[ce];
+          int32_t nv = (ea[ue[ce]] == cv) ? eb[ue[ce]] : ea[ue[ce]];
+          vseq[vn++] = nv;
+          uint64_t h = (uint64_t)(uint32_t)nv * 0x9E3779B97F4A7C15ULL;
+          int64_t s = (int64_t)(h >> 40) & (hcap - 1);
+          while (hkey[s] >= 0 && hkey[s] != nv)
+            s = (s + 1) & (hcap - 1);
+          int deg = 0;
+          int64_t nxt = -1;
+          for (int32_t p = hhead[s]; p >= 0; p = hnxt[p]) {
+            deg++;
+            int64_t ei = p >> 1;
+            if (ei != ce && !used[ei]) nxt = ei;
+          }
+          if (deg != 2 || nxt < 0) break;
+          ce = nxt;
+          cv = nv;
+        }
+        C->nchain++;
+        /* Дуглас — Пекер с переменным допуском, итеративно. */
+        for (int64_t i = 0; i < vn; i++)
+          keep[i] = 0;
+        keep[0] = 1;
+        keep[vn - 1] = 1;
+        int64_t sp = 0;
+        stk[sp++] = 0;
+        stk[sp++] = (int32_t)(vn - 1);
+        while (sp > 0) {
+          int32_t hi = stk[--sp], lo = stk[--sp];
+          if (hi <= lo + 1) continue;
+          const double *pa = v + 3 * (size_t)vseq[lo], *pb = v + 3 * (size_t)vseq[hi];
+          double ab[3], la = 0.0;
+          for (int a = 0; a < 3; a++) {
+            ab[a] = pb[a] - pa[a];
+            la += ab[a] * ab[a];
+          }
+          la = sqrt(la);
+          double worst = 0.0;
+          int32_t wi = -1;
+          for (int32_t t = lo + 1; t < hi; t++) {
+            const double *pt = v + 3 * (size_t)vseq[t];
+            double ap[3], cr[3], dist;
+            for (int a = 0; a < 3; a++)
+              ap[a] = pt[a] - pa[a];
+            if (la > 0.0) {
+              cr[0] = ap[1] * ab[2] - ap[2] * ab[1];
+              cr[1] = ap[2] * ab[0] - ap[0] * ab[2];
+              cr[2] = ap[0] * ab[1] - ap[1] * ab[0];
+              dist = sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]) / la;
+            } else {
+              dist = sqrt(ap[0] * ap[0] + ap[1] * ap[1] + ap[2] * ap[2]);
+            }
+            double dc = 0.0;
+            for (int a = 0; a < 3; a++) {
+              double w2 = pt[a] - cen[a];
+              dc += w2 * w2;
+            }
+            double tol = alpha * (sqrt(dc) - rblk);
+            if (tol < 0.0) tol = 0.0;
+            double ex = dist - tol;
+            if (ex > worst) {
+              worst = ex;
+              wi = t;
+            }
+          }
+          if (wi < 0) continue; /* вся ломаная внутри полутени — хорда одна */
+          keep[wi] = 1;
+          stk[sp++] = lo;
+          stk[sp++] = wi;
+          stk[sp++] = wi;
+          stk[sp++] = hi;
+        }
+        /* хорды: между соседними оставленными вершинами */
+        int64_t prev = 0;
+        for (int64_t t = 1; t < vn; t++) {
+          if (!keep[t]) continue;
+          C->coff[C->nchord] = (int32_t)(e0 + prev);
+          const double *pa = v + 3 * (size_t)vseq[prev], *pb = v + 3 * (size_t)vseq[t];
+          double dc = 0.0, ln = 0.0;
+          for (int a = 0; a < 3; a++) {
+            double mid = 0.5 * (pa[a] + pb[a]) - cen[a];
+            dc += mid * mid;
+            ln += (pb[a] - pa[a]) * (pb[a] - pa[a]);
+          }
+          int kk = (dc > 0.0) ? ilogb(sqrt(dc)) - PSIL_KMIN : 0;
+          if (kk < 0) kk = 0;
+          if (kk >= PSIL_NBIN) kk = PSIL_NBIN - 1;
+          C->voct[C->nchord] = kk;
+          /* А371: цепь, схлопнувшаяся в точку, — предмет тоньше полутени.
+           * Физически законно, но обязано быть посчитано, а не случиться
+           * молча. */
+          if (sqrt(ln) <= 0.0) C->ncollapse++;
+          C->nchord++;
+          prev = t;
+        }
+        C->nwalk += (double)(vn - 1);
+      }
+    }
+  }
+  C->coff[C->nchord] = (int32_t)nord;
+}
+
 static int32_t psil_find(int32_t *uf, int32_t x) {
   while (uf[x] != x) {
     uf[x] = uf[uf[x]];
@@ -890,7 +1063,9 @@ int main(int argc, char **argv) {
   int32_t **vset = calloc((size_t)nrecv, sizeof *vset);
   unsigned char **voct = calloc((size_t)nrecv, sizeof *voct);
   int64_t *vsn = calloc((size_t)nrecv, sizeof *vsn);
-  if (vset == NULL || vsn == NULL || voct == NULL) return 2;
+  int32_t **aset = calloc((size_t)nrecv, sizeof *aset);
+  int64_t *asn = calloc((size_t)nrecv, sizeof *asn);
+  if (vset == NULL || vsn == NULL || voct == NULL || aset == NULL || asn == NULL) return 2;
   if (tot == NULL || srv == NULL || totnm == NULL || srvnm == NULL || nskip == NULL ||
       vis == NULL || seg == NULL || vseg == NULL || vmhist == NULL || chmax == NULL || novf == NULL)
     return 2;
@@ -1051,6 +1226,17 @@ int main(int argc, char **argv) {
            * общность между соседями и меряет О52. Рёбра, а не сегменты: индекс
            * ребра глобален, а сегмент у разных приёмников кроится по-разному
            * (А355). */
+          /* §162: ВТОРОЙ набор — выжившие силуэтные рёбра ДО фильтра видимости.
+           * Заведён потому, что видимое объединение оказалось РВАНЫМ: фильтр
+           * режет силуэтную кривую, и огрублять в нём нечего. Силуэт же связен
+           * по построению. */
+          if (clust && !onlyvis && q == PSIL_Q_MAIN && n > 0) {
+            aset[r] = malloc((size_t)n * sizeof **aset);
+            if (aset[r] != NULL) {
+              memcpy(aset[r], lstI, (size_t)n * sizeof **aset);
+              asn[r] = n;
+            }
+          }
           if (clust && onlyvis && q == PSIL_Q_MAIN && n > 0) {
             vset[r] = malloc((size_t)n * sizeof **vset);
             voct[r] = malloc((size_t)n);
@@ -1444,6 +1630,177 @@ int main(int argc, char **argv) {
       printf("   ЛИЧНАЯ ЧАСТЬ (ближе 8 м): %.1f рёбер на приёмник; ОБЩАЯ (дальше): %.1f\n", nearsum,
              farsum);
     }
+
+    /* ---- УГЛОВОЕ ОГРУБЛЕНИЕ КОНТУРА (§162, шаг О54) ----------------------- */
+    for (int ri = 0; ri < PSIL_CL_NR; ri++) {
+      double R = PSIL_CL_R[ri];
+      if (!(R > 1.9 && R < 2.1)) continue; /* рабочий радиус §158 */
+      for (int which = 0; which < 2; which++) {
+        /* which = 0 — ВИДИМОЕ объединение (то, что фильтрует приёмник по §158);
+         * which = 1 — ВЫЖИВШИЕ силуэты ДО фильтра видимости: кривая там связна по
+         * построению, и огрублять есть что. Чистота хорды в ОБОИХ случаях
+         * считается против ВИДИМОГО множества приёмника — вопрос один и тот же:
+         * решается ли хорда одной проверкой. */
+        int32_t **SET = which ? aset : vset;
+        int64_t *SETN = which ? asn : vsn;
+        printf("\n== УГЛОВОЕ ОГРУБЛЕНИЕ %s (радиус %.1f м, α = %.2f°)\n",
+               which == 0 ? "ВИДИМОГО объединения блока" : "СИЛУЭТА блока (ДО видимости)", R,
+               PSIL_ALPHA_DEG[PSIL_Q_MAIN]);
+        double sU = 0.0, sCh[3] = {0.0, 0.0, 0.0}, sChain = 0.0, sColl = 0.0, sPart = 0.0;
+        double sPure = 0.0, sMix = 0.0, sVis = 0.0;
+        double octE[PSIL_NBIN], octC[PSIL_NBIN];
+        for (int k = 0; k < PSIL_NBIN; k++) {
+          octE[k] = 0.0;
+          octC[k] = 0.0;
+        }
+        int ncl = 0;
+        for (int ci = 0; ci < PSIL_CL_NC; ci++) {
+          int base = ((ri * PSIL_CL_NC) + ci) * PSIL_CL_K;
+          int keff = clk[(ri * PSIL_CL_NC) + ci];
+          /* объединение блока, отсортированное и без повторов */
+          int64_t nk = 0;
+          for (int j = 0; j < keff; j++)
+            for (int64_t i = 0; i < SETN[base + j] && nk < keycap; i++)
+              key[nk++] = SET[base + j][i];
+          if (nk == 0) continue;
+          qsort(key, (size_t)nk, sizeof *key, cmp_i64);
+          int64_t nu = 0;
+          for (int64_t i = 0; i < nk; i++)
+            if (i == 0 || key[i] != key[i - 1]) sub[nu++] = (int32_t)key[i];
+          const double *cen = rcen + (size_t)base * 3;
+          int64_t hcap2 = 16;
+          while (hcap2 < 4 * (nu + 1))
+            hcap2 <<= 1;
+          psil_contour C;
+          C.ord = malloc((size_t)nu * sizeof *C.ord);
+          C.coff = malloc((size_t)(nu + 2) * sizeof *C.coff);
+          C.voct = malloc((size_t)(nu + 2) * sizeof *C.voct);
+          int32_t *hk = malloc((size_t)hcap2 * sizeof *hk);
+          int32_t *hh = malloc((size_t)hcap2 * sizeof *hh);
+          int32_t *hn = malloc((size_t)(2 * nu) * sizeof *hn);
+          int32_t *vq = malloc((size_t)(nu + 2) * sizeof *vq);
+          unsigned char *kp = malloc((size_t)(2 * nu + 4));
+          int32_t *stk = malloc((size_t)(4 * nu + 16) * sizeof *stk);
+          if (C.ord == NULL || C.coff == NULL || C.voct == NULL || hk == NULL || hh == NULL ||
+              hn == NULL || vq == NULL || kp == NULL || stk == NULL) {
+            free(stk);
+            free(kp);
+            free(vq);
+            free(hn);
+            free(hh);
+            free(hk);
+            free(C.voct);
+            free(C.coff);
+            free(C.ord);
+            return 2;
+          }
+          /* Три допуска: 0 (регрессия), α (рабочий), ∞ (потолок связности, А372). */
+          double tolv[3] = {0.0, PSIL_ALPHA_DEG[PSIL_Q_MAIN] * M_PI / 180.0, 1.0e9};
+          for (int tv = 0; tv < 3; tv++) {
+            psil_contour_build(&C, sub, nu, ea, eb, m.v, cen, R, tolv[tv], hk, hh, hn, hcap2, vq,
+                               kp, stk);
+            sCh[tv] += (double)C.nchord;
+            if (tv == 1) {
+              sChain += (double)C.nchain;
+              sColl += (double)C.ncollapse;
+              sPart += C.nwalk;
+              for (int64_t c = 0; c < C.nchord; c++)
+                octC[C.voct[c]] += 1.0;
+              /* ЧИСТОТА ХОРДЫ: у приёмника все её рёбра видимы, все невидимы или
+               * смешанно. Без этого «одна проверка на хорду» есть допущение. */
+              for (int j = 0; j < keff; j++) {
+                if (vsn[base + j] == 0) continue;
+                for (int64_t i = 0; i < nu; i++)
+                  kp[i] = 0;
+                int64_t ia = 0, ib = 0;
+                while (ia < nu && ib < vsn[base + j]) {
+                  if (sub[ia] == vset[base + j][ib]) {
+                    kp[ia] = 1;
+                    ia++;
+                    ib++;
+                  } else if (sub[ia] < vset[base + j][ib])
+                    ia++;
+                  else
+                    ib++;
+                }
+                for (int64_t c = 0; c < C.nchord; c++) {
+                  int64_t f = 0, tt = 0;
+                  for (int32_t p = C.coff[c]; p < C.coff[c + 1]; p++) {
+                    /* позиция ребра `C.ord[p]` в `sub` — бинарным поиском */
+                    int64_t lo2 = 0, hi2 = nu - 1, pos = -1;
+                    while (lo2 <= hi2) {
+                      int64_t mid = (lo2 + hi2) / 2;
+                      if (sub[mid] == C.ord[p]) {
+                        pos = mid;
+                        break;
+                      }
+                      if (sub[mid] < C.ord[p])
+                        lo2 = mid + 1;
+                      else
+                        hi2 = mid - 1;
+                    }
+                    tt++;
+                    if (pos >= 0 && kp[pos]) f++;
+                  }
+                  if (f == 0) continue;
+                  if (f == tt)
+                    sPure += 1.0;
+                  else
+                    sMix += 1.0;
+                  sVis += 1.0;
+                }
+              }
+            }
+          }
+          for (int64_t i = 0; i < nu; i++) {
+            const double *va = m.v + 3 * (size_t)ea[sub[i]];
+            const double *vb = m.v + 3 * (size_t)eb[sub[i]];
+            double dc = 0.0;
+            for (int a = 0; a < 3; a++) {
+              double w2 = 0.5 * (va[a] + vb[a]) - cen[a];
+              dc += w2 * w2;
+            }
+            int kk = (dc > 0.0) ? ilogb(sqrt(dc)) - PSIL_KMIN : 0;
+            if (kk < 0) kk = 0;
+            if (kk >= PSIL_NBIN) kk = PSIL_NBIN - 1;
+            octE[kk] += 1.0;
+          }
+          sU += (double)nu;
+          ncl++;
+          free(stk);
+          free(kp);
+          free(vq);
+          free(hn);
+          free(hh);
+          free(hk);
+          free(C.voct);
+          free(C.coff);
+          free(C.ord);
+        }
+        if (ncl == 0) continue;
+        printf("   объединение блока: %.1f рёбер -> %.1f хорд при допуске α·d "
+               "(множитель %.2f)\n",
+               sU / ncl, sCh[1] / ncl, (sCh[1] > 0.0) ? sU / sCh[1] : 0.0);
+        printf("   допуск 0 (регрессия): %.1f хорд; допуск ∞ (ПОТОЛОК связности, А372): %.1f "
+               "цепей; схлопнулось в точку: %.1f\n",
+               sCh[0] / ncl, sCh[2] / ncl, sColl / ncl);
+        printf("   разбиение (А-проверка): пройдено %.1f рёбер против |U| = %.1f — %s\n",
+               sPart / ncl, sU / ncl, (fabs(sPart - sU) < 1e-9) ? "СОВПАЛО" : "РАЗОШЛОСЬ");
+        printf(
+            "   ЧИСТОТА (А343 для хорд): видимых приёмнику хорд %.0f, из них СМЕШАННЫХ %.1f %%\n",
+            sVis / ncl, (sVis > 0.0) ? 100.0 * sMix / sVis : 0.0);
+        printf("   окт | рёбер_k | хорд_k | множитель |\n");
+        for (int k = 0; k < PSIL_NBIN; k++) {
+          if (octE[k] <= 0.0) continue;
+          printf("   %3d | %7.1f | %6.1f | %9.2f |\n", k + PSIL_KMIN, octE[k] / ncl, octC[k] / ncl,
+                 (octC[k] > 0.0) ? octE[k] / octC[k] : 0.0);
+        }
+        double chords = sCh[1] / ncl;
+        printf("   АРИФМЕТИКА КАДРА: 446013 приёмников × %.1f хорд = %.2e операций против бюджета "
+               "2.6e8 — приёмка §162 (≤ 580): %s\n",
+               chords, 446013.0 * chords, (chords <= 580.0) ? "ДА" : "НЕТ");
+      }
+    }
     /* Регрессия К=1 (§156): объединение группы из ОДНОГО приёмника обязано
      * совпасть с его множеством, а `A` — быть равным единице ТОЧНО. */
     {
@@ -1467,7 +1824,10 @@ int main(int argc, char **argv) {
   for (int r = 0; r < nrecv; r++) {
     free(vset[r]);
     free(voct[r]);
+    free(aset[r]);
   }
+  free(aset);
+  free(asn);
   free(voct);
   free(vset);
   free(vsn);

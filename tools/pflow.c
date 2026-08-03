@@ -233,6 +233,7 @@ int main(int argc, char **argv) {
   int shells = 0;                         /* §133: замер цены каскада по оболочкам */
   double szmul = 0.0;                     /* §136: второй предел среза, в допусках ε */
   int link1 = 0;                          /* §137 З1: связность направлений по парам */
+  int sunmode = 0;                        /* §137 З3: 1 — отдельный проход, 2 — на ординату */
   int slots = 0, slots1 = 0;              /* §137 З2: заменять вклад ячейки; `slots1` — НК */
   /* §128: направлений за шаг свёртки. `0` читается как число потоков OpenMP —
    * иначе параллелизм по направлениям простаивает. */
@@ -260,6 +261,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "shells") == 0) shells = 1;
     if (strncmp(argv[i], "sz=", 3) == 0) szmul = strtod(argv[i] + 3, NULL);
     if (strcmp(argv[i], "link1") == 0) link1 = 1;
+    if (strncmp(argv[i], "sun=", 4) == 0) sunmode = (int)strtol(argv[i] + 4, NULL, 10);
     if (strcmp(argv[i], "slots") == 0) slots = 1;
     if (strcmp(argv[i], "slots1") == 0) {
       slots = 1;
@@ -381,6 +383,27 @@ int main(int argc, char **argv) {
 
   tr3_dirs d;
   if (tr3_dirs_product(&d, nmu, nphi) != 0) return 1;
+  /* З3, способ 2: солнце добавляется к БЛИЖАЙШЕЙ ординате — так поступает всякая
+   * ординатная схема, не выделяющая источник. Вес подобран так, чтобы полный
+   * поток совпал с прямым проходом: `E⊥` есть облучённость площадки поперёк
+   * пучка, а ордината несёт радианс, поэтому делится на её вес. */
+  int sun_ord = -1;
+  if (sunmode == 2) {
+    double sw[3] = HZ_CFG_SUN_DIR;
+    double sn = sqrt(sw[0] * sw[0] + sw[1] * sw[1] + sw[2] * sw[2]);
+    for (int c = 0; c < 3; c++)
+      sw[c] /= sn;
+    double best = -2.0;
+    for (int k = 0; k < d.n; k++) {
+      double dp = d.ox[k] * sw[0] + d.oy[k] * sw[1] + d.oz[k] * sw[2];
+      if (dp > best) {
+        best = dp;
+        sun_ord = k;
+      }
+    }
+    printf("== З3: солнце на ординату %d, угол промаха %.2f°, вес ординаты %.4f\n", sun_ord,
+           acos(best > 1.0 ? 1.0 : best) * 180.0 / M_PI, d.w[sun_ord]);
+  }
   printf("== НАПРАВЛЕНИЙ: %d (nmu %d × nphi %d); шаг растра %.2f м; отскоков %d; ρ %.2f; "
          "небо %.2f\n",
          d.n, nmu, nphi, h, nb, rho, sky);
@@ -809,6 +832,27 @@ int main(int argc, char **argv) {
           tr.acc[q] = s * sc;
         }
       }
+      hz_psweep_solve(&tr, &st);
+    }
+    /* З3 (§137): СОЛНЦЕ ДВУМЯ СПОСОБАМИ.
+     *
+     * `sun=1` — отдельным проходом `hz_psweep_direct`: коллимированный пучок
+     *   идёт по СВОЕМУ направлению, тень выходит той же резкости, что растр.
+     *   Это «источник первого столкновения», и он написан, но не использовался.
+     * `sun=2` — добавлением к ближайшей ординате: то, что делает всякая
+     *   ординатная схема без особого обращения с источником. К23 предсказывает
+     *   тут лучевой эффект — полосы вместо ровной тени.
+     *
+     * Оба кладутся в `acc` ДО решения, между обнулением и подгонкой, поэтому
+     * двойного учёта нет: в развёртке этого источника не существует. */
+    if (sunmode == 1) {
+      double sw[3] = HZ_CFG_SUN_DIR;
+      double sn = sqrt(sw[0] * sw[0] + sw[1] * sw[1] + sw[2] * sw[2]);
+      for (int c = 0; c < 3; c++)
+        sw[c] /= sn;
+      hz_pstats sd;
+      memset(&sd, 0, sizeof sd);
+      if (hz_psweep_direct(&tr, sw, HZ_CFG_SUN_LE, h, &sd) != 0) return 1;
       hz_psweep_solve(&tr, &st);
     }
     double dt = now_s() - tb;

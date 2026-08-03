@@ -290,7 +290,8 @@ static uint64_t cell_hash(int64_t x, int64_t y, int64_t z) {
 }
 
 int main(int argc, char **argv) {
-  int city = 1, do_sun = 1, do_wall = 1, do_pic = 1, rows = PF_ROWS;
+  int city = 1, do_sun = 1, do_wall = 1, do_pic = 1, rows = PF_ROWS, f32 = 0;
+  double quant = 0.0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "hall") == 0) city = 0;
     if (strcmp(argv[i], "city") == 0) city = 1;
@@ -308,6 +309,12 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[i], "nopic") == 0) do_pic = 0;
     if (strncmp(argv[i], "rows=", 5) == 0) rows = (int)strtol(argv[i] + 5, NULL, 10);
+    /* СКОЛЬКО РАЗРЯДОВ НУЖНО ГЕОМЕТРИИ — вопрос замеряемый, а не обсуждаемый.
+     * `f32` округляет вершины до одинарной точности, `quant=X` — до сетки с
+     * шагом `X` метров (то есть к целым числам с этим квантом). Всё остальное
+     * считается как считалось; если ответ не меняется, разрядность лишняя. */
+    if (strcmp(argv[i], "f32") == 0) f32 = 1;
+    if (strncmp(argv[i], "quant=", 6) == 0) quant = strtod(argv[i] + 6, NULL);
   }
   if (rows < 16) rows = 16;
 
@@ -336,6 +343,39 @@ int main(int argc, char **argv) {
     return 1;
   }
   double t_load = now_s() - t_start;
+
+  /* ОГРУБЛЕНИЕ ВЕРШИН — ЗАМЕР ТРЕБОВАНИЯ К РАЗРЯДНОСТИ, а не режим работы.
+   * Округление делается ОДИН раз, сразу после чтения, и дальше весь счёт идёт
+   * прежним `double`: так изолируется вопрос ПРЕДСТАВЛЕНИЯ (сколько разрядов
+   * нужно координате) от вопроса НАКОПЛЕНИЯ (сколько нужно сумме). Это разные
+   * вопросы, и мерить их одним прогоном значило бы не измерить ни одного.
+   * Габарит и коробка пересчитываются, иначе они остались бы от неокруглённых. */
+  if (f32 || quant > 0.0) {
+    for (int32_t i = 0; i < 3 * m.nv; i++) {
+      if (quant > 0.0)
+        m.v[i] = quant * floor(m.v[i] / quant + 0.5);
+      else
+        m.v[i] = (double)(float)m.v[i];
+    }
+    for (int a = 0; a < 3; a++) {
+      m.lo[a] = 1e300;
+      m.hi[a] = -1e300;
+    }
+    for (int32_t i = 0; i < m.nv; i++)
+      for (int a = 0; a < 3; a++) {
+        double c = m.v[3 * (size_t)i + (size_t)a];
+        if (c < m.lo[a]) m.lo[a] = c;
+        if (c > m.hi[a]) m.hi[a] = c;
+      }
+    if (quant > 0.0)
+      printf("== ВЕРШИНЫ ОКРУГЛЕНЫ ДО СЕТКИ %.3g м (целые числа с этим квантом; на габарите "
+             "%.0f м это %.1f разрядов)\n",
+             quant, 655.0, log2(655.0 / quant));
+    else
+      printf("== ВЕРШИНЫ ОКРУГЛЕНЫ ДО ОДИНАРНОЙ ТОЧНОСТИ (float, 24 разряда мантиссы; на "
+             "габарите 655 м это шаг %.2e м)\n",
+             655.0 * 6.0e-8);
+  }
   double ext[3], diag = 0.0;
   for (int a = 0; a < 3; a++) {
     ext[a] = m.hi[a] - m.lo[a];

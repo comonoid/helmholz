@@ -244,8 +244,10 @@ int main(int argc, char **argv) {
   double szmul = 0.0;                     /* §136: второй предел среза, в допусках ε */
   int link1 = 0;                          /* §137 З1: связность направлений по парам */
   int sunmode = 0;                        /* §137 З3: 1 — отдельный проход, 2 — на ординату */
-  int sunord = -1;                        /* §142 нег. контроль: солнце ТОЧНО на ординату */
-  int slots = 0, slots1 = 0;              /* §137 З2: заменять вклад ячейки; `slots1` — НК */
+  int sunord = -1;
+  int diag = 0; /* §145 А326: распределение радиуса размытия */ /* §142 нег. контроль: солнце ТОЧНО
+                                                                   на ординату */
+  int slots = 0, slots1 = 0; /* §137 З2: заменять вклад ячейки; `slots1` — НК */
   /* §128: направлений за шаг свёртки. `0` читается как число потоков OpenMP —
    * иначе параллелизм по направлениям простаивает. */
   int nfold = 0;
@@ -273,6 +275,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "sz=", 3) == 0) szmul = strtod(argv[i] + 3, NULL);
     if (strcmp(argv[i], "link1") == 0) link1 = 1;
     if (strncmp(argv[i], "sun=", 4) == 0) sunmode = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strcmp(argv[i], "diag") == 0) diag = 1;
     if (strncmp(argv[i], "sunord=", 7) == 0) sunord = (int)strtol(argv[i] + 7, NULL, 10);
     if (strcmp(argv[i], "slots") == 0) slots = 1;
     if (strcmp(argv[i], "slots1") == 0) {
@@ -795,6 +798,18 @@ int main(int argc, char **argv) {
     memset(tr.E, 0, 3 * (size_t)ps.np * sizeof *tr.E);
   }
 
+  /* §145 А324/А326: половинный угол корзины — РАВНОВЕЛИКИЙ конус. Телесный угол
+   * на направление Omega = 4*pi/N_D, отсюда theta = sqrt(Omega/pi) = sqrt(4/N_D).
+   * Не sqrt(4*pi/N_D): то диаметр, а множитель два в радиусе размытия — не
+   * мелочь. При N_D = 64 выходит 0.250 рад = 14.3°. */
+  int64_t rhist[HZ_PSW_RHOBINS];
+  if (diag) {
+    memset(rhist, 0, sizeof rhist);
+    tr.diag_theta = sqrt(4.0 / (double)d.n);
+    tr.diag_hist = rhist;
+    printf("== ДИАГНОСТИКА ШИРИНЫ: θ = %.4f рад (%.2f°) при N_D = %d\n", tr.diag_theta,
+           tr.diag_theta * 180.0 / M_PI, d.n);
+  }
   printf("  отскок   Σ B·A, Вт/ср      dE      фрагментов    растр,с   редукция,с   всего,с\n");
   double ttot = 0.0;
   for (int b = 0; b < nb; b++) {
@@ -924,6 +939,29 @@ int main(int argc, char **argv) {
   printf("== ВСЕГО НА ПЕРЕНОС: %.1f с на %d отскоков (%.2f с на отскок, %.3f с на направление)\n",
          ttot, nb, ttot / (double)(nb > 0 ? nb : 1),
          ttot / (double)((nb > 0 ? nb : 1) * (d.n > 0 ? d.n : 1)));
+  if (diag) {
+    /* А326: если медиана радиуса ниже ОДНОЙ КЛЕТКИ, разделимый фильтр вырождается
+     * в тождество, и отрицательный итог замера О49 ничего не будет означать. */
+    int64_t tot = 0;
+    for (int q = 0; q < HZ_PSW_RHOBINS; q++)
+      tot += rhist[q];
+    printf("== РАДИУС РАЗМЫТИЯ по %lld переносам, доли:\n", (long long)tot);
+    double e = 0.25, cum = 0.0, med = -1.0, p90 = -1.0;
+    for (int q = 0; q < HZ_PSW_RHOBINS; q++) {
+      double fr = tot > 0 ? (double)rhist[q] / (double)tot : 0.0;
+      if (q < HZ_PSW_RHOBINS - 1)
+        printf("     ρ < %6.2f клеток: %6.2f %%\n", e, 100.0 * fr);
+      else
+        printf("     ρ ≥ %6.2f клеток: %6.2f %%\n", e / 2.0, 100.0 * fr);
+      cum += fr;
+      if (med < 0.0 && cum >= 0.5) med = e;
+      if (p90 < 0.0 && cum >= 0.9) p90 = e;
+      if (q < HZ_PSW_RHOBINS - 1) e *= 2.0;
+    }
+    printf("== МЕДИАНА ρ ≈ %.2f клеток, p90 ≈ %.2f клеток — %s\n", med, p90,
+           med >= 1.0 ? "фильтр имеет на чём работать"
+                      : "ФИЛЬТР ВЫРОЖДАЕТСЯ, замер О49 на этом шаге растра слеп");
+  }
   printf("== ЭТАЛОН ХРАНИМЫМ ОПЕРАТОРОМ (§120, тот же город, ρ = 0.5, небо 1.0): "
          "поток 2.398505e+05 Вт/ср, сборка 3102.6 с\n");
 

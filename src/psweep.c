@@ -2,6 +2,7 @@
 
 #include "psweep.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -100,7 +101,8 @@ static int solve3s(double A[3][3], double b[3]) {
  * фрагмента `*pk < 0`. */
 static inline void frag_step(hz_ptrans *t, const hz_pview *v, const double *nwt, double wq,
                              double h2, double Lsky, double *acc, const double r[3], int32_t k,
-                             double depth, int32_t *pk, double *pu, double *pv, int64_t *npair) {
+                             double depth, int32_t *pk, double *pu, double *pv, double *pd,
+                             int64_t *npair) {
   const hz_poly *P = &t->ps->p[k];
   /* `n·ω` НЕ пересчитывается на фрагмент: оно зависит только от (полигон,
    * направление), а фрагментов на полигон — сотни. Таблица на направление
@@ -122,6 +124,18 @@ static inline void frag_step(hz_ptrans *t, const hz_pview *v, const double *nwt,
       L = (nwt[*pk] > 0.0) ? hz_ptrans_lout(t, *pk, *pu, *pv) : 0.0;
     }
     if (L > 0.0) {
+      if (t->diag_theta > 0.0 && t->diag_hist != NULL && *pk >= 0) {
+        /* Радиус в КЛЕТКАХ, поэтому делится на шаг растра. */
+        double rho = t->diag_theta * (depth - *pd) / v->h;
+        int bn = 0;
+        double eb = 0.25;
+        while (bn < HZ_PSW_RHOBINS - 1 && rho >= eb) {
+          bn++;
+          eb *= 2.0;
+        }
+#pragma omp atomic
+        t->diag_hist[bn]++;
+      }
       double c = wq * h2 * L;
       if (t->pair_cap > 0 && t->pair_n < t->pair_cap && *pk >= 0) {
         t->pair_k[t->pair_n] = k;
@@ -138,6 +152,7 @@ static inline void frag_step(hz_ptrans *t, const hz_pview *v, const double *nwt,
   *pk = k;
   *pu = u;
   *pv = vv;
+  *pd = depth;
 }
 
 /* --- редукция, раскладка СПЛОШНЫХ ПРОБЕГОВ ---------------------------------- */
@@ -155,9 +170,9 @@ static void reduce_fbuf(hz_ptrans *t, const hz_pview *v, const double *nwt, cons
       int32_t b = fb->start[base + i], e = fb->start[base + i + 1];
       if (b != e) {
         int32_t pk = -1;
-        double pu = 0.0, pv = 0.0;
+        double pu = 0.0, pv = 0.0, pd = 0.0;
         for (int32_t f = b; f < e; f++)
-          frag_step(t, v, nwt, wq, h2, Lsky, acc, r, fb->poly[f], fb->depth[f], &pk, &pu, &pv,
+          frag_step(t, v, nwt, wq, h2, Lsky, acc, r, fb->poly[f], fb->depth[f], &pk, &pu, &pv, &pd,
                     &st->npair);
       }
       for (int a = 0; a < 3; a++)
@@ -178,9 +193,9 @@ static void reduce_abuf(hz_ptrans *t, const hz_pview *v, const double *nwt, cons
     for (int32_t i = 0; i < ab->W; i++) {
       int32_t f = ab->head[base + i];
       int32_t pk = -1;
-      double pu = 0.0, pv = 0.0;
+      double pu = 0.0, pv = 0.0, pd = 0.0;
       while (f >= 0) {
-        frag_step(t, v, nwt, wq, h2, Lsky, acc, r, ab->poly[f], ab->depth[f], &pk, &pu, &pv,
+        frag_step(t, v, nwt, wq, h2, Lsky, acc, r, ab->poly[f], ab->depth[f], &pk, &pu, &pv, &pd,
                   &st->npair);
         f = ab->next[f];
       }
@@ -308,6 +323,18 @@ int hz_psweep_gather(hz_ptrans *t, const tr3_dirs *d, double h, int nthr, double
     double w[3] = {d->ox[m], d->oy[m], d->oz[m]};
     hz_pview v;
     if (hz_pview_make(&v, w, lo, hi, h) != 0) return 1;
+    /* §145 А325: размер растра РАЗВЁРТКИ нигде не печатался, и предсказание цены
+     * фильтра писать было не из чего. Печатается один раз, с первого
+     * направления первого сбора. */
+    if (t->diag_theta > 0.0 && t->diag_hist != NULL && t->diag_hist[HZ_PSW_RHOBINS - 1] >= 0) {
+      static int shown = 0;
+#pragma omp critical
+      if (!shown) {
+        shown = 1;
+        fprintf(stderr, "== РАСТР РАЗВЁРТКИ: %d×%d = %lld пикселей на направление, шаг %.2f м\n",
+                v.W, v.H, (long long)v.W * v.H, h);
+      }
+    }
     if ((int64_t)v.W * v.H > maxpix) maxpix = (int64_t)v.W * v.H;
   }
   if (maxpix <= 0) return 1;

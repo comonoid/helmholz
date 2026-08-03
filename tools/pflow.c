@@ -802,9 +802,11 @@ int main(int argc, char **argv) {
    * на направление Omega = 4*pi/N_D, отсюда theta = sqrt(Omega/pi) = sqrt(4/N_D).
    * Не sqrt(4*pi/N_D): то диаметр, а множитель два в радиусе размытия — не
    * мелочь. При N_D = 64 выходит 0.250 рад = 14.3°. */
-  int64_t rhist[HZ_PSW_RHOBINS];
+  int64_t rhist[HZ_PSW_RHOBINS], dhist[HZ_PSW_RHOBINS];
   if (diag) {
     memset(rhist, 0, sizeof rhist);
+    memset(dhist, 0, sizeof dhist);
+    tr.diag_depth = dhist;
     tr.diag_theta = sqrt(4.0 / (double)d.n);
     tr.diag_hist = rhist;
     printf("== ДИАГНОСТИКА ШИРИНЫ: θ = %.4f рад (%.2f°) при N_D = %d\n", tr.diag_theta,
@@ -958,6 +960,21 @@ int main(int argc, char **argv) {
       if (p90 < 0.0 && cum >= 0.9) p90 = e;
       if (q < HZ_PSW_RHOBINS - 1) e *= 2.0;
     }
+    int64_t dt2 = 0;
+    for (int q = 0; q < HZ_PSW_RHOBINS; q++)
+      dt2 += dhist[q];
+    printf("== ГЛУБИННАЯ СЛОЖНОСТЬ (фрагментов на непустой пиксель), доли:\n");
+    int32_t ee = 1;
+    double c2 = 0.0, dmed = -1.0, dp99 = -1.0;
+    for (int q = 0; q < HZ_PSW_RHOBINS; q++) {
+      double fr = dt2 > 0 ? (double)dhist[q] / (double)dt2 : 0.0;
+      printf("     до %3d слоёв: %6.2f %%\n", ee, 100.0 * fr);
+      c2 += fr;
+      if (dmed < 0.0 && c2 >= 0.5) dmed = ee;
+      if (dp99 < 0.0 && c2 >= 0.99) dp99 = ee;
+      ee = ee * 2 + 1;
+    }
+    printf("== СЛОЁВ: медиана %.0f, p99 %.0f — столько таблиц на направление\n", dmed, dp99);
     printf("== МЕДИАНА ρ ≈ %.2f клеток, p90 ≈ %.2f клеток — %s\n", med, p90,
            med >= 1.0 ? "фильтр имеет на чём работать"
                       : "ФИЛЬТР ВЫРОЖДАЕТСЯ, замер О49 на этом шаге растра слеп");

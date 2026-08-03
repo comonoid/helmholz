@@ -92,7 +92,8 @@ typedef struct {
    * в тождество, и «механизм не работает» будет неотличимо от «не проверено».
    * `diag_theta` — половинный угол корзины `sqrt(4/N_D)` (А324); 0 — выключено. */
   double diag_theta;
-  int64_t *diag_hist; /* HZ_PSW_RHOBINS корзин по удвоению ρ */
+  int64_t *diag_depth; /* HZ_PSW_RHOBINS корзин по длине цепочки фрагментов */
+  int64_t *diag_hist;  /* HZ_PSW_RHOBINS корзин по удвоению ρ */
 } hz_ptrans;
 
 /* Границы корзин: 0.25 0.5 1 2 4 8 16 32 и «свыше». */

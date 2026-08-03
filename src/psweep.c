@@ -162,6 +162,25 @@ static inline void frag_step(hz_ptrans *t, const hz_pview *v, const double *nwt,
 static void reduce_fbuf(hz_ptrans *t, const hz_pview *v, const double *nwt, const hz_fbuf *fb,
                         double wq, double Lsky, double *acc, hz_pstats *st) {
   const double h2 = v->h * v->h;
+  /* §146: ГЛУБИННАЯ СЛОЖНОСТЬ — сколько фрагментов лежит на пикселе. Она, а не
+   * протяжённость сцены, задаёт число таблиц у послойного фильтра (срезы по
+   * ДИАПАЗОНУ глубин посчитаны и отвергнуты: `428` срезов на город). Считается
+   * той же диагностикой, что и радиус, и в корзины `HZ_PSW_RHOBINS` по длине
+   * цепочки: 1, 2, 3, 5, 9, 17, 33, 65, свыше. */
+  if (t->diag_theta > 0.0 && t->diag_hist != NULL) {
+    for (int64_t p = 0; p < (int64_t)fb->W * fb->H; p++) {
+      int32_t len = fb->start[p + 1] - fb->start[p];
+      if (len <= 0) continue;
+      int bn = 0;
+      int32_t e = 1;
+      while (bn < HZ_PSW_RHOBINS - 1 && len > e) {
+        bn++;
+        e = e * 2 + 1;
+      }
+#pragma omp atomic
+      t->diag_depth[bn]++;
+    }
+  }
   for (int32_t j = 0; j < fb->H; j++) {
     double r[3];
     hz_pview_origin(v, 0, j, r);

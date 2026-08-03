@@ -79,6 +79,7 @@
  * Запуск: `pfront [city|hall] [sun|wall|both] [nopic] [rows=ЧИСЛО]`.
  */
 #include "padj.h"
+#include <omp.h>
 #include "pff.h"
 #include "pgrid.h"
 #include "scene_cfg.h"
@@ -1272,8 +1273,13 @@ int main(int argc, char **argv) {
      * десятки миллионов, и держать их разом значит гигабайт; полоса стоит
      * лишнего прохода по граням (секунды) и снимает потолок памяти совсем. */
     int64_t nxr_tot = 0, nband = 0;
+    double t_scan = 0.0; /* обход граней отдельно от развёртки строк — пункт 11 реестра */
+    int nth = omp_get_max_threads();
     int64_t *roff = calloc((size_t)PF_BAND + 2, sizeof *roff);
-    if (roff == NULL) return 2;
+    /* Счётчики строк ПО ПОТОКАМ: nth × (nr+1) при nr ≤ PF_BAND — тридцать
+     * килобайт, то есть цена нулевая, а атомарных операций в обходе нет вовсе. */
+    int64_t *tcnt = calloc((size_t)nth * (size_t)(PF_BAND + 1) + 1, sizeof *tcnt);
+    if (roff == NULL || tcnt == NULL) return 2;
     double *xu = NULL, *xs = NULL;
     signed char *xg = NULL;
     int64_t xcap = 0;
@@ -1286,27 +1292,26 @@ int main(int argc, char **argv) {
       nband++;
       double bvlo = vlo + (double)rlo * dv, bvhi = vlo + (double)rhi * dv;
       int64_t nxr = 0;
-      for (int i = 0; i <= nr + 1; i++)
-        roff[i] = 0;
-      for (int pass = 0; pass < 2; pass++) {
-        if (pass == 1) {
-          for (int r = 0; r < nr; r++)
-            roff[r + 1] += roff[r];
-          nxr = roff[nr];
-          if (nxr > xcap) {
-            free(xu);
-            free(xs);
-            free(xg);
-            xcap = nxr + nxr / 2 + 16;
-            xu = calloc((size_t)xcap, sizeof *xu);
-            xs = calloc((size_t)xcap, sizeof *xs);
-            xg = calloc((size_t)xcap, 1);
-            if (xu == NULL || xs == NULL || xg == NULL) return 2;
-          }
-          for (int64_t r = nr; r > 0; r--)
-            roff[r] = roff[r - 1];
-          roff[0] = 0;
-        }
+      double t_sc0 = now_s();
+      /* ОБХОД ГРАНЕЙ ПАРАЛЛЕЛЬНЫЙ, ДВА ПРОХОДА ПО ОДНОМУ И ТОМУ ЖЕ РАЗБИЕНИЮ.
+       *
+       * Счёт идёт в СВОЙ на поток массив строк; после редукции каждый поток
+       * знает не только сколько он записал, но и КУДА — своё начало внутри
+       * каждой строки. Тогда заполнение обходится без атомарных операций и без
+       * блокировок, а порядок записей внутри строки от числа потоков не
+       * зависит вовсе: строка потом всё равно сортируется.
+       *
+       * `schedule(static)` в ОБОИХ проходах обязателен и не косметичен: он
+       * гарантирует, что поток получит РОВНО ТЕ ЖЕ грани, что и в проходе
+       * счёта. С `dynamic` разбиение разъехалось бы, и потоки писали бы в чужие
+       * места. */
+      for (int i = 0; i <= nth * (nr + 1); i++)
+        tcnt[i] = 0;
+#pragma omp parallel
+      {
+        int tid = omp_get_thread_num();
+        int64_t *cnt = tcnt + (size_t)tid * (size_t)(nr + 1);
+#pragma omp for schedule(static)
         for (int32_t t = 0; t < m.nt; t++) {
           if (!(v_dot(fn + 3 * (size_t)t, w) < 0.0)) continue; /* грань не освещена */
           const double *A = m.v + 3 * (size_t)m.f[(size_t)t * 3 + 0];
@@ -1318,12 +1323,12 @@ int main(int argc, char **argv) {
           const double *vp[4] = {A, B, C, A};
           for (int k = 0; k < 3; k++) {
             double v0 = v_dot(bb, vp[k]), v1 = v_dot(bb, vp[k + 1]);
-            double u0 = v_dot(aa, vp[k]), u1 = v_dot(aa, vp[k + 1]);
             double lo = v0 < v1 ? v0 : v1, hi = v0 < v1 ? v1 : v0;
             if (hi < bvlo || lo > bvhi) continue;
             int r0 = (int)floor((lo - vlo) / dv) - rlo, r1 = (int)floor((hi - vlo) / dv) - rlo;
             if (r0 < 0) r0 = 0;
             if (r1 >= nr) r1 = nr - 1;
+            double u0 = v_dot(aa, vp[k]), u1 = v_dot(aa, vp[k + 1]);
             for (int r = r0; r <= r1; r++) {
               double vr = vlo + ((double)(rlo + r) + 0.5) * dv;
               /* Полуоткрытое правило: вершина ровно на строке считается ОДИН
@@ -1331,20 +1336,73 @@ int main(int argc, char **argv) {
                * пересечений там, где должно быть нечётное. */
               if ((v0 <= vr) == (v1 <= vr)) continue;
               double tt = (vr - v0) / (v1 - v0);
-              double uc = u0 + tt * (u1 - u0);
-              if (uc < umin) continue; /* левее всех пикселей — запросам не нужно */
-              if (pass == 0) {
-                roff[r + 1]++;
-              } else {
-                int64_t at2 = roff[r + 1]++;
-                xu[at2] = uc;
-                xs[at2] = dface;
-                xg[at2] = (signed char)((v1 > v0) ? 1 : -1);
-              }
+              if (u0 + tt * (u1 - u0) < umin) continue; /* левее всех пикселей */
+              cnt[r]++;
             }
           }
         }
       }
+      /* Редукция: строкам — начала CSR, потокам — их места внутри строк. */
+      {
+        int64_t acc = 0;
+        for (int r = 0; r < nr; r++) {
+          roff[r] = acc;
+          for (int q = 0; q < nth; q++) {
+            int64_t c = tcnt[(size_t)q * (size_t)(nr + 1) + (size_t)r];
+            tcnt[(size_t)q * (size_t)(nr + 1) + (size_t)r] = acc;
+            acc += c;
+          }
+        }
+        roff[nr] = acc;
+        nxr = acc;
+      }
+      if (nxr > xcap) {
+        free(xu);
+        free(xs);
+        free(xg);
+        xcap = nxr + nxr / 2 + 16;
+        xu = calloc((size_t)xcap, sizeof *xu);
+        xs = calloc((size_t)xcap, sizeof *xs);
+        xg = calloc((size_t)xcap, 1);
+        if (xu == NULL || xs == NULL || xg == NULL) return 2;
+      }
+#pragma omp parallel
+      {
+        int tid = omp_get_thread_num();
+        int64_t *cur = tcnt + (size_t)tid * (size_t)(nr + 1);
+#pragma omp for schedule(static)
+        for (int32_t t = 0; t < m.nt; t++) {
+          if (!(v_dot(fn + 3 * (size_t)t, w) < 0.0)) continue;
+          const double *A = m.v + 3 * (size_t)m.f[(size_t)t * 3 + 0];
+          const double *B = m.v + 3 * (size_t)m.f[(size_t)t * 3 + 1];
+          const double *C = m.v + 3 * (size_t)m.f[(size_t)t * 3 + 2];
+          double da = v_dot(w, A), db2 = v_dot(w, B), dc = v_dot(w, C);
+          double dface = da > db2 ? (da > dc ? da : dc) : (db2 > dc ? db2 : dc);
+          if (dface > shi_) continue;
+          const double *vp[4] = {A, B, C, A};
+          for (int k = 0; k < 3; k++) {
+            double v0 = v_dot(bb, vp[k]), v1 = v_dot(bb, vp[k + 1]);
+            double lo = v0 < v1 ? v0 : v1, hi = v0 < v1 ? v1 : v0;
+            if (hi < bvlo || lo > bvhi) continue;
+            int r0 = (int)floor((lo - vlo) / dv) - rlo, r1 = (int)floor((hi - vlo) / dv) - rlo;
+            if (r0 < 0) r0 = 0;
+            if (r1 >= nr) r1 = nr - 1;
+            double u0 = v_dot(aa, vp[k]), u1 = v_dot(aa, vp[k + 1]);
+            for (int r = r0; r <= r1; r++) {
+              double vr = vlo + ((double)(rlo + r) + 0.5) * dv;
+              if ((v0 <= vr) == (v1 <= vr)) continue;
+              double tt = (vr - v0) / (v1 - v0);
+              double uc = u0 + tt * (u1 - u0);
+              if (uc < umin) continue;
+              int64_t at2 = cur[r]++;
+              xu[at2] = uc;
+              xs[at2] = dface;
+              xg[at2] = (signed char)((v1 > v0) ? 1 : -1);
+            }
+          }
+        }
+      }
+      t_scan += now_s() - t_sc0;
       nxr_tot += nxr;
 
       /* СТРОКИ НЕЗАВИСИМЫ — И СЧИТАЮТСЯ ПАРАЛЛЕЛЬНО. Каждая строка держит своё
@@ -1450,12 +1508,16 @@ int main(int argc, char **argv) {
     printf("   освещённых граней %lld из %d; пересечений строк %lld при %d строках (шаг строки "
            "%.4f м, полос %lld)\n",
            (long long)nlitf, m.nt, (long long)nxr_tot, rows, dv, (long long)nband);
+    printf("   ИЗ НИХ ОБХОД ГРАНЕЙ %.2f с (%d потоков, %d проходов по %d млн граней) — пункт 11 "
+           "реестра\n",
+           t_scan, nth, 2 * (int)nband, m.nt / 1000000);
     fflush(stdout);
 
     free(xu);
     free(xs);
     free(xg);
     free(roff);
+    free(tcnt);
     double t_fr = now_s() - t_fr0;
     t_pic_front = t_fr;
 

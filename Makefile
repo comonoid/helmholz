@@ -188,6 +188,12 @@ build/pcoarse: tools/pcoarse.c $(PFULL) | build
 build/scenechk: tools/scenechk.c src/scene_obj.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/scenechk.c src/scene_obj.c -lm'
 
+# psil — §149, шаг О50: сколько силуэтных рёбер переживает минимальный угловой
+# размер источника. Кроме сетки не нужно НИЧЕГО (ни сегментации, ни лестницы),
+# поэтому и собирается из одного `scene_obj.c`: замер про рёбра ВХОДА.
+build/psil: tools/psil.c src/scene_obj.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/psil.c src/scene_obj.c -lm'
+
 build/prad: tools/prad.c $(PFULL) | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/prad.c $(PFULL) -lm'
 

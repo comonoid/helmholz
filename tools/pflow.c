@@ -229,6 +229,7 @@ int main(int argc, char **argv) {
   int noqn = 0;
   int skyf = 0; /* §130: замерить долю неба и сверить с хранимым оператором */
   int lod = 0;  /* §131: перенос по срезу лестницы вместо всех участков */
+  const char *fsave = NULL, *fcmp = NULL; /* §132: поле на диск и сверка */
   /* §128: направлений за шаг свёртки. `0` читается как число потоков OpenMP —
    * иначе параллелизм по направлениям простаивает. */
   int nfold = 0;
@@ -250,6 +251,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "noqn") == 0) noqn = 1;
     if (strcmp(argv[i], "skyf") == 0) skyf = 1;
     if (strcmp(argv[i], "lod") == 0) lod = 1;
+    if (strncmp(argv[i], "save=", 5) == 0) fsave = argv[i] + 5;
+    if (strncmp(argv[i], "cmp=", 4) == 0) fcmp = argv[i] + 4;
     if (strncmp(argv[i], "nfold=", 6) == 0) nfold = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "osub=", 5) == 0) osub = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "w=", 2) == 0) imgw = (int)strtol(argv[i] + 2, NULL, 10);
@@ -670,6 +673,89 @@ int main(int argc, char **argv) {
     free(val);
     free(org0);
     free(E0);
+  }
+
+  /* ------------------------- ПОЛЕ НА ДИСК И СВЕРКА С ЭТАЛОНОМ (§132) ------
+   *
+   * Поток — ИНТЕГРАЛ, и он к местным ошибкам слеп: при `h` от `0.5` до `2` м он
+   * менялся на `0.01 %`, тогда как кромка тени размывается на два метра. §4
+   * требует мерить радианс и ХВОСТ распределения, а не среднее и не картинку.
+   *
+   * Разбиение от `h` не зависит (сегментация идёт по мешу), поэтому номера
+   * полигонов у эталона и у сравниваемого совпадают, и сверка идёт один в один.
+   * Проценты берутся по ПЛОЩАДИ: вклад в изображение идёт площадью. */
+  if (fsave != NULL) {
+    FILE *fp = fopen(fsave, "wb");
+    if (fp == NULL) return 1;
+    int32_t n0 = ps.np;
+    fwrite(&n0, sizeof n0, 1, fp);
+    for (int32_t k = 0; k < ps.np; k++) {
+      double b = hz_ptrans_lout(&tr, k, 0.0, 0.0);
+      fwrite(&b, sizeof b, 1, fp);
+    }
+    fclose(fp);
+    printf("== ПОЛЕ СОХРАНЕНО: %s, полигонов %d\n", fsave, ps.np);
+  }
+  if (fcmp != NULL) {
+    FILE *fp = fopen(fcmp, "rb");
+    int32_t n0 = 0;
+    if (fp == NULL || fread(&n0, sizeof n0, 1, fp) != 1 || n0 != ps.np) {
+      fprintf(stderr, "эталон %s не годится (полигонов %d, ожидалось %d)\n", fcmp, n0, ps.np);
+      if (fp != NULL) fclose(fp);
+      return 1;
+    }
+    double *ref = malloc((size_t)n0 * sizeof *ref);
+    double *er = malloc((size_t)n0 * sizeof *er);
+    double *aw = malloc((size_t)n0 * sizeof *aw);
+    if (ref == NULL || er == NULL || aw == NULL ||
+        fread(ref, sizeof *ref, (size_t)n0, fp) != (size_t)n0)
+      return 1;
+    fclose(fp);
+    /* Нормировка на СРЕДНИЙ по площади радианс эталона, а не на местное
+     * значение: у тёмного элемента относительная ошибка взрывается и хвост
+     * начинает мерить деление на малое, а не расхождение полей. */
+    double sa = 0.0, sb = 0.0;
+    for (int32_t k = 0; k < n0; k++) {
+      sa += ps.p[k].area;
+      sb += ref[k] * ps.p[k].area;
+    }
+    double bref = (sa > 0.0) ? sb / sa : 1.0;
+    int nn = 0;
+    for (int32_t k = 0; k < n0; k++) {
+      if (!(ps.p[k].area > 0.0)) continue;
+      er[nn] = fabs(hz_ptrans_lout(&tr, k, 0.0, 0.0) - ref[k]) / (bref > 0.0 ? bref : 1.0);
+      aw[nn] = ps.p[k].area;
+      nn++;
+    }
+    /* Процентили ПО ПЛОЩАДИ: сортируем по ошибке, идём по накопленной площади. */
+    for (int a = 1; a < nn; a++) {
+      double e = er[a], w = aw[a];
+      int b = a - 1;
+      while (b >= 0 && er[b] > e) {
+        er[b + 1] = er[b];
+        aw[b + 1] = aw[b];
+        b--;
+      }
+      er[b + 1] = e;
+      aw[b + 1] = w;
+    }
+    double tot = 0.0;
+    for (int a = 0; a < nn; a++)
+      tot += aw[a];
+    double q[3] = {0.5, 0.9, 0.99}, out[3] = {0, 0, 0};
+    double acc2 = 0.0;
+    int qi = 0;
+    for (int a = 0; a < nn && qi < 3; a++) {
+      acc2 += aw[a];
+      while (qi < 3 && acc2 >= q[qi] * tot)
+        out[qi++] = er[a];
+    }
+    printf("== СВЕРКА ПОЛЯ с %s (ошибка в долях среднего радианса %.4e, по ПЛОЩАДИ): "
+           "p50 %.4f, p90 %.4f, p99 %.4f, максимум %.4f\n",
+           fcmp, bref, out[0], out[1], out[2], er[nn - 1]);
+    free(ref);
+    free(er);
+    free(aw);
   }
 
   /* ------------------------------------------------------------------ КАДР */

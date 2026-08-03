@@ -160,7 +160,7 @@ build/psimp: tools/psimp.c $(PGEOM) | build
 # Полный набор полигональной модели: развёртка, луч, прямой свет, разрезы,
 # огрубление. Стенды Ш5…Ш8 и §10 собираются из него.
 PFULL = src/scene_obj.c src/poly_seg.c src/polygon.c src/pedge.c src/prast.c src/psweep.c \
-        src/pray.c src/phcube.c src/ptree.c src/pvert.c src/pdirect.c src/pcut.c src/pmerge.c src/pvfit.c src/plod.c src/lodio.c src/plink.c src/image.c \
+        src/pray.c src/phcube.c src/ptree.c src/pvert.c src/pdirect.c src/pcut.c src/pmerge.c src/pvfit.c src/plod.c src/lodio.c src/plink.c src/pff.c src/image.c \
         src/cut/surf.c src/cut/poly3.c src/cut/qef.c \
         src/transport/dirs3.c src/transport/quad.c src/transport/cam3.c src/transport/ray3.c \
         src/octree.c
@@ -191,8 +191,8 @@ build/scenechk: tools/scenechk.c src/scene_obj.c | build
 # psil — §149, шаг О50: сколько силуэтных рёбер переживает минимальный угловой
 # размер источника. Кроме сетки не нужно НИЧЕГО (ни сегментации, ни лестницы),
 # поэтому и собирается из одного `scene_obj.c`: замер про рёбра ВХОДА.
-build/psil: tools/psil.c src/scene_obj.c | build
-	$(RUN) 'gcc $(CFLAGS) -o $@ tools/psil.c src/scene_obj.c -lm'
+build/psil: tools/psil.c src/scene_obj.c src/pgrid.c src/pgrid.h src/padj.c src/padj.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/psil.c src/scene_obj.c src/pgrid.c src/padj.c -lm'
 
 build/prad: tools/prad.c $(PFULL) | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/prad.c $(PFULL) -lm'

@@ -44,6 +44,8 @@
  *
  * Запуск: `psil [city|hall] [n=ЧИСЛО_ПРИЁМНИКОВ]`.
  */
+#include "padj.h"
+#include "pgrid.h"
 #include "scene_cfg.h"
 #include "scene_obj.h"
 #include <math.h>
@@ -67,7 +69,7 @@
 /* СКОЛЬКО ГРАНЕЙ РЕБРА ХРАНИТСЯ. У воксельного стыка их четыре; рёбра с
  * бо́льшим числом считаются отдельно, чтобы «не поместилось» не выглядело
  * как «не бывает». */
-#define PSIL_MAXF 4
+#define PSIL_MAXF HZ_PADJ_MAXF
 /* ПРИЁМКА (А333, вывод, а не потолок). Цель — 60 кадров при 4K, это 16 мс; на
  * 16 потоках при 1e9 простых операций в секунду на поток — 2.6e8 операций на
  * кадр; приёмников (полигонов города) 446 013, то есть ~580 операций на
@@ -101,23 +103,6 @@ static const double PSIL_ALPHA_DEG[] = {1.0, 0.5, 0.1, 0.0};
 #define PSIL_Q_MAIN 0                /* α = 1°: по нему сформулировано «УБИВАЕТ» */
 #define PSIL_Q_CTL (PSIL_NALPHA - 1) /* α = 0: негативный контроль */
 
-/* ЭПСИЛОН ЛУЧА — ОТНОСИТЕЛЬНЫЙ, и он не новый: ровно то соглашение, что стоит
- * в `prender.c:599` (`len * (1.0 - 1e-6)`). Нужен для СКОЛЬЗЯЩИХ лучей вдоль
- * пола, где исключение по индексу не помогает (А345). */
-#define PSIL_EPSREL 1.0e-6
-/* Определитель Мёллера — Трумбора ниже этого считается вырожденным: у
- * метровых треугольников он порядка единицы, `1e-12` есть луч, лежащий в
- * плоскости с точностью до `1e-12` радиана. */
-#define PSIL_DET_TINY 1.0e-12
-#define PSIL_DTINY 1.0e-300
-/* РАЗМЕР ЯЧЕЙКИ СЕТКИ выводится из СРЕДНЕЙ площади треугольника: ячейка не
- * должна быть мельче треугольника (иначе один треугольник растекается по
- * многим ячейкам) и не крупнее нескольких его размеров (иначе в ячейке
- * очередь). `cs = 2·sqrt(2·A_ср)`; у города `A = 0.5015` м² даёт `2.0` м. */
-#define PSIL_CELL_MUL 2.0
-/* Потолок числа ячеек: `start[]` есть `8` байт на ячейку, `64` млн ячеек —
- * `512` МБ. При превышении ячейка укрупняется. */
-#define PSIL_CELL_MAX 67108864LL
 /* КОЛЛИНЕАРНОСТЬ ПРИ СШИВКЕ (А346): синус угла. Координаты до `655` м дают
  * машинный ноль порядка `1e-13` относительно, `1e-9` — три порядка над ним и
  * одновременно нанометр отклонения на метровом ребре, то есть заведомо ниже
@@ -160,207 +145,14 @@ static int cmp_i64(const void *a, const void *b) {
   return (x < y) ? -1 : ((x > y) ? 1 : 0);
 }
 
-/* ---- РАВНОМЕРНАЯ СЕТКА ПО ТРЕУГОЛЬНИКАМ И ЛУЧ ПО НЕЙ --------------------
+/* ---- СЕТКА И ЛУЧ ЖИВУТ В `src/pgrid.[ch]` -------------------------------
  *
- * Своя, а не `hz_pray` — довод в §153, пункт 2: `hz_pray` ищет попадание по
- * ПОЛИГОНАМ сегментации, отстоящим от треугольников на `δ`, и тогда «видно/не
- * видно» решала бы поверхность, отличная от той, что породила силуэт. */
-typedef struct {
-  int32_t nc[3];
-  double lo[3], hi[3], cs;
-  int64_t *start; /* ncell+1 */
-  int32_t *idx;
-  int64_t ncell, nref;
-} psil_grid;
-
-static void psil_tri_box(const hz_objmesh *m, int32_t t, double blo[3], double bhi[3]) {
-  for (int a = 0; a < 3; a++) {
-    blo[a] = 1e300;
-    bhi[a] = -1e300;
-  }
-  for (int i = 0; i < 3; i++) {
-    const double *p = m->v + 3 * (size_t)m->f[(size_t)t * 3 + (size_t)i];
-    for (int a = 0; a < 3; a++) {
-      if (p[a] < blo[a]) blo[a] = p[a];
-      if (p[a] > bhi[a]) bhi[a] = p[a];
-    }
-  }
-}
-
-static int psil_grid_build(psil_grid *g, const hz_objmesh *m) {
-  double asum = 0.0;
-  for (int32_t t = 0; t < m->nt; t++)
-    asum += hz_obj_tri_area(m, t);
-  double cs = PSIL_CELL_MUL * sqrt(2.0 * asum / (double)m->nt);
-  for (int a = 0; a < 3; a++) {
-    /* Коробка расширяется на ячейку: точка ровно на грани сцены обязана иметь
-     * ячейку, а не выпадать из сетки. */
-    g->lo[a] = m->lo[a] - cs;
-    g->hi[a] = m->hi[a] + cs;
-  }
-  for (;;) {
-    int64_t n = 1;
-    for (int a = 0; a < 3; a++) {
-      double w = (g->hi[a] - g->lo[a]) / cs;
-      int32_t k = (int32_t)floor(w) + 1;
-      g->nc[a] = k < 1 ? 1 : k;
-      n *= g->nc[a];
-    }
-    if (n <= PSIL_CELL_MAX) {
-      g->ncell = n;
-      break;
-    }
-    cs *= 2.0;
-  }
-  g->cs = cs;
-  g->start = calloc((size_t)g->ncell + 2, sizeof *g->start);
-  if (g->start == NULL) return 2;
-  for (int pass = 0; pass < 2; pass++) {
-    if (pass == 1) {
-      for (int64_t i = 0; i < g->ncell; i++)
-        g->start[i + 1] += g->start[i];
-      g->nref = g->start[g->ncell];
-      g->idx = malloc((size_t)(g->nref > 0 ? g->nref : 1) * sizeof *g->idx);
-      if (g->idx == NULL) return 2;
-      for (int64_t i = g->ncell; i > 0; i--)
-        g->start[i] = g->start[i - 1];
-      g->start[0] = 0;
-    }
-    for (int32_t t = 0; t < m->nt; t++) {
-      double blo[3], bhi[3];
-      psil_tri_box(m, t, blo, bhi);
-      /* Инициализация нулём не «на всякий случай»: без неё gcc-analyzer не
-       * связывает цикл по трём осям с последующим использованием и даёт
-       * ложное «use of uninitialized value». */
-      int32_t c0[3] = {0, 0, 0}, c1[3] = {0, 0, 0};
-      for (int a = 0; a < 3; a++) {
-        int32_t i0 = (int32_t)floor((blo[a] - g->lo[a]) / cs);
-        int32_t i1 = (int32_t)floor((bhi[a] - g->lo[a]) / cs);
-        c0[a] = i0 < 0 ? 0 : (i0 >= g->nc[a] ? g->nc[a] - 1 : i0);
-        c1[a] = i1 < 0 ? 0 : (i1 >= g->nc[a] ? g->nc[a] - 1 : i1);
-      }
-      for (int32_t z = c0[2]; z <= c1[2]; z++)
-        for (int32_t y = c0[1]; y <= c1[1]; y++)
-          for (int32_t x = c0[0]; x <= c1[0]; x++) {
-            int64_t c = (int64_t)x + (int64_t)g->nc[0] * ((int64_t)y + (int64_t)g->nc[1] * z);
-            if (pass == 0)
-              g->start[c + 1]++;
-            else
-              g->idx[g->start[c + 1]++] = t;
-          }
-    }
-  }
-  return 0;
-}
-
-static void psil_grid_free(psil_grid *g) {
-  free(g->start);
-  free(g->idx);
-  g->start = NULL;
-  g->idx = NULL;
-}
-
-static int psil_tri_hit(const hz_objmesh *m, int32_t t, const double o[3], const double d[3],
-                        double *tout) {
-  const double *p0 = m->v + 3 * (size_t)m->f[(size_t)t * 3 + 0];
-  const double *p1 = m->v + 3 * (size_t)m->f[(size_t)t * 3 + 1];
-  const double *p2 = m->v + 3 * (size_t)m->f[(size_t)t * 3 + 2];
-  double e1[3], e2[3], pv[3], tv[3], qv[3];
-  for (int a = 0; a < 3; a++) {
-    e1[a] = p1[a] - p0[a];
-    e2[a] = p2[a] - p0[a];
-  }
-  pv[0] = d[1] * e2[2] - d[2] * e2[1];
-  pv[1] = d[2] * e2[0] - d[0] * e2[2];
-  pv[2] = d[0] * e2[1] - d[1] * e2[0];
-  double det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
-  if (fabs(det) < PSIL_DET_TINY) return 0; /* луч лежит в плоскости */
-  double inv = 1.0 / det;
-  for (int a = 0; a < 3; a++)
-    tv[a] = o[a] - p0[a];
-  double u = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
-  if (u < 0.0 || u > 1.0) return 0;
-  qv[0] = tv[1] * e1[2] - tv[2] * e1[1];
-  qv[1] = tv[2] * e1[0] - tv[0] * e1[2];
-  qv[2] = tv[0] * e1[1] - tv[1] * e1[0];
-  double v = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) * inv;
-  if (v < 0.0 || u + v > 1.0) return 0;
-  *tout = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) * inv;
-  return 1;
-}
-
-/* Обход DDA. `anyhit` — вопрос «есть ли заслон» (для тени), иначе ищется
- * БЛИЖАЙШЕЕ попадание (нужно контролю по горизонту). Двусторонний: стена
- * заслоняет независимо от ориентации. */
-static int psil_trace(const psil_grid *g, const hz_objmesh *m, const double o[3],
-                      const double dir[3], double tmin, double tmax, const int32_t *skip, int nskip,
-                      int anyhit, double *thit) {
-  double t0 = tmin, t1 = tmax;
-  for (int a = 0; a < 3; a++) {
-    if (fabs(dir[a]) < PSIL_DTINY) {
-      if (o[a] < g->lo[a] || o[a] > g->hi[a]) return 0;
-    } else {
-      double ta = (g->lo[a] - o[a]) / dir[a], tb = (g->hi[a] - o[a]) / dir[a];
-      if (ta > tb) {
-        double s = ta;
-        ta = tb;
-        tb = s;
-      }
-      if (ta > t0) t0 = ta;
-      if (tb < t1) t1 = tb;
-    }
-  }
-  if (t0 > t1) return 0;
-  int32_t ix[3], st[3];
-  double tnext[3], tdel[3];
-  for (int a = 0; a < 3; a++) {
-    double p = o[a] + t0 * dir[a];
-    int32_t k = (int32_t)floor((p - g->lo[a]) / g->cs);
-    ix[a] = k < 0 ? 0 : (k >= g->nc[a] ? g->nc[a] - 1 : k);
-    if (dir[a] > PSIL_DTINY) {
-      st[a] = 1;
-      tdel[a] = g->cs / dir[a];
-      tnext[a] = (g->lo[a] + (double)(ix[a] + 1) * g->cs - o[a]) / dir[a];
-    } else if (dir[a] < -PSIL_DTINY) {
-      st[a] = -1;
-      tdel[a] = -g->cs / dir[a];
-      tnext[a] = (g->lo[a] + (double)ix[a] * g->cs - o[a]) / dir[a];
-    } else {
-      st[a] = 0;
-      tdel[a] = 1e300;
-      tnext[a] = 1e300;
-    }
-  }
-  double best = tmax;
-  int found = 0;
-  for (;;) {
-    int64_t c = (int64_t)ix[0] + (int64_t)g->nc[0] * ((int64_t)ix[1] + (int64_t)g->nc[1] * ix[2]);
-    for (int64_t i = g->start[c]; i < g->start[c + 1]; i++) {
-      int32_t t = g->idx[i];
-      int sk = 0;
-      for (int q = 0; q < nskip; q++)
-        if (skip[q] == t) sk = 1;
-      if (sk) continue;
-      double th;
-      if (!psil_tri_hit(m, t, o, dir, &th)) continue;
-      if (th <= tmin || th >= best) continue;
-      if (anyhit) {
-        *thit = th;
-        return 1;
-      }
-      best = th;
-      found = 1;
-    }
-    int a =
-        (tnext[0] < tnext[1]) ? ((tnext[0] < tnext[2]) ? 0 : 2) : ((tnext[1] < tnext[2]) ? 1 : 2);
-    if (tnext[a] > t1 || (found && tnext[a] > best)) break;
-    ix[a] += st[a];
-    if (ix[a] < 0 || ix[a] >= g->nc[a]) break;
-    tnext[a] += tdel[a];
-  }
-  if (found) *thit = best;
-  return found;
-}
+ * Вынесены отсюда шагом О55 (§172, пункт 0): тот же луч по тем же
+ * треугольникам нужен стенду фронта, а третья копия трассировщика — это три
+ * места, где «видно/не видно» может разойтись, и ни одного, где расхождение
+ * поймается. Довод, почему не `hz_pray`, переехал в `pgrid.h` вместе с кодом.
+ * Числа после выноса обязаны совпасть: `./build/psil city noocc n=32` ->
+ * медиана `20518`. */
 
 /* ---- СШИВКА ВЫЖИВШИХ РЁБЕР В ПРЯМЫЕ УЧАСТКИ КОНТУРА (§153, пункт 3) ------
  *
@@ -765,78 +557,18 @@ int main(int argc, char **argv) {
   printf("== загрузка %.1f с\n", t_load);
   fflush(stdout);
 
-  /* ---- СМЕЖНОСТЬ РЁБЕР (пункт 1 порядка работ, А336) --------------------- */
+  /* ---- СМЕЖНОСТЬ РЁБЕР (пункт 1 порядка работ, А336) ---------------------
+   *
+   * Сам разбор живёт в `src/padj.[ch]`: шаг О55 требует, чтобы стенд фронта
+   * работал по ТОМУ ЖЕ набору рёбер, а два разбора — это два множества под
+   * одним числом. Ниже только локальные псевдонимы, чтобы остальной код стенда
+   * не переписывать. */
   double t1 = now_s();
-  int64_t nslot = (int64_t)m.nt * 3;
-  int64_t nvp1 = (int64_t)m.nv + 1;
-  int64_t *off = calloc((size_t)nvp1 + 1, sizeof *off);
-  if (off == NULL) return 2;
-  for (int32_t t = 0; t < m.nt; t++)
-    for (int i = 0; i < 3; i++) {
-      int32_t a = m.f[(size_t)t * 3 + (size_t)i];
-      int32_t b = m.f[(size_t)t * 3 + (size_t)((i + 1) % 3)];
-      int32_t lo = a < b ? a : b;
-      off[(int64_t)lo + 1]++;
-    }
-  for (int64_t i = 0; i < nvp1; i++)
-    off[i + 1] += off[i];
-  int32_t *shi = malloc((size_t)nslot * sizeof *shi);
-  int32_t *sfa = malloc((size_t)nslot * sizeof *sfa);
-  int64_t *cur = malloc((size_t)nvp1 * sizeof *cur);
-  unsigned char *mark = calloc((size_t)nslot, 1);
-  if (shi == NULL || sfa == NULL || cur == NULL || mark == NULL) return 2;
-  for (int64_t i = 0; i < nvp1; i++)
-    cur[i] = off[i];
-  for (int32_t t = 0; t < m.nt; t++)
-    for (int i = 0; i < 3; i++) {
-      int32_t a = m.f[(size_t)t * 3 + (size_t)i];
-      int32_t b = m.f[(size_t)t * 3 + (size_t)((i + 1) % 3)];
-      int32_t lo = a < b ? a : b, hi = a < b ? b : a;
-      int64_t p = cur[lo]++;
-      shi[p] = hi;
-      sfa[p] = t;
-    }
-
-  /* Уникальные рёбра: в каждом ведре линейная группировка по старшей вершине.
-   * Вёдер `nv`, записей в ведре в среднем `3·nt/nv` (у города около шести), так
-   * что `O(k²)` внутри ведра дёшево и предсказуемо. */
-  int32_t *ea = malloc((size_t)nslot * sizeof *ea);
-  int32_t *eb = malloc((size_t)nslot * sizeof *eb);
-  int32_t *ef = malloc((size_t)nslot * PSIL_MAXF * sizeof *ef);
-  unsigned char *enf = malloc((size_t)nslot);
-  if (ea == NULL || eb == NULL || ef == NULL || enf == NULL) return 2;
-  int64_t ne = 0, nb1 = 0, nb2 = 0, nbm = 0, nover = 0;
-  for (int32_t a = 0; a < m.nv; a++) {
-    int64_t s = off[a], e = off[a + 1];
-    for (int64_t i = s; i < e; i++) {
-      if (mark[i]) continue;
-      int32_t h = shi[i];
-      int64_t nf = 1;
-      ea[ne] = a;
-      eb[ne] = h;
-      ef[ne * PSIL_MAXF] = sfa[i];
-      for (int64_t j = i + 1; j < e; j++) {
-        if (mark[j] || shi[j] != h) continue;
-        mark[j] = 1;
-        if (nf < PSIL_MAXF) ef[ne * PSIL_MAXF + nf] = sfa[j];
-        nf++;
-      }
-      if (nf > PSIL_MAXF) nover++;
-      enf[ne] = (unsigned char)(nf > 255 ? 255 : nf);
-      if (nf == 1)
-        nb1++;
-      else if (nf == 2)
-        nb2++;
-      else
-        nbm++;
-      ne++;
-    }
-  }
-  free(mark);
-  free(cur);
-  free(off);
-  free(shi);
-  free(sfa);
+  hz_padj adj;
+  if (hz_padj_build(&adj, &m) != 0) return 2;
+  int32_t *ea = adj.ea, *eb = adj.eb, *ef = adj.ef;
+  unsigned char *enf = adj.enf;
+  int64_t ne = adj.ne, nb1 = adj.nb1, nb2 = adj.nb2, nbm = adj.nbm, nover = adj.nover;
   double t_adj = now_s() - t1;
   printf("== СМЕЖНОСТЬ (%.1f с): рёбер всего %lld\n", t_adj, (long long)ne);
   printf("   ГРАНИЧНЫХ (одна грань, от точки НЕ зависят) %lld (%.2f %%)\n", (long long)nb1,
@@ -870,11 +602,11 @@ int main(int argc, char **argv) {
   }
 
   /* ---- СЕТКА И КОНТРОЛЬ ЛУЧА ЧУЖИМ ЧИСЛОМ (А344) ------------------------- */
-  psil_grid grid;
+  hz_pgrid grid;
   memset(&grid, 0, sizeof grid);
   if (!noocc) {
     double tg = now_s();
-    if (psil_grid_build(&grid, &m) != 0) return 2;
+    if (hz_pgrid_build(&grid, &m) != 0) return 2;
     printf("== СЕТКА (%.1f с): ячейка %.3f м, %d x %d x %d = %lld ячеек, ссылок %lld (%.2f на "
            "треугольник)\n",
            now_s() - tg, grid.cs, grid.nc[0], grid.nc[1], grid.nc[2], (long long)grid.ncell,
@@ -900,14 +632,14 @@ int main(int argc, char **argv) {
       double rr = sqrt(u1), th = 2.0 * M_PI * u2;
       double d[3] = {rr * cos(th), sqrt(1.0 - u1), rr * sin(th)};
       double t;
-      if (!psil_trace(&grid, &m, eye, d, 0.0, far, NULL, 0, 1, &t)) nsky++;
+      if (!hz_pgrid_trace(&grid, &m, eye, d, 0.0, far, NULL, 0, 1, &t)) nsky++;
     }
     int nh = 0;
     for (int i = 0; i < PSIL_NPROBE; i++) {
       double th = 2.0 * M_PI * ((double)i + 0.5) / PSIL_NPROBE;
       double d[3] = {cos(th), 0.0, sin(th)};
       double t;
-      if (psil_trace(&grid, &m, eye, d, 0.0, far, NULL, 0, 0, &t)) hd[nh++] = t;
+      if (hz_pgrid_trace(&grid, &m, eye, d, 0.0, far, NULL, 0, 0, &t)) hd[nh++] = t;
     }
     qsort(hd, (size_t)nh, sizeof *hd, cmp_dbl);
     printf("== КОНТРОЛЬ ЛУЧА (П1, сверка с §110, снятым ПОЛУКУБОМ): доля неба %.4f (§110: "
@@ -1178,8 +910,8 @@ int main(int argc, char **argv) {
           for (int a = 0; a < 3; a++)
             dd[a] /= len;
           double th;
-          if (!psil_trace(&grid, &m, o, dd, PSIL_EPSREL * len, len * (1.0 - PSIL_EPSREL), skip, 3,
-                          1, &th))
+          if (!hz_pgrid_trace(&grid, &m, o, dd, HZ_PGRID_EPSREL * len,
+                              len * (1.0 - HZ_PGRID_EPSREL), skip, 3, 1, &th))
             bits |= (unsigned char)(1u << s);
         }
         reB[i] = bits;
@@ -1835,7 +1567,8 @@ int main(int argc, char **argv) {
   free(clk);
   free(tmp);
   free(silsum);
-  psil_grid_free(&grid);
+  hz_pgrid_free(&grid);
+  hz_padj_free(&adj);
   free(rtri);
   free(novf);
   free(chmax);
@@ -1850,10 +1583,6 @@ int main(int argc, char **argv) {
   free(tot);
   free(rc);
   free(pn);
-  free(enf);
-  free(ef);
-  free(eb);
-  free(ea);
   hz_obj_free(&m);
   printf("\n== ВСЕГО %.1f с\n", now_s() - t0);
   return 0;

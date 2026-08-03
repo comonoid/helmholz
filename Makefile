@@ -194,6 +194,14 @@ build/scenechk: tools/scenechk.c src/scene_obj.c | build
 build/psil: tools/psil.c src/scene_obj.c src/pgrid.c src/pgrid.h src/padj.c src/padj.h | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/psil.c src/scene_obj.c src/pgrid.c src/padj.c -lm'
 
+# pfront — §172, шаг О55: насыщается ли сложность фронта при ходе. Собирается
+# из того же общего слоя, что psil (сетка, смежность, форм-фактор) плюс запись
+# картинки — ни сегментации, ни лестницы шагу не нужно.
+build/pfront: tools/pfront.c src/scene_obj.c src/pgrid.c src/pgrid.h src/padj.c src/padj.h \
+              src/pff.c src/pff.h src/image.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pfront.c src/scene_obj.c src/pgrid.c src/padj.c \
+	  src/pff.c src/image.c -lm'
+
 build/prad: tools/prad.c $(PFULL) | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/prad.c $(PFULL) -lm'
 

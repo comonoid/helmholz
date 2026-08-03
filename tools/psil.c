@@ -130,6 +130,20 @@ static const double PSIL_ALPHA_DEG[] = {1.0, 0.5, 0.1, 0.0};
  * при сверяемой величине `15 %` — на порядок меньше допуска сверки `±5 %`. */
 #define PSIL_NPROBE 4096
 
+/* ---- ГРУППЫ ПРИЁМНИКОВ (§156, шаг О52) ----------------------------------- */
+/* Центров на радиус и приёмников в центре. `8 × 16` при пяти радиусах даёт
+ * `640` приёмников — по замеру §155 (`0.44` с на приёмник) это около пяти
+ * минут, то есть внутри вилки, названной планом. */
+#define PSIL_CL_NC 8
+#define PSIL_CL_K 16
+/* Последний радиус ОТРИЦАТЕЛЕН — это метка «вся сцена», негативный контроль. */
+static const double PSIL_CL_R[] = {0.5, 2.0, 8.0, 32.0, -1.0};
+#define PSIL_CL_NR ((int)(sizeof PSIL_CL_R / sizeof PSIL_CL_R[0]))
+/* Потолок списка кандидатов в шаре: при `R = 32` м и плотности Rungholt
+ * (`6.7` млн треугольников на `2.5e7` м³) в шаре порядка `3.7e4`; миллион —
+ * тридцатикратный запас, а переполнение считается и печатается. */
+#define PSIL_CL_CANDMAX (1 << 20)
+
 static double now_s(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -467,15 +481,21 @@ static int64_t pct_i64(const int64_t *v, int n, double p) {
 }
 
 int main(int argc, char **argv) {
-  int city = 1, nrecv = PSIL_NRECV, noocc = 0;
+  int city = 1, nrecv = PSIL_NRECV, noocc = 0, clust = 0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "hall") == 0) city = 0;
     if (strcmp(argv[i], "city") == 0) city = 1;
     /* НК1 (§153): заслонение ВЫКЛЮЧЕНО — числа обязаны совпасть с §152 точно. */
     if (strcmp(argv[i], "noocc") == 0) noocc = 1;
+    /* §156, шаг О52: приёмники группами, замер общности видимого контура. */
+    if (strcmp(argv[i], "clust") == 0) clust = 1;
     if (strncmp(argv[i], "n=", 2) == 0) nrecv = (int)strtol(argv[i] + 2, NULL, 10);
   }
   if (nrecv < 1) nrecv = 1;
+  if (clust) {
+    noocc = 0; /* без заслонения замерять общность видимого нечего */
+    nrecv = PSIL_CL_NR * PSIL_CL_NC * PSIL_CL_K;
+  }
 
   double t0 = now_s();
   hz_objmesh m;
@@ -608,28 +628,6 @@ int main(int argc, char **argv) {
     pn[(size_t)t * 4 + 3] = c[0] * p0[0] + c[1] * p0[1] + c[2] * p0[2];
   }
 
-  /* ---- ПРИЁМНИКИ -------------------------------------------------------- */
-  double *rc = malloc((size_t)nrecv * 3 * sizeof *rc);
-  if (rc == NULL) return 2;
-  {
-    double eyec[3] = HZ_CFG_CITY_EYE, eyeh[3] = HZ_CFG_HALL_EYE;
-    const double *ey = city ? eyec : eyeh;
-    for (int a = 0; a < 3; a++)
-      rc[a] = ey[a];
-  }
-  int32_t *rtri = malloc((size_t)nrecv * sizeof *rtri);
-  if (rtri == NULL) return 2;
-  rtri[0] = -1; /* камера §110 — точка в воздухе, своего треугольника нет */
-  uint64_t sd = PSIL_SEED;
-  for (int r = 1; r < nrecv; r++) {
-    int32_t t = (int32_t)(rnd64(&sd) % (uint64_t)m.nt);
-    double p[3][3];
-    hz_obj_tri(&m, t, p);
-    for (int a = 0; a < 3; a++)
-      rc[(size_t)r * 3 + (size_t)a] = (p[0][a] + p[1][a] + p[2][a]) / 3.0;
-    rtri[r] = t;
-  }
-
   /* ---- СЕТКА И КОНТРОЛЬ ЛУЧА ЧУЖИМ ЧИСЛОМ (А344) ------------------------- */
   psil_grid grid;
   memset(&grid, 0, sizeof grid);
@@ -680,6 +678,127 @@ int main(int argc, char **argv) {
     fflush(stdout);
   }
 
+  /* ---- ПРИЁМНИКИ -------------------------------------------------------- */
+  double *rc = malloc((size_t)nrecv * 3 * sizeof *rc);
+  int32_t *rtri = malloc((size_t)nrecv * sizeof *rtri);
+  if (rc == NULL || rtri == NULL) return 2;
+  uint64_t sd = PSIL_SEED;
+  int32_t *clk = malloc((size_t)PSIL_CL_NR * PSIL_CL_NC * sizeof *clk);
+  if (clk == NULL) return 2;
+  if (!clust) {
+    double eyec[3] = HZ_CFG_CITY_EYE, eyeh[3] = HZ_CFG_HALL_EYE;
+    const double *ey = city ? eyec : eyeh;
+    for (int a = 0; a < 3; a++)
+      rc[a] = ey[a];
+    rtri[0] = -1; /* камера §110 — точка в воздухе, своего треугольника нет */
+    for (int r = 1; r < nrecv; r++) {
+      int32_t t = (int32_t)(rnd64(&sd) % (uint64_t)m.nt);
+      double p[3][3];
+      hz_obj_tri(&m, t, p);
+      for (int a = 0; a < 3; a++)
+        rc[(size_t)r * 3 + (size_t)a] = (p[0][a] + p[1][a] + p[2][a]) / 3.0;
+      rtri[r] = t;
+    }
+  } else {
+    /* ГРУППЫ (§156): `NC` центров, в каждом `K` треугольников из шара радиуса
+     * `R`. Шар набирается ПО СЕТКЕ, а не отбором наугад: при `R = 0.5` м доля
+     * годных треугольников есть `1e-8`, и отбор наугад не сошёлся бы никогда. */
+    int32_t *stamp = calloc((size_t)m.nt, sizeof *stamp);
+    int32_t *cand = malloc((size_t)PSIL_CL_CANDMAX * sizeof *cand);
+    if (stamp == NULL || cand == NULL) return 2;
+    for (int i = 0; i < PSIL_CL_NR * PSIL_CL_NC; i++)
+      clk[i] = PSIL_CL_K;
+    int32_t cmark = 0;
+    printf("\n== ГРУППЫ ПРИЁМНИКОВ: %d центров × %d приёмников на радиус\n", PSIL_CL_NC, PSIL_CL_K);
+    for (int ri = 0; ri < PSIL_CL_NR; ri++) {
+      double R = PSIL_CL_R[ri];
+      int64_t got = 0, deficit = 0, trunc = 0;
+      for (int ci = 0; ci < PSIL_CL_NC; ci++) {
+        int32_t tc = (int32_t)(rnd64(&sd) % (uint64_t)m.nt);
+        double p[3][3], cen[3];
+        hz_obj_tri(&m, tc, p);
+        for (int a = 0; a < 3; a++)
+          cen[a] = (p[0][a] + p[1][a] + p[2][a]) / 3.0;
+        int64_t nc2 = 0;
+        if (R < 0.0) {
+          /* НЕГАТИВНЫЙ КОНТРОЛЬ: вся сцена. Шар тут не нужен — берутся
+           * случайные треугольники, что и есть «радиус = габарит». */
+          while (nc2 < PSIL_CL_K)
+            cand[nc2++] = (int32_t)(rnd64(&sd) % (uint64_t)m.nt);
+        } else {
+          cmark++;
+          int32_t c0[3] = {0, 0, 0}, c1[3] = {0, 0, 0};
+          for (int a = 0; a < 3; a++) {
+            int32_t i0 = (int32_t)floor((cen[a] - R - grid.lo[a]) / grid.cs);
+            int32_t i1 = (int32_t)floor((cen[a] + R - grid.lo[a]) / grid.cs);
+            c0[a] = i0 < 0 ? 0 : (i0 >= grid.nc[a] ? grid.nc[a] - 1 : i0);
+            c1[a] = i1 < 0 ? 0 : (i1 >= grid.nc[a] ? grid.nc[a] - 1 : i1);
+          }
+          for (int32_t z = c0[2]; z <= c1[2] && nc2 < PSIL_CL_CANDMAX; z++)
+            for (int32_t y = c0[1]; y <= c1[1] && nc2 < PSIL_CL_CANDMAX; y++)
+              for (int32_t x = c0[0]; x <= c1[0] && nc2 < PSIL_CL_CANDMAX; x++) {
+                int64_t c =
+                    (int64_t)x + (int64_t)grid.nc[0] * ((int64_t)y + (int64_t)grid.nc[1] * z);
+                for (int64_t i = grid.start[c]; i < grid.start[c + 1]; i++) {
+                  int32_t t = grid.idx[i];
+                  if (stamp[t] == cmark) continue;
+                  stamp[t] = cmark;
+                  double q[3][3], g2[3], dd = 0.0;
+                  hz_obj_tri(&m, t, q);
+                  for (int a = 0; a < 3; a++) {
+                    g2[a] = (q[0][a] + q[1][a] + q[2][a]) / 3.0 - cen[a];
+                    dd += g2[a] * g2[a];
+                  }
+                  if (dd > R * R) continue;
+                  if (nc2 >= PSIL_CL_CANDMAX) {
+                    trunc++;
+                    break;
+                  }
+                  cand[nc2++] = t;
+                }
+              }
+          if (nc2 < PSIL_CL_K) deficit++;
+          got += nc2;
+          /* Перемешать первые `K` — выбор без возврата. */
+          for (int64_t i = 0; i < PSIL_CL_K && i < nc2; i++) {
+            int64_t j = i + (int64_t)(rnd64(&sd) % (uint64_t)(nc2 - i));
+            int32_t s = cand[i];
+            cand[i] = cand[j];
+            cand[j] = s;
+          }
+        }
+        /* РАЗМЕР ГРУППЫ — ТОЛЬКО РАЗЛИЧНЫЕ ТРЕУГОЛЬНИКИ (А353). Дублировать
+         * приёмник, когда в шаре их меньше `K`, значит завысить `A`: копия
+         * добавляет `|S|` в числитель и ноль в объединение. Лишние места
+         * считаются, но в статистику группы НЕ входят. */
+        int keff = (int)(nc2 < PSIL_CL_K ? nc2 : PSIL_CL_K);
+        if (keff < 1) keff = 1;
+        clk[(ri * PSIL_CL_NC) + ci] = keff;
+        for (int j = 0; j < PSIL_CL_K; j++) {
+          int r = ((ri * PSIL_CL_NC) + ci) * PSIL_CL_K + j;
+          int32_t t = (nc2 > 0) ? cand[j < keff ? j : 0] : tc;
+          double q[3][3];
+          hz_obj_tri(&m, t, q);
+          for (int a = 0; a < 3; a++)
+            rc[(size_t)r * 3 + (size_t)a] = (q[0][a] + q[1][a] + q[2][a]) / 3.0;
+          rtri[r] = t;
+        }
+      }
+      /* А353: сколько треугольников НАШЛОСЬ в шаре — печатается, а не
+       * подразумевается. Если их меньше `K`, совпадение множеств тривиально. */
+      if (R >= 0.0)
+        printf("   R = %6.2f м: в шаре в среднем %.1f треугольника; групп с недобором до %d: "
+               "%lld; переполнений списка: %lld\n",
+               R, (double)got / PSIL_CL_NC, PSIL_CL_K, (long long)deficit, (long long)trunc);
+      else
+        printf("   R = ВСЯ СЦЕНА (негативный контроль): %d случайных треугольника на группу\n",
+               PSIL_CL_K);
+    }
+    free(cand);
+    free(stamp);
+    fflush(stdout);
+  }
+
   /* ---- СЧЁТ ------------------------------------------------------------- */
   double t2 = now_s();
   int64_t *tot = calloc((size_t)nrecv * PSIL_NBIN, sizeof *tot);
@@ -693,6 +812,9 @@ int main(int argc, char **argv) {
   int64_t *vmhist = calloc((size_t)nrecv * 4, sizeof *vmhist);
   int64_t *chmax = calloc((size_t)nrecv, sizeof *chmax);
   int64_t *novf = calloc((size_t)nrecv, sizeof *novf);
+  int32_t **vset = calloc((size_t)nrecv, sizeof *vset);
+  int64_t *vsn = calloc((size_t)nrecv, sizeof *vsn);
+  if (vset == NULL || vsn == NULL) return 2;
   if (tot == NULL || srv == NULL || totnm == NULL || srvnm == NULL || nskip == NULL ||
       vis == NULL || seg == NULL || vseg == NULL || vmhist == NULL || chmax == NULL || novf == NULL)
     return 2;
@@ -848,6 +970,17 @@ int main(int argc, char **argv) {
             lstO[n] = reO[i];
             lstD[n] = reD[i];
             n++;
+          }
+          /* §156: множество ВИДИМЫХ выживших РЁБЕР при основном `α` — то, чью
+           * общность между соседями и меряет О52. Рёбра, а не сегменты: индекс
+           * ребра глобален, а сегмент у разных приёмников кроится по-разному
+           * (А355). */
+          if (clust && onlyvis && q == PSIL_Q_MAIN && n > 0) {
+            vset[r] = malloc((size_t)n * sizeof **vset);
+            if (vset[r] != NULL) {
+              memcpy(vset[r], lstI, (size_t)n * sizeof **vset);
+              vsn[r] = n;
+            }
           }
           int64_t *oc =
               (onlyvis ? vseg : seg) + ((size_t)r * PSIL_NALPHA + (size_t)q) * (size_t)PSIL_NBIN;
@@ -1118,6 +1251,115 @@ int main(int argc, char **argv) {
     free(ss);
   }
 
+  if (clust) {
+    /* ---- ДЕЛИТСЯ ЛИ ВИДИМЫЙ КОНТУР МЕЖДУ СОСЕДЯМИ (§156) ------------------ */
+    printf("\n== ОБЩНОСТЬ ВИДИМОГО КОНТУРА ПО ГРУППАМ (α = %.2f°, множества ВИДИМЫХ РЁБЕР)\n",
+           PSIL_ALPHA_DEG[PSIL_Q_MAIN]);
+    printf("   радиус | K факт | слепых |  |S| средн. | объединение |   A   | Жаккар ср./худш. | "
+           "пустых пар СРЕДИ ЗРЯЧИХ | доля личного |\n");
+    int64_t *key = malloc((size_t)PSIL_CL_K * 100000 * sizeof *key);
+    if (key == NULL) return 2;
+    for (int ri = 0; ri < PSIL_CL_NR; ri++) {
+      double sA = 0.0, sU = 0.0, sS = 0.0, sJ = 0.0, sJw = 0.0, sZ = 0.0, sOwn = 0.0;
+      double sK = 0.0, sB = 0.0;
+      int ncl = 0;
+      for (int ci = 0; ci < PSIL_CL_NC; ci++) {
+        int base = ((ri * PSIL_CL_NC) + ci) * PSIL_CL_K;
+        int keff = clk[(ri * PSIL_CL_NC) + ci];
+        int64_t nk = 0, sum = 0, nblind = 0;
+        for (int j = 0; j < keff; j++) {
+          int r = base + j;
+          sum += vsn[r];
+          if (vsn[r] == 0) nblind++;
+          for (int64_t i = 0; i < vsn[r] && nk < PSIL_CL_K * 100000; i++)
+            key[nk++] = (int64_t)vset[r][i] * PSIL_CL_K + j;
+        }
+        if (sum == 0) continue;
+        qsort(key, (size_t)nk, sizeof *key, cmp_i64);
+        int64_t uni = 0, own = 0;
+        for (int64_t i = 0; i < nk;) {
+          int64_t e = key[i] / PSIL_CL_K, j2 = i;
+          while (j2 < nk && key[j2] / PSIL_CL_K == e)
+            j2++;
+          uni++;
+          if (j2 - i == 1) own++;
+          i = j2;
+        }
+        /* Попарная мера Жаккара — по А354: среднее прячет случай «две стороны
+         * одной стены», поэтому печатается и ХУДШАЯ пара, и доля пустых. */
+        double js = 0.0, jw = 1.0;
+        int64_t np = 0, nz = 0;
+        for (int a = 0; a < keff; a++)
+          for (int b = a + 1; b < keff; b++) {
+            const int32_t *A1 = vset[base + a], *B1 = vset[base + b];
+            int64_t na = vsn[base + a], nb = vsn[base + b];
+            /* ПАРЫ СО СЛЕПЫМ ПРИЁМНИКОМ ИСКЛЮЧАЮТСЯ (правка по А354): у
+             * замурованного в толще блоков пересечение пусто ВСЕГДА, и, попав в
+             * счёт, он выдал бы «две стороны одной стены» там, где стены нет
+             * вовсе. Слепые считаются отдельным числом. */
+            if (na == 0 || nb == 0) continue;
+            int64_t ia = 0, ib = 0, inter = 0;
+            while (ia < na && ib < nb) {
+              if (A1[ia] == B1[ib]) {
+                inter++;
+                ia++;
+                ib++;
+              } else if (A1[ia] < B1[ib])
+                ia++;
+              else
+                ib++;
+            }
+            double jj = (double)inter / (double)(na + nb - inter);
+            js += jj;
+            if (jj < jw) jw = jj;
+            if (inter == 0) nz++;
+            np++;
+          }
+        sA += (double)sum / (double)uni;
+        sU += (double)uni;
+        sS += (double)sum / (double)keff;
+        sJ += (np > 0) ? js / (double)np : 0.0;
+        sJw += (np > 0) ? jw : 0.0;
+        sZ += (np > 0) ? (double)nz / (double)np : 0.0;
+        sOwn += (double)own / (double)sum;
+        sK += keff;
+        sB += (double)nblind;
+        ncl++;
+      }
+      if (ncl == 0) continue;
+      double R = PSIL_CL_R[ri];
+      char rn[32];
+      if (R >= 0.0)
+        snprintf(rn, sizeof rn, "%6.2f м", R);
+      else
+        snprintf(rn, sizeof rn, "  СЦЕНА");
+      printf("   %s | %6.1f | %6.1f | %11.1f | %11.1f | %5.2f | %6.3f / %.3f | %19.1f %% | "
+             "%11.1f %% |%s\n",
+             rn, sK / ncl, sB / ncl, sS / ncl, sU / ncl, sA / ncl, sJ / ncl, sJw / ncl,
+             100.0 * sZ / ncl, 100.0 * sOwn / ncl, (R < 0.0) ? " НЕГ. КОНТРОЛЬ" : "");
+    }
+    /* Регрессия К=1 (§156): объединение группы из ОДНОГО приёмника обязано
+     * совпасть с его множеством, а `A` — быть равным единице ТОЧНО. */
+    {
+      int r = 0;
+      while (r < nrecv && vsn[r] == 0)
+        r++;
+      if (r < nrecv) {
+        int64_t uni = 0;
+        for (int64_t i = 0; i < vsn[r]; i++)
+          if (i == 0 || vset[r][i] != vset[r][i - 1]) uni++;
+        printf("   регрессия K=1: |S| = %lld, |объединение| = %lld, A = %.6f — %s\n",
+               (long long)vsn[r], (long long)uni, (double)vsn[r] / (double)uni,
+               (uni == vsn[r]) ? "СОВПАЛО" : "РАЗОШЛОСЬ");
+      }
+    }
+    free(key);
+  }
+  for (int r = 0; r < nrecv; r++)
+    free(vset[r]);
+  free(vset);
+  free(vsn);
+  free(clk);
   free(tmp);
   free(silsum);
   psil_grid_free(&grid);

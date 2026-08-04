@@ -49,6 +49,10 @@
  * уровень) ровно до шестого; §202 — там же сжатие освещённого набора выходит на
  * `30×` при `1 008` источниках. */
 #define PCELL_AGG_LEV 5
+/* УРОВЕНЬ АГРЕГАЦИИ СТАЛ КЛЮЧОМ (шаг О67, план §230): О66 показала, что от него
+ * зависит, где лежит ТОЧКА источника, а прежние два замера выводили `5` из
+ * размера набора и к положению центра слепы. Умолчание — прежнее. */
+static int g_agg = PCELL_AGG_LEV;
 /* Сколько лучей в бескамерном замере О63. Число выбрано не круглым ради
  * круглости: у Сан-Мигеля освещённый набор строится по `1 068 334` элементам
  * (§200), и замер обязан быть сопоставим с ним по объёму работы, а не мельче. */
@@ -144,7 +148,7 @@ static int pc_trace(const hz_pgrid *G, const hz_ptree *T, const hz_objmesh *m, c
 
 static double pc_gather(const pc_srcs *S, const double hp[3], const double nrm[3], int64_t *ngath,
                         int64_t *nvis, const pc_vis *V, int64_t *npair, int64_t *nblk,
-                        int64_t *ntst) {
+                        int64_t *ntst, double *sumr) {
   double ind = 0.0;
   int32_t st2[128];
   int sp3 = 0;
@@ -197,6 +201,9 @@ static double pc_gather(const pc_srcs *S, const double hp[3], const double nrm[3
       if (npair != NULL) (*npair)++;
       if (nblk != NULL && blocked) (*nblk)++;
       if (ntst != NULL) (*ntst) += e1;
+      /* ДЛИНА ЛУЧА (А457): без неё падение доли перекрытых при углублении
+       * уровня нельзя отличить от того, что источники просто стали ближе. */
+      if (sumr != NULL) (*sumr) += rr;
       int take = (V->mode == 2) ? blocked : !blocked;
       if (!take) continue;
     }
@@ -273,6 +280,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "img=", 4) == 0) imgw = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "gather=", 7) == 0) g_gmode = (strcmp(argv[i] + 7, "elem") == 0);
     if (strncmp(argv[i], "shift=", 6) == 0) g_shift = (int)strtol(argv[i] + 6, NULL, 10);
+    if (strncmp(argv[i], "agg=", 4) == 0) g_agg = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "vis=", 4) == 0)
       g_vis =
           (strcmp(argv[i] + 4, "on") == 0) ? 1 : ((strcmp(argv[i] + 4, "inverse") == 0) ? 2 : 0);
@@ -751,8 +759,8 @@ int main(int argc, char **argv) {
            * одном ребёнке. У `ptree` там висит 72.5 %% геометрии, и крупнейшие
            * стены — как раз наверху. Каждый элемент числится ровно один раз:
            * узлы `dep == L` берут ПОДДЕРЕВО, узлы `dep < L` — только СВОЁ. */
-          int at_lev = (dep[i] == PCELL_AGG_LEV && ls[i] > 0);
-          int above = (dep[i] < PCELL_AGG_LEV && litn[i] > 0);
+          int at_lev = (dep[i] == g_agg && ls[i] > 0);
+          int above = (dep[i] < g_agg && litn[i] > 0);
           if (!at_lev && !above) continue;
           const double *vsrc = at_lev ? &lv[4 * (size_t)i] : &litv[4 * (size_t)i];
           const double *psrc = at_lev ? &lp[4 * (size_t)i] : &litp[4 * (size_t)i];
@@ -779,7 +787,7 @@ int main(int argc, char **argv) {
           wsum += src_w[q2];
         printf("== ВТОРИЧНЫХ ИСТОЧНИКОВ построено %lld (уровень %d), мощность %.2f против эталона "
                "%.2f — ИНВАРИАНТ ЭНЕРГИИ %s\n",
-               (long long)nsrc, PCELL_AGG_LEV, wsum, wref,
+               (long long)nsrc, g_agg, wsum, wref,
                (fabs(wsum - wref) <= 1e-9 * (wref > 0.0 ? wref : 1.0)) ? "СОШЁЛСЯ" : "НЕ СОШЁЛСЯ");
       }
       /* НЕ ОСВОБОЖДАЕМ: суммы по поддеревьям нужны кадру для ИЕРАРХИЧЕСКОГО
@@ -1044,9 +1052,10 @@ int main(int argc, char **argv) {
       double t_gth = now_s();
       int64_t ng2 = 0, nv2 = 0, npair = 0, nblk = 0, ntst = 0;
       int64_t npL = 0, nbL = 0, npD = 0, nbD = 0;
+      double srsum = 0.0;
       pc_vis VIS = {&G, &T, (g_vis != 0) ? &m : NULL, diag2, g_vis};
 #pragma omp parallel for schedule(dynamic, 256)                                                    \
-    reduction(+ : ng2, nv2, npair, nblk, ntst, npL, nbL, npD, nbD)
+    reduction(+ : ng2, nv2, npair, nblk, ntst, npL, nbL, npD, nbD, srsum)
       for (int64_t e = 0; e < nel; e++) {
         if (el_vis[e] == 0 || !(el_p[4 * (size_t)e + 3] > 0.0)) continue;
         double hp[3] = {0, 0, 0}, nrm[3] = {0, 0, 0};
@@ -1068,7 +1077,7 @@ int main(int argc, char **argv) {
           for (int c = 0; c < 3; c++)
             nrm[c] = -nrm[c];
         int64_t p0 = 0, b0 = 0;
-        el_ind[e] = pc_gather(&SRC, hp, nrm, &ng2, &nv2, &VIS, &p0, &b0, &ntst);
+        el_ind[e] = pc_gather(&SRC, hp, nrm, &ng2, &nv2, &VIS, &p0, &b0, &ntst, &srsum);
         npair += p0;
         nblk += b0;
         if (el_lit[e]) {
@@ -1089,10 +1098,11 @@ int main(int argc, char **argv) {
              (double)ng2 / (double)(nvel > 0 ? nvel : 1), (long long)nv2, esum);
       if (g_vis != 0) {
         printf("== ВИДИМОСТЬ В КОСВЕННОМ (%s): пар %lld, перекрыто %lld (%.1f %%), "
-               "треугольников на луч %.1f\n",
+               "треугольников на луч %.1f, СРЕДНЯЯ ДЛИНА луча %.2f м (А457)\n",
                (g_vis == 2) ? "ИНВЕРСИЯ, негативный контроль" : "прямой тест", (long long)npair,
                (long long)nblk, 100.0 * (double)nblk / (double)(npair > 0 ? npair : 1),
-               (double)ntst / (double)(npair > 0 ? npair : 1));
+               (double)ntst / (double)(npair > 0 ? npair : 1),
+               srsum / (double)(npair > 0 ? npair : 1));
         printf("   ВТОРАЯ ПРОВЕРКА (А452): у элементов В ТЕНИ перекрыто %.1f %%, у ОСВЕЩЁННЫХ "
                "%.1f %% — %s\n",
                100.0 * (double)nbD / (double)(npD > 0 ? npD : 1),
@@ -1124,7 +1134,7 @@ int main(int argc, char **argv) {
           if (nrm[0] * vd[0] + nrm[1] * vd[1] + nrm[2] * vd[2] > 0.0)
             for (int c = 0; c < 3; c++)
               nrm[c] = -nrm[c];
-          double i0 = pc_gather(&SRC, hp, nrm, NULL, NULL, &VOFF, NULL, NULL, NULL);
+          double i0 = pc_gather(&SRC, hp, nrm, NULL, NULL, &VOFF, NULL, NULL, NULL, NULL);
           esum0 += i0 * el_p[4 * (size_t)e + 3];
           if (el_ind[e] > i0) nup++;
         }
@@ -1299,7 +1309,7 @@ int main(int argc, char **argv) {
              * с которым сравнивается поэлементный, и потому обязан считать той
              * же арифметикой, а не своей копией. */
             if (g_gmode == 0)
-              ind = pc_gather(&SRC, hp, nrm, &ngath, &nvis3, NULL, NULL, NULL, NULL);
+              ind = pc_gather(&SRC, hp, nrm, &ngath, &nvis3, NULL, NULL, NULL, NULL, NULL);
             else {
               /* СБОР НА ЭЛЕМЕНТЕ: одно чтение вместо спуска по дереву.
                * `g_shift` — негативный контроль (§219): косвенное берётся у

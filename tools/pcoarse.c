@@ -337,6 +337,17 @@ static void negcontrol(const hz_objmesh *m, const hz_polyset *ps, int ntop) {
 
 int main(int argc, char **argv) {
   int city = (argc > 1 && strcmp(argv[1], "city") == 0);
+  /* Третья сцена (§187). Отдельным флагом, а не переключением `city`: числа
+   * города цитируются в десятке докладов, и путать их нельзя. */
+  int miguel = 0;
+  for (int i = 1; i < argc; i++)
+    if (strcmp(argv[i], "miguel") == 0) miguel = 1;
+  int miglow = 0;
+  for (int i = 1; i < argc; i++)
+    if (strcmp(argv[i], "miglow") == 0) {
+      miguel = 1;
+      miglow = 1;
+    }
   /* ЭТАЛОН БЕЗ ОБОЛОЧКИ (А45): опорное множество — все различные вершины.
    * Слепок и `dmax_worst` обязаны совпасть с обычным прогоном; расхождение
    * означает, что монотонная цепь теряет опорные точки. */
@@ -360,10 +371,17 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "loss=", 5) == 0) g_lossmax = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "asp=", 4) == 0) g_aspmax = strtod(argv[i] + 4, NULL);
   }
-  double delta = (argc > 2) ? strtod(argv[2], NULL) : (city ? 0.05 : 0.045);
+  /* Допуск планарности. У Сан-Мигеля берётся городской `0.05` м: он в метрах,
+   * как и город, а зальные `45` мм привязаны к масштабу зала. */
+  double delta = (argc > 2 && argv[2][0] >= '0' && argv[2][0] <= '9')
+                     ? strtod(argv[2], NULL)
+                     : ((city || miguel) ? 0.05 : 0.045);
   hz_objmesh m;
-  if (hz_obj_load(&m, city ? HZ_CFG_CITY_OBJ : HZ_CFG_HALL_OBJ,
-                  city ? HZ_CFG_CITY_SCALE : HZ_CFG_HALL_SCALE) != 0) {
+  if (hz_obj_load(&m,
+                  miguel ? (miglow ? HZ_CFG_MIGUEL_LOW_OBJ : HZ_CFG_MIGUEL_OBJ)
+                         : (city ? HZ_CFG_CITY_OBJ : HZ_CFG_HALL_OBJ),
+                  miguel ? HZ_CFG_MIGUEL_SCALE : (city ? HZ_CFG_CITY_SCALE : HZ_CFG_HALL_SCALE)) !=
+      0) {
     fprintf(stderr, "нет сцены\n");
     return 1;
   }

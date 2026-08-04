@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   double delta = PCELL_DELTA;
-  int leafmax = 0, maxlev = 0, wpx = HZ_CFG_W;
+  int leafmax = 0, maxlev = 0, wpx = HZ_CFG_W, loose = 0;
   /* Полоса §191, названная пользователем: элемент от 4 до 32 пикселей. */
   double pxlo = 4.0, pxhi = 32.0;
   for (int i = 3; i < argc; i++) {
@@ -75,6 +75,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "w=", 2) == 0) wpx = (int)strtol(argv[i] + 2, NULL, 10);
     if (strncmp(argv[i], "pxhi=", 5) == 0) pxhi = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "pxlo=", 5) == 0) pxlo = strtod(argv[i] + 5, NULL);
+    if (strcmp(argv[i], "loose") == 0) loose = 1;
   }
 
   hz_objmesh m;
@@ -92,7 +93,7 @@ int main(int argc, char **argv) {
   /* ---- ДЕРЕВО ---------------------------------------------------------- */
   hz_ptree T;
   t0 = now_s();
-  if (hz_ptree_build(&T, &m, leafmax, maxlev) != 0) {
+  if (hz_ptree_build_ex(&T, &m, leafmax, maxlev, loose) != 0) {
     fprintf(stderr, "отказ дерева\n");
     return 2;
   }

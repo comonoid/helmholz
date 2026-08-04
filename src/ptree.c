@@ -92,17 +92,43 @@ static int pt_split(hz_ptree *t, const hz_objmesh *m, int32_t nid, int32_t *list
     free(keep);
     return 1;
   }
+  /* РЫХЛАЯ УКЛАДКА (§196, ключ `t->loose`). Строгое правило «влезает целиком»
+   * оставляет у внутренних узлов 71…79 % треугольников (замерено по трём
+   * сценам), и `leafmax` их размер не ограничивает. Рыхлое правило отправляет
+   * треугольник вниз ВСЕГДА — по октанту его ЦЕНТРА, — а коробка ребёнка
+   * расширяется, чтобы его содержать. Цена названа в §196: коробки детей
+   * начинают ПЕРЕКРЫВАТЬСЯ, и обход спереди назад по порядку октантов
+   * перестаёт быть точным. Поэтому правило только по ключу и НИКОГДА не
+   * умолчание: у `pvis` точный порядок обхода — несущее свойство. */
+  int32_t *owner = malloc((size_t)n * sizeof *owner);
+  if (owner == NULL) {
+    free(sub);
+    free(keep);
+    return 1;
+  }
   int32_t nk = 0;
   for (int32_t i = 0; i < n; i++) {
     const double *bl = tlo + 3 * (size_t)list[i], *bh = thi + 3 * (size_t)list[i];
     int own = -1;
-    for (int k = 0; k < 8 && own < 0; k++) {
-      const double *clo = t->nd[c0 + k].lo, *chi = t->nd[c0 + k].hi;
-      int in = 1;
-      for (int c = 0; c < 3 && in; c++)
-        if (bl[c] < clo[c] || bh[c] > chi[c]) in = 0;
-      if (in) own = k;
+    if (t->loose) {
+      own = 0;
+      for (int c = 0; c < 3; c++)
+        if (0.5 * (bl[c] + bh[c]) >= mid[c]) own |= (1 << c);
+      hz_ptnode *C = &t->nd[c0 + own];
+      for (int c = 0; c < 3; c++) {
+        if (bl[c] < C->lo[c]) C->lo[c] = bl[c];
+        if (bh[c] > C->hi[c]) C->hi[c] = bh[c];
+      }
+    } else {
+      for (int k = 0; k < 8 && own < 0; k++) {
+        const double *clo = t->nd[c0 + k].lo, *chi = t->nd[c0 + k].hi;
+        int in = 1;
+        for (int c = 0; c < 3 && in; c++)
+          if (bl[c] < clo[c] || bh[c] > chi[c]) in = 0;
+        if (in) own = k;
+      }
     }
+    owner[i] = own;
     if (own < 0) keep[nk++] = list[i];
   }
   if (pt_grow_ref(t, nk) != 0) {
@@ -116,27 +142,32 @@ static int pt_split(hz_ptree *t, const hz_objmesh *m, int32_t nid, int32_t *list
   memcpy(t->ref + t->nref, keep, (size_t)nk * sizeof *keep);
   t->nref += nk;
   free(keep);
+  /* Раскладка по детям идёт ПО ТОМУ ЖЕ `owner`, что и подсчёт остатка выше.
+   * Прежняя редакция перепроверяла условие вторым циклом — при рыхлом правиле
+   * это дало бы РАСХОЖДЕНИЕ двух проверок (коробки уже расширены), то есть
+   * ровно тот класс, где два места считают одно и то же по-разному. */
   for (int k = 0; k < 8; k++) {
-    const double *clo = t->nd[c0 + k].lo, *chi = t->nd[c0 + k].hi;
     int32_t ns = 0;
-    for (int32_t i = 0; i < n; i++) {
-      const double *bl = tlo + 3 * (size_t)list[i], *bh = thi + 3 * (size_t)list[i];
-      int in = 1;
-      for (int c = 0; c < 3 && in; c++)
-        if (bl[c] < clo[c] || bh[c] > chi[c]) in = 0;
-      if (in) sub[ns++] = list[i];
-    }
+    for (int32_t i = 0; i < n; i++)
+      if (owner[i] == k) sub[ns++] = list[i];
     if (pt_split(t, m, c0 + k, sub, ns, lev + 1, tlo, thi) != 0) {
       free(sub);
+      free(owner);
       return 1;
     }
   }
   free(sub);
+  free(owner);
   return 0;
 }
 
 int hz_ptree_build(hz_ptree *t, const hz_objmesh *m, int leafmax, int maxlev) {
+  return hz_ptree_build_ex(t, m, leafmax, maxlev, 0);
+}
+
+int hz_ptree_build_ex(hz_ptree *t, const hz_objmesh *m, int leafmax, int maxlev, int loose) {
   memset(t, 0, sizeof *t);
+  t->loose = loose;
   t->leafmax = (leafmax > 0) ? leafmax : 16;
   t->maxlev = (maxlev > 0) ? maxlev : 12;
   if (m->nt <= 0) return 1;

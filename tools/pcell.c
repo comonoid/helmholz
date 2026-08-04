@@ -92,6 +92,10 @@ static int g_agg = PCELL_AGG_LEV;
  * источника ниже `~28°` — та же по смыслу величина, что допуск связи в
  * иерархической радиосити. Меньше — точнее и дороже. */
 #define PCELL_SRC_K 4.0
+/* СТАЛ КЛЮЧОМ (шаг О68, план §233): О67 показала, что гранулярность источника в
+ * сборе задаёт ИМЕННО он, а не уровень агрегации, и что не сканирован он ни
+ * разу (отмечено ещё §209). Умолчание — прежнее. */
+static double g_srck = PCELL_SRC_K;
 /* Проб неба на пиксель. При `24` шум видимости ниже кванта восьми разрядов
  * везде, кроме контактных стыков, — та же оценка `1/√N`, что в §183. */
 #define PCELL_SKY_SAMP 24
@@ -148,7 +152,7 @@ static int pc_trace(const hz_pgrid *G, const hz_ptree *T, const hz_objmesh *m, c
 
 static double pc_gather(const pc_srcs *S, const double hp[3], const double nrm[3], int64_t *ngath,
                         int64_t *nvis, const pc_vis *V, int64_t *npair, int64_t *nblk,
-                        int64_t *ntst, double *sumr) {
+                        int64_t *ntst, double *sumr, double *sumt, int64_t *nnear) {
   double ind = 0.0;
   int32_t st2[128];
   int sp3 = 0;
@@ -167,7 +171,7 @@ static double pc_gather(const pc_srcs *S, const double hp[3], const double nrm[3
     rad2 = sqrt(rad2);
     double dc[3] = {c2[0] - hp[0], c2[1] - hp[1], c2[2] - hp[2]};
     double rc = sqrt(dc[0] * dc[0] + dc[1] * dc[1] + dc[2] * dc[2]);
-    int split = (nd2->child >= 0) && (rc < rad2 * PCELL_SRC_K) && (sp3 + 8 < 128);
+    int split = (nd2->child >= 0) && (rc < rad2 * g_srck) && (sp3 + 8 < 128);
     const double *vv = split ? &S->sv[4 * (size_t)ni] : &S->lv[4 * (size_t)ni];
     const double *pp = split ? &S->sp[4 * (size_t)ni] : &S->lp[4 * (size_t)ni];
     if (split)
@@ -204,6 +208,11 @@ static double pc_gather(const pc_srcs *S, const double hp[3], const double nrm[3
       /* ДЛИНА ЛУЧА (А457): без неё падение доли перекрытых при углублении
        * уровня нельзя отличить от того, что источники просто стали ближе. */
       if (sumr != NULL) (*sumr) += rr;
+      /* ГДЕ ИМЕННО ЛУЧ УПИРАЕТСЯ (диагностика к «УБИВАЕТ» О68): доля пути до
+       * заслона. Если заслон стоит у самого приёмника, это САМОЗАСЛОН элемента,
+       * а не густая сцена, и лечится он отступом, а не размером источника. */
+      if (blocked && sumt != NULL) (*sumt) += sth / rr;
+      if (blocked && nnear != NULL && sth < 0.01 * rr) (*nnear)++;
       int take = (V->mode == 2) ? blocked : !blocked;
       if (!take) continue;
     }
@@ -281,6 +290,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "gather=", 7) == 0) g_gmode = (strcmp(argv[i] + 7, "elem") == 0);
     if (strncmp(argv[i], "shift=", 6) == 0) g_shift = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "agg=", 4) == 0) g_agg = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "srck=", 5) == 0) g_srck = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "vis=", 4) == 0)
       g_vis =
           (strcmp(argv[i] + 4, "on") == 0) ? 1 : ((strcmp(argv[i] + 4, "inverse") == 0) ? 2 : 0);
@@ -1052,10 +1062,11 @@ int main(int argc, char **argv) {
       double t_gth = now_s();
       int64_t ng2 = 0, nv2 = 0, npair = 0, nblk = 0, ntst = 0;
       int64_t npL = 0, nbL = 0, npD = 0, nbD = 0;
-      double srsum = 0.0;
+      double srsum = 0.0, stsum = 0.0;
+      int64_t nnear = 0;
       pc_vis VIS = {&G, &T, (g_vis != 0) ? &m : NULL, diag2, g_vis};
 #pragma omp parallel for schedule(dynamic, 256)                                                    \
-    reduction(+ : ng2, nv2, npair, nblk, ntst, npL, nbL, npD, nbD, srsum)
+    reduction(+ : ng2, nv2, npair, nblk, ntst, npL, nbL, npD, nbD, srsum, stsum, nnear)
       for (int64_t e = 0; e < nel; e++) {
         if (el_vis[e] == 0 || !(el_p[4 * (size_t)e + 3] > 0.0)) continue;
         double hp[3] = {0, 0, 0}, nrm[3] = {0, 0, 0};
@@ -1077,7 +1088,8 @@ int main(int argc, char **argv) {
           for (int c = 0; c < 3; c++)
             nrm[c] = -nrm[c];
         int64_t p0 = 0, b0 = 0;
-        el_ind[e] = pc_gather(&SRC, hp, nrm, &ng2, &nv2, &VIS, &p0, &b0, &ntst, &srsum);
+        el_ind[e] =
+            pc_gather(&SRC, hp, nrm, &ng2, &nv2, &VIS, &p0, &b0, &ntst, &srsum, &stsum, &nnear);
         npair += p0;
         nblk += b0;
         if (el_lit[e]) {
@@ -1103,6 +1115,13 @@ int main(int argc, char **argv) {
                (long long)nblk, 100.0 * (double)nblk / (double)(npair > 0 ? npair : 1),
                (double)ntst / (double)(npair > 0 ? npair : 1),
                srsum / (double)(npair > 0 ? npair : 1));
+        printf("   ГДЕ УПИРАЕТСЯ ЛУЧ: средняя доля пути до заслона %.4f; перекрытых В ПЕРВОМ "
+               "ПРОЦЕНТЕ пути %lld (%.1f %% от перекрытых) — %s\n",
+               stsum / (double)(nblk > 0 ? nblk : 1), (long long)nnear,
+               100.0 * (double)nnear / (double)(nblk > 0 ? nblk : 1),
+               ((double)nnear / (double)(nblk > 0 ? nblk : 1) > 0.5)
+                   ? "САМОЗАСЛОН ЭЛЕМЕНТА, лечится отступом"
+                   : "заслон настоящий, сцена густа");
         printf("   ВТОРАЯ ПРОВЕРКА (А452): у элементов В ТЕНИ перекрыто %.1f %%, у ОСВЕЩЁННЫХ "
                "%.1f %% — %s\n",
                100.0 * (double)nbD / (double)(npD > 0 ? npD : 1),
@@ -1134,7 +1153,8 @@ int main(int argc, char **argv) {
           if (nrm[0] * vd[0] + nrm[1] * vd[1] + nrm[2] * vd[2] > 0.0)
             for (int c = 0; c < 3; c++)
               nrm[c] = -nrm[c];
-          double i0 = pc_gather(&SRC, hp, nrm, NULL, NULL, &VOFF, NULL, NULL, NULL, NULL);
+          double i0 =
+              pc_gather(&SRC, hp, nrm, NULL, NULL, &VOFF, NULL, NULL, NULL, NULL, NULL, NULL);
           esum0 += i0 * el_p[4 * (size_t)e + 3];
           if (el_ind[e] > i0) nup++;
         }
@@ -1309,7 +1329,8 @@ int main(int argc, char **argv) {
              * с которым сравнивается поэлементный, и потому обязан считать той
              * же арифметикой, а не своей копией. */
             if (g_gmode == 0)
-              ind = pc_gather(&SRC, hp, nrm, &ngath, &nvis3, NULL, NULL, NULL, NULL, NULL);
+              ind = pc_gather(&SRC, hp, nrm, &ngath, &nvis3, NULL, NULL, NULL, NULL, NULL, NULL,
+                              NULL);
             else {
               /* СБОР НА ЭЛЕМЕНТЕ: одно чтение вместо спуска по дереву.
                * `g_shift` — негативный контроль (§219): косвенное берётся у

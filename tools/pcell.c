@@ -78,6 +78,11 @@
  * контраста там нет по построению. Число выбрано так, чтобы прямое солнце на
  * площадке, повёрнутой к нему, ложилось в `0.9`, оставляя запас под блики. */
 #define PCELL_EXPO 0.9
+/* Критерий дробления при иерархическом сборе: узел берётся источником, пока
+ * приёмник дальше `PCELL_SRC_K` его радиусов. `4` означает угловой размер
+ * источника ниже `~28°` — та же по смыслу величина, что допуск связи в
+ * иерархической радиосити. Меньше — точнее и дороже. */
+#define PCELL_SRC_K 4.0
 /* Проб неба на пиксель. При `24` шум видимости ниже кванта восьми разрядов
  * везде, кроме контактных стыков, — та же оценка `1/√N`, что в §183. */
 #define PCELL_SKY_SAMP 24
@@ -204,6 +209,11 @@ int main(int argc, char **argv) {
   /* Вторичные источники: центр+нормаль (по 6 чисел) и мощность. Потолок —
    * число узлов, заведомо с запасом. */
   int64_t nsrc = 0;
+  /* Суммы по поддеревьям переживают блок агрегирования: их читает кадр. */
+  double *g_lv = NULL, *g_lp = NULL;
+  int64_t *g_ls = NULL;
+  int32_t *g_dep = NULL;
+  (void)g_dep;
   double *src_p = calloc((size_t)(T.nnd > 0 ? T.nnd : 1) * 6, sizeof *src_p);
   double *src_n = calloc((size_t)(T.nnd > 0 ? T.nnd : 1) * 6, sizeof *src_n);
   double *src_w = calloc((size_t)(T.nnd > 0 ? T.nnd : 1), sizeof *src_w);
@@ -479,11 +489,14 @@ int main(int argc, char **argv) {
                (long long)nsrc, PCELL_AGG_LEV, wsum, wref,
                (fabs(wsum - wref) <= 1e-9 * (wref > 0.0 ? wref : 1.0)) ? "СОШЁЛСЯ" : "НЕ СОШЁЛСЯ");
       }
-      free(lp);
-      free(lv);
+      /* НЕ ОСВОБОЖДАЕМ: суммы по поддеревьям нужны кадру для ИЕРАРХИЧЕСКОГО
+       * СБОРА (§209). Плоский перебор 1 326 источников на пиксель и есть
+       * главный расход кадра. */
+      g_lv = lv;
+      g_lp = lp;
     }
-    free(ls);
-    free(dep);
+    g_ls = ls;
+    g_dep = dep;
   }
 
   /* ---- РОСТ ЧИСЛА УЗЛОВ ПО УРОВНЯМ ДЕРЕВА (§199, гипотеза «б») ---------
@@ -661,8 +674,8 @@ int main(int argc, char **argv) {
       uv[2] = ri[0] * fw[1] - ri[1] * fw[0];
       double th2 = tan(0.5 * HZ_CFG_FOV_DEG * M_PI / 180.0);
       double t_pic = now_s();
-      int64_t nmis = 0, npix2 = 0;
-#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nmis, npix2)
+      int64_t nmis = 0, npix2 = 0, ngath = 0;
+#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nmis, npix2, ngath)
       for (int j = 0; j < H; j++)
         for (int i = 0; i < W; i++) {
           double sx = (2.0 * ((double)i + 0.5) / W - 1.0) * th2;
@@ -776,19 +789,48 @@ int main(int argc, char **argv) {
             if ((nrm[0] * d[0] + nrm[1] * d[1] + nrm[2] * d[2]) > 0.0)
               for (int c = 0; c < 3; c++)
                 nrm[c] = -nrm[c];
-            for (int64_t q3 = 0; q3 < nsrc; q3++) {
-              double dv[3] = {src_p[6 * q3] - hp[0], src_p[6 * q3 + 1] - hp[1],
-                              src_p[6 * q3 + 2] - hp[2]};
+            /* ИЕРАРХИЧЕСКИЙ СБОР ПО ИНДЕКСУ (§209), вместо плоского перебора
+             * всех источников на каждый пиксель. Спуск от корня: узел берётся
+             * ИСТОЧНИКОМ, пока его угловой размер из этой точки мал; иначе
+             * дробится. Учёт тот же, что поймал §206: ВЗЯТЫЙ узел представляет
+             * ПОДДЕРЕВО (`g_lv`/`g_lp`), ПРОЙДЕННЫЙ отдаёт только СВОЁ
+             * (`litv`/`litp`). Каждый освещённый элемент учитывается ровно раз. */
+            int32_t st2[128];
+            int sp3 = 0;
+            st2[sp3++] = 0;
+            while (sp3 > 0) {
+              int32_t ni = st2[--sp3];
+              if (g_ls == NULL || g_ls[ni] <= 0) continue;
+              const hz_ptnode *nd2 = &T.nd[ni];
+              double c2[3] = {0, 0, 0}, rad2 = 0.0;
+              for (int a = 0; a < 3; a++) {
+                c2[a] = 0.5 * (nd2->lo[a] + nd2->hi[a]);
+                double h2 = 0.5 * (nd2->hi[a] - nd2->lo[a]);
+                rad2 += h2 * h2;
+              }
+              rad2 = sqrt(rad2);
+              double dc[3] = {c2[0] - hp[0], c2[1] - hp[1], c2[2] - hp[2]};
+              double rc = sqrt(dc[0] * dc[0] + dc[1] * dc[1] + dc[2] * dc[2]);
+              int split = (nd2->child >= 0) && (rc < rad2 * PCELL_SRC_K) && (sp3 + 8 < 128);
+              const double *vv = split ? &litv[4 * (size_t)ni] : &g_lv[4 * (size_t)ni];
+              const double *pp = split ? &litp[4 * (size_t)ni] : &g_lp[4 * (size_t)ni];
+              if (split)
+                for (int qq = 0; qq < 8; qq++)
+                  st2[sp3++] = nd2->child + qq;
+              if (!(vv[3] > 0.0)) continue;
+              double dv[3] = {pp[0] / vv[3] - hp[0], pp[1] / vv[3] - hp[1], pp[2] / vv[3] - hp[2]};
               double r2 = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
               if (!(r2 > 1e-9)) continue;
               double rr = sqrt(r2);
               double cr2 = (nrm[0] * dv[0] + nrm[1] * dv[1] + nrm[2] * dv[2]) / rr;
               if (!(cr2 > 0.0)) continue;
-              double cs2 =
-                  -(src_n[6 * q3] * dv[0] + src_n[6 * q3 + 1] * dv[1] + src_n[6 * q3 + 2] * dv[2]) /
-                  rr;
+              double vn2 = sqrt(vv[0] * vv[0] + vv[1] * vv[1] + vv[2] * vv[2]);
+              if (!(vn2 > 0.0)) continue;
+              double cs2 = -(vv[0] * dv[0] + vv[1] * dv[1] + vv[2] * dv[2]) / (vn2 * rr);
               if (!(cs2 > 0.0)) continue;
-              ind += src_w[q3] * cr2 * cs2 / (M_PI * r2 + src_w[q3]);
+              double w2 = PCELL_RHO * pp[3];
+              ind += w2 * cr2 * cs2 / (M_PI * r2 + w2);
+              ngath++;
             }
             /* ЦВЕТ БЕРЁТСЯ ИЗ МАТЕРИАЛА, А НЕ ПРИДУМЫВАЕТСЯ. Прежняя редакция красила
              * тёплым/холодным по признаку «освещён», и кадр выходил чистым
@@ -869,6 +911,10 @@ int main(int argc, char **argv) {
         printf("== КАРТИНКА img/pcell_lit.ppm за %.2f с: тень ЧЕСТНАЯ (луч на пиксель); косвенного "
                "НЕТ — отскок не сделан\n",
                now_s() - t_pic);
+        printf("   ИЕРАРХИЧЕСКИЙ СБОР: обращений к источникам %lld, то есть %.1f на пиксель "
+               "против %lld при плоском переборе (выигрыш %.1f×)\n",
+               (long long)ngath, (double)ngath / (double)(npix2 > 0 ? npix2 : 1), (long long)nsrc,
+               (double)nsrc * (double)npix2 / (double)(ngath > 0 ? ngath : 1));
         printf("   ЦЕНА КВАНТОВАНИЯ ТЕНИ ЭЛЕМЕНТОМ: поэлементная расходится с честной на %lld "
                "пикселей из %lld (%.2f %%)\n",
                (long long)nmis, (long long)npix2,

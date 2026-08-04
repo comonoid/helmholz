@@ -194,6 +194,11 @@ build/scenechk: tools/scenechk.c src/scene_obj.c | build
 build/psil: tools/psil.c src/scene_obj.c src/pgrid.c src/pgrid.h src/padj.c src/padj.h | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/psil.c src/scene_obj.c src/pgrid.c src/padj.c -lm'
 
+# pcam — камера сцены находится ЗАМЕРОМ, а не назначается (§187). Обе прежние
+# камеры были назначены на глаз и обе оказались негодными.
+build/pcam: tools/pcam.c src/scene_obj.c src/pgrid.c src/pgrid.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pcam.c src/scene_obj.c src/pgrid.c -lm'
+
 # pfront — §172, шаг О55: насыщается ли сложность фронта при ходе. Собирается
 # из того же общего слоя, что psil (сетка, смежность, форм-фактор) плюс запись
 # картинки — ни сегментации, ни лестницы шагу не нужно.

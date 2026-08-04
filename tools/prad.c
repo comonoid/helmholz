@@ -40,6 +40,11 @@
 #include <string.h>
 #include <time.h>
 
+/* Отступ солнечного луча от плоскости элемента (А413). Тот же относительный
+ * порядок, что у теневого отступа всей оснастки: без него элемент ловит
+ * собственную плоскость и объявляется затенённым сам собой. */
+#define PRAD_SUN_EPS 1.0e-4
+
 static double now_s(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -83,7 +88,7 @@ static int cmp_d(const void *a, const void *b) {
  * Сверх того есть явный флаг материала `flat`.
  */
 #define SH_DEPTH                                                                                   \
-  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает \
+  3 /* отскоков: 3 хватает на «зеркало в зеркале» и ограничивает                                 \
      * стоимость; глубже вклад падает как произведение долей */
 
 /* ТОЧНЫЙ ФРЕНЕЛЬ ПО НЕПОЛЯРИЗОВАННОМУ СВЕТУ. Приближение Шлика не нужно: точная
@@ -399,6 +404,10 @@ int main(int argc, char **argv) {
   int capset = 0;
   double epsmul = 1.0, radmul = 4.0, base = 1.4142, linkmul = 1.0, segcap = 0.5, trimax = 0.0,
          weldeps = 0.0;
+  /* ВТОРОЙ ПРЕДЕЛ СРЕЗА (А300, §136) и СОЛНЦЕ (А413) — ключами, умолчание
+   * прежнее: `sz = 0` снимает предел, `sune = 0` гасит солнце, и тогда числа
+   * §120 обязаны воспроизводиться. */
+  double szmul = 0.0, sun_e = 0.0;
   int flatfield = 0, vertR = 0, noshift = 0, usecap = 0;
   double refineq = 0.0;
   for (int i = 1; i < argc; i++) {
@@ -408,6 +417,8 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "vis=", 4) == 0) nvis = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "lev=", 4) == 0) maxlev = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "eps=", 4) == 0) epsmul = strtod(argv[i] + 4, NULL);
+    if (strncmp(argv[i], "sz=", 3) == 0) szmul = strtod(argv[i] + 3, NULL);
+    if (strncmp(argv[i], "sune=", 5) == 0) sun_e = strtod(argv[i] + 5, NULL);
     /* Допуск СВЯЗИ в допусках среза: `1` — тот же критерий, что у камеры. */
     if (strncmp(argv[i], "link=", 5) == 0) linkmul = strtod(argv[i] + 5, NULL);
     /* ДВА ВЫКЛЮЧАТЕЛЯ — ЗАМЕРЫ, А НЕ РЕЖИМЫ (§86, А195). `noself` снимает
@@ -611,6 +622,7 @@ int main(int argc, char **argv) {
   lc.eps = eps;
   lc.maxlev = maxlev;
   lc.radmul = radmul;
+  lc.szmul = szmul;
   lc.base = base;
   if (hz_lod_build_merge(&L, &m, &sg, &ps, &lc) != 0) {
     fprintf(stderr, "отказ лестницы\n");
@@ -1099,6 +1111,49 @@ int main(int argc, char **argv) {
     printf("== ИСТОЧНИК ГОРОДА — НЕБО: элементов с видимым небом %lld, доля полусферы "
            "средняя %.4f, максимум %.4f; L_неба = %.2f\n",
            (long long)nsky, (nsky > 0) ? ssum / (double)nsky : 0.0, smax2, HZ_CFG_SKY_LE);
+
+    /* СОЛНЦЕ (А413). Под ОДНИМ равномерным небом освещённых поверхностей не
+     * существует вовсе: небо светит отовсюду, и второй отскок даёт почти
+     * равномерную добавку `≈ ρ·Σf`, то есть глобальное осветление, а не
+     * подцветку. Эффект, ради которого шаг делается, — свет с ОСВЕЩЁННОГО
+     * СОЛНЦЕМ фасада в затенённую улицу, — при таком источнике не может
+     * появиться в принципе, и шаг измерил бы его отсутствие как свойство схемы.
+     * Поэтому солнце вносится тем же способом, что и небо: собственным
+     * излучением первого отскока `Le += ρ·E·max(0, n·ω)` у элементов, до
+     * которых солнце доходит. Цена — ОДИН луч на элемент против 24.8 млн
+     * связей, то есть в узкое место не попадает. */
+    if (sun_e > 0.0) {
+      double wsun[3] = HZ_CFG_SUN_DIR;
+      double ln = sqrt(wsun[0] * wsun[0] + wsun[1] * wsun[1] + wsun[2] * wsun[2]);
+      for (int c = 0; c < 3; c++)
+        wsun[c] /= ln;
+      double tsun0 = now_s();
+      int64_t nlit = 0;
+      double diag2 = 0.0;
+      for (int c = 0; c < 3; c++) {
+        double d2 = m.hi[c] - m.lo[c];
+        diag2 += d2 * d2;
+      }
+      diag2 = 4.0 * sqrt(diag2);
+#pragma omp parallel for schedule(dynamic, 256) reduction(+ : nlit)
+      for (int32_t k = 0; k < L.nnd; k++) {
+        const hz_lodnode *nd = &L.nd[k];
+        double ndl = -(nd->n[0] * wsun[0] + nd->n[1] * wsun[1] + nd->n[2] * wsun[2]);
+        if (!(ndl > 0.0)) continue;
+        /* Отступ по нормали — тот же относительный, что у всей оснастки: без
+         * него элемент ловит собственную плоскость. */
+        double o[3] = {nd->cx + PRAD_SUN_EPS * nd->n[0], nd->cy + PRAD_SUN_EPS * nd->n[1],
+                       nd->cz + PRAD_SUN_EPS * nd->n[2]};
+        double dsun[3] = {-wsun[0], -wsun[1], -wsun[2]};
+        if (hz_pray_occluded(&g, o, dsun, 0.0, diag2)) continue;
+        Le[k] += rho[k] * HZ_CFG_SUN_LE * sun_e * ndl;
+        nlit++;
+      }
+      printf("== ИСТОЧНИК ГОРОДА — СОЛНЦЕ (А413): освещено %lld узлов из %d (%.1f %%), ω = (%.3f, "
+             "%.3f, %.3f), E = %.2f, за %.2f с\n",
+             (long long)nlit, L.nnd, 100.0 * (double)nlit / (double)L.nnd, wsun[0], wsun[1],
+             wsun[2], HZ_CFG_SUN_LE * sun_e, now_s() - tsun0);
+    }
   }
   printf("== ИСТОЧНИК: светящихся элементов %lld, суммарная площадь %.3f м² (было: ПОТОЛОК, "
          "37.720 м²)\n",

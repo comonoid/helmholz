@@ -11,9 +11,10 @@ typedef struct {
   const hz_objmesh *m;
   const double *o, *d;
   const int32_t *skip;
+  const int32_t *tag; /* тег на треугольник; NULL — фильтра нет */
   double tmin, best;
   int64_t *nnode, *ntest;
-  int32_t tri;
+  int32_t tri, tagskip;
   int nskip, anyhit, found, mask;
 } pt_ray;
 
@@ -54,6 +55,9 @@ static int pt_walk(pt_ray *r, int32_t ni, double tent) {
     for (int q = 0; q < r->nskip; q++)
       if (r->skip[q] == tr) sk = 1;
     if (sk) continue;
+    /* Треугольник с тегом `tagskip` заслоном не считается — маска самозаслона
+     * (§237). Проверка стоит ДО пересечения: она дешевле его. */
+    if (r->tag != NULL && r->tag[tr] == r->tagskip) continue;
     if (r->ntest != NULL) (*r->ntest)++;
     double th;
     if (!hz_pgrid_tri_hit(r->m, tr, r->o, r->d, &th)) continue;
@@ -86,7 +90,8 @@ static int pt_walk(pt_ray *r, int32_t ni, double tent) {
 
 int hz_ptrace_cnt(const hz_ptree *t, const hz_objmesh *m, const double o[3], const double dir[3],
                   double tmin, double tmax, const int32_t *skip, int nskip, int anyhit,
-                  double *thit, int32_t *tri, int64_t *nnode, int64_t *ntest) {
+                  double *thit, int32_t *tri, int64_t *nnode, int64_t *ntest, const int32_t *tag,
+                  int32_t tagskip) {
   if (t->nnd <= 0) return 0;
   double tent;
   if (!pt_box(t->nd[0].lo, t->nd[0].hi, o, dir, tmin, tmax, &tent)) return 0;
@@ -96,6 +101,8 @@ int hz_ptrace_cnt(const hz_ptree *t, const hz_objmesh *m, const double o[3], con
   r.o = o;
   r.d = dir;
   r.skip = skip;
+  r.tag = tag;
+  r.tagskip = tagskip;
   r.tmin = tmin;
   r.best = tmax;
   r.nnode = nnode;

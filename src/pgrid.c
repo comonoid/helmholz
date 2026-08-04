@@ -138,13 +138,14 @@ int hz_pgrid_trace(const hz_pgrid *g, const hz_objmesh *m, const double o[3], co
 int hz_pgrid_trace_tri(const hz_pgrid *g, const hz_objmesh *m, const double o[3],
                        const double dir[3], double tmin, double tmax, const int32_t *skip,
                        int nskip, int anyhit, double *thit, int32_t *tri) {
-  return hz_pgrid_trace_cnt(g, m, o, dir, tmin, tmax, skip, nskip, anyhit, thit, tri, NULL, NULL);
+  return hz_pgrid_trace_cnt(g, m, o, dir, tmin, tmax, skip, nskip, anyhit, thit, tri, NULL, NULL,
+                            NULL, -1);
 }
 
 int hz_pgrid_trace_cnt(const hz_pgrid *g, const hz_objmesh *m, const double o[3],
                        const double dir[3], double tmin, double tmax, const int32_t *skip,
                        int nskip, int anyhit, double *thit, int32_t *tri, int64_t *ncell,
-                       int64_t *ntest) {
+                       int64_t *ntest, const int32_t *tag, int32_t tagskip) {
   double t0 = tmin, t1 = tmax;
   for (int a = 0; a < 3; a++) {
     if (fabs(dir[a]) < HZ_PGRID_DTINY) {
@@ -192,6 +193,9 @@ int hz_pgrid_trace_cnt(const hz_pgrid *g, const hz_objmesh *m, const double o[3]
       for (int q = 0; q < nskip; q++)
         if (skip[q] == t) sk = 1;
       if (sk) continue;
+      /* Треугольник с тегом `tagskip` заслоном не считается — маска самозаслона
+       * (§237). Проверка стоит ДО пересечения: она дешевле его. */
+      if (tag != NULL && tag[t] == tagskip) continue;
       if (ntest != NULL) (*ntest)++;
       double th;
       if (!hz_pgrid_tri_hit(m, t, o, dir, &th)) continue;

@@ -60,9 +60,14 @@
  * могут быть NULL). Порознь они нужны потому, что дерево выигрывает у сетки
  * ДВУМЯ разными способами, и смешивать их нельзя (А424): пропуском пустоты
  * (это `nnode`) и отсутствием повторных проверок одного треугольника из разных
- * ячеек (это `ntest`; избыточность дерева `1.000` против сетки). */
+ * ячеек (это `ntest`; избыточность дерева `1.000` против сетки).
+ *
+ * ФИЛЬТР ПО ТЕГУ (`tag`, `tagskip`) — тот же, что у `hz_pgrid_trace_cnt`, и с
+ * тем же доводом: маска САМОЗАСЛОНА, выраженная нейтрально, чтобы общий слой
+ * лучей не знал слова «элемент». `tag == NULL` выключает фильтр. */
 int hz_ptrace_cnt(const hz_ptree *t, const hz_objmesh *m, const double o[3], const double dir[3],
                   double tmin, double tmax, const int32_t *skip, int nskip, int anyhit,
-                  double *thit, int32_t *tri, int64_t *nnode, int64_t *ntest);
+                  double *thit, int32_t *tri, int64_t *nnode, int64_t *ntest, const int32_t *tag,
+                  int32_t tagskip);
 
 #endif

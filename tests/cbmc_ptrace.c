@@ -83,6 +83,7 @@ void harness(void) {
   static hz_ptnode nd[HZ_N];
   static int32_t ref[HZ_NREF];
   static int32_t fidx[3 * HZ_NT];
+  static int32_t tags[HZ_NT]; /* тег на треугольник — фильтр самозаслона (О69) */
   static double vtx[3 * HZ_NV];
 
   /* ГЕОМЕТРИЯ КОНКРЕТНА (см. заголовок). Корень — куб [0,2]^3, дети — его
@@ -112,6 +113,10 @@ void harness(void) {
     fidx[i] = nondet_i32();
     __CPROVER_assume(fidx[i] >= 0 && fidx[i] < HZ_NV);
   }
+  /* Теги НЕДЕТЕРМИНИРОВАНЫ И НИЧЕМ НЕ ОГРАНИЧЕНЫ: фильтр обязан быть безопасен
+   * при любом их значении, включая совпадение со всеми и ни с одним. */
+  for (int i = 0; i < HZ_NT; i++)
+    tags[i] = nondet_i32();
 
   /* ТОПОЛОГИЯ НЕДЕТЕРМИНИРОВАНА, при трёх предпосылках — ровно тех, что
    * обеспечивает построитель и на которых держится обход. */
@@ -204,5 +209,6 @@ void harness(void) {
   double thit = 0.0;
   int32_t tri = -1;
   int64_t nnode = 0, ntest = 0;
-  (void)hz_ptrace_cnt(&t, &m, o, d, 0.0, 100.0, &skip1, nskip, anyhit, &thit, &tri, &nnode, &ntest);
+  (void)hz_ptrace_cnt(&t, &m, o, d, 0.0, 100.0, &skip1, nskip, anyhit, &thit, &tri, &nnode, &ntest,
+                      tags, nondet_i32());
 }

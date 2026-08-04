@@ -96,6 +96,10 @@ static int g_agg = PCELL_AGG_LEV;
  * сборе задаёт ИМЕННО он, а не уровень агрегации, и что не сканирован он ни
  * разу (отмечено ещё §209). Умолчание — прежнее. */
 static double g_srck = PCELL_SRC_K;
+/* МАСКА САМОЗАСЛОНА (шаг О69, план §237): 0 — off (умолчание, прежнее
+ * поведение), 1 — не считать заслоном СВОЙ элемент, 2 — СОСЕДНИЙ по номеру
+ * (негативный контроль). */
+static int g_self = 0;
 /* Проб неба на пиксель. При `24` шум видимости ниже кванта восьми разрядов
  * везде, кроме контактных стыков, — та же оценка `1/√N`, что в §183. */
 #define PCELL_SKY_SAMP 24
@@ -141,6 +145,7 @@ typedef struct {
   const hz_pgrid *G;
   const hz_ptree *T;
   const hz_objmesh *m;
+  const int32_t *tag; /* `tri_seg`: номер элемента на треугольник; NULL — фильтра нет */
   double tmax;
   int mode;
 } pc_vis;
@@ -148,11 +153,12 @@ typedef struct {
 /* Объявление вперёд: обёртка трассировщика определена ниже, а нужна сбору. */
 static int pc_trace(const hz_pgrid *G, const hz_ptree *T, const hz_objmesh *m, const double o[3],
                     const double d[3], double tmin, double tmax, const int32_t *skip, int nskip,
-                    int anyhit, double *thit, int32_t *tri, int64_t *nvis, int64_t *ntest);
+                    int anyhit, double *thit, int32_t *tri, int64_t *nvis, int64_t *ntest,
+                    const int32_t *tag, int32_t tagskip);
 
 static double pc_gather(const pc_srcs *S, const double hp[3], const double nrm[3], int64_t *ngath,
                         int64_t *nvis, const pc_vis *V, int64_t *npair, int64_t *nblk,
-                        int64_t *ntst, double *sumr, double *sumt, int64_t *nnear) {
+                        int64_t *ntst, double *sumr, double *sumt, int64_t *nnear, int32_t self) {
   double ind = 0.0;
   int32_t st2[128];
   int sp3 = 0;
@@ -201,7 +207,7 @@ static double pc_gather(const pc_srcs *S, const double hp[3], const double nrm[3
         so[c] = hp[c] + 1e-4 * nrm[c];
       int64_t v1 = 0, e1 = 0;
       int blocked = pc_trace(V->G, V->T, V->m, so, sdir, 0.0, rr * (1.0 - HZ_PGRID_EPSREL), NULL, 0,
-                             1, &sth, NULL, &v1, &e1);
+                             1, &sth, NULL, &v1, &e1, V->tag, self);
       if (npair != NULL) (*npair)++;
       if (nblk != NULL && blocked) (*nblk)++;
       if (ntst != NULL) (*ntst) += e1;
@@ -253,10 +259,13 @@ static double pc_clk(void) {
  * смешивать их нельзя (А424). */
 static int pc_trace(const hz_pgrid *G, const hz_ptree *T, const hz_objmesh *m, const double o[3],
                     const double d[3], double tmin, double tmax, const int32_t *skip, int nskip,
-                    int anyhit, double *thit, int32_t *tri, int64_t *nvis, int64_t *ntest) {
+                    int anyhit, double *thit, int32_t *tri, int64_t *nvis, int64_t *ntest,
+                    const int32_t *tag, int32_t tagskip) {
   if (g_trmode)
-    return hz_ptrace_cnt(T, m, o, d, tmin, tmax, skip, nskip, anyhit, thit, tri, nvis, ntest);
-  return hz_pgrid_trace_cnt(G, m, o, d, tmin, tmax, skip, nskip, anyhit, thit, tri, nvis, ntest);
+    return hz_ptrace_cnt(T, m, o, d, tmin, tmax, skip, nskip, anyhit, thit, tri, nvis, ntest, tag,
+                         tagskip);
+  return hz_pgrid_trace_cnt(G, m, o, d, tmin, tmax, skip, nskip, anyhit, thit, tri, nvis, ntest,
+                            tag, tagskip);
 }
 
 int main(int argc, char **argv) {
@@ -291,6 +300,8 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "shift=", 6) == 0) g_shift = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "agg=", 4) == 0) g_agg = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "srck=", 5) == 0) g_srck = strtod(argv[i] + 5, NULL);
+    if (strncmp(argv[i], "self=", 5) == 0)
+      g_self = (strcmp(argv[i] + 5, "own") == 0) ? 1 : ((strcmp(argv[i] + 5, "next") == 0) ? 2 : 0);
     if (strncmp(argv[i], "vis=", 4) == 0)
       g_vis =
           (strcmp(argv[i] + 4, "on") == 0) ? 1 : ((strcmp(argv[i] + 4, "inverse") == 0) ? 2 : 0);
@@ -541,7 +552,8 @@ int main(int argc, char **argv) {
             double o[3], dsun[3] = {-wsun[0], -wsun[1], -wsun[2]}, th = 0.0;
             for (int c = 0; c < 3; c++)
               o[c] = p[c] + 1e-4 * nn2[c];
-            if (!pc_trace(&G, &T, &m, o, dsun, 0.0, diag2, NULL, 0, 1, &th, NULL, NULL, NULL)) {
+            if (!pc_trace(&G, &T, &m, o, dsun, 0.0, diag2, NULL, 0, 1, &th, NULL, NULL, NULL, NULL,
+                          -1)) {
               nlit++;
               alit += sg.seg[s].area;
               litn[leaf[k]]++;
@@ -684,7 +696,7 @@ int main(int argc, char **argv) {
       for (int c = 0; c < 3; c++)
         o[c] = (A[c] + B[c] + C[c]) / 3.0 + 1e-4 * nn[c];
       int64_t v1 = 0, e3 = 0;
-      int hit = pc_trace(&G, &T, &m, o, ds, 0.0, diag2, NULL, 0, 1, &th, NULL, &v1, &e3);
+      int hit = pc_trace(&G, &T, &m, o, ds, 0.0, diag2, NULL, 0, 1, &th, NULL, &v1, &e3, NULL, -1);
       nray++;
       nvisit += v1;
       ntest += e3;
@@ -1006,7 +1018,8 @@ int main(int argc, char **argv) {
           d[c] /= dl;
         double tt = 0.0;
         int32_t tri = -1;
-        if (pc_trace(&G, &T, &m, eyeP, d, 0.0, diag2, NULL, 0, 0, &tt, &tri, NULL, NULL) &&
+        if (pc_trace(&G, &T, &m, eyeP, d, 0.0, diag2, NULL, 0, 0, &tt, &tri, NULL, NULL, NULL,
+                     -1) &&
             tri >= 0 && el_vis != NULL && tri_seg[tri] >= 0)
           el_vis[tri_seg[tri]] = 1;
       }
@@ -1064,7 +1077,7 @@ int main(int argc, char **argv) {
       int64_t npL = 0, nbL = 0, npD = 0, nbD = 0;
       double srsum = 0.0, stsum = 0.0;
       int64_t nnear = 0;
-      pc_vis VIS = {&G, &T, (g_vis != 0) ? &m : NULL, diag2, g_vis};
+      pc_vis VIS = {&G, &T, (g_vis != 0) ? &m : NULL, (g_self != 0) ? tri_seg : NULL, diag2, g_vis};
 #pragma omp parallel for schedule(dynamic, 256)                                                    \
     reduction(+ : ng2, nv2, npair, nblk, ntst, npL, nbL, npD, nbD, srsum, stsum, nnear)
       for (int64_t e = 0; e < nel; e++) {
@@ -1088,8 +1101,13 @@ int main(int argc, char **argv) {
           for (int c = 0; c < 3; c++)
             nrm[c] = -nrm[c];
         int64_t p0 = 0, b0 = 0;
-        el_ind[e] =
-            pc_gather(&SRC, hp, nrm, &ng2, &nv2, &VIS, &p0, &b0, &ntst, &srsum, &stsum, &nnear);
+        /* КАКОЙ ЭЛЕМЕНТ НЕ СЧИТАТЬ ЗАСЛОНОМ (О69): `own` — свой, `next` —
+         * СОСЕДНИЙ по номеру, и это негативный контроль §237: он исключает
+         * чужую геометрию того же узла дерева, то есть отличается от опыта
+         * ТОЛЬКО принадлежностью геометрии приёмнику. */
+        int32_t tskip = (g_self == 1) ? (int32_t)e : ((g_self == 2) ? (int32_t)e + 1 : -1);
+        el_ind[e] = pc_gather(&SRC, hp, nrm, &ng2, &nv2, &VIS, &p0, &b0, &ntst, &srsum, &stsum,
+                              &nnear, tskip);
         npair += p0;
         nblk += b0;
         if (el_lit[e]) {
@@ -1136,7 +1154,7 @@ int main(int argc, char **argv) {
       if (g_vis == 1) {
         int64_t nup = 0;
         double esum0 = 0.0;
-        pc_vis VOFF = {&G, &T, NULL, diag2, 0};
+        pc_vis VOFF = {&G, &T, NULL, NULL, diag2, 0};
 #pragma omp parallel for schedule(dynamic, 256) reduction(+ : nup, esum0)
         for (int64_t e = 0; e < nel; e++) {
           if (el_vis[e] == 0 || !(el_p[4 * (size_t)e + 3] > 0.0)) continue;
@@ -1154,7 +1172,7 @@ int main(int argc, char **argv) {
             for (int c = 0; c < 3; c++)
               nrm[c] = -nrm[c];
           double i0 =
-              pc_gather(&SRC, hp, nrm, NULL, NULL, &VOFF, NULL, NULL, NULL, NULL, NULL, NULL);
+              pc_gather(&SRC, hp, nrm, NULL, NULL, &VOFF, NULL, NULL, NULL, NULL, NULL, NULL, -1);
           esum0 += i0 * el_p[4 * (size_t)e + 3];
           if (el_ind[e] > i0) nup++;
         }
@@ -1206,7 +1224,8 @@ int main(int argc, char **argv) {
           int32_t tri = -1;
           int64_t q = (int64_t)j * W + i;
           double col[3] = {0.45, 0.55, 0.70};
-          if (pc_trace(&G, &T, &m, eyeP, d, 0.0, diag2, NULL, 0, 0, &tt, &tri, &nvray, &ntray) &&
+          if (pc_trace(&G, &T, &m, eyeP, d, 0.0, diag2, NULL, 0, 0, &tt, &tri, &nvray, &ntray, NULL,
+                       -1) &&
               tri >= 0) {
             {
               double k1 = pc_clk();
@@ -1297,7 +1316,8 @@ int main(int argc, char **argv) {
               double jl = sqrt(sdj[0] * sdj[0] + sdj[1] * sdj[1] + sdj[2] * sdj[2]);
               for (int c = 0; c < 3; c++)
                 sdj[c] /= jl;
-              if (!pc_trace(&G, &T, &m, so, sdj, 0.0, diag2, NULL, 0, 1, &st, NULL, &nvray, &ntray))
+              if (!pc_trace(&G, &T, &m, so, sdj, 0.0, diag2, NULL, 0, 1, &st, NULL, &nvray, &ntray,
+                            NULL, -1))
                 nvis2++;
             }
             {
@@ -1330,7 +1350,7 @@ int main(int argc, char **argv) {
              * же арифметикой, а не своей копией. */
             if (g_gmode == 0)
               ind = pc_gather(&SRC, hp, nrm, &ngath, &nvis3, NULL, NULL, NULL, NULL, NULL, NULL,
-                              NULL);
+                              NULL, -1);
             else {
               /* СБОР НА ЭЛЕМЕНТЕ: одно чтение вместо спуска по дереву.
                * `g_shift` — негативный контроль (§219): косвенное берётся у
@@ -1394,7 +1414,8 @@ int main(int argc, char **argv) {
               for (int c = 0; c < 3; c++)
                 dk3[c] /= kl;
               double kt = 0.0;
-              if (!pc_trace(&G, &T, &m, so, dk3, 0.0, diag2, NULL, 0, 1, &kt, NULL, &nvray, &ntray))
+              if (!pc_trace(&G, &T, &m, so, dk3, 0.0, diag2, NULL, 0, 1, &kt, NULL, &nvray, &ntray,
+                            NULL, -1))
                 nsk++;
             }
             {

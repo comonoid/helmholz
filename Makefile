@@ -195,8 +195,8 @@ build/psil: tools/psil.c src/scene_obj.c src/pgrid.c src/pgrid.h src/padj.c src/
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/psil.c src/scene_obj.c src/pgrid.c src/padj.c -lm'
 
 # pcell — сегментация по ячейкам против глобальной (замер О57, §191).
-build/pcell: tools/pcell.c src/scene_obj.c src/ptree.c src/ptree.h src/poly_seg.c src/poly_seg.h | build
-	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pcell.c src/scene_obj.c src/ptree.c src/poly_seg.c -lm'
+build/pcell: tools/pcell.c src/scene_obj.c src/ptree.c src/ptree.h src/poly_seg.c src/poly_seg.h src/pgrid.c src/pgrid.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pcell.c src/scene_obj.c src/ptree.c src/poly_seg.c src/pgrid.c -lm'
 
 # pcam — камера сцены находится ЗАМЕРОМ, а не назначается (§187). Обе прежние
 # камеры были назначены на глаз и обе оказались негодными.

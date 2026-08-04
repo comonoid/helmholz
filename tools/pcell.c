@@ -29,6 +29,7 @@
  */
 #include "poly_seg.h"
 #include "scene_cfg.h"
+#include "pgrid.h"
 #include "ptree.h"
 #include "scene_obj.h"
 #include <math.h>
@@ -134,9 +135,33 @@ int main(int argc, char **argv) {
   double *dmax_of = calloc((size_t)(nl > 0 ? nl : 1), sizeof *dmax_of);
   if (cnt == NULL || nseg_of == NULL || area_of == NULL || dmax_of == NULL) return 2;
 
+  /* СЕТКА ЛУЧЕЙ — для ОСВЕЩЁННОГО НАБОРА: у каждого элемента считается его
+   * положение (центр по площади) и видно ли из него солнце. Это первая
+   * половина схемы «фронт от источника → освещённый набор → вторичные
+   * источники» (директива пользователя 08-04, §186/§190). */
+  hz_pgrid G;
+  if (hz_pgrid_build(&G, &m) != 0) {
+    fprintf(stderr, "отказ сетки лучей\n");
+    return 2;
+  }
+  double wsun[3] = HZ_CFG_SUN_DIR;
+  {
+    double L = sqrt(wsun[0] * wsun[0] + wsun[1] * wsun[1] + wsun[2] * wsun[2]);
+    for (int c = 0; c < 3; c++)
+      wsun[c] /= L;
+  }
+  double diag2 = 0.0;
+  for (int c = 0; c < 3; c++) {
+    double d2 = m.hi[c] - m.lo[c];
+    diag2 += d2 * d2;
+  }
+  diag2 = 4.0 * sqrt(diag2);
+  int64_t nlit = 0;
+  double alit = 0.0;
+
   int64_t nfail = 0;
   t0 = now_s();
-#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nfail)
+#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nfail, nlit, alit)
   for (int64_t k = 0; k < nl; k++) {
     const hz_ptnode *nd = &T.nd[leaf[k]];
     int32_t nt = nd->ntri;
@@ -173,6 +198,56 @@ int main(int argc, char **argv) {
         ar += sg.seg[s].area;
         if (sg.seg[s].dmax > dm) dm = sg.seg[s].dmax;
       }
+      /* ОСВЕЩЁННЫЙ НАБОР: центр элемента по площади треугольников, затем один
+       * теневой луч к солнцу. Отступ по нормали — тот же относительный, что у
+       * всей оснастки. */
+      {
+        double *cx = calloc((size_t)(sg.nseg > 0 ? sg.nseg : 1) * 4, sizeof *cx);
+        if (cx != NULL) {
+          for (int32_t j = 0; j < nt; j++) {
+            int32_t s = sg.label[j];
+            if (s < 0 || s >= sg.nseg) continue;
+            const double *A = m.v + 3 * (size_t)sub.f[3 * j];
+            const double *B = m.v + 3 * (size_t)sub.f[3 * j + 1];
+            const double *C = m.v + 3 * (size_t)sub.f[3 * j + 2];
+            double e1[3], e2[3], cr[3];
+            for (int c = 0; c < 3; c++) {
+              e1[c] = B[c] - A[c];
+              e2[c] = C[c] - A[c];
+            }
+            cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
+            cr[1] = e1[2] * e2[0] - e1[0] * e2[2];
+            cr[2] = e1[0] * e2[1] - e1[1] * e2[0];
+            double atri = 0.5 * sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+            for (int c = 0; c < 3; c++)
+              cx[4 * s + c] += atri * (A[c] + B[c] + C[c]) / 3.0;
+            cx[4 * s + 3] += atri;
+          }
+          for (int32_t s = 0; s < sg.nseg; s++) {
+            if (!(cx[4 * s + 3] > 0.0)) continue;
+            double p[3];
+            for (int c = 0; c < 3; c++)
+              p[c] = cx[4 * s + c] / cx[4 * s + 3];
+            double ndl =
+                -(sg.seg[s].n[0] * wsun[0] + sg.seg[s].n[1] * wsun[1] + sg.seg[s].n[2] * wsun[2]);
+            double nn2[3] = {sg.seg[s].n[0], sg.seg[s].n[1], sg.seg[s].n[2]};
+            if (ndl < 0.0) {
+              ndl = -ndl;
+              for (int c = 0; c < 3; c++)
+                nn2[c] = -nn2[c];
+            }
+            if (!(ndl > 0.0)) continue;
+            double o[3], dsun[3] = {-wsun[0], -wsun[1], -wsun[2]}, th = 0.0;
+            for (int c = 0; c < 3; c++)
+              o[c] = p[c] + 1e-4 * nn2[c];
+            if (!hz_pgrid_trace(&G, &m, o, dsun, 0.0, diag2, NULL, 0, 1, &th)) {
+              nlit++;
+              alit += sg.seg[s].area;
+            }
+          }
+          free(cx);
+        }
+      }
       cnt[k] = c2;
       area_of[k] = ar;
       dmax_of[k] = dm;
@@ -194,6 +269,10 @@ int main(int argc, char **argv) {
   }
   printf("== СЕГМЕНТАЦИЯ ПО УЗЛАМ за %.2f с (%d потоков): ЭЛЕМЕНТОВ %lld; отказов %lld\n", t_seg,
          omp_get_max_threads(), (long long)nel, (long long)nfail);
+  printf("== ОСВЕЩЁННЫЙ НАБОР (солнце, один луч на элемент): элементов %lld из %lld (%.1f %%), "
+         "площадь %.1f из %.1f м² (%.1f %%)\n",
+         (long long)nlit, (long long)nel, 100.0 * (double)nlit / (double)(nel > 0 ? nel : 1), alit,
+         area, 100.0 * alit / (area > 0.0 ? area : 1.0));
   printf("   суммарная площадь элементов %.4f м²; худший dmax %.3e м при δ = %g м — %s\n", area,
          dmax, delta, (dmax <= delta) ? "инвариант держится" : "ИНВАРИАНТ НАРУШЕН");
 

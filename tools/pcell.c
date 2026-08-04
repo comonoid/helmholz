@@ -28,6 +28,7 @@
  * Запуск: `pcell ФАЙЛ.obj МАСШТАБ [d=МЕТРЫ] [leaf=N] [lev=N]`.
  */
 #include "poly_seg.h"
+#include "scene_cfg.h"
 #include "ptree.h"
 #include "scene_obj.h"
 #include <math.h>
@@ -48,6 +49,11 @@ static double now_s(void) {
   return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
+static int cmp_dbl(const void *a, const void *b) {
+  double x = *(const double *)a, y = *(const double *)b;
+  return (x < y) ? -1 : ((x > y) ? 1 : 0);
+}
+
 static int cmp_i32(const void *a, const void *b) {
   int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
   return (x < y) ? -1 : ((x > y) ? 1 : 0);
@@ -59,11 +65,16 @@ int main(int argc, char **argv) {
     return 1;
   }
   double delta = PCELL_DELTA;
-  int leafmax = 0, maxlev = 0;
+  int leafmax = 0, maxlev = 0, wpx = HZ_CFG_W;
+  /* Полоса §191, названная пользователем: элемент от 4 до 32 пикселей. */
+  double pxlo = 4.0, pxhi = 32.0;
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "d=", 2) == 0) delta = strtod(argv[i] + 2, NULL);
     if (strncmp(argv[i], "leaf=", 5) == 0) leafmax = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "lev=", 4) == 0) maxlev = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "w=", 2) == 0) wpx = (int)strtol(argv[i] + 2, NULL, 10);
+    if (strncmp(argv[i], "pxhi=", 5) == 0) pxhi = strtod(argv[i] + 5, NULL);
+    if (strncmp(argv[i], "pxlo=", 5) == 0) pxlo = strtod(argv[i] + 5, NULL);
   }
 
   hz_objmesh m;
@@ -193,6 +204,111 @@ int main(int argc, char **argv) {
   printf("== ВСЕГО (холодный старт, один раз на сцену): дерево %.2f с + сегментация %.2f с = "
          "%.2f с\n",
          t_tree, t_seg, t_tree + t_seg);
+
+  /* ---- ВЫБОР УРОВНЯ ПО ПОЛОСЕ 4…32 px (О58, §194) ---------------------
+   * Спуск от корня: пока узел крупнее верхнего предела — вниз, иначе выбран.
+   * Нижний предел спуском не движет, он ДИАГНОСТИКА: элементы мельче него —
+   * дальние, у которых даже грубейший доступный узел мал.
+   * ВЫБРАННЫМ УЗЛОМ ЕЩЁ НЕЛЬЗЯ РИСОВАТЬ: крупный узел обязан представлять всё
+   * своё поддерево, а слияния снизу вверх (§190) нет. Здесь считается БЮДЖЕТ
+   * КАДРА, и только он. */
+  {
+    double eye[3] = HZ_CFG_MIGUEL_EYE;
+    double eps = (HZ_CFG_FOV_DEG * M_PI / 180.0) / (double)wpx;
+    /* ПОДДЕРЕВНЫЕ СУММЫ: у остановленного узла засчитывается ВСЁ его поддерево
+     * (он его и представляет), у пройденного насквозь — только собственные
+     * треугольники. Сумма обязана дать ровно `nt`. Прежний инвариант («сумма
+     * собственных по выбранным = nt») был сформулирован МНОЮ неверно: он
+     * справедлив только без LOD, а при LOD треугольники под срезом не берутся
+     * СОЗНАТЕЛЬНО — в этом вся экономия. Дети лежат в арене ПОСЛЕ родителя,
+     * поэтому обратный проход по индексам даёт суммы за один раз. */
+    int64_t *sub_t = malloc((size_t)(T.nnd > 0 ? T.nnd : 1) * sizeof *sub_t);
+    if (sub_t != NULL) {
+      for (int32_t i = T.nnd - 1; i >= 0; i--) {
+        sub_t[i] = T.nd[i].ntri;
+        if (T.nd[i].child >= 0)
+          for (int q = 0; q < 8; q++)
+            sub_t[i] += sub_t[T.nd[i].child + q];
+      }
+    }
+    int32_t *stack = malloc((size_t)(T.nnd > 0 ? T.nnd : 1) * sizeof *stack);
+    double *pxs = malloc((size_t)(T.nnd > 0 ? T.nnd : 1) * sizeof *pxs);
+    if (stack != NULL && pxs != NULL) {
+      double ts = now_s();
+      int64_t sp = 0, nsel = 0, nsmall = 0, ntri_sel = 0, ninside = 0, cov = 0;
+      stack[sp++] = 0;
+      while (sp > 0) {
+        int32_t i = stack[--sp];
+        const hz_ptnode *nd = &T.nd[i];
+        double c[3], rad = 0.0;
+        for (int a = 0; a < 3; a++) {
+          c[a] = 0.5 * (nd->lo[a] + nd->hi[a]);
+          double h = 0.5 * (nd->hi[a] - nd->lo[a]);
+          rad += h * h;
+        }
+        rad = sqrt(rad);
+        /* РАССТОЯНИЕ ДО БЛИЖАЙШЕЙ ТОЧКИ КОРОБКИ, а не «до центра минус радиус».
+         * Второе даёт отрицательное `R` у всякого узла, ВНУТРИ которого стоит
+         * глаз, и после обрезки — угловой размер в миллиарды пикселей
+         * (замерено: максимум 4.6e9). Глаз внутри коробки — законный случай, и
+         * означает он «дробить обязательно», а не «элемент бесконечно велик». */
+        double dd = 0.0;
+        for (int a = 0; a < 3; a++) {
+          double e = eye[a];
+          double q2 = (e < nd->lo[a]) ? (nd->lo[a] - e) : ((e > nd->hi[a]) ? (e - nd->hi[a]) : 0.0);
+          dd += q2 * q2;
+        }
+        double R = sqrt(dd);
+        int inside = (R <= 0.0);
+        double px = inside ? HUGE_VAL : (2.0 * rad / R) / eps;
+        (void)c;
+        if (px > pxhi && nd->child >= 0) {
+          for (int q = 0; q < 8; q++)
+            stack[sp++] = nd->child + q;
+          /* СОБСТВЕННЫЕ ТРЕУГОЛЬНИКИ УЗЛА НЕ ТЕРЯЮТСЯ ПРИ СПУСКЕ. Первая
+           * редакция их роняла, а у внутренних узлов висит 72.5 %% геометрии —
+           * тот же класс, что А419. Ловится инвариантом ниже. */
+          if (nd->ntri > 0) {
+            pxs[nsel++] = px;
+            ntri_sel += nd->ntri;
+            cov += nd->ntri;
+            if (inside)
+              ninside++;
+            else if (px < pxlo)
+              nsmall++;
+          }
+          continue;
+        }
+        cov += (sub_t != NULL) ? sub_t[i] : 0;
+        if (sub_t != NULL && sub_t[i] == 0) continue; /* пусто: ни своих, ни в поддереве */
+        if (nd->ntri > 0) {
+          pxs[nsel++] = px;
+          ntri_sel += nd->ntri;
+          if (inside)
+            ninside++;
+          else if (px < pxlo)
+            nsmall++;
+        }
+      }
+      double t_sel = now_s() - ts;
+      qsort(pxs, (size_t)nsel, sizeof *pxs, cmp_dbl);
+      printf("== ВЫБОР УРОВНЯ (полоса %.0f…%.0f px при %d точках кадра) за %.4f с: УЗЛОВ %lld из "
+             "%d; треугольников в них %lld\n",
+             pxlo, pxhi, wpx, t_sel, (long long)nsel, T.nnd, (long long)ntri_sel);
+      printf("   ИНВАРИАНТ ПОКРЫТИЯ: представлено %lld треугольников против %d в сцене — %s; под "
+             "срезом %lld (экономия LOD); узлов с глазом ВНУТРИ %lld\n",
+             (long long)cov, m.nt, (cov == m.nt) ? "СОШЛОСЬ" : "НЕ СОШЛОСЬ",
+             (long long)(m.nt - ntri_sel), (long long)ninside);
+      if (nsel > 0)
+        printf("   угловой размер выбранных, px: p10 %.2f, МЕДИАНА %.2f, p90 %.2f, максимум %.2f; "
+               "мельче %.0f px — %lld (%.1f %%)\n",
+               pxs[nsel / 10], pxs[nsel / 2], pxs[(nsel * 9) / 10], pxs[nsel - 1], pxlo,
+               (long long)nsmall, 100.0 * (double)nsmall / (double)nsel);
+    }
+    free(stack);
+    free(pxs);
+    free(sub_t);
+  }
 
   for (int64_t k = 0; k < nl; k++)
     free(cnt[k]);

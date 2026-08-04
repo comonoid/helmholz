@@ -674,8 +674,8 @@ int main(int argc, char **argv) {
       uv[2] = ri[0] * fw[1] - ri[1] * fw[0];
       double th2 = tan(0.5 * HZ_CFG_FOV_DEG * M_PI / 180.0);
       double t_pic = now_s();
-      int64_t nmis = 0, npix2 = 0, ngath = 0;
-#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nmis, npix2, ngath)
+      int64_t nmis = 0, npix2 = 0, ngath = 0, nvis3 = 0;
+#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nmis, npix2, ngath, nvis3)
       for (int j = 0; j < H; j++)
         for (int i = 0; i < W; i++) {
           double sx = (2.0 * ((double)i + 0.5) / W - 1.0) * th2;
@@ -800,6 +800,7 @@ int main(int argc, char **argv) {
             st2[sp3++] = 0;
             while (sp3 > 0) {
               int32_t ni = st2[--sp3];
+              nvis3++;
               if (g_ls == NULL || g_ls[ni] <= 0) continue;
               const hz_ptnode *nd2 = &T.nd[ni];
               double c2[3] = {0, 0, 0}, rad2 = 0.0;
@@ -915,6 +916,10 @@ int main(int argc, char **argv) {
                "против %lld при плоском переборе (выигрыш %.1f×)\n",
                (long long)ngath, (double)ngath / (double)(npix2 > 0 ? npix2 : 1), (long long)nsrc,
                (double)nsrc * (double)npix2 / (double)(ngath > 0 ? ngath : 1));
+        printf("   ПОСЕЩЕНО УЗЛОВ %lld = %.1f на пиксель — ВОТ ЭТО и есть цена обхода; полезных "
+               "из них %.0f %%\n",
+               (long long)nvis3, (double)nvis3 / (double)(npix2 > 0 ? npix2 : 1),
+               100.0 * (double)ngath / (double)(nvis3 > 0 ? nvis3 : 1));
         printf("   ЦЕНА КВАНТОВАНИЯ ТЕНИ ЭЛЕМЕНТОМ: поэлементная расходится с честной на %lld "
                "пикселей из %lld (%.2f %%)\n",
                (long long)nmis, (long long)npix2,

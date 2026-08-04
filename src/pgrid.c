@@ -138,6 +138,13 @@ int hz_pgrid_trace(const hz_pgrid *g, const hz_objmesh *m, const double o[3], co
 int hz_pgrid_trace_tri(const hz_pgrid *g, const hz_objmesh *m, const double o[3],
                        const double dir[3], double tmin, double tmax, const int32_t *skip,
                        int nskip, int anyhit, double *thit, int32_t *tri) {
+  return hz_pgrid_trace_cnt(g, m, o, dir, tmin, tmax, skip, nskip, anyhit, thit, tri, NULL, NULL);
+}
+
+int hz_pgrid_trace_cnt(const hz_pgrid *g, const hz_objmesh *m, const double o[3],
+                       const double dir[3], double tmin, double tmax, const int32_t *skip,
+                       int nskip, int anyhit, double *thit, int32_t *tri, int64_t *ncell,
+                       int64_t *ntest) {
   double t0 = tmin, t1 = tmax;
   for (int a = 0; a < 3; a++) {
     if (fabs(dir[a]) < HZ_PGRID_DTINY) {
@@ -178,12 +185,14 @@ int hz_pgrid_trace_tri(const hz_pgrid *g, const hz_objmesh *m, const double o[3]
   int found = 0;
   for (;;) {
     int64_t c = (int64_t)ix[0] + (int64_t)g->nc[0] * ((int64_t)ix[1] + (int64_t)g->nc[1] * ix[2]);
+    if (ncell != NULL) (*ncell)++;
     for (int64_t i = g->start[c]; i < g->start[c + 1]; i++) {
       int32_t t = g->idx[i];
       int sk = 0;
       for (int q = 0; q < nskip; q++)
         if (skip[q] == t) sk = 1;
       if (sk) continue;
+      if (ntest != NULL) (*ntest)++;
       double th;
       if (!hz_pgrid_tri_hit(m, t, o, dir, &th)) continue;
       if (th <= tmin || th >= best) continue;

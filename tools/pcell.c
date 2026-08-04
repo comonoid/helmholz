@@ -30,6 +30,7 @@
 #include "poly_seg.h"
 #include "scene_cfg.h"
 #include "pgrid.h"
+#include "ptrace.h"
 #include "ptree.h"
 #include "scene_obj.h"
 #include <math.h>
@@ -48,6 +49,10 @@
  * уровень) ровно до шестого; §202 — там же сжатие освещённого набора выходит на
  * `30×` при `1 008` источниках. */
 #define PCELL_AGG_LEV 5
+/* Сколько лучей в бескамерном замере О63. Число выбрано не круглым ради
+ * круглости: у Сан-Мигеля освещённый набор строится по `1 068 334` элементам
+ * (§200), и замер обязан быть сопоставим с ним по объёму работы, а не мельче. */
+#define PCELL_RAY_N 1000000
 /* Альбедо агрегата. Материала у объединения нет, и брать его неоткуда: это
  * СРЕДНЕЕ по сцене, названное здесь, а не спрятанное в формулу. Городское
  * `0.3` из разбора 08-03. */
@@ -103,6 +108,24 @@ static int cmp_i32(const void *a, const void *b) {
   return (x < y) ? -1 : ((x > y) ? 1 : 0);
 }
 
+/* ВЫБОР ТРАССИРОВЩИКА (шаг О63, план §215). Ключ `trace=grid|tree`. Умолчание —
+ * СЕТКА: прежние числа стенда не должны поехать от одного появления новой
+ * ветки. Переменная ставится один раз до параллельных областей и дальше только
+ * читается, поэтому гонки нет по построению. */
+static int g_trmode = 0; /* 0 — равномерная сетка `pgrid`, 1 — дерево `ptree` */
+
+/* Одна обёртка на все четыре места, где стенд пускает луч. Счётчики `nvis`
+ * (пройдено ячеек или посещено узлов) и `ntest` (проверено треугольников)
+ * печатаются ПОРОЗНЬ: дерево выигрывает у сетки двумя разными способами, и
+ * смешивать их нельзя (А424). */
+static int pc_trace(const hz_pgrid *G, const hz_ptree *T, const hz_objmesh *m, const double o[3],
+                    const double d[3], double tmin, double tmax, const int32_t *skip, int nskip,
+                    int anyhit, double *thit, int32_t *tri, int64_t *nvis, int64_t *ntest) {
+  if (g_trmode)
+    return hz_ptrace_cnt(T, m, o, d, tmin, tmax, skip, nskip, anyhit, thit, tri, nvis, ntest);
+  return hz_pgrid_trace_cnt(G, m, o, d, tmin, tmax, skip, nskip, anyhit, thit, tri, nvis, ntest);
+}
+
 int main(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr, "pcell ФАЙЛ.obj МАСШТАБ [d=МЕТРЫ] [leaf=N] [lev=N]\n");
@@ -115,6 +138,7 @@ int main(int argc, char **argv) {
   /* Пробы ключами — чтобы доли стадий кадра получались ВЫЧИТАНИЕМ, а не
    * гаданием: узкое место надо мерить, а не предполагать (§209.2). */
   int nsun = PCELL_SUN_SAMP, nsky = PCELL_SKY_SAMP;
+  int imgw = 1024;
   double pxlo = 4.0, pxhi = 32.0;
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "d=", 2) == 0) delta = strtod(argv[i] + 2, NULL);
@@ -126,6 +150,10 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "loose") == 0) loose = 1;
     if (strncmp(argv[i], "sun=", 4) == 0) nsun = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "sky=", 4) == 0) nsky = (int)strtol(argv[i] + 4, NULL, 10);
+    /* О63: чем пускаются лучи и какой стороны кадр. `img=` нужен негативному
+     * контролю (дерево из одного листа при полном кадре не считается вовсе). */
+    if (strncmp(argv[i], "trace=", 6) == 0) g_trmode = (strcmp(argv[i] + 6, "tree") == 0);
+    if (strncmp(argv[i], "img=", 4) == 0) imgw = (int)strtol(argv[i] + 4, NULL, 10);
     /* Камера ключом: закон роста среза надо мерить на РАЗНЫХ сценах, а глаз у
      * каждой свой и найден замером (§187). */
     if (strncmp(argv[i], "eye=", 4) == 0) {
@@ -161,6 +189,33 @@ int main(int argc, char **argv) {
          t_tree, T.nnd, (long long)T.nleaf, (long long)T.nref, T.redundancy);
   printf("   треугольников у ВНУТРЕННИХ узлов %lld (%.2f %%), у листьев %lld\n",
          (long long)T.n_inner, 100.0 * (double)T.n_inner / (double)m.nt, (long long)T.n_leaf_tri);
+  printf("== ТРАССИРОВЩИК: %s\n", g_trmode ? "ДЕРЕВО ptree" : "равномерная сетка pgrid");
+  /* РАСПРЕДЕЛЕНИЕ ГЕОМЕТРИИ ПО УРОВНЯМ (А427). Луч, вошедший в корень, проверяет
+   * треугольники КАЖДОГО посещённого узла (`ptree.c:87`), поэтому висящее
+   * НАВЕРХУ он платит на каждом луче, а сетка — только там, где луч зашёл в
+   * ячейку стены. Без этой строки причина провала (если он будет) останется
+   * догадкой. Глубина считается прямым проходом: у `hz_ptree` дети всегда имеют
+   * больший номер, чем родитель. */
+  {
+    int32_t *dep0 = calloc((size_t)(T.nnd > 0 ? T.nnd : 1), sizeof *dep0);
+    if (dep0 != NULL) {
+      int64_t per[32] = {0};
+      int32_t dmaxl = 0;
+      for (int32_t i = 0; i < T.nnd; i++) {
+        if (T.nd[i].child >= 0)
+          for (int q = 0; q < 8; q++)
+            dep0[T.nd[i].child + q] = dep0[i] + 1;
+        int32_t dd = dep0[i] < 31 ? dep0[i] : 31;
+        per[dd] += T.nd[i].ntri;
+        if (T.nd[i].ntri > 0 && dd > dmaxl) dmaxl = dd;
+      }
+      printf("   треугольников по УРОВНЯМ дерева (уровень:доля от сцены): ");
+      for (int32_t d3 = 0; d3 <= dmaxl; d3++)
+        if (per[d3] > 0) printf("%d:%.1f%% ", d3, 100.0 * (double)per[d3] / (double)m.nt);
+      printf("\n");
+      free(dep0);
+    }
+  }
 
   /* ---- СЕГМЕНТАЦИЯ ПО ЛИСТЬЯМ ------------------------------------------ */
   /* СЕГМЕНТИРУЮТСЯ ВСЕ УЗЛЫ С ТРЕУГОЛЬНИКАМИ, А НЕ ТОЛЬКО ЛИСТЬЯ.
@@ -328,7 +383,7 @@ int main(int argc, char **argv) {
             double o[3], dsun[3] = {-wsun[0], -wsun[1], -wsun[2]}, th = 0.0;
             for (int c = 0; c < 3; c++)
               o[c] = p[c] + 1e-4 * nn2[c];
-            if (!hz_pgrid_trace(&G, &m, o, dsun, 0.0, diag2, NULL, 0, 1, &th)) {
+            if (!pc_trace(&G, &T, &m, o, dsun, 0.0, diag2, NULL, 0, 1, &th, NULL, NULL, NULL)) {
               nlit++;
               alit += sg.seg[s].area;
               litn[leaf[k]]++;
@@ -392,6 +447,64 @@ int main(int argc, char **argv) {
   printf("== ВСЕГО (холодный старт, один раз на сцену): дерево %.2f с + сегментация %.2f с = "
          "%.2f с\n",
          t_tree, t_seg, t_tree + t_seg);
+
+  /* ---- БЕСКАМЕРНЫЙ ЗАМЕР ЛУЧЕЙ (О63, пункт 4 плана §215) -----------------
+   * ГЛАВНОЕ ЧИСЛО ШАГА, и камеры в нём нет вовсе. §199 вывел правило: если
+   * величина зависит и от сцены, и от камеры, и от структуры — сначала мерить
+   * ту её часть, где камеры нет; там три прогона С камерой дали одно и то же
+   * число по трём РАЗНЫМ причинам, и совпадение выглядело законом (А425).
+   * Луч здесь тот же, что строит освещённый набор: из точки поверхности к
+   * солнцу, вопрос «есть ли заслон». Выборка треугольников равномерная по
+   * индексу — не случайная, чтобы прогон был воспроизводим побитово. */
+  {
+    int64_t stride = (int64_t)m.nt / PCELL_RAY_N;
+    if (stride < 1) stride = 1;
+    int64_t nray = 0, nvis0 = 0, nvisit = 0, ntest = 0;
+    double t_ray = now_s();
+#pragma omp parallel for schedule(dynamic, 1024) reduction(+ : nray, nvis0, nvisit, ntest)
+    for (int64_t t3 = 0; t3 < (int64_t)m.nt; t3 += stride) {
+      const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t3];
+      const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)t3 + 1];
+      const double *C = m.v + 3 * (size_t)m.f[3 * (size_t)t3 + 2];
+      double e1[3] = {0.0, 0.0, 0.0}, e2[3] = {0.0, 0.0, 0.0}, nn[3] = {0.0, 0.0, 0.0};
+      for (int c = 0; c < 3; c++) {
+        e1[c] = B[c] - A[c];
+        e2[c] = C[c] - A[c];
+      }
+      nn[0] = e1[1] * e2[2] - e1[2] * e2[1];
+      nn[1] = e1[2] * e2[0] - e1[0] * e2[2];
+      nn[2] = e1[0] * e2[1] - e1[1] * e2[0];
+      double nl4 = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+      if (!(nl4 > 0.0)) continue;
+      double ndl = 0.0;
+      for (int c = 0; c < 3; c++) {
+        nn[c] /= nl4;
+        ndl -= nn[c] * wsun[c];
+      }
+      if (ndl < 0.0) {
+        ndl = -ndl;
+        for (int c = 0; c < 3; c++)
+          nn[c] = -nn[c];
+      }
+      if (!(ndl > 0.0)) continue;
+      double o[3] = {0.0, 0.0, 0.0}, ds[3] = {-wsun[0], -wsun[1], -wsun[2]}, th = 0.0;
+      for (int c = 0; c < 3; c++)
+        o[c] = (A[c] + B[c] + C[c]) / 3.0 + 1e-4 * nn[c];
+      int64_t v1 = 0, e3 = 0;
+      int hit = pc_trace(&G, &T, &m, o, ds, 0.0, diag2, NULL, 0, 1, &th, NULL, &v1, &e3);
+      nray++;
+      nvisit += v1;
+      ntest += e3;
+      if (!hit) nvis0++;
+    }
+    t_ray = now_s() - t_ray;
+    printf("== ЛУЧИ БЕЗ КАМЕРЫ (%s): %lld лучей за %.3f с = %.2f млн/с; %s на луч %.1f; "
+           "треугольников на луч %.1f; ВИДЯТ СОЛНЦЕ %lld\n",
+           g_trmode ? "ДЕРЕВО" : "СЕТКА", (long long)nray, t_ray,
+           1e-6 * (double)nray / (t_ray > 0.0 ? t_ray : 1.0), g_trmode ? "узлов" : "ячеек",
+           (double)nvisit / (double)(nray > 0 ? nray : 1),
+           (double)ntest / (double)(nray > 0 ? nray : 1), (long long)nvis0);
+  }
 
   /* ---- СЖАТИЕ ОСВЕЩЁННОГО НАБОРА ПО УРОВНЯМ (§202) ---------------------
    * Сколько ВТОРИЧНЫХ ИСТОЧНИКОВ останется, если объединять освещённые
@@ -655,7 +768,7 @@ int main(int argc, char **argv) {
    * должно — отскок не сделан (§202). Тень в затенённых местах поэтому глухая,
    * и это честно, а не дефект раскраски. */
   {
-    int W = 1024, H = 1024;
+    int W = imgw, H = imgw;
     unsigned char *rgb = malloc((size_t)W * (size_t)H * 3);
     double eyeP[3] = HZ_CFG_MIGUEL_EYE, atP[3] = HZ_CFG_MIGUEL_AT, upP[3] = HZ_CFG_UP;
     if (haseye)
@@ -680,7 +793,10 @@ int main(int argc, char **argv) {
       double th2 = tan(0.5 * HZ_CFG_FOV_DEG * M_PI / 180.0);
       double t_pic = now_s();
       int64_t nmis = 0, npix2 = 0, ngath = 0, nvis3 = 0;
-#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nmis, npix2, ngath, nvis3)
+      /* Счётчики ЛУЧЕЙ кадра (О63): пройдено ячеек или посещено узлов, и
+       * проверено треугольников. Порознь — по доводу А424. */
+      int64_t nvray = 0, ntray = 0;
+#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nmis, npix2, ngath, nvis3, nvray, ntray)
       for (int j = 0; j < H; j++)
         for (int i = 0; i < W; i++) {
           double sx = (2.0 * ((double)i + 0.5) / W - 1.0) * th2;
@@ -695,7 +811,8 @@ int main(int argc, char **argv) {
           int32_t tri = -1;
           int64_t q = (int64_t)j * W + i;
           double col[3] = {0.45, 0.55, 0.70};
-          if (hz_pgrid_trace_tri(&G, &m, eyeP, d, 0.0, diag2, NULL, 0, 0, &tt, &tri) && tri >= 0) {
+          if (pc_trace(&G, &T, &m, eyeP, d, 0.0, diag2, NULL, 0, 0, &tt, &tri, &nvray, &ntray) &&
+              tri >= 0) {
             const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)tri];
             const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)tri + 1];
             const double *C = m.v + 3 * (size_t)m.f[3 * (size_t)tri + 2];
@@ -774,7 +891,8 @@ int main(int argc, char **argv) {
               double jl = sqrt(sdj[0] * sdj[0] + sdj[1] * sdj[1] + sdj[2] * sdj[2]);
               for (int c = 0; c < 3; c++)
                 sdj[c] /= jl;
-              if (!hz_pgrid_trace(&G, &m, so, sdj, 0.0, diag2, NULL, 0, 1, &st)) nvis2++;
+              if (!pc_trace(&G, &T, &m, so, sdj, 0.0, diag2, NULL, 0, 1, &st, NULL, &nvray, &ntray))
+                nvis2++;
             }
             double vfrac = (double)nvis2 / (double)nsun;
             int litpx = (vfrac > 0.0);
@@ -906,7 +1024,8 @@ int main(int argc, char **argv) {
               for (int c = 0; c < 3; c++)
                 dk3[c] /= kl;
               double kt = 0.0;
-              if (!hz_pgrid_trace(&G, &m, so, dk3, 0.0, diag2, NULL, 0, 1, &kt)) nsk++;
+              if (!pc_trace(&G, &T, &m, so, dk3, 0.0, diag2, NULL, 0, 1, &kt, NULL, &nvray, &ntray))
+                nsk++;
             }
             double amb2 = PCELL_SKY * (double)nsk / (double)PCELL_SKY_SAMP;
             double sun2 = vfrac * ndl;
@@ -942,6 +1061,11 @@ int main(int argc, char **argv) {
                "из них %.0f %%\n",
                (long long)nvis3, (double)nvis3 / (double)(npix2 > 0 ? npix2 : 1),
                100.0 * (double)ngath / (double)(nvis3 > 0 ? nvis3 : 1));
+        printf("   ЛУЧИ КАДРА (%s): %s на луч %.1f, треугольников на луч %.1f (всего лучей %lld)\n",
+               g_trmode ? "ДЕРЕВО" : "СЕТКА", g_trmode ? "узлов" : "ячеек",
+               (double)nvray / (double)(npix2 > 0 ? npix2 : 1) / (double)(1 + nsun + nsky),
+               (double)ntray / (double)(npix2 > 0 ? npix2 : 1) / (double)(1 + nsun + nsky),
+               (long long)npix2 * (1 + nsun + nsky));
         printf("   ЦЕНА КВАНТОВАНИЯ ТЕНИ ЭЛЕМЕНТОМ: поэлементная расходится с честной на %lld "
                "пикселей из %lld (%.2f %%)\n",
                (long long)nmis, (long long)npix2,

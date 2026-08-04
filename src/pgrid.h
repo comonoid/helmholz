@@ -84,4 +84,15 @@ int hz_pgrid_trace_tri(const hz_pgrid *g, const hz_objmesh *m, const double o[3]
                        const double dir[3], double tmin, double tmax, const int32_t *skip,
                        int nskip, int anyhit, double *thit, int32_t *tri);
 
+/* То же со СЧЁТЧИКАМИ (шаг О63): `ncell` — пройдено ячеек, `ntest` — проверено
+ * треугольников; оба могут быть NULL. Заведено ТРЕТЬЕЙ функцией, а не лишними
+ * параметрами у двух прежних, по тому же доводу, что и `hz_pgrid_trace_tri`:
+ * у `hz_pgrid_trace` есть потребитель (`tools/psil.c`), чьи числа сверяются
+ * побитово, и подпись его вызова трогать нельзя. Арифметика одна на всех трёх —
+ * две прежние стали обёртками над этой. */
+int hz_pgrid_trace_cnt(const hz_pgrid *g, const hz_objmesh *m, const double o[3],
+                       const double dir[3], double tmin, double tmax, const int32_t *skip,
+                       int nskip, int anyhit, double *thit, int32_t *tri, int64_t *ncell,
+                       int64_t *ntest);
+
 #endif

@@ -66,7 +66,18 @@
 #define PCELL_SUN_SAMP 16
 /* Яркость неба как доли солнечной. Ясный день: небо даёт около четверти
  * горизонтальной облучённости против прямого солнца. */
-#define PCELL_SKY 0.25
+/* Небо как доля прямого солнца. `0.25` было завышением: столько получает
+ * ГОРИЗОНТАЛЬНАЯ площадка под открытым небом, а стена в каньоне двора —
+ * `0.10…0.15`. Завышение делало тени слишком светлыми. */
+#define PCELL_SKY 0.12
+/* ЭКСПОЗИЦИЯ. Без неё освещённая поверхность при `kd ≈ 1` и солнце `1.0` даёт
+ * ровно `1.0` и упирается в потолок: всё на свету схлопывается в белое, и
+ * контраста там нет по построению. Число выбрано так, чтобы прямое солнце на
+ * площадке, повёрнутой к нему, ложилось в `0.9`, оставляя запас под блики. */
+#define PCELL_EXPO 0.9
+/* Проб неба на пиксель. При `24` шум видимости ниже кванта восьми разрядов
+ * везде, кроме контактных стыков, — та же оценка `1/√N`, что в §183. */
+#define PCELL_SKY_SAMP 24
 
 static double now_s(void) {
   struct timespec ts;
@@ -182,6 +193,11 @@ int main(int argc, char **argv) {
   diag2 = 4.0 * sqrt(diag2);
   int64_t nlit = 0;
   double alit = 0.0;
+  /* ИНВАРИАНТ ЭНЕРГИИ (§206). Считается НЕЗАВИСИМО ОТ ДЕРЕВА, прямо в цикле по
+   * элементам: суммарная мощность вторичных источников обязана совпасть с этим
+   * числом. Три раза за заход одна ошибка (А419, А420, §206) проходила там, где
+   * инварианта не было, и ловилась немедленно там, где он был. */
+  double wref = 0.0;
   /* Вторичные источники: центр+нормаль (по 6 чисел) и мощность. Потолок —
    * число узлов, заведомо с запасом. */
   int64_t nsrc = 0;
@@ -212,7 +228,7 @@ int main(int argc, char **argv) {
 
   int64_t nfail = 0;
   t0 = now_s();
-#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nfail, nlit, alit)
+#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nfail, nlit, alit, wref)
   for (int64_t k = 0; k < nl; k++) {
     const hz_ptnode *nd = &T.nd[leaf[k]];
     int32_t nt = nd->ntri;
@@ -304,6 +320,7 @@ int main(int argc, char **argv) {
               for (int c = 0; c < 3; c++)
                 litp[4 * leaf[k] + c] += sg.seg[s].area * p[c];
               litp[4 * leaf[k] + 3] += sg.seg[s].area * ndl;
+              wref += PCELL_RHO * sg.seg[s].area * ndl;
               for (int32_t j2 = 0; j2 < nt; j2++)
                 if (sg.label[j2] == s) tri_lit[T.ref[nd->t0 + j2]] = 1;
             }
@@ -422,13 +439,22 @@ int main(int argc, char **argv) {
                 lp[4 * (size_t)i + (size_t)c] += lp[4 * (size_t)(T.nd[i].child + q) + (size_t)c];
         }
         for (int32_t i = 0; i < T.nnd; i++) {
-          int take = (dep[i] == PCELL_AGG_LEV && ls[i] > 0) ||
-                     (dep[i] < PCELL_AGG_LEV && T.nd[i].child < 0 && ls[i] > 0);
-          if (!take || !(lv[4 * (size_t)i + 3] > 0.0)) continue;
-          double a = lv[4 * (size_t)i + 3];
+          /* УЗЛЫ ВЫШЕ УРОВНЯ ОБЪЕДИНЕНИЯ ДАЮТ СВОИ СОБСТВЕННЫЕ ЭЛЕМЕНТЫ (§206).
+           * Первая редакция брала только `dep == L` и листья выше, а собственные
+           * элементы внутренних узлов `dep < L` не попадали НИКУДА: их нет ни в
+           * одном ребёнке. У `ptree` там висит 72.5 %% геометрии, и крупнейшие
+           * стены — как раз наверху. Каждый элемент числится ровно один раз:
+           * узлы `dep == L` берут ПОДДЕРЕВО, узлы `dep < L` — только СВОЁ. */
+          int at_lev = (dep[i] == PCELL_AGG_LEV && ls[i] > 0);
+          int above = (dep[i] < PCELL_AGG_LEV && litn[i] > 0);
+          if (!at_lev && !above) continue;
+          const double *vsrc = at_lev ? &lv[4 * (size_t)i] : &litv[4 * (size_t)i];
+          const double *psrc = at_lev ? &lp[4 * (size_t)i] : &litp[4 * (size_t)i];
+          if (!(vsrc[3] > 0.0)) continue;
+          double a = vsrc[3];
           for (int c = 0; c < 3; c++) {
-            src_p[6 * nsrc + c] = lp[4 * (size_t)i + (size_t)c] / a;
-            src_n[6 * nsrc + c] = lv[4 * (size_t)i + (size_t)c];
+            src_p[6 * nsrc + c] = psrc[c] / a;
+            src_n[6 * nsrc + c] = vsrc[c];
           }
           double nl3 =
               sqrt(src_n[6 * nsrc] * src_n[6 * nsrc] + src_n[6 * nsrc + 1] * src_n[6 * nsrc + 1] +
@@ -439,14 +465,16 @@ int main(int argc, char **argv) {
           /* Мощность: альбедо × облучённость солнцем × Σ(площадь·cos).
            * Альбедо взято средним по сцене — материала у агрегата нет, и это
            * названо здесь, а не спрятано. */
-          src_w[nsrc] = PCELL_RHO * lp[4 * (size_t)i + 3];
+          src_w[nsrc] = PCELL_RHO * psrc[3];
           nsrc++;
         }
         double wsum = 0.0;
         for (int64_t q2 = 0; q2 < nsrc; q2++)
           wsum += src_w[q2];
-        printf("== ВТОРИЧНЫХ ИСТОЧНИКОВ построено %lld (уровень %d), суммарная мощность %.1f\n",
-               (long long)nsrc, PCELL_AGG_LEV, wsum);
+        printf("== ВТОРИЧНЫХ ИСТОЧНИКОВ построено %lld (уровень %d), мощность %.2f против эталона "
+               "%.2f — ИНВАРИАНТ ЭНЕРГИИ %s\n",
+               (long long)nsrc, PCELL_AGG_LEV, wsum, wref,
+               (fabs(wsum - wref) <= 1e-9 * (wref > 0.0 ? wref : 1.0)) ? "СОШЁЛСЯ" : "НЕ СОШЁЛСЯ");
       }
       free(lp);
       free(lv);
@@ -762,8 +790,50 @@ int main(int argc, char **argv) {
             /* Небо как подсветка теней: полусферически, по наклону нормали.
              * Косвенного от стен пока нет (мощность источников неверна, §206),
              * и без неба тень была бы чёрной. Число названо, в замер не входит. */
-            double nup = 0.5 + 0.5 * nrm[1];
-            double amb2 = PCELL_SKY * nup;
+            /* НЕБО — ВИДИМОСТЬЮ, А НЕ КОНСТАНТОЙ (§183). Полусферическое
+             * приближение `0.5+0.5·n_y` не знает о заслонах, и потому тени
+             * выходят без контактных затемнений и без формы. Здесь берётся
+             * косинусно взвешенная доля неба — точный член уравнения
+             * рендеринга, приближается только интеграл. Выборка
+             * детерминированная. */
+            double sky1[3] = {0, 0, 0}, sky2[3] = {0, 0, 0};
+            {
+              int ax3 = (fabs(nrm[0]) < fabs(nrm[1])) ? ((fabs(nrm[0]) < fabs(nrm[2])) ? 0 : 2)
+                                                      : ((fabs(nrm[1]) < fabs(nrm[2])) ? 1 : 2);
+              double tv2[3] = {0, 0, 0};
+              tv2[ax3] = 1.0;
+              sky1[0] = nrm[1] * tv2[2] - nrm[2] * tv2[1];
+              sky1[1] = nrm[2] * tv2[0] - nrm[0] * tv2[2];
+              sky1[2] = nrm[0] * tv2[1] - nrm[1] * tv2[0];
+              double s1l = sqrt(sky1[0] * sky1[0] + sky1[1] * sky1[1] + sky1[2] * sky1[2]);
+              for (int c = 0; c < 3; c++)
+                sky1[c] /= s1l;
+              sky2[0] = nrm[1] * sky1[2] - nrm[2] * sky1[1];
+              sky2[1] = nrm[2] * sky1[0] - nrm[0] * sky1[2];
+              sky2[2] = nrm[0] * sky1[1] - nrm[1] * sky1[0];
+            }
+            int nsk = 0;
+            for (int s4 = 0; s4 < PCELL_SKY_SAMP; s4++) {
+              double u1 = ((double)s4 + 0.5) / (double)PCELL_SKY_SAMP;
+              uint32_t b4 = (uint32_t)s4;
+              b4 = (b4 << 16) | (b4 >> 16);
+              b4 = ((b4 & 0x55555555u) << 1) | ((b4 & 0xAAAAAAAAu) >> 1);
+              b4 = ((b4 & 0x33333333u) << 2) | ((b4 & 0xCCCCCCCCu) >> 2);
+              b4 = ((b4 & 0x0F0F0F0Fu) << 4) | ((b4 & 0xF0F0F0F0u) >> 4);
+              b4 = ((b4 & 0x00FF00FFu) << 8) | ((b4 & 0xFF00FF00u) >> 8);
+              double u2 = (double)b4 * 2.3283064365386963e-10;
+              double rr3 = sqrt(u1), ph3 = 2.0 * M_PI * u2;
+              double dz3 = sqrt(1.0 - u1 > 0.0 ? 1.0 - u1 : 0.0);
+              double dk3[3] = {0, 0, 0};
+              for (int c = 0; c < 3; c++)
+                dk3[c] = rr3 * cos(ph3) * sky1[c] + rr3 * sin(ph3) * sky2[c] + dz3 * nrm[c];
+              double kl = sqrt(dk3[0] * dk3[0] + dk3[1] * dk3[1] + dk3[2] * dk3[2]);
+              for (int c = 0; c < 3; c++)
+                dk3[c] /= kl;
+              double kt = 0.0;
+              if (!hz_pgrid_trace(&G, &m, so, dk3, 0.0, diag2, NULL, 0, 1, &kt)) nsk++;
+            }
+            double amb2 = PCELL_SKY * (double)nsk / (double)PCELL_SKY_SAMP;
             double sun2 = vfrac * ndl;
             col[0] = kd[0] * (sun2 * 1.00 + amb2 * 0.60 + ind * PCELL_IND);
             col[1] = kd[1] * (sun2 * 0.97 + amb2 * 0.72 + ind * PCELL_IND);
@@ -772,7 +842,12 @@ int main(int argc, char **argv) {
             /* Косвенный свет ДОБАВЛЯЕТСЯ к обоим случаям — он есть и на свету. */
           }
           for (int c = 0; c < 3; c++) {
-            double g2 = pow(col[c] < 0 ? 0 : (col[c] > 1 ? 1 : col[c]), 1.0 / 2.2);
+            double e3 = col[c] * PCELL_EXPO;
+            if (e3 < 0.0) e3 = 0.0;
+            /* Плечо вместо обрезки: без него всё ярче единицы становится
+             * одинаково белым, и градации на солнце пропадают. */
+            e3 = e3 / (1.0 + e3 * 0.6);
+            double g2 = pow(e3 > 1.0 ? 1.0 : e3, 1.0 / 2.2);
             rgb[3 * q + c] = (unsigned char)(255.0 * g2 + 0.5);
           }
         }

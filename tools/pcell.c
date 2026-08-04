@@ -210,7 +210,10 @@ int main(int argc, char **argv) {
             const double *A = m.v + 3 * (size_t)sub.f[3 * j];
             const double *B = m.v + 3 * (size_t)sub.f[3 * j + 1];
             const double *C = m.v + 3 * (size_t)sub.f[3 * j + 2];
-            double e1[3], e2[3], cr[3];
+            /* Инициализация нулём — тот же класс ложных срабатываний OpenMP,
+             * что описан в CLAUDE.md: анализатор не проводит связь «заполнено
+             * циклом — прочитано» через параллельную область. */
+            double e1[3] = {0.0, 0.0, 0.0}, e2[3] = {0.0, 0.0, 0.0}, cr[3] = {0.0, 0.0, 0.0};
             for (int c = 0; c < 3; c++) {
               e1[c] = B[c] - A[c];
               e2[c] = C[c] - A[c];

@@ -551,7 +551,8 @@ int main(int argc, char **argv) {
       uv[2] = ri[0] * fw[1] - ri[1] * fw[0];
       double th2 = tan(0.5 * HZ_CFG_FOV_DEG * M_PI / 180.0);
       double t_pic = now_s();
-#pragma omp parallel for schedule(dynamic, 8)
+      int64_t nmis = 0, npix2 = 0;
+#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nmis, npix2)
       for (int j = 0; j < H; j++)
         for (int i = 0; i < W; i++) {
           double sx = (2.0 * ((double)i + 0.5) / W - 1.0) * th2;
@@ -587,10 +588,26 @@ int main(int argc, char **argv) {
              * геометрия читается ВСЕГДА (затенение по `|n·взгляд|`), а
              * освещённость показана ЦВЕТОМ: тёплый и яркий — солнце дошло,
              * холодный и тусклый — нет. Это диагностика, не рендер. */
+            /* ЧЕСТНАЯ ТЕНЬ НА ПИКСЕЛЬ — эталон, с которым сравнивается поэлементная.
+             * Разница между ними и есть цена КВАНТОВАНИЯ ТЕНИ ЭЛЕМЕНТОМ, то
+             * есть ровно то, что портит кадр; всё прочее — незаконченность
+             * (отскока нет). */
+            double hp[3] = {0, 0, 0};
+            for (int c = 0; c < 3; c++)
+              hp[c] = eyeP[c] + tt * d[c];
+            double nsg = (nl2 > 0.0 && (nn[0] * wsun[0] + nn[1] * wsun[1] + nn[2] * wsun[2]) > 0.0)
+                             ? -1.0
+                             : 1.0;
+            double so[3] = {0, 0, 0}, sd[3] = {-wsun[0], -wsun[1], -wsun[2]}, st = 0.0;
+            for (int c = 0; c < 3; c++)
+              so[c] = hp[c] + 1e-4 * nsg * nn[c] / (nl2 > 0.0 ? nl2 : 1.0);
+            int litpx = !hz_pgrid_trace(&G, &m, so, sd, 0.0, diag2, NULL, 0, 1, &st);
+            if (litpx != (tri_lit[tri] ? 1 : 0)) nmis++;
+            npix2++;
             double vdn = 0.0;
             if (nl2 > 0.0) vdn = fabs((nn[0] * d[0] + nn[1] * d[1] + nn[2] * d[2]) / nl2);
             double base = 0.30 + 0.70 * vdn;
-            if (tri_lit[tri]) {
+            if (litpx) {
               double s2 = 0.55 + 0.45 * ndl;
               col[0] = base * s2 * 1.00;
               col[1] = base * s2 * 0.93;
@@ -611,10 +628,13 @@ int main(int argc, char **argv) {
         fprintf(fp, "P6\n%d %d\n255\n", W, H);
         fwrite(rgb, 1, (size_t)W * (size_t)H * 3, fp);
         fclose(fp);
-        printf(
-            "== КАРТИНКА img/pcell_lit.ppm за %.2f с: освещённый набор (прямой свет), косвенного "
-            "НЕТ — отскок не сделан\n",
-            now_s() - t_pic);
+        printf("== КАРТИНКА img/pcell_lit.ppm за %.2f с: тень ЧЕСТНАЯ (луч на пиксель); косвенного "
+               "НЕТ — отскок не сделан\n",
+               now_s() - t_pic);
+        printf("   ЦЕНА КВАНТОВАНИЯ ТЕНИ ЭЛЕМЕНТОМ: поэлементная расходится с честной на %lld "
+               "пикселей из %lld (%.2f %%)\n",
+               (long long)nmis, (long long)npix2,
+               100.0 * (double)nmis / (double)(npix2 > 0 ? npix2 : 1));
       }
       free(rgb);
     }

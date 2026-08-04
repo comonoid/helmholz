@@ -815,9 +815,16 @@ int main(int argc, char **argv) {
               int split = (nd2->child >= 0) && (rc < rad2 * PCELL_SRC_K) && (sp3 + 8 < 128);
               const double *vv = split ? &litv[4 * (size_t)ni] : &g_lv[4 * (size_t)ni];
               const double *pp = split ? &litp[4 * (size_t)ni] : &g_lp[4 * (size_t)ni];
+              /* ПУСТОТА ОТСЕИВАЕТСЯ ДО УКЛАДКИ В СТЕК, а не после снятия с него
+               * (довод пользователя 08-04: «если в самом крупном уровне записано
+               * пустое пространство, его очень быстро пропустить»). Прежняя
+               * редакция клала ВСЕ восемь детей и проверяла содержимое потом —
+               * то есть платила за пустоту полную цену стека и снятия. */
               if (split)
-                for (int qq = 0; qq < 8; qq++)
-                  st2[sp3++] = nd2->child + qq;
+                for (int qq = 0; qq < 8; qq++) {
+                  int32_t ch2 = nd2->child + qq;
+                  if (g_ls[ch2] > 0) st2[sp3++] = ch2;
+                }
               if (!(vv[3] > 0.0)) continue;
               double dv[3] = {pp[0] / vv[3] - hp[0], pp[1] / vv[3] - hp[1], pp[2] / vv[3] - hp[2]};
               double r2 = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];

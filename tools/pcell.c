@@ -112,6 +112,9 @@ int main(int argc, char **argv) {
   int leafmax = 0, maxlev = 0, wpx = HZ_CFG_W, loose = 0, haseye = 0;
   double eye0[3] = {0.0, 0.0, 0.0};
   /* Полоса §191, названная пользователем: элемент от 4 до 32 пикселей. */
+  /* Пробы ключами — чтобы доли стадий кадра получались ВЫЧИТАНИЕМ, а не
+   * гаданием: узкое место надо мерить, а не предполагать (§209.2). */
+  int nsun = PCELL_SUN_SAMP, nsky = PCELL_SKY_SAMP;
   double pxlo = 4.0, pxhi = 32.0;
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "d=", 2) == 0) delta = strtod(argv[i] + 2, NULL);
@@ -121,6 +124,8 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "pxhi=", 5) == 0) pxhi = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "pxlo=", 5) == 0) pxlo = strtod(argv[i] + 5, NULL);
     if (strcmp(argv[i], "loose") == 0) loose = 1;
+    if (strncmp(argv[i], "sun=", 4) == 0) nsun = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "sky=", 4) == 0) nsky = (int)strtol(argv[i] + 4, NULL, 10);
     /* Камера ключом: закон роста среза надо мерить на РАЗНЫХ сценах, а глаз у
      * каждой свой и найден замером (§187). */
     if (strncmp(argv[i], "eye=", 4) == 0) {
@@ -753,8 +758,8 @@ int main(int argc, char **argv) {
             double rot_px = 2.0 * M_PI * (double)(hpx >> 11) / 9007199254740992.0;
             double tanr = tan(0.5 * PCELL_SUN_DEG * M_PI / 180.0);
             int nvis2 = 0;
-            for (int s3 = 0; s3 < PCELL_SUN_SAMP; s3++) {
-              double u1 = ((double)s3 + 0.5) / (double)PCELL_SUN_SAMP;
+            for (int s3 = 0; s3 < nsun; s3++) {
+              double u1 = ((double)s3 + 0.5) / (double)nsun;
               uint32_t b3 = (uint32_t)s3;
               b3 = (b3 << 16) | (b3 >> 16);
               b3 = ((b3 & 0x55555555u) << 1) | ((b3 & 0xAAAAAAAAu) >> 1);
@@ -771,7 +776,7 @@ int main(int argc, char **argv) {
                 sdj[c] /= jl;
               if (!hz_pgrid_trace(&G, &m, so, sdj, 0.0, diag2, NULL, 0, 1, &st)) nvis2++;
             }
-            double vfrac = (double)nvis2 / (double)PCELL_SUN_SAMP;
+            double vfrac = (double)nvis2 / (double)nsun;
             int litpx = (vfrac > 0.0);
             if (litpx != (tri_lit[tri] ? 1 : 0)) nmis++;
             npix2++;
@@ -873,7 +878,7 @@ int main(int argc, char **argv) {
               sky2[2] = nrm[0] * sky1[1] - nrm[1] * sky1[0];
             }
             int nsk = 0;
-            for (int s4 = 0; s4 < PCELL_SKY_SAMP; s4++) {
+            for (int s4 = 0; s4 < nsky; s4++) {
               double u1 = ((double)s4 + 0.5) / (double)PCELL_SKY_SAMP;
               uint32_t b4 = (uint32_t)s4;
               b4 = (b4 << 16) | (b4 >> 16);

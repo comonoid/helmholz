@@ -43,6 +43,30 @@
 /* Допуск планарности. Тот же, что у городских прогонов `pcoarse` (`0.05` м):
  * сравнивать надо с ними, а разный допуск сделал бы сравнение бессмысленным. */
 #define PCELL_DELTA 0.05
+/* Уровень объединения вторичных источников. Выведен ДВУМЯ независимыми
+ * замерами, а не подобран: §199 — дерево ведёт себя как поверхность (`×4` на
+ * уровень) ровно до шестого; §202 — там же сжатие освещённого набора выходит на
+ * `30×` при `1 008` источниках. */
+#define PCELL_AGG_LEV 5
+/* Альбедо агрегата. Материала у объединения нет, и брать его неоткуда: это
+ * СРЕДНЕЕ по сцене, названное здесь, а не спрятанное в формулу. Городское
+ * `0.3` из разбора 08-03. */
+#define PCELL_RHO 0.3
+/* Множитель косвенного в кадре. Радиометрия сцены условна (солнце `E = 1`),
+ * и этот множитель приводит косвенное к тому же масштабу. Названо числом, а не
+ * подобрано на глаз: при `E = 1` и `ρ = 0.3` косвенное обязано дать порядка
+ * `0.09` от прямого, что и заложено. */
+#define PCELL_IND 1.0
+/* Угловой ДИАМЕТР солнца — физическая величина, не порог схемы (та же, что в
+ * `tools/pfront.c`). Из-за неё тень имеет полутень, растущую с расстоянием до
+ * заслона: `9` мм на метре, `9` см на десяти. */
+#define PCELL_SUN_DEG 0.533
+/* Проб по диску солнца на пиксель. При `16` шум полутени ниже кванта восьми
+ * разрядов на всех расстояниях этой сцены. */
+#define PCELL_SUN_SAMP 16
+/* Яркость неба как доли солнечной. Ясный день: небо даёт около четверти
+ * горизонтальной облучённости против прямого солнца. */
+#define PCELL_SKY 0.25
 
 static double now_s(void) {
   struct timespec ts;
@@ -158,6 +182,13 @@ int main(int argc, char **argv) {
   diag2 = 4.0 * sqrt(diag2);
   int64_t nlit = 0;
   double alit = 0.0;
+  /* Вторичные источники: центр+нормаль (по 6 чисел) и мощность. Потолок —
+   * число узлов, заведомо с запасом. */
+  int64_t nsrc = 0;
+  double *src_p = calloc((size_t)(T.nnd > 0 ? T.nnd : 1) * 6, sizeof *src_p);
+  double *src_n = calloc((size_t)(T.nnd > 0 ? T.nnd : 1) * 6, sizeof *src_n);
+  double *src_w = calloc((size_t)(T.nnd > 0 ? T.nnd : 1), sizeof *src_w);
+  if (src_p == NULL || src_n == NULL || src_w == NULL) return 2;
   /* Признак «освещён» НА ТРЕУГОЛЬНИК — только ради картинки: она рисуется
    * первичными лучами, а луч попадает в треугольник, не в элемент. */
   unsigned char *tri_lit = calloc((size_t)(m.nt > 0 ? m.nt : 1), 1);
@@ -167,13 +198,17 @@ int main(int argc, char **argv) {
    * пар, и вопрос не в том, дорого ли это, а во сколько раз агрегирование
    * сжимает набор (пункт 2 реестра: «второе отражение на ОГРУБЛЁННОМ наборе»). */
   int32_t *litn = calloc((size_t)(T.nnd > 0 ? T.nnd : 1), sizeof *litn);
+  /* Положение агрегата (сумма площадь×центр) и его излучение (сумма
+   * площадь×cos): вторичный источник есть площадка с этим центром, этой
+   * нормалью и этой мощностью. */
+  double *litp = calloc((size_t)(T.nnd > 0 ? T.nnd : 1) * 4, sizeof *litp);
   /* СВЯЗНОСТЬ НОРМАЛЕЙ освещённой группы: `|Σ area·n| / Σ area`. Единица —
    * группа плоская и заменима ОДНОЙ плоскостью; ноль — нормали смотрят врозь, и
    * агрегат обязан нести РАСПРЕДЕЛЕНИЕ, а не плоскость. Без этого числа
    * объединение источников (§202) построить нельзя: неизвестно, что у агрегата
    * за нормаль. */
   double *litv = calloc((size_t)(T.nnd > 0 ? T.nnd : 1) * 4, sizeof *litv);
-  if (litn == NULL || litv == NULL) return 2;
+  if (litn == NULL || litv == NULL || litp == NULL) return 2;
 
   int64_t nfail = 0;
   t0 = now_s();
@@ -266,6 +301,9 @@ int main(int argc, char **argv) {
               for (int c = 0; c < 3; c++)
                 litv[4 * leaf[k] + c] += sg.seg[s].area * nn2[c];
               litv[4 * leaf[k] + 3] += sg.seg[s].area;
+              for (int c = 0; c < 3; c++)
+                litp[4 * leaf[k] + c] += sg.seg[s].area * p[c];
+              litp[4 * leaf[k] + 3] += sg.seg[s].area * ndl;
               for (int32_t j2 = 0; j2 < nt; j2++)
                 if (sg.label[j2] == s) tri_lit[T.ref[nd->t0 + j2]] = 1;
             }
@@ -370,6 +408,47 @@ int main(int argc, char **argv) {
                L, (long long)c2, (double)nlit / (double)c2, (cw > 0.0) ? csum / cw : 0.0,
                (cmin <= 1.0) ? cmin : 0.0);
       }
+      /* ВТОРИЧНЫЕ ИСТОЧНИКИ уровня `PCELL_AGG_LEV` — то, ради чего вся §202.
+       * Каждый есть площадка: центр по площади, нормаль по площади, мощность
+       * `ρ·E·Σ(area·cos)`. Строится один раз и от камеры НЕ зависит (§190). */
+      double *lp = calloc((size_t)(T.nnd > 0 ? T.nnd : 1) * 4, sizeof *lp);
+      if (lp != NULL && lv != NULL) {
+        for (int32_t i = T.nnd - 1; i >= 0; i--) {
+          for (int c = 0; c < 4; c++)
+            lp[4 * (size_t)i + (size_t)c] = litp[4 * (size_t)i + (size_t)c];
+          if (T.nd[i].child >= 0)
+            for (int q = 0; q < 8; q++)
+              for (int c = 0; c < 4; c++)
+                lp[4 * (size_t)i + (size_t)c] += lp[4 * (size_t)(T.nd[i].child + q) + (size_t)c];
+        }
+        for (int32_t i = 0; i < T.nnd; i++) {
+          int take = (dep[i] == PCELL_AGG_LEV && ls[i] > 0) ||
+                     (dep[i] < PCELL_AGG_LEV && T.nd[i].child < 0 && ls[i] > 0);
+          if (!take || !(lv[4 * (size_t)i + 3] > 0.0)) continue;
+          double a = lv[4 * (size_t)i + 3];
+          for (int c = 0; c < 3; c++) {
+            src_p[6 * nsrc + c] = lp[4 * (size_t)i + (size_t)c] / a;
+            src_n[6 * nsrc + c] = lv[4 * (size_t)i + (size_t)c];
+          }
+          double nl3 =
+              sqrt(src_n[6 * nsrc] * src_n[6 * nsrc] + src_n[6 * nsrc + 1] * src_n[6 * nsrc + 1] +
+                   src_n[6 * nsrc + 2] * src_n[6 * nsrc + 2]);
+          if (!(nl3 > 0.0)) continue;
+          for (int c = 0; c < 3; c++)
+            src_n[6 * nsrc + c] /= nl3;
+          /* Мощность: альбедо × облучённость солнцем × Σ(площадь·cos).
+           * Альбедо взято средним по сцене — материала у агрегата нет, и это
+           * названо здесь, а не спрятано. */
+          src_w[nsrc] = PCELL_RHO * lp[4 * (size_t)i + 3];
+          nsrc++;
+        }
+        double wsum = 0.0;
+        for (int64_t q2 = 0; q2 < nsrc; q2++)
+          wsum += src_w[q2];
+        printf("== ВТОРИЧНЫХ ИСТОЧНИКОВ построено %lld (уровень %d), суммарная мощность %.1f\n",
+               (long long)nsrc, PCELL_AGG_LEV, wsum);
+      }
+      free(lp);
       free(lv);
     }
     free(ls);
@@ -601,22 +680,96 @@ int main(int argc, char **argv) {
             double so[3] = {0, 0, 0}, sd[3] = {-wsun[0], -wsun[1], -wsun[2]}, st = 0.0;
             for (int c = 0; c < 3; c++)
               so[c] = hp[c] + 1e-4 * nsg * nn[c] / (nl2 > 0.0 ? nl2 : 1.0);
-            int litpx = !hz_pgrid_trace(&G, &m, so, sd, 0.0, diag2, NULL, 0, 1, &st);
+            /* ПОЛУТЕНЬ: солнце — ДИСК углового диаметра `PCELL_SUN_DEG`, а не
+             * точка. Один луч в центр даёт резкую тень, которой в природе нет.
+             * Выборка детерминированная (радикальный обратный по основанию 2),
+             * то есть кадр воспроизводится побитово. */
+            double sa[3] = {0, 0, 0}, sb[3] = {0, 0, 0};
+            {
+              int ax2 = (fabs(sd[0]) < fabs(sd[1])) ? ((fabs(sd[0]) < fabs(sd[2])) ? 0 : 2)
+                                                    : ((fabs(sd[1]) < fabs(sd[2])) ? 1 : 2);
+              double tv[3] = {0, 0, 0};
+              tv[ax2] = 1.0;
+              sa[0] = sd[1] * tv[2] - sd[2] * tv[1];
+              sa[1] = sd[2] * tv[0] - sd[0] * tv[2];
+              sa[2] = sd[0] * tv[1] - sd[1] * tv[0];
+              double al = sqrt(sa[0] * sa[0] + sa[1] * sa[1] + sa[2] * sa[2]);
+              for (int c = 0; c < 3; c++)
+                sa[c] /= al;
+              sb[0] = sd[1] * sa[2] - sd[2] * sa[1];
+              sb[1] = sd[2] * sa[0] - sd[0] * sa[2];
+              sb[2] = sd[0] * sa[1] - sd[1] * sa[0];
+            }
+            double tanr = tan(0.5 * PCELL_SUN_DEG * M_PI / 180.0);
+            int nvis2 = 0;
+            for (int s3 = 0; s3 < PCELL_SUN_SAMP; s3++) {
+              double u1 = ((double)s3 + 0.5) / (double)PCELL_SUN_SAMP;
+              uint32_t b3 = (uint32_t)s3;
+              b3 = (b3 << 16) | (b3 >> 16);
+              b3 = ((b3 & 0x55555555u) << 1) | ((b3 & 0xAAAAAAAAu) >> 1);
+              b3 = ((b3 & 0x33333333u) << 2) | ((b3 & 0xCCCCCCCCu) >> 2);
+              b3 = ((b3 & 0x0F0F0F0Fu) << 4) | ((b3 & 0xF0F0F0F0u) >> 4);
+              b3 = ((b3 & 0x00FF00FFu) << 8) | ((b3 & 0xFF00FF00u) >> 8);
+              double u2 = (double)b3 * 2.3283064365386963e-10;
+              double rr2 = tanr * sqrt(u1), ph2 = 2.0 * M_PI * u2;
+              double sdj[3] = {0, 0, 0};
+              for (int c = 0; c < 3; c++)
+                sdj[c] = sd[c] + rr2 * (cos(ph2) * sa[c] + sin(ph2) * sb[c]);
+              double jl = sqrt(sdj[0] * sdj[0] + sdj[1] * sdj[1] + sdj[2] * sdj[2]);
+              for (int c = 0; c < 3; c++)
+                sdj[c] /= jl;
+              if (!hz_pgrid_trace(&G, &m, so, sdj, 0.0, diag2, NULL, 0, 1, &st)) nvis2++;
+            }
+            double vfrac = (double)nvis2 / (double)PCELL_SUN_SAMP;
+            int litpx = (vfrac > 0.0);
             if (litpx != (tri_lit[tri] ? 1 : 0)) nmis++;
             npix2++;
             double vdn = 0.0;
             if (nl2 > 0.0) vdn = fabs((nn[0] * d[0] + nn[1] * d[1] + nn[2] * d[2]) / nl2);
-            double base = 0.30 + 0.70 * vdn;
-            if (litpx) {
-              double s2 = 0.55 + 0.45 * ndl;
-              col[0] = base * s2 * 1.00;
-              col[1] = base * s2 * 0.93;
-              col[2] = base * s2 * 0.70;
-            } else {
-              col[0] = base * 0.30 * 0.62;
-              col[1] = base * 0.30 * 0.68;
-              col[2] = base * 0.30 * 0.85;
+            /* ОТСКОК: вклад вторичных источников в эту точку. Площадка видна как
+             * диск: `F = cos_r·cos_s·A / (π r² + A)`. Видимости в отскоке НЕТ —
+             * это названная грубость (пункт 2 реестра допускает огрубление
+             * второго отскока), и она завышает свет в углах. */
+            double ind = 0.0;
+            double nrm[3] = {nn[0], nn[1], nn[2]};
+            if (nl2 > 0.0)
+              for (int c = 0; c < 3; c++)
+                nrm[c] /= nl2;
+            if ((nrm[0] * d[0] + nrm[1] * d[1] + nrm[2] * d[2]) > 0.0)
+              for (int c = 0; c < 3; c++)
+                nrm[c] = -nrm[c];
+            for (int64_t q3 = 0; q3 < nsrc; q3++) {
+              double dv[3] = {src_p[6 * q3] - hp[0], src_p[6 * q3 + 1] - hp[1],
+                              src_p[6 * q3 + 2] - hp[2]};
+              double r2 = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
+              if (!(r2 > 1e-9)) continue;
+              double rr = sqrt(r2);
+              double cr2 = (nrm[0] * dv[0] + nrm[1] * dv[1] + nrm[2] * dv[2]) / rr;
+              if (!(cr2 > 0.0)) continue;
+              double cs2 =
+                  -(src_n[6 * q3] * dv[0] + src_n[6 * q3 + 1] * dv[1] + src_n[6 * q3 + 2] * dv[2]) /
+                  rr;
+              if (!(cs2 > 0.0)) continue;
+              ind += src_w[q3] * cr2 * cs2 / (M_PI * r2 + src_w[q3]);
             }
+            /* ЦВЕТ БЕРЁТСЯ ИЗ МАТЕРИАЛА, А НЕ ПРИДУМЫВАЕТСЯ. Прежняя редакция красила
+             * тёплым/холодным по признаку «освещён», и кадр выходил чистым
+             * lightmap-ом при том, что `kd3` у сцены есть по 288 материалам и
+             * загрузчик их читает. Свет и цвет — разные вещи, и смешивать их в
+             * одну шкалу нельзя (правило Т1: альбедо прикладывается при ЧТЕНИИ
+             * поля). Текстур пока нет — это Ш8, и до неё не дошли. */
+            const double *kd = m.mtl[m.fm[tri]].kd3;
+            /* Небо как подсветка теней: полусферически, по наклону нормали.
+             * Косвенного от стен пока нет (мощность источников неверна, §206),
+             * и без неба тень была бы чёрной. Число названо, в замер не входит. */
+            double nup = 0.5 + 0.5 * nrm[1];
+            double amb2 = PCELL_SKY * nup;
+            double sun2 = vfrac * ndl;
+            col[0] = kd[0] * (sun2 * 1.00 + amb2 * 0.60 + ind * PCELL_IND);
+            col[1] = kd[1] * (sun2 * 0.97 + amb2 * 0.72 + ind * PCELL_IND);
+            col[2] = kd[2] * (sun2 * 0.88 + amb2 * 1.00 + ind * PCELL_IND);
+            (void)vdn;
+            /* Косвенный свет ДОБАВЛЯЕТСЯ к обоим случаям — он есть и на свету. */
           }
           for (int c = 0; c < 3; c++) {
             double g2 = pow(col[c] < 0 ? 0 : (col[c] > 1 ? 1 : col[c]), 1.0 / 2.2);

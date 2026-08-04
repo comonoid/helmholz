@@ -59,7 +59,7 @@ static double g_conemax = 0.0;
  * если стоит — виновата геометрия, и экономить нечего. */
 static double g_dgate = 0.0;
 static double g_radexp = 0.0; /* опыт «ворота стоят, радиус растёт» (§67) */
-static double g_lossmax = 0.0, g_aspmax = 0.0;
+static double g_lossmax = 0.0, g_aspmax = 0.0, g_scap = 0.0;
 
 static void run(const hz_objmesh *m, const hz_pseglist *si, const hz_polyset *ps, double eps,
                 int32_t target, int random, int brute, double delta, int ov) {
@@ -369,6 +369,11 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "dgate=", 6) == 0) g_dgate = strtod(argv[i] + 6, NULL);
     if (strncmp(argv[i], "radexp=", 7) == 0) g_radexp = strtod(argv[i] + 7, NULL);
     if (strncmp(argv[i], "loss=", 5) == 0) g_lossmax = strtod(argv[i] + 5, NULL);
+    /* ОГРАНИЧЕНИЕ ГАБАРИТА УЧАСТКА (§92). Замер §189 показал, что цену
+     * сегментации задаёт РАЗМЕР крупнейших полигонов; ограничение написано
+     * давно (`hz_seg_planar_cap`), но `pcoarse` его не звал никогда — все
+     * прежние числа сняты БЕЗ него. */
+    if (strncmp(argv[i], "scap=", 5) == 0) g_scap = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "asp=", 4) == 0) g_aspmax = strtod(argv[i] + 4, NULL);
   }
   /* Допуск планарности. У Сан-Мигеля берётся городской `0.05` м: он в метрах,
@@ -387,7 +392,7 @@ int main(int argc, char **argv) {
   }
   double t0 = now_s();
   hz_pseglist sg;
-  if (hz_seg_planar(&sg, &m, delta) != 0) return 1;
+  if (hz_seg_planar_cap(&sg, &m, delta, g_scap) != 0) return 1;
   double t1 = now_s();
   hz_polyset ps;
   if (hz_poly_build_ex(&ps, &m, &sg, use_hull) != 0) return 1;

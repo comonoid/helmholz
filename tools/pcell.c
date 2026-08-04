@@ -163,7 +163,13 @@ int main(int argc, char **argv) {
    * пар, и вопрос не в том, дорого ли это, а во сколько раз агрегирование
    * сжимает набор (пункт 2 реестра: «второе отражение на ОГРУБЛЁННОМ наборе»). */
   int32_t *litn = calloc((size_t)(T.nnd > 0 ? T.nnd : 1), sizeof *litn);
-  if (litn == NULL) return 2;
+  /* СВЯЗНОСТЬ НОРМАЛЕЙ освещённой группы: `|Σ area·n| / Σ area`. Единица —
+   * группа плоская и заменима ОДНОЙ плоскостью; ноль — нормали смотрят врозь, и
+   * агрегат обязан нести РАСПРЕДЕЛЕНИЕ, а не плоскость. Без этого числа
+   * объединение источников (§202) построить нельзя: неизвестно, что у агрегата
+   * за нормаль. */
+  double *litv = calloc((size_t)(T.nnd > 0 ? T.nnd : 1) * 4, sizeof *litv);
+  if (litn == NULL || litv == NULL) return 2;
 
   int64_t nfail = 0;
   t0 = now_s();
@@ -253,6 +259,9 @@ int main(int argc, char **argv) {
               nlit++;
               alit += sg.seg[s].area;
               litn[leaf[k]]++;
+              for (int c = 0; c < 3; c++)
+                litv[4 * leaf[k] + c] += sg.seg[s].area * nn2[c];
+              litv[4 * leaf[k] + 3] += sg.seg[s].area;
             }
           }
           free(cx);
@@ -324,17 +333,38 @@ int main(int argc, char **argv) {
           for (int q = 0; q < 8; q++)
             dep[T.nd[i].child + q] = dep[i] + 1;
       printf("== СЖАТИЕ ОСВЕЩЁННОГО НАБОРА (вторичные источники после объединения до уровня L):\n");
+      /* Векторные суммы нормалей по поддеревьям — тем же обратным проходом. */
+      double *lv = calloc((size_t)(T.nnd > 0 ? T.nnd : 1) * 4, sizeof *lv);
+      if (lv != NULL)
+        for (int32_t i = T.nnd - 1; i >= 0; i--) {
+          for (int c = 0; c < 4; c++)
+            lv[4 * (size_t)i + (size_t)c] = litv[4 * (size_t)i + (size_t)c];
+          if (T.nd[i].child >= 0)
+            for (int q = 0; q < 8; q++)
+              for (int c = 0; c < 4; c++)
+                lv[4 * (size_t)i + (size_t)c] += lv[4 * (size_t)(T.nd[i].child + q) + (size_t)c];
+        }
       for (int L = 2; L <= 12; L++) {
         int64_t c2 = 0;
-        for (int32_t i = 0; i < T.nnd; i++)
-          if (dep[i] == L && ls[i] > 0)
-            c2++;
-          else if (dep[i] < L && T.nd[i].child < 0 && ls[i] > 0)
-            c2++;
+        double csum = 0.0, cw = 0.0, cmin = 2.0;
+        for (int32_t i = 0; i < T.nnd; i++) {
+          int take = (dep[i] == L && ls[i] > 0) || (dep[i] < L && T.nd[i].child < 0 && ls[i] > 0);
+          if (!take) continue;
+          c2++;
+          if (lv == NULL || !(lv[4 * (size_t)i + 3] > 0.0)) continue;
+          double vx = lv[4 * (size_t)i], vy = lv[4 * (size_t)i + 1], vz = lv[4 * (size_t)i + 2];
+          double coh = sqrt(vx * vx + vy * vy + vz * vz) / lv[4 * (size_t)i + 3];
+          csum += coh * lv[4 * (size_t)i + 3];
+          cw += lv[4 * (size_t)i + 3];
+          if (coh < cmin) cmin = coh;
+        }
         if (c2 == 0) continue;
-        printf("   до уровня %2d: %8lld источников (сжатие %.1f× от %lld)\n", L, (long long)c2,
-               (double)nlit / (double)c2, (long long)nlit);
+        printf("   до уровня %2d: %8lld источников (сжатие %5.1f×); СВЯЗНОСТЬ нормалей: средняя "
+               "%.3f, худшая %.3f\n",
+               L, (long long)c2, (double)nlit / (double)c2, (cw > 0.0) ? csum / cw : 0.0,
+               (cmin <= 1.0) ? cmin : 0.0);
       }
+      free(lv);
     }
     free(ls);
     free(dep);

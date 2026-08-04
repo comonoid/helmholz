@@ -65,7 +65,8 @@ int main(int argc, char **argv) {
     return 1;
   }
   double delta = PCELL_DELTA;
-  int leafmax = 0, maxlev = 0, wpx = HZ_CFG_W, loose = 0;
+  int leafmax = 0, maxlev = 0, wpx = HZ_CFG_W, loose = 0, haseye = 0;
+  double eye0[3] = {0.0, 0.0, 0.0};
   /* Полоса §191, названная пользователем: элемент от 4 до 32 пикселей. */
   double pxlo = 4.0, pxhi = 32.0;
   for (int i = 3; i < argc; i++) {
@@ -76,6 +77,15 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "pxhi=", 5) == 0) pxhi = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "pxlo=", 5) == 0) pxlo = strtod(argv[i] + 5, NULL);
     if (strcmp(argv[i], "loose") == 0) loose = 1;
+    /* Камера ключом: закон роста среза надо мерить на РАЗНЫХ сценах, а глаз у
+     * каждой свой и найден замером (§187). */
+    if (strncmp(argv[i], "eye=", 4) == 0) {
+      char *e = NULL;
+      eye0[0] = strtod(argv[i] + 4, &e);
+      if (e != NULL && *e == ',') eye0[1] = strtod(e + 1, &e);
+      if (e != NULL && *e == ',') eye0[2] = strtod(e + 1, NULL);
+      haseye = 1;
+    }
   }
 
   hz_objmesh m;
@@ -215,6 +225,9 @@ int main(int argc, char **argv) {
    * КАДРА, и только он. */
   {
     double eye[3] = HZ_CFG_MIGUEL_EYE;
+    if (haseye)
+      for (int a = 0; a < 3; a++)
+        eye[a] = eye0[a];
     double eps = (HZ_CFG_FOV_DEG * M_PI / 180.0) / (double)wpx;
     /* ПОДДЕРЕВНЫЕ СУММЫ: у остановленного узла засчитывается ВСЁ его поддерево
      * (он его и представляет), у пройденного насквозь — только собственные

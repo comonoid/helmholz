@@ -581,10 +581,25 @@ int main(int argc, char **argv) {
             double nl2 = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
             double ndl = 0.0;
             if (nl2 > 0.0) ndl = fabs((nn[0] * wsun[0] + nn[1] * wsun[1] + nn[2] * wsun[2]) / nl2);
-            const double *kd = m.mtl[m.fm[tri]].kd3;
-            double lit = tri_lit[tri] ? ndl : 0.0;
-            for (int c = 0; c < 3; c++)
-              col[c] = kd[c] * (0.06 + 0.94 * lit);
+            /* ЧИТАЕМОСТЬ ВАЖНЕЕ ФИЗИЧНОСТИ В ДИАГНОСТИЧЕСКОМ КАДРЕ. Первая
+             * редакция умножала незасвеченное на `0.06` и загоняла 97 %% кадра
+             * почти в чёрное: судить о качестве по такому нельзя. Теперь
+             * геометрия читается ВСЕГДА (затенение по `|n·взгляд|`), а
+             * освещённость показана ЦВЕТОМ: тёплый и яркий — солнце дошло,
+             * холодный и тусклый — нет. Это диагностика, не рендер. */
+            double vdn = 0.0;
+            if (nl2 > 0.0) vdn = fabs((nn[0] * d[0] + nn[1] * d[1] + nn[2] * d[2]) / nl2);
+            double base = 0.30 + 0.70 * vdn;
+            if (tri_lit[tri]) {
+              double s2 = 0.55 + 0.45 * ndl;
+              col[0] = base * s2 * 1.00;
+              col[1] = base * s2 * 0.93;
+              col[2] = base * s2 * 0.70;
+            } else {
+              col[0] = base * 0.30 * 0.62;
+              col[1] = base * 0.30 * 0.68;
+              col[2] = base * 0.30 * 0.85;
+            }
           }
           for (int c = 0; c < 3; c++) {
             double g2 = pow(col[c] < 0 ? 0 : (col[c] > 1 ? 1 : col[c]), 1.0 / 2.2);

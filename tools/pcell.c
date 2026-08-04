@@ -158,6 +158,12 @@ int main(int argc, char **argv) {
   diag2 = 4.0 * sqrt(diag2);
   int64_t nlit = 0;
   double alit = 0.0;
+  /* Освещённость ПО УЗЛАМ — чтобы потом сжать освещённый набор по уровням
+   * дерева: наивный сбор 1.07 млн приёмников на 30 тыс. источников есть 3.2e10
+   * пар, и вопрос не в том, дорого ли это, а во сколько раз агрегирование
+   * сжимает набор (пункт 2 реестра: «второе отражение на ОГРУБЛЁННОМ наборе»). */
+  int32_t *litn = calloc((size_t)(T.nnd > 0 ? T.nnd : 1), sizeof *litn);
+  if (litn == NULL) return 2;
 
   int64_t nfail = 0;
   t0 = now_s();
@@ -246,6 +252,7 @@ int main(int argc, char **argv) {
             if (!hz_pgrid_trace(&G, &m, o, dsun, 0.0, diag2, NULL, 0, 1, &th)) {
               nlit++;
               alit += sg.seg[s].area;
+              litn[leaf[k]]++;
             }
           }
           free(cx);
@@ -297,6 +304,41 @@ int main(int argc, char **argv) {
   printf("== ВСЕГО (холодный старт, один раз на сцену): дерево %.2f с + сегментация %.2f с = "
          "%.2f с\n",
          t_tree, t_seg, t_tree + t_seg);
+
+  /* ---- СЖАТИЕ ОСВЕЩЁННОГО НАБОРА ПО УРОВНЯМ (§202) ---------------------
+   * Сколько ВТОРИЧНЫХ ИСТОЧНИКОВ останется, если объединять освещённые
+   * элементы до уровня `L`. Это и есть цена отскока: пар = приёмники ×
+   * источники, и сжатие входит в неё множителем. */
+  {
+    int64_t *ls = calloc((size_t)(T.nnd > 0 ? T.nnd : 1), sizeof *ls);
+    int32_t *dep = calloc((size_t)(T.nnd > 0 ? T.nnd : 1), sizeof *dep);
+    if (ls != NULL && dep != NULL) {
+      for (int32_t i = T.nnd - 1; i >= 0; i--) {
+        ls[i] = litn[i];
+        if (T.nd[i].child >= 0)
+          for (int q = 0; q < 8; q++)
+            ls[i] += ls[T.nd[i].child + q];
+      }
+      for (int32_t i = 0; i < T.nnd; i++)
+        if (T.nd[i].child >= 0)
+          for (int q = 0; q < 8; q++)
+            dep[T.nd[i].child + q] = dep[i] + 1;
+      printf("== СЖАТИЕ ОСВЕЩЁННОГО НАБОРА (вторичные источники после объединения до уровня L):\n");
+      for (int L = 2; L <= 12; L++) {
+        int64_t c2 = 0;
+        for (int32_t i = 0; i < T.nnd; i++)
+          if (dep[i] == L && ls[i] > 0)
+            c2++;
+          else if (dep[i] < L && T.nd[i].child < 0 && ls[i] > 0)
+            c2++;
+        if (c2 == 0) continue;
+        printf("   до уровня %2d: %8lld источников (сжатие %.1f× от %lld)\n", L, (long long)c2,
+               (double)nlit / (double)c2, (long long)nlit);
+      }
+    }
+    free(ls);
+    free(dep);
+  }
 
   /* ---- РОСТ ЧИСЛА УЗЛОВ ПО УРОВНЯМ ДЕРЕВА (§199, гипотеза «б») ---------
    * Камеры НЕ содержит: это чистое свойство сцены. Если геометрия на масштабе

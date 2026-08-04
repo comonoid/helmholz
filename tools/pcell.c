@@ -126,8 +126,25 @@ typedef struct {
  * `hz_pgrid_tri_hit`, а не копирует его.
  * Спуск от корня: узел берётся источником, пока его угловой размер из точки
  * мал; иначе дробится. Пустота отсеивается ДО укладки в стек (§209.2). */
+/* Чем меряется ВИДИМОСТЬ в косвенном (шаг О66, план §226). NULL в `m` — режим
+ * `vis=off`, прежнее поведение. `mode`: 1 — вклад берётся при отсутствии
+ * заслона, 2 — ИНВЕРСИЯ (негативный контроль §226). */
+typedef struct {
+  const hz_pgrid *G;
+  const hz_ptree *T;
+  const hz_objmesh *m;
+  double tmax;
+  int mode;
+} pc_vis;
+
+/* Объявление вперёд: обёртка трассировщика определена ниже, а нужна сбору. */
+static int pc_trace(const hz_pgrid *G, const hz_ptree *T, const hz_objmesh *m, const double o[3],
+                    const double d[3], double tmin, double tmax, const int32_t *skip, int nskip,
+                    int anyhit, double *thit, int32_t *tri, int64_t *nvis, int64_t *ntest);
+
 static double pc_gather(const pc_srcs *S, const double hp[3], const double nrm[3], int64_t *ngath,
-                        int64_t *nvis) {
+                        int64_t *nvis, const pc_vis *V, int64_t *npair, int64_t *nblk,
+                        int64_t *ntst) {
   double ind = 0.0;
   int32_t st2[128];
   int sp3 = 0;
@@ -165,6 +182,24 @@ static double pc_gather(const pc_srcs *S, const double hp[3], const double nrm[3
     if (!(vn2 > 0.0)) continue;
     double cs2 = -(vv[0] * dv[0] + vv[1] * dv[1] + vv[2] * dv[2]) / (vn2 * rr);
     if (!(cs2 > 0.0)) continue;
+    /* ВИДИМОСТЬ (О66). Луч от приёмника к точке источника, укороченный на
+     * `HZ_PGRID_EPSREL` — то же соглашение об отступе, что у всех прочих лучей
+     * проекта. Набор ПРИНЯТЫХ узлов от видимости не зависит (решение дробить
+     * берётся по геометрии), поэтому вклад может только УМЕНЬШИТЬСЯ, и это
+     * проверяется поразрядным инвариантом монотонности (А450). */
+    if (V != NULL && V->m != NULL) {
+      double so[3] = {0, 0, 0}, sdir[3] = {dv[0] / rr, dv[1] / rr, dv[2] / rr}, sth = 0.0;
+      for (int c = 0; c < 3; c++)
+        so[c] = hp[c] + 1e-4 * nrm[c];
+      int64_t v1 = 0, e1 = 0;
+      int blocked = pc_trace(V->G, V->T, V->m, so, sdir, 0.0, rr * (1.0 - HZ_PGRID_EPSREL), NULL, 0,
+                             1, &sth, NULL, &v1, &e1);
+      if (npair != NULL) (*npair)++;
+      if (nblk != NULL && blocked) (*nblk)++;
+      if (ntst != NULL) (*ntst) += e1;
+      int take = (V->mode == 2) ? blocked : !blocked;
+      if (!take) continue;
+    }
     /* В ЗНАМЕНАТЕЛЕ — ПЛОЩАДЬ ИСТОЧНИКА, А НЕ ЕГО МОЩНОСТЬ (§212): член `+A`
      * есть единственное, что делает источник конечным ДИСКОМ вместо ТОЧКИ. */
     ind += PCELL_RHO * pp[3] * cr2 * cs2 / (M_PI * r2 + vv[3]);
@@ -188,6 +223,9 @@ static int g_gmode = 0, g_shift = 0;
  * положено измерить, а не объявить малыми (А444). `notimer=sun` — намеренно
  * испорченный прибор, негативный контроль §222. */
 static int g_notimer = 0, g_notimer_sun = 0;
+/* ВИДИМОСТЬ В КОСВЕННОМ (шаг О66): 0 — off (прежнее поведение и умолчание),
+ * 1 — прямой тест, 2 — ИНВЕРСИЯ (негативный контроль §226). */
+static int g_vis = 0;
 
 static double pc_clk(void) {
   return g_notimer ? 0.0 : omp_get_wtime();
@@ -235,6 +273,9 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "img=", 4) == 0) imgw = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "gather=", 7) == 0) g_gmode = (strcmp(argv[i] + 7, "elem") == 0);
     if (strncmp(argv[i], "shift=", 6) == 0) g_shift = (int)strtol(argv[i] + 6, NULL, 10);
+    if (strncmp(argv[i], "vis=", 4) == 0)
+      g_vis =
+          (strcmp(argv[i] + 4, "on") == 0) ? 1 : ((strcmp(argv[i] + 4, "inverse") == 0) ? 2 : 0);
     if (strncmp(argv[i], "notimer=", 8) == 0) {
       g_notimer = (strcmp(argv[i] + 8, "all") == 0);
       g_notimer_sun = (strcmp(argv[i] + 8, "sun") == 0);
@@ -992,10 +1033,20 @@ int main(int argc, char **argv) {
         }
         el_p[4 * (size_t)e + 3] += at;
       }
+      /* ОСВЕЩЁН ЛИ ЭЛЕМЕНТ ПРЯМЫМ СОЛНЦЕМ — нужен второй, независимой проверке
+       * видимости (А452): у неосвещённых доля перекрытых пар обязана быть выше,
+       * чем у освещённых, и общая ошибка в самом луче этого бы не дала. */
+      unsigned char *el_lit = calloc((size_t)(nel > 0 ? nel : 1), 1);
+      if (el_lit == NULL) return 2;
+      for (int32_t t5 = 0; t5 < m.nt; t5++)
+        if (tri_seg[t5] >= 0 && tri_lit[t5]) el_lit[tri_seg[t5]] = 1;
       t_geo = now_s() - t_geo;
       double t_gth = now_s();
-      int64_t ng2 = 0, nv2 = 0;
-#pragma omp parallel for schedule(dynamic, 256) reduction(+ : ng2, nv2)
+      int64_t ng2 = 0, nv2 = 0, npair = 0, nblk = 0, ntst = 0;
+      int64_t npL = 0, nbL = 0, npD = 0, nbD = 0;
+      pc_vis VIS = {&G, &T, (g_vis != 0) ? &m : NULL, diag2, g_vis};
+#pragma omp parallel for schedule(dynamic, 256)                                                    \
+    reduction(+ : ng2, nv2, npair, nblk, ntst, npL, nbL, npD, nbD)
       for (int64_t e = 0; e < nel; e++) {
         if (el_vis[e] == 0 || !(el_p[4 * (size_t)e + 3] > 0.0)) continue;
         double hp[3] = {0, 0, 0}, nrm[3] = {0, 0, 0};
@@ -1016,7 +1067,17 @@ int main(int argc, char **argv) {
         if (nrm[0] * vd[0] + nrm[1] * vd[1] + nrm[2] * vd[2] > 0.0)
           for (int c = 0; c < 3; c++)
             nrm[c] = -nrm[c];
-        el_ind[e] = pc_gather(&SRC, hp, nrm, &ng2, &nv2);
+        int64_t p0 = 0, b0 = 0;
+        el_ind[e] = pc_gather(&SRC, hp, nrm, &ng2, &nv2, &VIS, &p0, &b0, &ntst);
+        npair += p0;
+        nblk += b0;
+        if (el_lit[e]) {
+          npL += p0;
+          nbL += b0;
+        } else {
+          npD += p0;
+          nbD += b0;
+        }
       }
       t_gth = now_s() - t_gth;
       double esum = 0.0;
@@ -1026,6 +1087,53 @@ int main(int argc, char **argv) {
              "источникам %lld (%.1f на приёмник), посещено узлов %lld; Σ(ind·площадь) %.6e\n",
              t_gth, t_geo, (long long)nvel, (long long)ng2,
              (double)ng2 / (double)(nvel > 0 ? nvel : 1), (long long)nv2, esum);
+      if (g_vis != 0) {
+        printf("== ВИДИМОСТЬ В КОСВЕННОМ (%s): пар %lld, перекрыто %lld (%.1f %%), "
+               "треугольников на луч %.1f\n",
+               (g_vis == 2) ? "ИНВЕРСИЯ, негативный контроль" : "прямой тест", (long long)npair,
+               (long long)nblk, 100.0 * (double)nblk / (double)(npair > 0 ? npair : 1),
+               (double)ntst / (double)(npair > 0 ? npair : 1));
+        printf("   ВТОРАЯ ПРОВЕРКА (А452): у элементов В ТЕНИ перекрыто %.1f %%, у ОСВЕЩЁННЫХ "
+               "%.1f %% — %s\n",
+               100.0 * (double)nbD / (double)(npD > 0 ? npD : 1),
+               100.0 * (double)nbL / (double)(npL > 0 ? npL : 1),
+               (npD > 0 && npL > 0 && (double)nbD / (double)npD > (double)nbL / (double)npL)
+                   ? "как и обязано"
+                   : "НЕ ТАК, тест видимости под подозрением");
+      }
+      /* ИНВАРИАНТ МОНОТОННОСТИ (А450), поразрядно и без допуска: набор принятых
+       * узлов от видимости не зависит, поэтому вклад может только УМЕНЬШИТЬСЯ.
+       * Считается пересчётом БЕЗ видимости — та же функция, тот же обход. */
+      if (g_vis == 1) {
+        int64_t nup = 0;
+        double esum0 = 0.0;
+        pc_vis VOFF = {&G, &T, NULL, diag2, 0};
+#pragma omp parallel for schedule(dynamic, 256) reduction(+ : nup, esum0)
+        for (int64_t e = 0; e < nel; e++) {
+          if (el_vis[e] == 0 || !(el_p[4 * (size_t)e + 3] > 0.0)) continue;
+          double hp[3] = {0, 0, 0}, nrm[3] = {0, 0, 0};
+          for (int c = 0; c < 3; c++)
+            hp[c] = el_p[4 * (size_t)e + (size_t)c] / el_p[4 * (size_t)e + 3];
+          double nl6 = sqrt(el_n[3 * (size_t)e] * el_n[3 * (size_t)e] +
+                            el_n[3 * (size_t)e + 1] * el_n[3 * (size_t)e + 1] +
+                            el_n[3 * (size_t)e + 2] * el_n[3 * (size_t)e + 2]);
+          if (!(nl6 > 0.0)) continue;
+          for (int c = 0; c < 3; c++)
+            nrm[c] = el_n[3 * (size_t)e + (size_t)c] / nl6;
+          double vd[3] = {hp[0] - eyeP[0], hp[1] - eyeP[1], hp[2] - eyeP[2]};
+          if (nrm[0] * vd[0] + nrm[1] * vd[1] + nrm[2] * vd[2] > 0.0)
+            for (int c = 0; c < 3; c++)
+              nrm[c] = -nrm[c];
+          double i0 = pc_gather(&SRC, hp, nrm, NULL, NULL, &VOFF, NULL, NULL, NULL);
+          esum0 += i0 * el_p[4 * (size_t)e + 3];
+          if (el_ind[e] > i0) nup++;
+        }
+        printf("   ИНВАРИАНТ МОНОТОННОСТИ: выросших от видимости элементов %lld из %lld — %s; "
+               "Σ(ind·площадь) без видимости %.6e, падение %.1f %%\n",
+               (long long)nup, (long long)nvel, (nup == 0) ? "ДЕРЖИТСЯ" : "НАРУШЕН", esum0,
+               100.0 * (1.0 - esum / (esum0 > 0.0 ? esum0 : 1.0)));
+      }
+      free(el_lit);
       free(el_p);
       free(el_n);
     }
@@ -1191,7 +1299,7 @@ int main(int argc, char **argv) {
              * с которым сравнивается поэлементный, и потому обязан считать той
              * же арифметикой, а не своей копией. */
             if (g_gmode == 0)
-              ind = pc_gather(&SRC, hp, nrm, &ngath, &nvis3);
+              ind = pc_gather(&SRC, hp, nrm, &ngath, &nvis3, NULL, NULL, NULL, NULL);
             else {
               /* СБОР НА ЭЛЕМЕНТЕ: одно чтение вместо спуска по дереву.
                * `g_shift` — негативный контроль (§219): косвенное берётся у

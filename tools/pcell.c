@@ -108,11 +108,81 @@ static int cmp_i32(const void *a, const void *b) {
   return (x < y) ? -1 : ((x > y) ? 1 : 0);
 }
 
+/* ВТОРИЧНЫЕ ИСТОЧНИКИ, КАК ИХ ВИДИТ СБОР. `lv`/`lp` — суммы по ПОДДЕРЕВУ узла,
+ * `sv`/`sp` — только СВОЁ у узла. Разделение поймало §206 и здесь сохраняется
+ * дословно: взятый узел представляет поддерево, пройденный отдаёт своё. */
+typedef struct {
+  const hz_ptree *T;
+  const int64_t *ls;
+  const double *lv, *lp;
+  const double *sv, *sp;
+} pc_srcs;
+
+/* ИЕРАРХИЧЕСКИЙ СБОР ПО ИНДЕКСУ (§209) — ОДНА ФУНКЦИЯ НА ДВУХ ПОТРЕБИТЕЛЕЙ.
+ * Вынесена из тела кадра шагом О64: сбор нужен и НА ПИКСЕЛЬ (он остаётся
+ * эталоном), и НА ЭЛЕМЕНТ (это и есть шаг). Две копии этой арифметики были бы
+ * двумя местами, где косвенный свет может разъехаться, и ни одного, где
+ * расхождение поймается, — тот же довод, по которому `ptrace` ЗОВЁТ
+ * `hz_pgrid_tri_hit`, а не копирует его.
+ * Спуск от корня: узел берётся источником, пока его угловой размер из точки
+ * мал; иначе дробится. Пустота отсеивается ДО укладки в стек (§209.2). */
+static double pc_gather(const pc_srcs *S, const double hp[3], const double nrm[3], int64_t *ngath,
+                        int64_t *nvis) {
+  double ind = 0.0;
+  int32_t st2[128];
+  int sp3 = 0;
+  st2[sp3++] = 0;
+  while (sp3 > 0) {
+    int32_t ni = st2[--sp3];
+    if (nvis != NULL) (*nvis)++;
+    if (S->ls == NULL || S->ls[ni] <= 0) continue;
+    const hz_ptnode *nd2 = &S->T->nd[ni];
+    double c2[3] = {0, 0, 0}, rad2 = 0.0;
+    for (int a = 0; a < 3; a++) {
+      c2[a] = 0.5 * (nd2->lo[a] + nd2->hi[a]);
+      double h2 = 0.5 * (nd2->hi[a] - nd2->lo[a]);
+      rad2 += h2 * h2;
+    }
+    rad2 = sqrt(rad2);
+    double dc[3] = {c2[0] - hp[0], c2[1] - hp[1], c2[2] - hp[2]};
+    double rc = sqrt(dc[0] * dc[0] + dc[1] * dc[1] + dc[2] * dc[2]);
+    int split = (nd2->child >= 0) && (rc < rad2 * PCELL_SRC_K) && (sp3 + 8 < 128);
+    const double *vv = split ? &S->sv[4 * (size_t)ni] : &S->lv[4 * (size_t)ni];
+    const double *pp = split ? &S->sp[4 * (size_t)ni] : &S->lp[4 * (size_t)ni];
+    if (split)
+      for (int qq = 0; qq < 8; qq++) {
+        int32_t ch2 = nd2->child + qq;
+        if (S->ls[ch2] > 0) st2[sp3++] = ch2;
+      }
+    if (!(vv[3] > 0.0)) continue;
+    double dv[3] = {pp[0] / vv[3] - hp[0], pp[1] / vv[3] - hp[1], pp[2] / vv[3] - hp[2]};
+    double r2 = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
+    if (!(r2 > 1e-9)) continue;
+    double rr = sqrt(r2);
+    double cr2 = (nrm[0] * dv[0] + nrm[1] * dv[1] + nrm[2] * dv[2]) / rr;
+    if (!(cr2 > 0.0)) continue;
+    double vn2 = sqrt(vv[0] * vv[0] + vv[1] * vv[1] + vv[2] * vv[2]);
+    if (!(vn2 > 0.0)) continue;
+    double cs2 = -(vv[0] * dv[0] + vv[1] * dv[1] + vv[2] * dv[2]) / (vn2 * rr);
+    if (!(cs2 > 0.0)) continue;
+    /* В ЗНАМЕНАТЕЛЕ — ПЛОЩАДЬ ИСТОЧНИКА, А НЕ ЕГО МОЩНОСТЬ (§212): член `+A`
+     * есть единственное, что делает источник конечным ДИСКОМ вместо ТОЧКИ. */
+    ind += PCELL_RHO * pp[3] * cr2 * cs2 / (M_PI * r2 + vv[3]);
+    if (ngath != NULL) (*ngath)++;
+  }
+  return ind;
+}
+
 /* ВЫБОР ТРАССИРОВЩИКА (шаг О63, план §215). Ключ `trace=grid|tree`. Умолчание —
  * СЕТКА: прежние числа стенда не должны поехать от одного появления новой
  * ветки. Переменная ставится один раз до параллельных областей и дальше только
  * читается, поэтому гонки нет по построению. */
 static int g_trmode = 0; /* 0 — равномерная сетка `pgrid`, 1 — дерево `ptree` */
+/* СБОР: `gather=pixel|elem` (шаг О64). Умолчание — ПИКСЕЛЬ: он остаётся
+ * эталоном, с которым сравнивается поэлементный, и прежние числа не должны
+ * поехать. `shift=N` — негативный контроль §219: косвенное берётся у чужого
+ * элемента, и картинка обязана заметно испортиться. */
+static int g_gmode = 0, g_shift = 0;
 
 /* Одна обёртка на все четыре места, где стенд пускает луч. Счётчики `nvis`
  * (пройдено ячеек или посещено узлов) и `ntest` (проверено треугольников)
@@ -154,6 +224,8 @@ int main(int argc, char **argv) {
      * контролю (дерево из одного листа при полном кадре не считается вовсе). */
     if (strncmp(argv[i], "trace=", 6) == 0) g_trmode = (strcmp(argv[i] + 6, "tree") == 0);
     if (strncmp(argv[i], "img=", 4) == 0) imgw = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "gather=", 7) == 0) g_gmode = (strcmp(argv[i] + 7, "elem") == 0);
+    if (strncmp(argv[i], "shift=", 6) == 0) g_shift = (int)strtol(argv[i] + 6, NULL, 10);
     /* Камера ключом: закон роста среза надо мерить на РАЗНЫХ сценах, а глаз у
      * каждой свой и найден замером (§187). */
     if (strncmp(argv[i], "eye=", 4) == 0) {
@@ -282,6 +354,15 @@ int main(int argc, char **argv) {
    * первичными лучами, а луч попадает в треугольник, не в элемент. */
   unsigned char *tri_lit = calloc((size_t)(m.nt > 0 ? m.nt : 1), 1);
   if (tri_lit == NULL) return 2;
+  /* НОМЕР ЭЛЕМЕНТА НА ТРЕУГОЛЬНИК (шаг О64, план §219). В цикле сегментации
+   * пишется МЕСТНАЯ метка узла, глобальной она становится вторым проходом по
+   * префиксным суммам — нумерация обязана быть детерминированной, иначе выход
+   * перестаёт быть воспроизводимым побитово (А438). `-1` — не покрыт: это
+   * значение и проверяет инвариант. */
+  int32_t *tri_seg = malloc((size_t)(m.nt > 0 ? m.nt : 1) * sizeof *tri_seg);
+  if (tri_seg == NULL) return 2;
+  for (int32_t i = 0; i < m.nt; i++)
+    tri_seg[i] = -1;
   /* Освещённость ПО УЗЛАМ — чтобы потом сжать освещённый набор по уровням
    * дерева: наивный сбор 1.07 млн приёмников на 30 тыс. источников есть 3.2e10
    * пар, и вопрос не в том, дорого ли это, а во сколько раз агрегирование
@@ -331,6 +412,11 @@ int main(int argc, char **argv) {
       nfail++;
     } else {
       nseg_of[k] = sg.nseg;
+      /* МЕСТНАЯ метка элемента на треугольник — глобальной станет ниже (А438).
+       * Каждый треугольник узла числится ровно один раз, потому что узлы
+       * непересекающиеся, а `sg.label` — разбиение треугольников узла. */
+      for (int32_t j = 0; j < nt; j++)
+        tri_seg[T.ref[nd->t0 + j]] = sg.label[j];
       int32_t *c2 = malloc((size_t)(sg.nseg > 0 ? sg.nseg : 1) * sizeof *c2);
       double ar = 0.0, dm = 0.0;
       for (int32_t s = 0; s < sg.nseg; s++) {
@@ -420,6 +506,41 @@ int main(int argc, char **argv) {
     area += area_of[k];
     if (dmax_of[k] > dmax) dmax = dmax_of[k];
   }
+  /* ---- ГЛОБАЛЬНАЯ НУМЕРАЦИЯ ЭЛЕМЕНТОВ И ЕЁ ИНВАРИАНТ (шаг О64, §219) ----
+   * Базы — префиксной суммой по узлам, то есть детерминированно (А438).
+   * ИНВАРИАНТ СТАВИТСЯ ПЕРВЫМ ДЕЙСТВИЕМ, как требует §211: три ошибки этого
+   * захода (А419, А420, §206) — все про потерю геометрии при обходе `ptree`, и
+   * все проходили ровно там, где инварианта не было. */
+  {
+    int64_t *base = malloc((size_t)(nl > 0 ? nl : 1) * sizeof *base);
+    if (base == NULL) return 2;
+    int64_t acc = 0;
+    for (int64_t k = 0; k < nl; k++) {
+      base[k] = acc;
+      acc += nseg_of[k];
+    }
+#pragma omp parallel for schedule(dynamic, 64)
+    for (int64_t k = 0; k < nl; k++) {
+      const hz_ptnode *nd = &T.nd[leaf[k]];
+      for (int32_t j = 0; j < nd->ntri; j++) {
+        int32_t g = T.ref[nd->t0 + j];
+        if (tri_seg[g] >= 0) tri_seg[g] = (int32_t)(base[k] + (int64_t)tri_seg[g]);
+      }
+    }
+    int64_t nuncov = 0, nbad = 0;
+    for (int32_t i = 0; i < m.nt; i++) {
+      if (tri_seg[i] < 0)
+        nuncov++;
+      else if ((int64_t)tri_seg[i] >= nel)
+        nbad++;
+    }
+    printf("== ИНВАРИАНТ tri_seg: непокрытых %lld, вне диапазона %lld, сумма баз %lld против "
+           "элементов %lld — %s\n",
+           (long long)nuncov, (long long)nbad, (long long)acc, (long long)nel,
+           (nuncov == 0 && nbad == 0 && acc == nel) ? "ДЕРЖИТСЯ" : "НАРУШЕН");
+    free(base);
+  }
+
   printf("== СЕГМЕНТАЦИЯ ПО УЗЛАМ за %.2f с (%d потоков): ЭЛЕМЕНТОВ %lld; отказов %lld\n", t_seg,
          omp_get_max_threads(), (long long)nel, (long long)nfail);
   printf("== ОСВЕЩЁННЫЙ НАБОР (солнце, один луч на элемент): элементов %lld из %lld (%.1f %%), "
@@ -762,6 +883,141 @@ int main(int argc, char **argv) {
     free(sub_t);
   }
 
+  /* ---- КАМЕРА: РАМА СЧИТАЕТСЯ ОДИН РАЗ НА ДВА ПРОХОДА -------------------
+   * Проход видимости и картинка обязаны смотреть ОДНОЙ камерой; две копии этой
+   * арифметики — это два места, где рама может разъехаться. */
+  double eyeP[3] = HZ_CFG_MIGUEL_EYE;
+  double fw[3] = {0, 0, 0}, ri[3] = {0, 0, 0}, uv[3] = {0, 0, 0}, th2 = 0.0;
+  {
+    double atP[3] = HZ_CFG_MIGUEL_AT, upP[3] = HZ_CFG_UP;
+    if (haseye)
+      for (int a = 0; a < 3; a++)
+        eyeP[a] = eye0[a];
+    for (int c = 0; c < 3; c++)
+      fw[c] = atP[c] - eyeP[c];
+    double fl = sqrt(fw[0] * fw[0] + fw[1] * fw[1] + fw[2] * fw[2]);
+    for (int c = 0; c < 3; c++)
+      fw[c] /= fl;
+    ri[0] = fw[1] * upP[2] - fw[2] * upP[1];
+    ri[1] = fw[2] * upP[0] - fw[0] * upP[2];
+    ri[2] = fw[0] * upP[1] - fw[1] * upP[0];
+    double rl = sqrt(ri[0] * ri[0] + ri[1] * ri[1] + ri[2] * ri[2]);
+    for (int c = 0; c < 3; c++)
+      ri[c] /= rl;
+    uv[0] = ri[1] * fw[2] - ri[2] * fw[1];
+    uv[1] = ri[2] * fw[0] - ri[0] * fw[2];
+    uv[2] = ri[0] * fw[1] - ri[1] * fw[0];
+    th2 = tan(0.5 * HZ_CFG_FOV_DEG * M_PI / 180.0);
+  }
+
+  /* ---- ПРОХОД ВИДИМОСТИ И СБОР НА ЭЛЕМЕНТЕ (шаг О64, §219) -------------
+   * ВИДИМЫЕ ЭЛЕМЕНТЫ — замер, решающий судьбу шага (А436): сколько РАЗЛИЧНЫХ
+   * элементов задевает хоть один первичный луч. Это и есть число приёмников,
+   * если собирать свет на элементе, а не на пикселе. Проход идёт в ОБОИХ
+   * режимах, чтобы времена были сравнимы. */
+  unsigned char *el_vis = calloc((size_t)(nel > 0 ? nel : 1), 1);
+  double *el_ind = NULL;
+  pc_srcs SRC = {&T, g_ls, g_lv, g_lp, litv, litp};
+  {
+    int W = imgw, H = imgw;
+    double t_vis = now_s();
+#pragma omp parallel for schedule(dynamic, 8)
+    for (int j = 0; j < H; j++)
+      for (int i = 0; i < W; i++) {
+        double sx = (2.0 * ((double)i + 0.5) / W - 1.0) * th2;
+        double sy = (1.0 - 2.0 * ((double)j + 0.5) / H) * th2;
+        double d[3] = {0, 0, 0};
+        for (int c = 0; c < 3; c++)
+          d[c] = fw[c] + sx * ri[c] + sy * uv[c];
+        double dl = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+        for (int c = 0; c < 3; c++)
+          d[c] /= dl;
+        double tt = 0.0;
+        int32_t tri = -1;
+        if (pc_trace(&G, &T, &m, eyeP, d, 0.0, diag2, NULL, 0, 0, &tt, &tri, NULL, NULL) &&
+            tri >= 0 && el_vis != NULL && tri_seg[tri] >= 0)
+          el_vis[tri_seg[tri]] = 1;
+      }
+    t_vis = now_s() - t_vis;
+    int64_t nvel = 0;
+    if (el_vis != NULL)
+      for (int64_t e4 = 0; e4 < nel; e4++)
+        nvel += el_vis[e4];
+    printf("== ПРОХОД ВИДИМОСТИ за %.2f с: ВИДИМЫХ ЭЛЕМЕНТОВ %lld из %lld (%.2f %%) при %lld "
+           "пикселях — приёмников в %.1f раза меньше\n",
+           t_vis, (long long)nvel, (long long)nel,
+           100.0 * (double)nvel / (double)(nel > 0 ? nel : 1), (long long)W * H,
+           (double)((int64_t)W * H) / (double)(nvel > 0 ? nvel : 1));
+
+    if (g_gmode != 0 && nvel > 0) {
+      /* ГЕОМЕТРИЯ ЭЛЕМЕНТА — ИЗ ТРЕУГОЛЬНИКОВ ПО `tri_seg`, а не из
+       * сегментации: та своих данных не переживает, а этот проход стоит один
+       * обход меша и от порядка потоков не зависит вовсе. */
+      double *el_p = calloc((size_t)(nel > 0 ? nel : 1) * 4, sizeof *el_p);
+      double *el_n = calloc((size_t)(nel > 0 ? nel : 1) * 3, sizeof *el_n);
+      el_ind = calloc((size_t)(nel > 0 ? nel : 1), sizeof *el_ind);
+      if (el_p == NULL || el_n == NULL || el_ind == NULL) return 2;
+      double t_geo = now_s();
+      for (int32_t t4 = 0; t4 < m.nt; t4++) {
+        int32_t e = tri_seg[t4];
+        if (e < 0 || el_vis[e] == 0) continue;
+        const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t4];
+        const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)t4 + 1];
+        const double *C = m.v + 3 * (size_t)m.f[3 * (size_t)t4 + 2];
+        double e1[3] = {0, 0, 0}, e2[3] = {0, 0, 0}, cr[3] = {0, 0, 0};
+        for (int c = 0; c < 3; c++) {
+          e1[c] = B[c] - A[c];
+          e2[c] = C[c] - A[c];
+        }
+        cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
+        cr[1] = e1[2] * e2[0] - e1[0] * e2[2];
+        cr[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        double at = 0.5 * sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+        for (int c = 0; c < 3; c++) {
+          el_p[4 * (size_t)e + (size_t)c] += at * (A[c] + B[c] + C[c]) / 3.0;
+          el_n[3 * (size_t)e + (size_t)c] += 0.5 * cr[c];
+        }
+        el_p[4 * (size_t)e + 3] += at;
+      }
+      t_geo = now_s() - t_geo;
+      double t_gth = now_s();
+      int64_t ng2 = 0, nv2 = 0;
+#pragma omp parallel for schedule(dynamic, 256) reduction(+ : ng2, nv2)
+      for (int64_t e = 0; e < nel; e++) {
+        if (el_vis[e] == 0 || !(el_p[4 * (size_t)e + 3] > 0.0)) continue;
+        double hp[3] = {0, 0, 0}, nrm[3] = {0, 0, 0};
+        for (int c = 0; c < 3; c++)
+          hp[c] = el_p[4 * (size_t)e + (size_t)c] / el_p[4 * (size_t)e + 3];
+        double nl5 = sqrt(el_n[3 * (size_t)e] * el_n[3 * (size_t)e] +
+                          el_n[3 * (size_t)e + 1] * el_n[3 * (size_t)e + 1] +
+                          el_n[3 * (size_t)e + 2] * el_n[3 * (size_t)e + 2]);
+        if (!(nl5 > 0.0)) continue;
+        for (int c = 0; c < 3; c++)
+          nrm[c] = el_n[3 * (size_t)e + (size_t)c] / nl5;
+        /* СТОРОНА ВЫБИРАЕТСЯ ПО КАМЕРЕ, И ЭТО НАЗВАННАЯ ГРУБОСТЬ. Пиксельный
+         * сбор разворачивал нормаль к наблюдателю (обмотка у сцены не всюду
+         * согласована); элемент несёт ОДНО значение, поэтому сторона у него
+         * одна — та, что смотрит на камеру. Двусторонний элемент нёс бы два
+         * значения, и это другая машинерия. */
+        double vd[3] = {hp[0] - eyeP[0], hp[1] - eyeP[1], hp[2] - eyeP[2]};
+        if (nrm[0] * vd[0] + nrm[1] * vd[1] + nrm[2] * vd[2] > 0.0)
+          for (int c = 0; c < 3; c++)
+            nrm[c] = -nrm[c];
+        el_ind[e] = pc_gather(&SRC, hp, nrm, &ng2, &nv2);
+      }
+      t_gth = now_s() - t_gth;
+      double esum = 0.0;
+      for (int64_t e = 0; e < nel; e++)
+        esum += el_ind[e] * el_p[4 * (size_t)e + 3];
+      printf("== СБОР НА ЭЛЕМЕНТЕ за %.2f с (геометрия %.2f с): приёмников %lld, обращений к "
+             "источникам %lld (%.1f на приёмник), посещено узлов %lld; Σ(ind·площадь) %.6e\n",
+             t_gth, t_geo, (long long)nvel, (long long)ng2,
+             (double)ng2 / (double)(nvel > 0 ? nvel : 1), (long long)nv2, esum);
+      free(el_p);
+      free(el_n);
+    }
+  }
+
   /* ---- КАРТИНКА: ОСВЕЩЁННЫЙ НАБОР ---------------------------------------
    * Рисуется то, что ПОСЧИТАНО, и ничего сверх: освещён элемент или нет, плюс
    * ламбертов косинус к солнцу у освещённых. Косвенного света тут нет и быть не
@@ -770,33 +1026,15 @@ int main(int argc, char **argv) {
   {
     int W = imgw, H = imgw;
     unsigned char *rgb = malloc((size_t)W * (size_t)H * 3);
-    double eyeP[3] = HZ_CFG_MIGUEL_EYE, atP[3] = HZ_CFG_MIGUEL_AT, upP[3] = HZ_CFG_UP;
-    if (haseye)
-      for (int a = 0; a < 3; a++)
-        eyeP[a] = eye0[a];
     if (rgb != NULL) {
-      double fw[3] = {0, 0, 0}, ri[3] = {0, 0, 0}, uv[3] = {0, 0, 0};
-      for (int c = 0; c < 3; c++)
-        fw[c] = atP[c] - eyeP[c];
-      double fl = sqrt(fw[0] * fw[0] + fw[1] * fw[1] + fw[2] * fw[2]);
-      for (int c = 0; c < 3; c++)
-        fw[c] /= fl;
-      ri[0] = fw[1] * upP[2] - fw[2] * upP[1];
-      ri[1] = fw[2] * upP[0] - fw[0] * upP[2];
-      ri[2] = fw[0] * upP[1] - fw[1] * upP[0];
-      double rl = sqrt(ri[0] * ri[0] + ri[1] * ri[1] + ri[2] * ri[2]);
-      for (int c = 0; c < 3; c++)
-        ri[c] /= rl;
-      uv[0] = ri[1] * fw[2] - ri[2] * fw[1];
-      uv[1] = ri[2] * fw[0] - ri[0] * fw[2];
-      uv[2] = ri[0] * fw[1] - ri[1] * fw[0];
-      double th2 = tan(0.5 * HZ_CFG_FOV_DEG * M_PI / 180.0);
       double t_pic = now_s();
       int64_t nmis = 0, npix2 = 0, ngath = 0, nvis3 = 0;
       /* Счётчики ЛУЧЕЙ кадра (О63): пройдено ячеек или посещено узлов, и
        * проверено треугольников. Порознь — по доводу А424. */
       int64_t nvray = 0, ntray = 0;
-#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nmis, npix2, ngath, nvis3, nvray, ntray)
+      double sind = 0.0;
+#pragma omp parallel for schedule(dynamic, 8)                                                      \
+    reduction(+ : nmis, npix2, ngath, nvis3, nvray, ntray, sind)
       for (int j = 0; j < H; j++)
         for (int i = 0; i < W; i++) {
           double sx = (2.0 * ((double)i + 0.5) / W - 1.0) * th2;
@@ -813,6 +1051,7 @@ int main(int argc, char **argv) {
           double col[3] = {0.45, 0.55, 0.70};
           if (pc_trace(&G, &T, &m, eyeP, d, 0.0, diag2, NULL, 0, 0, &tt, &tri, &nvray, &ntray) &&
               tri >= 0) {
+            if (el_vis != NULL && tri_seg[tri] >= 0) el_vis[tri_seg[tri]] = 1;
             const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)tri];
             const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)tri + 1];
             const double *C = m.v + 3 * (size_t)m.f[3 * (size_t)tri + 2];
@@ -912,66 +1151,17 @@ int main(int argc, char **argv) {
             if ((nrm[0] * d[0] + nrm[1] * d[1] + nrm[2] * d[2]) > 0.0)
               for (int c = 0; c < 3; c++)
                 nrm[c] = -nrm[c];
-            /* ИЕРАРХИЧЕСКИЙ СБОР ПО ИНДЕКСУ (§209), вместо плоского перебора
-             * всех источников на каждый пиксель. Спуск от корня: узел берётся
-             * ИСТОЧНИКОМ, пока его угловой размер из этой точки мал; иначе
-             * дробится. Учёт тот же, что поймал §206: ВЗЯТЫЙ узел представляет
-             * ПОДДЕРЕВО (`g_lv`/`g_lp`), ПРОЙДЕННЫЙ отдаёт только СВОЁ
-             * (`litv`/`litp`). Каждый освещённый элемент учитывается ровно раз. */
-            int32_t st2[128];
-            int sp3 = 0;
-            st2[sp3++] = 0;
-            while (sp3 > 0) {
-              int32_t ni = st2[--sp3];
-              nvis3++;
-              if (g_ls == NULL || g_ls[ni] <= 0) continue;
-              const hz_ptnode *nd2 = &T.nd[ni];
-              double c2[3] = {0, 0, 0}, rad2 = 0.0;
-              for (int a = 0; a < 3; a++) {
-                c2[a] = 0.5 * (nd2->lo[a] + nd2->hi[a]);
-                double h2 = 0.5 * (nd2->hi[a] - nd2->lo[a]);
-                rad2 += h2 * h2;
-              }
-              rad2 = sqrt(rad2);
-              double dc[3] = {c2[0] - hp[0], c2[1] - hp[1], c2[2] - hp[2]};
-              double rc = sqrt(dc[0] * dc[0] + dc[1] * dc[1] + dc[2] * dc[2]);
-              int split = (nd2->child >= 0) && (rc < rad2 * PCELL_SRC_K) && (sp3 + 8 < 128);
-              const double *vv = split ? &litv[4 * (size_t)ni] : &g_lv[4 * (size_t)ni];
-              const double *pp = split ? &litp[4 * (size_t)ni] : &g_lp[4 * (size_t)ni];
-              /* ПУСТОТА ОТСЕИВАЕТСЯ ДО УКЛАДКИ В СТЕК, а не после снятия с него
-               * (довод пользователя 08-04: «если в самом крупном уровне записано
-               * пустое пространство, его очень быстро пропустить»). Прежняя
-               * редакция клала ВСЕ восемь детей и проверяла содержимое потом —
-               * то есть платила за пустоту полную цену стека и снятия. */
-              if (split)
-                for (int qq = 0; qq < 8; qq++) {
-                  int32_t ch2 = nd2->child + qq;
-                  if (g_ls[ch2] > 0) st2[sp3++] = ch2;
-                }
-              if (!(vv[3] > 0.0)) continue;
-              double dv[3] = {pp[0] / vv[3] - hp[0], pp[1] / vv[3] - hp[1], pp[2] / vv[3] - hp[2]};
-              double r2 = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
-              if (!(r2 > 1e-9)) continue;
-              double rr = sqrt(r2);
-              double cr2 = (nrm[0] * dv[0] + nrm[1] * dv[1] + nrm[2] * dv[2]) / rr;
-              if (!(cr2 > 0.0)) continue;
-              double vn2 = sqrt(vv[0] * vv[0] + vv[1] * vv[1] + vv[2] * vv[2]);
-              if (!(vn2 > 0.0)) continue;
-              double cs2 = -(vv[0] * dv[0] + vv[1] * dv[1] + vv[2] * dv[2]) / (vn2 * rr);
-              if (!(cs2 > 0.0)) continue;
-              double w2 = PCELL_RHO * pp[3];
-              /* В ЗНАМЕНАТЕЛЕ — ПЛОЩАДЬ ИСТОЧНИКА, А НЕ ЕГО МОЩНОСТЬ. Член `+A`
-               * есть единственное, что делает источник конечным ДИСКОМ вместо
-               * ТОЧКИ: он ограничивает ближнее поле, когда приёмник подходит
-               * ближе размера источника. Стояла `w2` (ватты) — размерность не
-               * сходилась, и агрегат в несколько метров работал точкой, хотя
-               * §186 требует протяжённого источника (в пределе шар), а §191.1 —
-               * анизотропной полутени по его осям. Площадь всё это время
-               * накапливалась в `vv[3]` и в форм-фактор не подставлялась.
-               * Поймал пользователь: «сдаётся мне, ты собираешь фронт из
-               * точечных источников». */
-              ind += w2 * cr2 * cs2 / (M_PI * r2 + vv[3]);
-              ngath++;
+            /* СБОР — ОБЩЕЙ ФУНКЦИЕЙ (О64). Пиксельный путь остаётся ЭТАЛОНОМ,
+             * с которым сравнивается поэлементный, и потому обязан считать той
+             * же арифметикой, а не своей копией. */
+            if (g_gmode == 0)
+              ind = pc_gather(&SRC, hp, nrm, &ngath, &nvis3);
+            else {
+              /* СБОР НА ЭЛЕМЕНТЕ: одно чтение вместо спуска по дереву.
+               * `g_shift` — негативный контроль (§219): косвенное берётся у
+               * ЧУЖОГО элемента, и картинка обязана заметно испортиться. */
+              int32_t e5 = tri_seg[tri] + g_shift;
+              if (e5 >= 0 && (int64_t)e5 < nel && el_ind != NULL) ind = el_ind[e5];
             }
             /* ЦВЕТ БЕРЁТСЯ ИЗ МАТЕРИАЛА, А НЕ ПРИДУМЫВАЕТСЯ. Прежняя редакция красила
              * тёплым/холодным по признаку «освещён», и кадр выходил чистым
@@ -1029,6 +1219,10 @@ int main(int argc, char **argv) {
             }
             double amb2 = PCELL_SKY * (double)nsk / (double)PCELL_SKY_SAMP;
             double sun2 = vfrac * ndl;
+            /* СУММА КОСВЕННОГО ПО ПИКСЕЛЯМ — величина, по которой пиксельный и
+             * поэлементный сбор сравниваются на равных (§219, П5): она мерит
+             * ровно то, что доходит до картинки. */
+            sind += ind;
             col[0] = kd[0] * (sun2 * 1.00 + amb2 * 0.60 + ind * PCELL_IND);
             col[1] = kd[1] * (sun2 * 0.97 + amb2 * 0.72 + ind * PCELL_IND);
             col[2] = kd[2] * (sun2 * 0.88 + amb2 * 1.00 + ind * PCELL_IND);
@@ -1061,6 +1255,9 @@ int main(int argc, char **argv) {
                "из них %.0f %%\n",
                (long long)nvis3, (double)nvis3 / (double)(npix2 > 0 ? npix2 : 1),
                100.0 * (double)ngath / (double)(nvis3 > 0 ? nvis3 : 1));
+        printf("   КОСВЕННОЕ ПО ПИКСЕЛЯМ (%s): Σ ind %.6e, среднее на пиксель с попаданием %.6e\n",
+               g_gmode ? "НА ЭЛЕМЕНТЕ" : "на пиксель", sind,
+               sind / (double)(npix2 > 0 ? npix2 : 1));
         printf("   ЛУЧИ КАДРА (%s): %s на луч %.1f, треугольников на луч %.1f (всего лучей %lld)\n",
                g_trmode ? "ДЕРЕВО" : "СЕТКА", g_trmode ? "узлов" : "ячеек",
                (double)nvray / (double)(npix2 > 0 ? npix2 : 1) / (double)(1 + nsun + nsky),
@@ -1073,8 +1270,10 @@ int main(int argc, char **argv) {
       }
       free(rgb);
     }
+    free(el_vis);
   }
   free(tri_lit);
+  free(tri_seg);
 
   for (int64_t k = 0; k < nl; k++)
     free(cnt[k]);

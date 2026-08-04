@@ -183,6 +183,15 @@ static int g_trmode = 0; /* 0 — равномерная сетка `pgrid`, 1 �
  * поехать. `shift=N` — негативный контроль §219: косвенное берётся у чужого
  * элемента, и картинка обязана заметно испортиться. */
 static int g_gmode = 0, g_shift = 0;
+/* ТАЙМЕРЫ СТАДИЙ КАДРА (шаг О65, план §222). `notimer=all` — часы не зовутся
+ * вовсе, и разность времени кадра с ним и без него ЕСТЬ накладные прибора: их
+ * положено измерить, а не объявить малыми (А444). `notimer=sun` — намеренно
+ * испорченный прибор, негативный контроль §222. */
+static int g_notimer = 0, g_notimer_sun = 0;
+
+static double pc_clk(void) {
+  return g_notimer ? 0.0 : omp_get_wtime();
+}
 
 /* Одна обёртка на все четыре места, где стенд пускает луч. Счётчики `nvis`
  * (пройдено ячеек или посещено узлов) и `ntest` (проверено треугольников)
@@ -226,6 +235,10 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "img=", 4) == 0) imgw = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "gather=", 7) == 0) g_gmode = (strcmp(argv[i] + 7, "elem") == 0);
     if (strncmp(argv[i], "shift=", 6) == 0) g_shift = (int)strtol(argv[i] + 6, NULL, 10);
+    if (strncmp(argv[i], "notimer=", 8) == 0) {
+      g_notimer = (strcmp(argv[i] + 8, "all") == 0);
+      g_notimer_sun = (strcmp(argv[i] + 8, "sun") == 0);
+    }
     /* Камера ключом: закон роста среза надо мерить на РАЗНЫХ сценах, а глаз у
      * каждой свой и найден замером (§187). */
     if (strncmp(argv[i], "eye=", 4) == 0) {
@@ -1033,10 +1046,16 @@ int main(int argc, char **argv) {
        * проверено треугольников. Порознь — по доводу А424. */
       int64_t nvray = 0, ntray = 0;
       double sind = 0.0;
+      /* ТАЙМЕРЫ СТАДИЙ (О65). Складываются по ПОТОКАМ, поэтому сравнивать их
+       * можно только с суммой ПОЛНОГО времени тех же потоков (`tALL`), а не со
+       * временем кадра: последнее меньше примерно во столько раз, сколько
+       * потоков (А443). */
+      double tL = 0.0, tG = 0.0, tS = 0.0, tO = 0.0, tN = 0.0, tC = 0.0, tALL = 0.0;
 #pragma omp parallel for schedule(dynamic, 8)                                                      \
-    reduction(+ : nmis, npix2, ngath, nvis3, nvray, ntray, sind)
+    reduction(+ : nmis, npix2, ngath, nvis3, nvray, ntray, sind, tL, tG, tS, tO, tN, tC, tALL)
       for (int j = 0; j < H; j++)
         for (int i = 0; i < W; i++) {
+          double kt0 = pc_clk(), ktp = kt0;
           double sx = (2.0 * ((double)i + 0.5) / W - 1.0) * th2;
           double sy = (1.0 - 2.0 * ((double)j + 0.5) / H) * th2;
           double d[3] = {0, 0, 0};
@@ -1051,6 +1070,11 @@ int main(int argc, char **argv) {
           double col[3] = {0.45, 0.55, 0.70};
           if (pc_trace(&G, &T, &m, eyeP, d, 0.0, diag2, NULL, 0, 0, &tt, &tri, &nvray, &ntray) &&
               tri >= 0) {
+            {
+              double k1 = pc_clk();
+              tL += k1 - ktp;
+              ktp = k1;
+            }
             if (el_vis != NULL && tri_seg[tri] >= 0) el_vis[tri_seg[tri]] = 1;
             const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)tri];
             const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)tri + 1];
@@ -1079,6 +1103,11 @@ int main(int argc, char **argv) {
             double hp[3] = {0, 0, 0};
             for (int c = 0; c < 3; c++)
               hp[c] = eyeP[c] + tt * d[c];
+            {
+              double k2 = pc_clk();
+              tG += k2 - ktp;
+              ktp = k2;
+            }
             double nsg = (nl2 > 0.0 && (nn[0] * wsun[0] + nn[1] * wsun[1] + nn[2] * wsun[2]) > 0.0)
                              ? -1.0
                              : 1.0;
@@ -1133,6 +1162,13 @@ int main(int argc, char **argv) {
               if (!pc_trace(&G, &T, &m, so, sdj, 0.0, diag2, NULL, 0, 1, &st, NULL, &nvray, &ntray))
                 nvis2++;
             }
+            {
+              double k3 = pc_clk();
+              /* НЕГАТИВНЫЙ КОНТРОЛЬ §222: прибор солнца намеренно не копит, и
+               * инвариант покрытия обязан это заметить. */
+              if (!g_notimer_sun) tS += k3 - ktp;
+              ktp = k3;
+            }
             double vfrac = (double)nvis2 / (double)nsun;
             int litpx = (vfrac > 0.0);
             if (litpx != (tri_lit[tri] ? 1 : 0)) nmis++;
@@ -1162,6 +1198,11 @@ int main(int argc, char **argv) {
                * ЧУЖОГО элемента, и картинка обязана заметно испортиться. */
               int32_t e5 = tri_seg[tri] + g_shift;
               if (e5 >= 0 && (int64_t)e5 < nel && el_ind != NULL) ind = el_ind[e5];
+            }
+            {
+              double k4 = pc_clk();
+              tO += k4 - ktp;
+              ktp = k4;
             }
             /* ЦВЕТ БЕРЁТСЯ ИЗ МАТЕРИАЛА, А НЕ ПРИДУМЫВАЕТСЯ. Прежняя редакция красила
              * тёплым/холодным по признаку «освещён», и кадр выходил чистым
@@ -1217,6 +1258,11 @@ int main(int argc, char **argv) {
               if (!pc_trace(&G, &T, &m, so, dk3, 0.0, diag2, NULL, 0, 1, &kt, NULL, &nvray, &ntray))
                 nsk++;
             }
+            {
+              double k5 = pc_clk();
+              tN += k5 - ktp;
+              ktp = k5;
+            }
             double amb2 = PCELL_SKY * (double)nsk / (double)PCELL_SKY_SAMP;
             double sun2 = vfrac * ndl;
             /* СУММА КОСВЕННОГО ПО ПИКСЕЛЯМ — величина, по которой пиксельный и
@@ -1238,6 +1284,11 @@ int main(int argc, char **argv) {
             double g2 = pow(e3 > 1.0 ? 1.0 : e3, 1.0 / 2.2);
             rgb[3 * q + c] = (unsigned char)(255.0 * g2 + 0.5);
           }
+          {
+            double k6 = pc_clk();
+            tC += k6 - ktp;
+            tALL += k6 - kt0;
+          }
         }
       FILE *fp = fopen("img/pcell_lit.ppm", "wb");
       if (fp != NULL) {
@@ -1255,6 +1306,24 @@ int main(int argc, char **argv) {
                "из них %.0f %%\n",
                (long long)nvis3, (double)nvis3 / (double)(npix2 > 0 ? npix2 : 1),
                100.0 * (double)ngath / (double)(nvis3 > 0 ? nvis3 : 1));
+        {
+          /* РАЗЛОЖЕНИЕ КАДРА ПО СТАДИЯМ (О65). Числа — СУММЫ ПО ПОТОКАМ, и
+           * сравнивать их можно только с `tALL` (сумма полного времени тех же
+           * потоков), а не со временем кадра: последнее меньше примерно во
+           * столько раз, сколько потоков (А443). Расхождение `tALL - Σ` есть
+           * работа ВНЕ приборов — промахнувшиеся лучи и накладные. */
+          double ssum = tL + tG + tS + tO + tN + tC;
+          printf("== СТАДИИ КАДРА, сумма по потокам (с): Л(луч) %.2f, Г(геометрия) %.2f, "
+                 "С(солнце) %.2f, О(сбор) %.2f, Н(небо) %.2f, Ц(цвет) %.2f\n",
+                 tL, tG, tS, tO, tN, tC);
+          printf("   доли: Л %.1f %%, Г %.1f %%, С %.1f %%, О %.1f %%, Н %.1f %%, Ц %.1f %%\n",
+                 100 * tL / (ssum > 0 ? ssum : 1), 100 * tG / (ssum > 0 ? ssum : 1),
+                 100 * tS / (ssum > 0 ? ssum : 1), 100 * tO / (ssum > 0 ? ssum : 1),
+                 100 * tN / (ssum > 0 ? ssum : 1), 100 * tC / (ssum > 0 ? ssum : 1));
+          printf("   ИНВАРИАНТ ПОКРЫТИЯ: Σ стадий %.2f против полного времени потоков %.2f — "
+                 "вне приборов %.2f с (%.1f %%)\n",
+                 ssum, tALL, tALL - ssum, 100.0 * (tALL - ssum) / (tALL > 0 ? tALL : 1));
+        }
         printf("   КОСВЕННОЕ ПО ПИКСЕЛЯМ (%s): Σ ind %.6e, среднее на пиксель с попаданием %.6e\n",
                g_gmode ? "НА ЭЛЕМЕНТЕ" : "на пиксель", sind,
                sind / (double)(npix2 > 0 ? npix2 : 1));

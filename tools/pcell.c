@@ -158,6 +158,10 @@ int main(int argc, char **argv) {
   diag2 = 4.0 * sqrt(diag2);
   int64_t nlit = 0;
   double alit = 0.0;
+  /* Признак «освещён» НА ТРЕУГОЛЬНИК — только ради картинки: она рисуется
+   * первичными лучами, а луч попадает в треугольник, не в элемент. */
+  unsigned char *tri_lit = calloc((size_t)(m.nt > 0 ? m.nt : 1), 1);
+  if (tri_lit == NULL) return 2;
   /* Освещённость ПО УЗЛАМ — чтобы потом сжать освещённый набор по уровням
    * дерева: наивный сбор 1.07 млн приёмников на 30 тыс. источников есть 3.2e10
    * пар, и вопрос не в том, дорого ли это, а во сколько раз агрегирование
@@ -262,6 +266,8 @@ int main(int argc, char **argv) {
               for (int c = 0; c < 3; c++)
                 litv[4 * leaf[k] + c] += sg.seg[s].area * nn2[c];
               litv[4 * leaf[k] + 3] += sg.seg[s].area;
+              for (int32_t j2 = 0; j2 < nt; j2++)
+                if (sg.label[j2] == s) tri_lit[T.ref[nd->t0 + j2]] = 1;
             }
           }
           free(cx);
@@ -514,6 +520,91 @@ int main(int argc, char **argv) {
     free(pxs);
     free(sub_t);
   }
+
+  /* ---- КАРТИНКА: ОСВЕЩЁННЫЙ НАБОР ---------------------------------------
+   * Рисуется то, что ПОСЧИТАНО, и ничего сверх: освещён элемент или нет, плюс
+   * ламбертов косинус к солнцу у освещённых. Косвенного света тут нет и быть не
+   * должно — отскок не сделан (§202). Тень в затенённых местах поэтому глухая,
+   * и это честно, а не дефект раскраски. */
+  {
+    int W = 1024, H = 1024;
+    unsigned char *rgb = malloc((size_t)W * (size_t)H * 3);
+    double eyeP[3] = HZ_CFG_MIGUEL_EYE, atP[3] = HZ_CFG_MIGUEL_AT, upP[3] = HZ_CFG_UP;
+    if (haseye)
+      for (int a = 0; a < 3; a++)
+        eyeP[a] = eye0[a];
+    if (rgb != NULL) {
+      double fw[3] = {0, 0, 0}, ri[3] = {0, 0, 0}, uv[3] = {0, 0, 0};
+      for (int c = 0; c < 3; c++)
+        fw[c] = atP[c] - eyeP[c];
+      double fl = sqrt(fw[0] * fw[0] + fw[1] * fw[1] + fw[2] * fw[2]);
+      for (int c = 0; c < 3; c++)
+        fw[c] /= fl;
+      ri[0] = fw[1] * upP[2] - fw[2] * upP[1];
+      ri[1] = fw[2] * upP[0] - fw[0] * upP[2];
+      ri[2] = fw[0] * upP[1] - fw[1] * upP[0];
+      double rl = sqrt(ri[0] * ri[0] + ri[1] * ri[1] + ri[2] * ri[2]);
+      for (int c = 0; c < 3; c++)
+        ri[c] /= rl;
+      uv[0] = ri[1] * fw[2] - ri[2] * fw[1];
+      uv[1] = ri[2] * fw[0] - ri[0] * fw[2];
+      uv[2] = ri[0] * fw[1] - ri[1] * fw[0];
+      double th2 = tan(0.5 * HZ_CFG_FOV_DEG * M_PI / 180.0);
+      double t_pic = now_s();
+#pragma omp parallel for schedule(dynamic, 8)
+      for (int j = 0; j < H; j++)
+        for (int i = 0; i < W; i++) {
+          double sx = (2.0 * ((double)i + 0.5) / W - 1.0) * th2;
+          double sy = (1.0 - 2.0 * ((double)j + 0.5) / H) * th2;
+          double d[3] = {0, 0, 0};
+          for (int c = 0; c < 3; c++)
+            d[c] = fw[c] + sx * ri[c] + sy * uv[c];
+          double dl = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+          for (int c = 0; c < 3; c++)
+            d[c] /= dl;
+          double tt = 0.0;
+          int32_t tri = -1;
+          int64_t q = (int64_t)j * W + i;
+          double col[3] = {0.45, 0.55, 0.70};
+          if (hz_pgrid_trace_tri(&G, &m, eyeP, d, 0.0, diag2, NULL, 0, 0, &tt, &tri) && tri >= 0) {
+            const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)tri];
+            const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)tri + 1];
+            const double *C = m.v + 3 * (size_t)m.f[3 * (size_t)tri + 2];
+            double e1[3] = {0, 0, 0}, e2[3] = {0, 0, 0}, nn[3] = {0, 0, 0};
+            for (int c = 0; c < 3; c++) {
+              e1[c] = B[c] - A[c];
+              e2[c] = C[c] - A[c];
+            }
+            nn[0] = e1[1] * e2[2] - e1[2] * e2[1];
+            nn[1] = e1[2] * e2[0] - e1[0] * e2[2];
+            nn[2] = e1[0] * e2[1] - e1[1] * e2[0];
+            double nl2 = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+            double ndl = 0.0;
+            if (nl2 > 0.0) ndl = fabs((nn[0] * wsun[0] + nn[1] * wsun[1] + nn[2] * wsun[2]) / nl2);
+            const double *kd = m.mtl[m.fm[tri]].kd3;
+            double lit = tri_lit[tri] ? ndl : 0.0;
+            for (int c = 0; c < 3; c++)
+              col[c] = kd[c] * (0.06 + 0.94 * lit);
+          }
+          for (int c = 0; c < 3; c++) {
+            double g2 = pow(col[c] < 0 ? 0 : (col[c] > 1 ? 1 : col[c]), 1.0 / 2.2);
+            rgb[3 * q + c] = (unsigned char)(255.0 * g2 + 0.5);
+          }
+        }
+      FILE *fp = fopen("img/pcell_lit.ppm", "wb");
+      if (fp != NULL) {
+        fprintf(fp, "P6\n%d %d\n255\n", W, H);
+        fwrite(rgb, 1, (size_t)W * (size_t)H * 3, fp);
+        fclose(fp);
+        printf(
+            "== КАРТИНКА img/pcell_lit.ppm за %.2f с: освещённый набор (прямой свет), косвенного "
+            "НЕТ — отскок не сделан\n",
+            now_s() - t_pic);
+      }
+      free(rgb);
+    }
+  }
+  free(tri_lit);
 
   for (int64_t k = 0; k < nl; k++)
     free(cnt[k]);

@@ -237,6 +237,15 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
                     const hz_pfront_face in[3], hz_pfront_face out[3], const int32_t *list,
                     int32_t n, int coarsened) {
   const hz_ptnode *N = &X->T->nd[nid];
+  /* ПОМЕТКА НЕСЁТ ЧИСЛО СТУПЕНЕЙ ПОСЛАБЛЕНИЯ, А НЕ ПРЕДЕЛЬНЫЙ УРОВЕНЬ. Сперва
+   * было наоборот, и скан вышел обратный: чем грубее просили, тем БОЛЬШЕ выходило
+   * ячеек, а при шести ступенях пометка не срабатывала вовсе. Причина в том, что
+   * «уровень узла + ступени» отодвигает предел ВНИЗ, то есть разрешает спускаться
+   * глубже. Правильно — отпускать ПОЛ, ровно как это делает пирамида: фронт
+   * впитывается либо согласно LOD, либо на столько-то ступеней грубее. */
+  /* Предел уровня, унаследованный сверху либо поставленный здесь. `-1` — нет. */
+  int save_on = X->markon;
+  if (X->mark != NULL && X->mark[nid] != 255) X->markon = 1;
   int stop = 0, why = 0;
   /* ПИРАМИДА КАМЕРЫ. Ячейка целиком снаружи хотя бы одной плоскости — невидима
    * камере, и её собственная подробность этому проходу не нужна. Берётся целиком
@@ -298,6 +307,15 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
     if (d2 > r2 && 4.0 * r2 <= pxe2 * d2) {
       stop = 1;
       why = 1;
+    } else if (X->markon && X->depth != NULL && X->depth[nid] <= X->markrelax) {
+      /* ОГРУБЛЕНИЕ НА `markrelax` УРОВНЕЙ ОТ ТОГО МЕСТА, ГДЕ ОСТАНОВИЛИСЬ БЫ
+       * ИНАЧЕ. Дно поддерева отсюда — `depth`; значит «на два уровня грубее»
+       * есть «остановиться, когда до дна осталось два». Так формулировал
+       * пользователь, и только так работает: пол бессилен там, где спуск
+       * упирается в лист, а предел по уровню узла не относителен ни к чему. */
+      stop = 1;
+      why = 4;
+      X->nmarkstop++;
     } else if (!X->noshadow && pf_dark3(in, X->dir)) {
       if (coarsened < HZ_PFRONT_COARSEN_MAX) {
         stop = 1;
@@ -308,6 +326,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
     }
   }
   if (stop) {
+    X->markon = save_on;
     X->ncell++;
     if (why == 0) X->stop_leaf++;
     if (why == 1) X->stop_floor++;
@@ -397,6 +416,24 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
       X->ncell_geo++;
     else
       X->ncell_void++;
+    /* ЗАПИСЬ ПОМЕТКИ (разбор 08-05/08-06): этот же проход, пущенный ОТ КАМЕРЫ,
+     * ищет НЕВИДИМОЕ напрямую — то, что за стеной, — и кладёт ему предел
+     * детализации. Насколько огрублять, задаёт диффузность: у полностью
+     * диффузной поверхности подробность дальше не передаётся вовсе (§259), и
+     * берётся `markrelax` ступеней. Пометка пишется ТОЛЬКО на крупных уровнях:
+     * ниже она и не нужна, и стоила бы полного второго обхода. */
+    if (X->markout != NULL && (int)X->T->lev[nid] <= X->markoutlev) {
+      double fo = 0.0, wo = 0.0;
+      for (int a = 0; a < 3; a++) {
+        double wa = (X->dir[a] < 0.0) ? -X->dir[a] : X->dir[a];
+        wo += wa;
+        fo += wa * in[a].c0;
+      }
+      if (wo > 0.0 && fo <= wo * HZ_PFRONT_FRAC_TOL) {
+        X->markout[nid] = 1;
+        X->nmarkset++;
+      }
+    }
     /* Освещённость ячейки — тоже по ПОТОКУ, а не среднее по трём граням. */
     double fl = 0.0, w = 0.0;
     for (int a = 0; a < 3; a++) {
@@ -482,6 +519,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
       }
     }
   }
+  X->markon = save_on;
   free(sub);
   /* Исходящие грани родителя — сложение моментов по четырём детским (Р2). */
   for (int a = 0; a < 3; a++) {

@@ -104,3 +104,19 @@ int hz_pocc_build(const hz_objmesh *m, const hz_ptree *T, const double *tlo, con
   }
   return 0;
 }
+
+void hz_pocc_depth(const hz_ptree *T, unsigned char *depth) {
+  /* Узлы дописываются ПОСЛЕ родителя, поэтому обратный порядок индексов и есть
+   * порядок «снизу вверх» — тот же довод, что у занятости. */
+  for (int32_t i = T->nnd - 1; i >= 0; i--) {
+    int32_t c0 = T->nd[i].child;
+    if (c0 < 0) {
+      depth[i] = 0;
+      continue;
+    }
+    unsigned char mx = 0;
+    for (int k = 0; k < 8; k++)
+      if (depth[c0 + k] > mx) mx = depth[c0 + k];
+    depth[i] = (unsigned char)(mx < 254 ? mx + 1 : 254);
+  }
+}

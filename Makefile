@@ -219,8 +219,8 @@ build/pfrontx: tools/pfrontx.c src/scene_obj.c src/ptree.c src/ptree.h src/pclip
 
 # psun — шаг О73 (Ф3, план §266): ФРОНТ ОТ СОЛНЦА с состоянием на гранях.
 # Огрубление вместо отсечения; shadow=0 — негативный контроль.
-build/psun: tools/psun.c src/scene_obj.c src/ptree.c src/pclip.c src/pfront.c src/pfront.h src/pocc.c src/pocc.h | build
-	$(RUN) 'gcc $(CFLAGS) -o $@ tools/psun.c src/scene_obj.c src/ptree.c src/pclip.c src/pfront.c src/pocc.c -lm'
+build/psun: tools/psun.c src/scene_obj.c src/ptree.c src/pclip.c src/pfront.c src/pfront.h src/pocc.c src/pocc.h src/pmark.c src/pmark.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/psun.c src/scene_obj.c src/ptree.c src/pclip.c src/pfront.c src/pocc.c src/pmark.c -lm'
 
 # pcam — камера сцены находится ЗАМЕРОМ, а не назначается (§187). Обе прежние
 # камеры были назначены на глаз и обе оказались негодными.

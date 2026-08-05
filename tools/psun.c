@@ -10,6 +10,7 @@
  */
 #include "pclip.h"
 #include "pfront.h"
+#include "pmark.h"
 #include "pocc.h"
 #include "ptree.h"
 #include "scene_cfg.h"
@@ -35,7 +36,9 @@ int main(int argc, char **argv) {
                     "[sun=dx,dy,dz] [shadow=0]\n");
     return 1;
   }
-  int leafmax = 0, maxlev = 0, grade = 1, shadow = 1, cam = 0, nref = 0, cliplev = -1, camfull = 0;
+  int leafmax = 0, maxlev = 0, grade = 1, shadow = 1, cam = 0, nref = 0, cliplev = -1, camfull = 0,
+      usemark = 0, relax = HZ_PMARK_OUT_LEVELS;
+  double camo[3] = {0.0, 0.0, 0.0}, camf[3] = {0.0, 0.0, 1.0};
   double px = 9.1, sdir[3] = {0.3, -0.9, 0.3};
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "leaf=", 5) == 0) leafmax = (int)strtol(argv[i] + 5, NULL, 10);
@@ -47,6 +50,8 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "ref=", 4) == 0) nref = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "clip=", 5) == 0) cliplev = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "camfull=", 8) == 0) camfull = (int)strtol(argv[i] + 8, NULL, 10);
+    if (strncmp(argv[i], "mark=", 5) == 0) usemark = (int)strtol(argv[i] + 5, NULL, 10);
+    if (strncmp(argv[i], "relax=", 6) == 0) relax = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "sun=", 4) == 0) {
       char *e = NULL;
       sdir[0] = strtod(argv[i] + 4, &e);
@@ -162,7 +167,7 @@ int main(int argc, char **argv) {
   /* ПИРАМИДА КАМЕРЫ (ключ `cam=1`). Глаз и цель — из `scene_cfg.h`, где камеры
    * НАЙДЕНЫ ЗАМЕРОМ, а не назначены (§187); поле зрения и разрешение оттуда же.
    * Плоскости строятся нормалями ВНУТРЬ. */
-  if (cam) {
+  if (cam || usemark) {
     double e[3], at[3];
     if (strstr(argv[1], "conference") != NULL) {
       double a1[3] = HZ_CFG_HALL_EYE, a2[3] = HZ_CFG_HALL_AT;
@@ -225,7 +230,12 @@ int main(int argc, char **argv) {
       diag += s * s;
     }
     X.fr[5][3] += sqrt(diag);
-    X.usefrustum = 1;
+    memcpy(camo, e, sizeof camo);
+    memcpy(camf, f, sizeof camf);
+    /* Пирамида нужна и проходу ПОМЕТОК, и прямой проверке в обходе. Считается
+     * она в обоих случаях, а ВКЛЮЧАЕТСЯ в обходе только по `cam=1`: иначе
+     * пирамида и пометка сделали бы одну работу дважды. */
+    X.usefrustum = cam;
     printf("== ПИРАМИДА КАМЕРЫ: глаз %.2f,%.2f,%.2f, цель %.2f,%.2f,%.2f, поле %.0f°;\n"
            "   ячейка ЦЕЛИКОМ снаружи берётся ОДНОЙ (огрубление), а не выбрасывается\n",
            e[0], e[1], e[2], at[0], at[1], at[2], HZ_CFG_FOV_DEG);
@@ -235,6 +245,57 @@ int main(int argc, char **argv) {
          X.dir[0], X.dir[1], X.dir[2], px, HZ_PFRONT_COARSEN_MAX, shadow ? "ВКЛ" : "ВЫКЛ");
   printf("== ОГОВОРКА ОПЕРАТОРА: %s\n", hz_pfront_note());
 
+  /* ПРОХОД ПОМЕТОК ОТ КАМЕРЫ (ключ `mark=1`). Дёшев: идёт только по крупным
+   * узлам. Кладёт каждому предельный уровень, который фронт читает третьим
+   * условием остановки. */
+  unsigned char *dep = calloc((size_t)T.nnd, 1);
+  if (dep == NULL) return 2;
+  hz_pocc_depth(&T, dep);
+  X.depth = dep;
+  unsigned char *mk = NULL;
+  if (usemark) {
+    /* ПРОХОД ОТ КАМЕРЫ, ищущий НЕВИДИМОЕ НАПРЯМУЮ. Это ТОТ ЖЕ фронт, только
+     * пущенный от камеры и остановленный на крупных уровнях: где он приходит
+     * тёмным, там от камеры не видно, и там ставится пометка. Направление берётся
+     * взглядом камеры — приближение параллельным пучком, точное в середине кадра
+     * и грубеющее к краям; конус при этом учтён отдельно, пирамидой. */
+    mk = calloc((size_t)T.nnd, 1);
+    if (mk == NULL) return 2;
+    for (int32_t i = 0; i < T.nnd; i++)
+      mk[i] = 255; /* 255 — пометки нет */
+    hz_pfront_ctx CX = X;
+    CX.mark = NULL;
+    CX.markout = mk;
+    CX.markoutlev = HZ_PMARK_LEVEL;
+    CX.markrelax = relax;
+    CX.depth = dep;
+    CX.cliplev = HZ_PMARK_LEVEL;
+    CX.usefrustum = 1;
+    CX.nmarkset = 0;
+    for (int c = 0; c < 3; c++)
+      CX.dir[c] = camf[c];
+    CX.t_entry = 1e300;
+    for (int k = 0; k < 8; k++) {
+      double tt = 0.0;
+      for (int c = 0; c < 3; c++)
+        tt += ((k & (1 << c)) ? T.nd[0].hi[c] : T.nd[0].lo[c]) * CX.dir[c];
+      if (tt < CX.t_entry) CX.t_entry = tt;
+    }
+    hz_pfront_face ci[3], co[3];
+    for (int a = 0; a < 3; a++) {
+      ci[a].c0 = 1.0;
+      ci[a].cu = 0.0;
+      ci[a].cv = 0.0;
+    }
+    double tmk = now_s();
+    hz_pfront_walk(&CX, 0, T.nd[0].lo, T.nd[0].hi, ci, co, list, m.nt, 0);
+    printf("== ПРОХОД ОТ КАМЕРЫ за %.2f с: ячеек %lld, ПОМЕТОК ПОСТАВЛЕНО %lld (невидимое, "
+           "огрубление на %d уровня)\n",
+           now_s() - tmk, (long long)CX.ncell, (long long)CX.nmarkset, relax);
+    X.mark = mk;
+    X.markcur = -1;
+    X.markrelax = relax;
+  }
   hz_pfront_face in[3], out[3];
   for (int a = 0; a < 3; a++) {
     in[a].c0 = 1.0; /* на входе в сцену диск источника открыт целиком */
@@ -276,6 +337,7 @@ int main(int argc, char **argv) {
          "кусков %lld раз\n",
          (long long)X.nlit, (long long)X.nshadow, (long long)X.ncap, (long long)X.npclip);
   printf("   вне пирамиды с ОТПУЩЕННЫМ полом %lld ячеек\n", (long long)X.noutside);
+  printf("   остановок ПО ПОМЕТКЕ %lld\n", (long long)X.nmarkstop);
   printf("   ЯЧЕЕК С ГЕОМЕТРИЕЙ ОДНОЙ ПЛОСКОСТИ %lld из %lld (%.2f %%) — их дробить незачем ни при "
          "каком поле\n",
          (long long)X.nflat1, (long long)X.nflatgeo,

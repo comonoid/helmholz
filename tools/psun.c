@@ -116,6 +116,13 @@ int main(int argc, char **argv) {
   t0 = now_s();
   if (hz_pocc_build(&m, &T, tlo, thi, tpl, occ, NULL) != 0) {
     fprintf(stderr, "отказ занятости\n");
+    free(tlo);
+    free(thi);
+    free(tpl);
+    free(list);
+    free(occ);
+    hz_ptree_free(&T);
+    hz_obj_free(&m);
     return 2;
   }
   int64_t nocc = 0;
@@ -160,6 +167,13 @@ int main(int argc, char **argv) {
   double secs = now_s() - t0;
   if (X.fail) {
     fprintf(stderr, "отказ обхода\n");
+    free(tlo);
+    free(thi);
+    free(tpl);
+    free(list);
+    free(occ);
+    hz_ptree_free(&T);
+    hz_obj_free(&m);
     return 2;
   }
   printf("   ЯЧЕЕК %lld (с геометрией %lld, пустых %lld)\n", (long long)X.ncell,

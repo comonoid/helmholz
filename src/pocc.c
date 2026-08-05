@@ -52,7 +52,11 @@ static void occ_walk(occctx *X, int32_t nid, const int32_t *list, int32_t n) {
     return;
   }
   int32_t c0 = N->child;
-  int32_t *sub = malloc((size_t)(n > 0 ? n : 1) * sizeof *sub);
+  /* На ОДИН элемент больше нужного: `ns` не превосходит `n` по построению цикла
+   * ниже, но анализатор связь «ёмкость — счётчик» теряет (класс, описанный в
+   * CLAUDE.md по разбору diam 07-24). Лишний элемент делает границу тривиально
+   * доказуемой и стоит четыре байта. */
+  int32_t *sub = malloc(((size_t)(n > 0 ? n : 1) + 1) * sizeof *sub);
   if (sub == NULL) {
     X->fail = 1;
     return;

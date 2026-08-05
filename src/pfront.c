@@ -1,7 +1,7 @@
 /* pfront.c — обход фронта с переносом состояния. Разбор — в `pfront.h`. */
 #include "pfront.h"
 #include "pclip.h"
-#include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -66,10 +66,7 @@ static hz_pfront_face face_shift(const hz_pfront_face *F) {
  * Поэтому берётся МАКСИМУМ по кускам, то есть заведомая НИЖНЯЯ оценка
  * перекрытия. Следствие: тени выходят слабее настоящих, огрубления МЕНЬШЕ, и
  * измеренный выигрыш есть НИЖНЯЯ граница. Ошибаться в эту сторону безопасно. */
-static double cover_max(const double *cov, int n) {
-  double m = 0.0;
-  for (int i = 0; i < n; i++)
-    if (cov[i] > m) m = cov[i];
+static double cover_max(double m) {
   return m > 1.0 ? 1.0 : m;
 }
 
@@ -79,22 +76,30 @@ static double piece_cover(const hz_pclip_poly *P, const double *lo, const double
                           const double *dir, int a) {
   int p, q;
   face_axes(a, &p, &q);
-  if (P->nv < 3) return 0.0;
+  /* Постусловие `nv ≤ 9` доказано в `pclip`, но СЮДА кусок приходит извне, и
+   * анализатор справедливо не берёт его на веру. Проверка явная — она же граница
+   * буферов ниже. */
+  int nv = P->nv;
+  if (nv < 3 || nv > HZ_PCLIP_MAXV) return 0.0;
   double du = hi[p] - lo[p], dv = hi[q] - lo[q];
   if (!(du > 0.0) || !(dv > 0.0)) return 0.0;
   /* Снос вдоль направления на грань `a`: параметр берётся так, чтобы точка легла
    * в плоскость грани. При `dir[a] == 0` кусок вдоль грани не сносится вовсе. */
   if (dir[a] < 1e-300 && dir[a] > -1e-300) return 0.0;
   double fa = (dir[a] > 0.0) ? hi[a] : lo[a];
-  double u[HZ_PCLIP_MAXV], v[HZ_PCLIP_MAXV];
-  for (int i = 0; i < P->nv; i++) {
+  /* Явная инициализация: анализатор не связывает заполнение в первом цикле с
+   * чтением во втором (известный класс его слабостей, ср. разбор diam 07-24 в
+   * CLAUDE.md). Девять записей на кусок против шести делений — цена никакая, а
+   * значение определено по построению, а не по рассуждению. */
+  double u[HZ_PCLIP_MAXV] = {0}, v[HZ_PCLIP_MAXV] = {0};
+  for (int i = 0; i < nv; i++) {
     double t = (fa - P->v[i][a]) / dir[a];
     u[i] = (P->v[i][p] + t * dir[p] - lo[p]) / du;
     v[i] = (P->v[i][q] + t * dir[q] - lo[q]) / dv;
   }
   double s = 0.0;
-  for (int i = 0; i < P->nv; i++) {
-    int j = (i + 1) % P->nv;
+  for (int i = 0; i < nv; i++) {
+    int j = (i + 1) % nv;
     s += u[i] * v[j] - u[j] * v[i];
   }
   s = 0.5 * (s < 0.0 ? -s : s);
@@ -115,11 +120,14 @@ int hz_pfront_step(const hz_pfront_face in[3], hz_pfront_face out[3], const hz_p
                    int npiece, const double *lo, const double *hi, const double *dir) {
   double cov[3];
   for (int a = 0; a < 3; a++) {
-    double c[64];
-    int n = npiece > 64 ? 64 : npiece;
-    for (int i = 0; i < n; i++)
-      c[i] = piece_cover(&pieces[i], lo, hi, dir, a);
-    cov[a] = cover_max(c, n);
+    /* Максимум копится на месте: временный массив здесь не нужен, а cppcheck на
+     * нём справедливо ругался — при `npiece == 0` он оставался незаполненным. */
+    double m = 0.0;
+    for (int i = 0; i < npiece; i++) {
+      double c = piece_cover(&pieces[i], lo, hi, dir, a);
+      if (c > m) m = c;
+    }
+    cov[a] = cover_max(m);
   }
   for (int a = 0; a < 3; a++) {
     hz_pfront_face f = face_shift(&in[a]);

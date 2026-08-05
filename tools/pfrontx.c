@@ -123,8 +123,11 @@ typedef struct {
   const unsigned char *occ;
   unsigned char *seen; /* А509: «один визит на узел» ПРОВЕРЯЕТСЯ, а не заявляется */
   double src[3], eps, px;
+  double pxeps2; /* (px·ε)² — пол в квадрате, чтобы в горячем пути не было корней */
+  int lean;      /* 1 — обход БЕЗ диагностики: чистая стоимость индекса */
   int voidfloor; /* негативный контроль: пол применяется и к пустоте */
   int64_t ncell, nempty, ngeo, nrevisit, ncap;
+  int64_t nnode; /* узлов ПРОЙДЕНО, включая внутренние: цена в обращениях к памяти */
   int64_t stop_void, stop_floor, stop_leaf;
   int64_t oct_cell[NOCT], oct_empty[NOCT];
   int64_t sz[NSZ];
@@ -152,9 +155,21 @@ static int sz_of(double h) {
 /* Взять узел как ячейку среза. Разложение по ПРИЧИНЕ остановки — сразу (А510). */
 static void take(frontstat *S, int32_t nid, int why) {
   const hz_ptnode *N = &S->T->nd[nid];
+  S->ncell++;
+  /* ЧИСТАЯ СТОИМОСТЬ ИНДЕКСА МЕРЯЕТСЯ ОТДЕЛЬНО ОТ СТОИМОСТИ ЕЁ ИЗМЕРЕНИЯ.
+   * Всё, что ниже, — диагностика: три корня на расстояния и два `log2` на
+   * гистограммы. В первом докладе О72 они попали в число «нс на ячейку», и
+   * получилось, что обход медленнее, чем он есть (поправка пользователя 08-05).
+   * `lean=1` выключает диагностику целиком; разность двух прогонов и есть цена
+   * замера. */
+  if (S->lean) {
+    if (why == 0) S->stop_void++;
+    if (why == 1) S->stop_floor++;
+    if (why == 2) S->stop_leaf++;
+    return;
+  }
   if (S->seen[nid]) S->nrevisit++;
   S->seen[nid] = 1;
-  S->ncell++;
   int lev = (int)S->T->lev[nid];
   if (lev < S->levmin) S->levmin = lev;
   if (lev > S->levmax) S->levmax = lev;
@@ -181,6 +196,53 @@ static void take(frontstat *S, int32_t nid, int why) {
   if (why == 0) S->stop_void++;
   if (why == 1) S->stop_floor++;
   if (why == 2) S->stop_leaf++;
+}
+
+/* ---- ОПЫТ: ТОТ ЖЕ ОБХОД ПО КОМПАКТНОМУ ИНДЕКСУ ---------------------------- *
+ * ЗАЧЕМ. Замер показал 3.6 ГБ/с при 64 Б на узел — это латентность памяти, а не
+ * счёт. Из 64 Б сорок восемь занимает КОРОБКА, а она ВЫВОДИТСЯ: коробка ребёнка
+ * есть половина родительской, и деление пополам двоичных значений точно. Опыт
+ * проверяет, действительно ли дело в размере узла: обход идёт по массиву одних
+ * ИНДЕКСОВ ДЕТЕЙ (4 Б) плюс байт занятости, а коробка передаётся вниз по
+ * рекурсии. Результат обязан СОВПАСТЬ по числу ячеек — иначе меряется не то. */
+static void compact_walk(frontstat *S, const int32_t *ch, int32_t nid, const double *lo,
+                         const double *hi) {
+  S->nnode++;
+  if (!S->occ[nid]) {
+    S->ncell++;
+    S->stop_void++;
+    return;
+  }
+  if (ch[nid] < 0) {
+    S->ncell++;
+    S->stop_leaf++;
+    return;
+  }
+  double r2 = 0.0, d2 = 0.0, mid[3];
+  for (int c = 0; c < 3; c++) {
+    double h = 0.5 * (hi[c] - lo[c]);
+    mid[c] = 0.5 * (lo[c] + hi[c]);
+    double dd = mid[c] - S->src[c];
+    r2 += h * h;
+    d2 += dd * dd;
+  }
+  if (d2 > r2 && 4.0 * r2 <= S->pxeps2 * d2) {
+    S->ncell++;
+    S->stop_floor++;
+    return;
+  }
+  int near = 0;
+  for (int c = 0; c < 3; c++)
+    if (S->src[c] >= mid[c]) near |= 1 << c;
+  for (int k = 0; k < 8; k++) {
+    int q = k ^ near;
+    double clo[3], chi[3];
+    for (int c = 0; c < 3; c++) {
+      clo[c] = (q & (1 << c)) ? mid[c] : lo[c];
+      chi[c] = (q & (1 << c)) ? hi[c] : mid[c];
+    }
+    compact_walk(S, ch, ch[nid] + q, clo, chi);
+  }
 }
 
 /* НЕГАТИВНЫЙ КОНТРОЛЬ, ЧЕСТНАЯ ФОРМА. Нарушение §241.4 — это дробление ПУСТОТЫ
@@ -233,6 +295,7 @@ static void front_walk(frontstat *S, int32_t nid) {
     return;
   }
   const hz_ptnode *N = &S->T->nd[nid];
+  S->nnode++;
   /* §241.4: ПУСТОЙ УЗЕЛ БЕРЁТСЯ ЦЕЛИКОМ. */
   if (!S->occ[nid]) {
     if (S->voidfloor) {
@@ -246,7 +309,12 @@ static void front_walk(frontstat *S, int32_t nid) {
     take(S, nid, 2);
     return;
   }
-  /* Пол `ε·d` ОТ ИСТОЧНИКА (А508: у Ф2 он от источника, а не от камеры). */
+  /* Пол `ε·d` ОТ ИСТОЧНИКА (А508: у Ф2 он от источника, а не от камеры).
+   *
+   * БЕЗ КОРНЕЙ И БЕЗ ДЕЛЕНИЯ. Условие `(2·rad/R)/ε ≤ px` равносильно
+   * `4·rad² ≤ (px·ε)²·R²`, а `R > rad` — `d2 > r2`. Прежняя запись стоила два
+   * `sqrt` и деление НА КАЖДЫЙ УЗЕЛ, и это была не стоимость индекса, а
+   * стоимость её записи (поправка пользователя 08-05). */
   double r2 = 0.0, d2 = 0.0;
   for (int c = 0; c < 3; c++) {
     double h = 0.5 * (N->hi[c] - N->lo[c]);
@@ -254,8 +322,7 @@ static void front_walk(frontstat *S, int32_t nid) {
     r2 += h * h;
     d2 += dd * dd;
   }
-  double rad = sqrt(r2), R = sqrt(d2);
-  if (R > rad && (2.0 * rad / R) / S->eps <= S->px) {
+  if (d2 > r2 && 4.0 * r2 <= S->pxeps2 * d2) {
     take(S, nid, 1);
     return;
   }
@@ -273,6 +340,9 @@ static void front_walk(frontstat *S, int32_t nid) {
 static void report(const frontstat *S, double secs, const char *name) {
   printf("   %s: ЯЧЕЕК %lld (пустых %lld, с геометрией %lld), уровни %d…%d\n", name,
          (long long)S->ncell, (long long)S->nempty, (long long)S->ngeo, S->levmin, S->levmax);
+  printf("      УЗЛОВ ПРОЙДЕНО %lld (внутренних %lld); байт узлов %.2f ГБ\n", (long long)S->nnode,
+         (long long)(S->nnode - S->ncell),
+         (double)S->nnode * (double)sizeof(hz_ptnode) / 1073741824.0);
   printf("      ПОВТОРНЫХ ВИЗИТОВ %lld (обязано 0); предел ячеек сработал %lld раз\n",
          (long long)S->nrevisit, (long long)S->ncap);
   printf("      спуск остановлен: ПУСТОТОЙ %lld (%.2f %%), ПОЛОМ %lld (%.2f %%), ЛИСТОМ %lld "
@@ -322,7 +392,8 @@ int main(int argc, char **argv) {
                     "[px=4] [voidfloor=1] [bboxocc=1]\n");
     return 1;
   }
-  int leafmax = 0, maxlev = 0, grade = 1, voidfloor = 0, bboxocc = 0, hassrc = 0;
+  int leafmax = 0, maxlev = 0, grade = 1, voidfloor = 0, bboxocc = 0, hassrc = 0, lean = 0,
+      compact = 0;
   double px = 4.0, src[3] = {0.0, 0.0, 0.0};
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "leaf=", 5) == 0) leafmax = (int)strtol(argv[i] + 5, NULL, 10);
@@ -331,6 +402,8 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "px=", 3) == 0) px = strtod(argv[i] + 3, NULL);
     if (strncmp(argv[i], "voidfloor=", 10) == 0) voidfloor = (int)strtol(argv[i] + 10, NULL, 10);
     if (strncmp(argv[i], "bboxocc=", 8) == 0) bboxocc = (int)strtol(argv[i] + 8, NULL, 10);
+    if (strncmp(argv[i], "lean=", 5) == 0) lean = (int)strtol(argv[i] + 5, NULL, 10);
+    if (strncmp(argv[i], "compact=", 8) == 0) compact = (int)strtol(argv[i] + 8, NULL, 10);
     if (strncmp(argv[i], "src=", 4) == 0) {
       char *e = NULL;
       src[0] = strtod(argv[i] + 4, &e);
@@ -457,11 +530,32 @@ int main(int argc, char **argv) {
   memcpy(S.src, src, sizeof src);
   S.eps = HZ_CFG_EPS;
   S.px = px;
+  S.pxeps2 = (px * HZ_CFG_EPS) * (px * HZ_CFG_EPS);
+  S.lean = lean;
   S.voidfloor = voidfloor;
   S.levmin = 99;
   S.levmax = -1;
   t0 = now_s();
-  front_walk(&S, 0);
+  if (compact) {
+    int32_t *ch = malloc((size_t)T.nnd * sizeof *ch);
+    if (ch == NULL) {
+      free(occ);
+      free(bocc);
+      free(seen);
+      hz_ptree_free(&T);
+      hz_obj_free(&m);
+      return 2;
+    }
+    for (int32_t i = 0; i < T.nnd; i++)
+      ch[i] = T.nd[i].child;
+    printf("== КОМПАКТНЫЙ ИНДЕКС: %d узлов по 4 Б = %.3f ГБ против %.3f ГБ полного\n", T.nnd,
+           (double)T.nnd * 4.0 / 1073741824.0,
+           (double)T.nnd * (double)sizeof(hz_ptnode) / 1073741824.0);
+    t0 = now_s();
+    compact_walk(&S, ch, 0, T.nd[0].lo, T.nd[0].hi);
+    free(ch);
+  } else
+    front_walk(&S, 0);
   report(&S, now_s() - t0, voidfloor ? "ОБХОД С ПОЛОМ В ПУСТОТЕ (негативный контроль)" : "ОБХОД");
   free(occ);
   free(bocc);

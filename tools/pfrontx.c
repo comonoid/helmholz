@@ -262,14 +262,18 @@ static void void_walk(frontstat *S, const double *lo, const double *hi, int lev)
     r2 += h * h;
     d2 += dd * dd;
   }
-  double rad = sqrt(r2), R = sqrt(d2);
-  if (lev >= HZ_PFRONT_MAXLEV || (R > rad && (2.0 * rad / R) / S->eps <= S->px)) {
+  /* Та же запись без корней, что и в рабочем обходе: контроль обязан мерить ту
+   * же цену, иначе он сравнивает не то. */
+  if (lev >= HZ_PFRONT_MAXLEV || (d2 > r2 && 4.0 * r2 <= S->pxeps2 * d2)) {
     if (lev >= HZ_PFRONT_MAXLEV) S->ndeep++;
     S->ncell++;
     S->nempty++;
     S->stop_floor++;
-    S->oct_cell[oct_of(R)]++;
-    S->oct_empty[oct_of(R)]++;
+    /* Корень остался ТОЛЬКО здесь — в гистограмме, то есть в диагностике, а не
+     * в критерии спуска. */
+    int o = oct_of(sqrt(d2));
+    S->oct_cell[o]++;
+    S->oct_empty[o]++;
     S->sz[sz_of(hi[0] - lo[0])]++;
     if (lev > S->levmax) S->levmax = lev;
     if (lev < S->levmin) S->levmin = lev;

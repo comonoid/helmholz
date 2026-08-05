@@ -26,9 +26,14 @@ static int pm_at_cut(const hz_pmarch *M, int32_t nid) {
     r2 += h * h;
     d2 += dd * dd;
   }
-  double rad = sqrt(r2), R = sqrt(d2);
-  if (!(R > rad)) return 0;
-  return (2.0 * rad / R) / M->cut.eps <= M->cut.pxcut;
+  /* БЕЗ КОРНЕЙ И БЕЗ ДЕЛЕНИЯ, как в `pfrontx.c` (§255): `(2·rad/R)/ε ≤ px`
+   * равносильно `4·rad² ≤ (px·ε)²·R²`, а `R > rad` — `d2 > r2`. Проверка эта
+   * стоит на КАЖДОМ пройденном узле, а их у луча 832.7 — два `sqrt` и деление
+   * здесь были прямой платой за форму записи. Сравнение «обход против пучка»
+   * без этой правки шло на неравных условиях. */
+  double pxeps = M->cut.pxcut * M->cut.eps;
+  if (!(d2 > r2)) return 0;
+  return 4.0 * r2 <= pxeps * pxeps * d2;
 }
 
 /* Спуск от корня к ячейке среза, содержащей точку `p`. Равенство с серединой

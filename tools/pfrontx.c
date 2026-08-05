@@ -130,6 +130,8 @@ typedef struct {
   int64_t nnode; /* узлов ПРОЙДЕНО, включая внутренние: цена в обращениях к памяти */
   int64_t stop_void, stop_floor, stop_leaf;
   int64_t oct_cell[NOCT], oct_empty[NOCT];
+  int64_t oct_lev[NOCT]; /* сумма уровней ячеек в октаве: падает ли детальность с расстоянием */
+  int64_t sib_empty[9]; /* у родителя с геометрией — сколько из 8 детей пусты (потенциал слияния) */
   int64_t sz[NSZ];
   int64_t ndeep;     /* виртуальных ячеек, упёршихся в предел уровня */
   int64_t nstraddle; /* ячеек, чьи ближняя и дальняя грани в разных октавах (А507) */
@@ -185,6 +187,7 @@ static void take(frontstat *S, int32_t nid, int why) {
   }
   int o = oct_of(sqrt(dc));
   S->oct_cell[o]++;
+  S->oct_lev[o] += lev;
   if (oct_of(sqrt(dnear)) != oct_of(sqrt(dfar))) S->nstraddle++;
   S->sz[sz_of(N->hi[0] - N->lo[0])]++;
   if (S->occ[nid]) {
@@ -334,6 +337,12 @@ static void front_walk(frontstat *S, int32_t nid) {
    * СЧЁТ он не влияет, но обход у Ф3 будет этот же, и заводить его надо здесь,
    * а не переписывать потом. */
   int32_t c0 = N->child;
+  if (!S->lean) {
+    int ne = 0;
+    for (int k = 0; k < 8; k++)
+      if (!S->occ[c0 + k]) ne++;
+    S->sib_empty[ne]++;
+  }
   int near = 0;
   for (int c = 0; c < 3; c++)
     if (S->src[c] >= 0.5 * (N->lo[c] + N->hi[c])) near |= 1 << c;
@@ -371,6 +380,23 @@ static void report(const frontstat *S, double secs, const char *name) {
     if (den > 0.0 || den < 0.0) printf("  -> наклон в log2 = %+.3f", (sw * sxy - sx * sy) / den);
   }
   printf("\n");
+  printf("      СРЕДНИЙ УРОВЕНЬ ЯЧЕЙКИ ПО ОКТАВАМ (падает ли детальность с расстоянием):");
+  for (int o = 0; o < NOCT; o++)
+    if (S->oct_cell[o] > 0)
+      printf(" %d:%.2f", o + OCT0, (double)S->oct_lev[o] / (double)S->oct_cell[o]);
+  printf("\n");
+  printf("      ПУСТЫХ ДЕТЕЙ У РОДИТЕЛЯ С ГЕОМЕТРИЕЙ (0..8):");
+  {
+    int64_t tot = 0, sum = 0;
+    for (int k = 0; k <= 8; k++) {
+      tot += S->sib_empty[k];
+      sum += (int64_t)k * S->sib_empty[k];
+    }
+    for (int k = 0; k <= 8; k++)
+      if (S->sib_empty[k] > 0)
+        printf(" %d:%.3f", k, (double)S->sib_empty[k] / (double)(tot > 0 ? tot : 1));
+    printf("  -> в среднем %.2f из 8\n", tot > 0 ? (double)sum / (double)tot : 0.0);
+  }
   printf("      ДОЛЯ ПУСТЫХ ПО ОКТАВАМ:");
   for (int o = 0; o < NOCT; o++)
     if (S->oct_cell[o] > 0)

@@ -198,6 +198,15 @@ build/psil: tools/psil.c src/scene_obj.c src/pgrid.c src/pgrid.h src/padj.c src/
 build/pcell: tools/pcell.c src/scene_obj.c src/ptree.c src/ptree.h src/poly_seg.c src/poly_seg.h src/pgrid.c src/pgrid.h src/ptrace.c src/ptrace.h | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pcell.c src/scene_obj.c src/ptree.c src/poly_seg.c src/pgrid.c src/ptrace.c -lm'
 
+# pstow — шаг О70 (Ф1, план §244): УКЛАДКА РЕЗКОЙ. Дерево камеронезависимо,
+# срез по полу в пикселях, куски выводятся отсечением и не хранятся.
+build/pstow: tools/pstow.c src/scene_obj.c src/ptree.c src/ptree.h src/pclip.c src/pclip.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pstow.c src/scene_obj.c src/ptree.c src/pclip.c -lm'
+
+# ОТДЕЛЬНОЕ ИМЯ ДЛЯ РАБОТЫ ПОВЕРХ ИДУЩЕГО ПРОГОНА — тот же довод, что у `plodx`.
+build/pstowx: tools/pstow.c src/scene_obj.c src/ptree.c src/pclip.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pstow.c src/scene_obj.c src/ptree.c src/pclip.c -lm'
+
 # pcam — камера сцены находится ЗАМЕРОМ, а не назначается (§187). Обе прежние
 # камеры были назначены на глаз и обе оказались негодными.
 build/pcam: tools/pcam.c src/scene_obj.c src/pgrid.c src/pgrid.h | build

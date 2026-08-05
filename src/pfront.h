@@ -69,13 +69,18 @@ static inline double hz_pfront_at(const hz_pfront_face *F, double u, double v) {
   return f < 0.0 ? 0.0 : (f > 1.0 ? 1.0 : f);
 }
 
-/* ПРЕДСТАВИМА ЛИ доля на грани этого уровня. Критерий — размах линейной части:
- * если по грани доля меняется меньше допуска, грубая грань несёт её без потери,
- * и спускаться незачем. Именно этот предикат и заменяет собой «отсечение»:
- * в глубокой тени он верен тождественно, у края тени — ложен. */
-static inline int hz_pfront_flat(const hz_pfront_face *F) {
-  double s = (F->cu < 0.0 ? -F->cu : F->cu) + (F->cv < 0.0 ? -F->cv : F->cv);
-  return s <= HZ_PFRONT_FRAC_TOL;
+/* МОЖНО ЛИ ОГРУБЛЯТЬ ЗДЕСЬ. Критерий — не «ровно», а ТЕМНО: доля открытого диска
+ * по всей грани ниже допуска. Тогда содержимое ячейки на исход не влияет вовсе
+ * (исходящее = входящее × (1 − перекрытие), а входящее уже ноль), и спускаться
+ * незачем — это и есть огрубление заслонённого ВМЕСТО отсечения.
+ *
+ * ПОЧЕМУ НЕ ПРОСТО «РОВНО», хотя так и было написано сперва: ровным состояние
+ * бывает и на ОТКРЫТОМ СВЕТУ (на входе в сцену оно тождественно единица), а там
+ * огрублять нельзя — именно в освещённых ячейках и рождаются тени. Поймано
+ * первым же прогоном: обход остановился на КОРНЕ, выдав одну ячейку. */
+static inline int hz_pfront_dark(const hz_pfront_face *F) {
+  double a = (F->cu < 0.0 ? -F->cu : F->cu) + (F->cv < 0.0 ? -F->cv : F->cv);
+  return F->c0 + a <= HZ_PFRONT_FRAC_TOL;
 }
 
 /* ШАГ ОПЕРАТОРА: по входящим граням, кускам ячейки и направлению даёт исходящие.
@@ -95,7 +100,9 @@ typedef struct {
   double dir[3], pxeps2, t_entry;
   int fail;
   int64_t ncell, ncell_geo, ncell_void, ncap, npclip;
-  int64_t stop_leaf, stop_floor, stop_flat, nlit, nshadow;
+  int64_t stop_leaf, stop_floor, stop_flat, stop_void, nlit, nshadow;
+  int noshadow;             /* негативный контроль: ни заслонения, ни огрубления по ровности */
+  const unsigned char *occ; /* §241.4: пустой узел берётся целиком; NULL — правило выключено */
 } hz_pfront_ctx;
 
 void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const double *hi,

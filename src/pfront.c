@@ -145,7 +145,7 @@ const char *hz_pfront_note(void) {
 /* Три причины остановить спуск, и третья — ради чего шаг затевался:
  *   ЛИСТ      дерево кончилось;
  *   ПОЛ       угловой размер ячейки упал ниже пола прохода;
- *   РОВНОЕ    все три входящие грани представимы линейно в пределах допуска —
+ *   ТЕМНОЕ    все три входящие грани ниже допуска по доле открытого диска —
  *             это и есть ОГРУБЛЕНИЕ ЗАСЛОНЁННОГО (и освещённого) вместо
  *             отсечения. Ограничено потолком `HZ_PFRONT_COARSEN_MAX`, и
  *             срабатывание потолка считается отдельно. */
@@ -176,7 +176,14 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
                     int32_t n, int coarsened) {
   const hz_ptnode *N = &X->T->nd[nid];
   int stop = 0, why = 0;
-  if (N->child < 0) {
+  /* §241.4: ПУСТОЙ УЗЕЛ БЕРЁТСЯ ЦЕЛИКОМ, каков бы ни был его размер. Оператор
+   * пустого — тождество, и спускаться незачем: линейное состояние проходит
+   * сквозь пустоту ТОЧНО. Правило измерено негативным контролем §263: без него
+   * спуск в пустоте упирается в потолок 150 млн ячеек. */
+  if (X->occ != NULL && !X->occ[nid]) {
+    stop = 1;
+    why = 3;
+  } else if (N->child < 0) {
     stop = 1;
     why = 0;
   } else {
@@ -190,7 +197,8 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
     if (d2 > r2 && 4.0 * r2 <= X->pxeps2 * d2) {
       stop = 1;
       why = 1;
-    } else if (hz_pfront_flat(&in[0]) && hz_pfront_flat(&in[1]) && hz_pfront_flat(&in[2])) {
+    } else if (!X->noshadow && hz_pfront_dark(&in[0]) && hz_pfront_dark(&in[1]) &&
+               hz_pfront_dark(&in[2])) {
       if (coarsened < HZ_PFRONT_COARSEN_MAX) {
         stop = 1;
         why = 2;
@@ -204,6 +212,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
     if (why == 0) X->stop_leaf++;
     if (why == 1) X->stop_floor++;
     if (why == 2) X->stop_flat++;
+    if (why == 3) X->stop_void++;
     hz_pclip_poly pc[HZ_PFRONT_MAXPIECE];
     int np = 0;
     if (n > 0) pf_pieces(X, lo, hi, list, n, pc, &np);
@@ -211,7 +220,11 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
       X->ncell_geo++;
     else
       X->ncell_void++;
-    hz_pfront_step(in, out, pc, np, lo, hi, X->dir);
+    if (X->noshadow) {
+      for (int a = 0; a < 3; a++)
+        out[a] = in[a];
+    } else
+      hz_pfront_step(in, out, pc, np, lo, hi, X->dir);
     double f = out[0].c0 + out[1].c0 + out[2].c0;
     if (f <= 3.0 * HZ_PFRONT_FRAC_TOL)
       X->nshadow++;

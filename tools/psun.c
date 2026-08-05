@@ -21,6 +21,8 @@
 #include <string.h>
 #include <time.h>
 
+#define HZ_REF_RAYS 16 /* лучей на точку выборки: диск солнца мал, шестнадцать дают шаг ~2 % */
+
 static double now_s(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -33,7 +35,7 @@ int main(int argc, char **argv) {
                     "[sun=dx,dy,dz] [shadow=0]\n");
     return 1;
   }
-  int leafmax = 0, maxlev = 0, grade = 1, shadow = 1, cam = 0;
+  int leafmax = 0, maxlev = 0, grade = 1, shadow = 1, cam = 0, nref = 0, cliplev = -1, camfull = 0;
   double px = 9.1, sdir[3] = {0.3, -0.9, 0.3};
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "leaf=", 5) == 0) leafmax = (int)strtol(argv[i] + 5, NULL, 10);
@@ -42,6 +44,9 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "px=", 3) == 0) px = strtod(argv[i] + 3, NULL);
     if (strncmp(argv[i], "shadow=", 7) == 0) shadow = (int)strtol(argv[i] + 7, NULL, 10);
     if (strncmp(argv[i], "cam=", 4) == 0) cam = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "ref=", 4) == 0) nref = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "clip=", 5) == 0) cliplev = (int)strtol(argv[i] + 5, NULL, 10);
+    if (strncmp(argv[i], "camfull=", 8) == 0) camfull = (int)strtol(argv[i] + 8, NULL, 10);
     if (strncmp(argv[i], "sun=", 4) == 0) {
       char *e = NULL;
       sdir[0] = strtod(argv[i] + 4, &e);
@@ -140,6 +145,8 @@ int main(int argc, char **argv) {
   X.thi = thi;
   X.occ = occ;
   X.noshadow = !shadow;
+  X.cliplev = cliplev;
+  X.frustfull = camfull;
   double L = sqrt(sdir[0] * sdir[0] + sdir[1] * sdir[1] + sdir[2] * sdir[2]);
   if (!(L > 0.0)) L = 1.0;
   for (int c = 0; c < 3; c++)
@@ -234,6 +241,15 @@ int main(int argc, char **argv) {
     in[a].cu = 0.0;
     in[a].cv = 0.0;
   }
+  double *refpt = NULL, *refvis = NULL;
+  if (nref > 0) {
+    refpt = malloc(3 * (size_t)nref * sizeof *refpt);
+    refvis = malloc((size_t)nref * sizeof *refvis);
+    X.refpt = refpt;
+    X.refvis = refvis;
+    X.refcap = nref;
+    X.refstride = 997; /* простое число: выборка не попадает в такт обхода */
+  }
   t0 = now_s();
   hz_pfront_walk(&X, 0, T.nd[0].lo, T.nd[0].hi, in, out, list, m.nt, 0);
   double secs = now_s() - t0;
@@ -259,6 +275,11 @@ int main(int argc, char **argv) {
   printf("   ячеек ОСВЕЩЁННЫХ %lld, В ТЕНИ %lld; потолок огрубления сработал %lld раз; предел "
          "кусков %lld раз\n",
          (long long)X.nlit, (long long)X.nshadow, (long long)X.ncap, (long long)X.npclip);
+  printf("   вне пирамиды с ОТПУЩЕННЫМ полом %lld ячеек\n", (long long)X.noutside);
+  printf("   ЯЧЕЕК С ГЕОМЕТРИЕЙ ОДНОЙ ПЛОСКОСТИ %lld из %lld (%.2f %%) — их дробить незачем ни при "
+         "каком поле\n",
+         (long long)X.nflat1, (long long)X.nflatgeo,
+         X.nflatgeo > 0 ? 100.0 * (double)X.nflat1 / (double)X.nflatgeo : 0.0);
   printf("   ВРЕМЯ %.2f с, на ячейку %.1f нс\n", secs,
          X.ncell > 0 ? 1e9 * secs / (double)X.ncell : 0.0);
   free(tlo);

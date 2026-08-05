@@ -1,6 +1,7 @@
 /* pfront.c — обход фронта с переносом состояния. Разбор — в `pfront.h`. */
 #include "pfront.h"
 #include "pclip.h"
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,62 +61,90 @@ static hz_pfront_face face_shift(const hz_pfront_face *F) {
   return *F;
 }
 
-/* ПЕРЕКРЫТИЕ КАК ЛИНЕЙНАЯ ФУНКЦИЯ, А НЕ СКАЛЯР. Первый прогон О73 (§268) показал,
- * зачем: скалярное перекрытие применяется ко ВСЕЙ грани разом, и стена,
- * закрывающая пол-грани, тушит её всю вдвое вместо того, чтобы половина ушла в
- * ноль. Состояние тогда затухает множительно, нуля не достигает никогда, и
- * предикат «темно» не срабатывает — огрубление вышло 0.01…0.19 %% вместо 96 %%.
- * Пространственная структура тени теряется ровно там, где линейное состояние и
- * заведено, чтобы её нести.
- *
- * Проекция куска даёт МНОГОУГОЛЬНИК на грани; его площадь и первые моменты
- * (контурными суммами, Грин) и суть коэффициенты: `c0 = A/4`,
- * `cu = 0.75·∫u`, `cv = 0.75·∫v` в местных координатах `[-1,1]²`, где `∫1 = 4`,
- * `∫u² = 4/3`. */
-static double piece_cover(const hz_pclip_poly *P, const double *lo, const double *hi,
-                          const double *dir, int a, hz_pfront_face *out) {
+/* Прежний точный вариант через `hz_pclip_tri` убран: он строил вершину ПО
+ * ПРОИСХОЖДЕНИЮ ради побитового совпадения у соседей (Г50), а тени это не нужно
+ * ни на что, и стоило 56 нс на кандидата. См. `tri_cover` ниже. */
+
+/* ПЕРЕКРЫТИЕ БЕЗ ТОЧНОГО ОТСЕКАТЕЛЯ (указание пользователя 08-05: «это простая
+ * операция, она не должна занимать много времени, и её можно делать
+ * приблизительно»). Замер, который к этому привёл: вывод кусков занимал 86 %
+ * шага, 56 нс на кандидата — потому что звался `hz_pclip_tri`, строящий вершину
+ * ПО ПРОИСХОЖДЕНИЮ ради побитового совпадения у соседей разных уровней (Г50).
+ * Тени эта точность не нужна ни на что: доля перекрытия есть площадь, а не
+ * стык. Здесь треугольник СНОСИТСЯ вдоль направления на грань и отсекается
+ * КВАДРАТОМ в двумерии — четыре полуплоскости, не более семи вершин, ни одного
+ * трёхмерного отсечения и ни одной записи о происхождении. */
+static double tri_cover(const double *A, const double *B, const double *C, const double *lo,
+                        const double *hi, const double *dir, int a, hz_pfront_face *out) {
   int p, q;
   face_axes(a, &p, &q);
-  /* Постусловие `nv ≤ 9` доказано в `pclip`, но СЮДА кусок приходит извне, и
-   * анализатор справедливо не берёт его на веру. Проверка явная — она же граница
-   * буферов ниже. */
-  int nv = P->nv;
-  if (nv < 3 || nv > HZ_PCLIP_MAXV) return 0.0;
+  if (dir[a] < 1e-300 && dir[a] > -1e-300) return 0.0;
   double du = hi[p] - lo[p], dv = hi[q] - lo[q];
   if (!(du > 0.0) || !(dv > 0.0)) return 0.0;
-  /* Снос вдоль направления на грань `a`: параметр берётся так, чтобы точка легла
-   * в плоскость грани. При `dir[a] == 0` кусок вдоль грани не сносится вовсе. */
-  if (dir[a] < 1e-300 && dir[a] > -1e-300) return 0.0;
   double fa = (dir[a] > 0.0) ? hi[a] : lo[a];
-  /* Явная инициализация: анализатор не связывает заполнение в первом цикле с
-   * чтением во втором (известный класс его слабостей, ср. разбор diam 07-24 в
-   * CLAUDE.md). Девять записей на кусок против шести делений — цена никакая, а
-   * значение определено по построению, а не по рассуждению. */
-  double u[HZ_PCLIP_MAXV] = {0}, v[HZ_PCLIP_MAXV] = {0};
-  for (int i = 0; i < nv; i++) {
-    double t = (fa - P->v[i][a]) / dir[a];
-    u[i] = (P->v[i][p] + t * dir[p] - lo[p]) / du;
-    v[i] = (P->v[i][q] + t * dir[q] - lo[q]) / dv;
+  const double *V[3] = {A, B, C};
+  double x[8], y[8];
+  int n = 3;
+  for (int i = 0; i < 3; i++) {
+    double t = (fa - V[i][a]) / dir[a];
+    x[i] = 2.0 * (V[i][p] + t * dir[p] - lo[p]) / du - 1.0;
+    y[i] = 2.0 * (V[i][q] + t * dir[q] - lo[q]) / dv - 1.0;
   }
-  /* Площадь и первые моменты по Грину. Координаты переводятся в `[-1,1]`. */
+  /* Отсечение квадратом [-1,1]²: четыре полуплоскости, Сазерленд—Ходжман. */
+  for (int e = 0; e < 4; e++) {
+    double x2[8], y2[8];
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+      int j = (i + 1) % n;
+      double si, sj;
+      if (e == 0) {
+        si = x[i] + 1.0;
+        sj = x[j] + 1.0;
+      } else if (e == 1) {
+        si = 1.0 - x[i];
+        sj = 1.0 - x[j];
+      } else if (e == 2) {
+        si = y[i] + 1.0;
+        sj = y[j] + 1.0;
+      } else {
+        si = 1.0 - y[i];
+        sj = 1.0 - y[j];
+      }
+      if (si >= 0.0 && m < 8) {
+        x2[m] = x[i];
+        y2[m] = y[i];
+        m++;
+      }
+      if ((si >= 0.0) != (sj >= 0.0) && m < 8) {
+        double d = si - sj;
+        double t = (d > 1e-300 || d < -1e-300) ? si / d : 0.0;
+        x2[m] = x[i] + t * (x[j] - x[i]);
+        y2[m] = y[i] + t * (y[j] - y[i]);
+        m++;
+      }
+    }
+    n = m;
+    if (n < 3) return 0.0;
+    for (int i = 0; i < n; i++) {
+      x[i] = x2[i];
+      y[i] = y2[i];
+    }
+  }
   double s = 0.0, mu = 0.0, mv = 0.0;
-  for (int i = 0; i < nv; i++) {
-    int j = (i + 1) % nv;
-    double x0 = 2.0 * u[i] - 1.0, y0 = 2.0 * v[i] - 1.0;
-    double x1 = 2.0 * u[j] - 1.0, y1 = 2.0 * v[j] - 1.0;
-    double cr = x0 * y1 - x1 * y0;
+  for (int i = 0; i < n; i++) {
+    int j = (i + 1) % n;
+    double cr = x[i] * y[j] - x[j] * y[i];
     s += cr;
-    mu += (x0 + x1) * cr;
-    mv += (y0 + y1) * cr;
+    mu += (x[i] + x[j]) * cr;
+    mv += (y[i] + y[j]) * cr;
   }
-  double A = 0.5 * s;
-  double sg = (A < 0.0) ? -1.0 : 1.0;
-  A *= sg;
-  if (!(A > 0.0)) return 0.0;
-  out->c0 = 0.25 * A;
+  double Ar = 0.5 * s, sg = (Ar < 0.0) ? -1.0 : 1.0;
+  Ar *= sg;
+  if (!(Ar > 0.0)) return 0.0;
+  out->c0 = 0.25 * Ar;
   out->cu = 0.75 * sg * mu / 6.0;
   out->cv = 0.75 * sg * mv / 6.0;
-  return A;
+  return Ar;
 }
 
 /* Ослабить грань перекрытием, которое САМО линейно. Произведение двух линейных
@@ -134,32 +163,38 @@ static hz_pfront_face face_block(const hz_pfront_face *F, const hz_pfront_face *
   return R;
 }
 
-int hz_pfront_step(const hz_pfront_face in[3], hz_pfront_face out[3], const hz_pclip_poly *pieces,
-                   int npiece, const double *lo, const double *hi, const double *dir) {
+/* Затенить грани ячейки прямо по КАНДИДАТАМ, без вывода кусков. Возврат: было ли
+ * в ячейке хоть какое-то перекрытие. */
+int hz_pfront_shade(const hz_pfront_face in[3], hz_pfront_face out[3], const hz_objmesh *m,
+                    const int32_t *list, int32_t n, const double *lo, const double *hi,
+                    const double *dir) {
+  int any = 0;
   for (int a = 0; a < 3; a++) {
     /* КОНСЕРВАТИВНО (А517): берётся ОДИН кусок — с наибольшей проекцией, — а не
      * сумма по всем. Сумма объявила бы закрытым угол, который открыт (проекции
      * пересекаются), и погасила бы свет там, где он есть. Один кусок есть
      * заведомо НИЖНЯЯ оценка объединения, и для главного случая — стена в
      * ячейке — она ТОЧНАЯ, потому что кусок там один. */
-    hz_pfront_face cov = {0.0, 0.0, 0.0}, best = {0.0, 0.0, 0.0};
+    hz_pfront_face best = {0.0, 0.0, 0.0};
     double ba = 0.0;
-    for (int i = 0; i < npiece; i++) {
-      /* Инициализация обязательна: `piece_cover` на ранних отказах возвращает 0 и
-       * коэффициентов не пишет, а анализатор связь «вернул 0 — не читаем» не
-       * видит (тот же класс, что выше). */
+    for (int32_t i = 0; i < n; i++) {
+      int32_t t = list[i];
+      const double *A = m->v + 3 * (size_t)m->f[3 * (size_t)t + 0];
+      const double *B = m->v + 3 * (size_t)m->f[3 * (size_t)t + 1];
+      const double *C = m->v + 3 * (size_t)m->f[3 * (size_t)t + 2];
       hz_pfront_face c = {0.0, 0.0, 0.0};
-      double A = piece_cover(&pieces[i], lo, hi, dir, a, &c);
-      if (A > ba) {
-        ba = A;
+      double Aa = tri_cover(A, B, C, lo, hi, dir, a, &c);
+      if (Aa > ba) {
+        ba = Aa;
         best = c;
       }
     }
-    cov = best;
+    if (ba > 0.0) any = 1;
+    hz_pfront_face cov = best;
     hz_pfront_face f = face_shift(&in[a]);
     out[a] = face_block(&f, &cov);
   }
-  return 0;
+  return any;
 }
 
 const char *hz_pfront_note(void) {
@@ -198,22 +233,6 @@ static int box_hits3(const double *bl, const double *bh, const double *clo, cons
   return 1;
 }
 
-static void pf_pieces(hz_pfront_ctx *X, const double *lo, const double *hi, const int32_t *list,
-                      int32_t n, hz_pclip_poly *out, int *np) {
-  int k = 0;
-  for (int32_t i = 0; i < n && k < HZ_PFRONT_MAXPIECE; i++) {
-    int32_t t = list[i];
-    const double *A = X->m->v + 3 * (size_t)X->m->f[3 * (size_t)t + 0];
-    const double *B = X->m->v + 3 * (size_t)X->m->f[3 * (size_t)t + 1];
-    const double *C = X->m->v + 3 * (size_t)X->m->f[3 * (size_t)t + 2];
-    hz_pclip_poly P;
-    hz_pclip_tri(A, B, C, lo, hi, &P);
-    if (P.nv >= 3 && hz_pclip_area(&P) > 0.0) out[k++] = P;
-  }
-  if (n > HZ_PFRONT_MAXPIECE) X->npclip++;
-  *np = k;
-}
-
 void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const double *hi,
                     const hz_pfront_face in[3], hz_pfront_face out[3], const int32_t *list,
                     int32_t n, int coarsened) {
@@ -223,13 +242,26 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
    * камере, и её собственная подробность этому проходу не нужна. Берётся целиком
    * (огрубление), а не отбрасывается: свет в ней есть, и другим проходам она
    * нужна. */
+  /* ВНЕ ПИРАМИДЫ — ПОДНЯТЬСЯ НА ПАРУ УРОВНЕЙ, А НЕ ОСТАНОВИТЬСЯ СОВСЕМ
+   * (уточнение пользователя 08-05). Разница существенная: остановка совсем
+   * означала бы, что ячейка вне кадра не рассматривается вовсе, а она ЗАСЛОНЯЕТ
+   * — её тень падает ВНУТРЬ кадра (§241.5, §259 граница 1). Поэтому вне
+   * пирамиды пол лишь ОТПУСКАЕТСЯ: при подъёме на `N` уровней допустимый размер
+   * ячейки растёт вдвое на уровень, а критерий `4·r² ≤ (px·ε)²·d²` — вчетверо.
+   * `frustfull = 1` даёт прежнее поведение (остановка совсем) — оно есть ВЕРХНЯЯ
+   * ГРАНИЦА выигрыша, и держать её рядом полезно. */
+  double pxe2 = X->pxeps2;
   if (X->usefrustum) {
-    for (int k = 0; k < 6; k++) {
+    int outside = 0;
+    for (int k = 0; k < 6 && !outside; k++) {
       const double *P = X->fr[k];
       double s = P[3];
       for (int c = 0; c < 3; c++)
         s += (P[c] > 0.0 ? hi[c] : lo[c]) * P[c];
-      if (s < 0.0) {
+      if (s < 0.0) outside = 1;
+    }
+    if (outside) {
+      if (X->frustfull) {
         X->ncell++;
         X->stop_flat++;
         X->nshadow++;
@@ -240,6 +272,9 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         }
         return;
       }
+      for (int k = 0; k < HZ_PFRONT_COARSEN_MAX; k++)
+        pxe2 *= 4.0;
+      X->noutside++;
     }
   }
   /* §241.4: ПУСТОЙ УЗЕЛ БЕРЁТСЯ ЦЕЛИКОМ, каков бы ни был его размер. Оператор
@@ -260,7 +295,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
       t += 0.5 * (lo[c] + hi[c]) * X->dir[c];
     }
     double dep = t - X->t_entry, d2 = dep * dep;
-    if (d2 > r2 && 4.0 * r2 <= X->pxeps2 * d2) {
+    if (d2 > r2 && 4.0 * r2 <= pxe2 * d2) {
       stop = 1;
       why = 1;
     } else if (!X->noshadow && pf_dark3(in, X->dir)) {
@@ -278,18 +313,90 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
     if (why == 1) X->stop_floor++;
     if (why == 2) X->stop_flat++;
     if (why == 3) X->stop_void++;
-    hz_pclip_poly pc[HZ_PFRONT_MAXPIECE];
-    int np = 0;
-    if (n > 0) pf_pieces(X, lo, hi, list, n, pc, &np);
-    if (np > 0)
+    /* Куски для ЭТОГО прохода больше не выводятся: перекрытие считается прямо по
+     * треугольникам-кандидатам дешёвой двумерной проекцией (см. `tri_cover`). */
+    /* КУСКИ ВЫВОДЯТСЯ ТОЛЬКО ТАМ, ГДЕ ОНИ НУЖНЫ, и это не оптимизация, а
+     * устранение заведомо напрасной работы. Отсечение стоит ~2300 нс на ячейку
+     * против 12…19 нс у обхода без света (§255), то есть почти вся цена шага
+     * сидит здесь. Два случая, где оно НЕ нужно и это ТОЧНО, а не приближённо:
+     *   ПУСТАЯ ЯЧЕЙКА — `occ` уже говорит, что куска с ненулевой площадью нет;
+     *     кандидаты по ГАБАРИТУ при этом есть, и на зале их 97 % против 13 %
+     *     настоящих (А511) — вот эта разница и резалась впустую;
+     *   ТЁМНАЯ ЯЧЕЙКА — заслонять нечего: исходящее есть входящее, умноженное
+     *     на (1 − перекрытие), а входящее уже ноль. */
+    /* ОТСЕЧЕНИЕ ВЕДЁТСЯ ТОЛЬКО ПО КРУПНЫМ ЭЛЕМЕНТАМ (указание пользователя 08-05).
+     * Замер: вывод кусков есть 86 %% времени шага (2329 нс на ячейку против 314 нс
+     * без него), и почти вся эта работа повторяет уже сделанное — тень
+     * устанавливается КРУПНОЙ ячейкой, а мелкие лишь пересчитывают ту же
+     * поверхность заново. Глубже `cliplev` куски не выводятся: перекрытие там
+     * берётся нулевым, то есть тень остаётся такой, какой её установил крупный
+     * элемент. Это НИЖНЯЯ оценка заслонения, как и всё в А517. */
+    int has = 0;
+    if (X->noshadow || !(n > 0) || why == 3 || pf_dark3(in, X->dir) ||
+        (X->cliplev >= 0 && (int)X->T->lev[nid] > X->cliplev)) {
+      for (int a = 0; a < 3; a++)
+        out[a] = in[a];
+      has = (why != 3);
+    } else {
+      has = hz_pfront_shade(in, out, X->m, list, n, lo, hi, X->dir);
+    }
+    /* ДИАГНОСТИКА «СОБСТВЕННОЙ МЕЛКОСТИ» УЗЛА (разбор с пользователем 08-05:
+     * сейчас тон задаёт общий уровень фронта, а менее детальный объект ничего не
+     * экономит). Гипотеза: у большинства ячеек вся геометрия лежит в ОДНОЙ
+     * плоскости, и такую ячейку дробить незачем при любом поле. Считается
+     * сравнением нормалей и смещений с первым кандидатом; допуск — тот же
+     * относительный, что у слияния компланарных в О70 (шестнадцатая доля ребра). */
+    if (has && n > 0) {
+      X->nflatgeo++;
+      double h0 = hi[0] - lo[0];
+      double tol = 0.0625 * h0;
+      const double *v0 = X->m->v;
+      const int32_t *f0 = X->m->f;
+      double n0[3] = {0.0, 0.0, 0.0}, d0 = 0.0;
+      int one = 1, first = 1;
+      for (int32_t i = 0; i < n && one; i++) {
+        int32_t t = list[i];
+        const double *A = v0 + 3 * (size_t)f0[3 * (size_t)t + 0];
+        const double *B = v0 + 3 * (size_t)f0[3 * (size_t)t + 1];
+        const double *C = v0 + 3 * (size_t)f0[3 * (size_t)t + 2];
+        double e1[3], e2[3], nr[3];
+        for (int c = 0; c < 3; c++) {
+          e1[c] = B[c] - A[c];
+          e2[c] = C[c] - A[c];
+        }
+        nr[0] = e1[1] * e2[2] - e1[2] * e2[1];
+        nr[1] = e1[2] * e2[0] - e1[0] * e2[2];
+        nr[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        double ln = nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2];
+        if (!(ln > 0.0)) continue;
+        ln = 1.0 / sqrt(ln);
+        for (int c = 0; c < 3; c++)
+          nr[c] *= ln;
+        double dd = nr[0] * A[0] + nr[1] * A[1] + nr[2] * A[2];
+        if (first) {
+          for (int c = 0; c < 3; c++)
+            n0[c] = nr[c];
+          d0 = dd;
+          first = 0;
+          continue;
+        }
+        double dot = n0[0] * nr[0] + n0[1] * nr[1] + n0[2] * nr[2];
+        double sg = (dot < 0.0) ? -1.0 : 1.0;
+        double gap = 0.0;
+        for (int c = 0; c < 3; c++) {
+          double dn = n0[c] - sg * nr[c];
+          gap += (dn < 0.0 ? -dn : dn) * 0.5 * h0;
+        }
+        double dd2 = d0 - sg * dd;
+        gap += (dd2 < 0.0 ? -dd2 : dd2);
+        if (gap > tol) one = 0;
+      }
+      if (one) X->nflat1++;
+    }
+    if (has)
       X->ncell_geo++;
     else
       X->ncell_void++;
-    if (X->noshadow) {
-      for (int a = 0; a < 3; a++)
-        out[a] = in[a];
-    } else
-      hz_pfront_step(in, out, pc, np, lo, hi, X->dir);
     /* Освещённость ячейки — тоже по ПОТОКУ, а не среднее по трём граням. */
     double fl = 0.0, w = 0.0;
     for (int a = 0; a < 3; a++) {
@@ -302,6 +409,20 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         X->nshadow++;
       else if (fl >= w * (1.0 - HZ_PFRONT_FRAC_TOL))
         X->nlit++;
+    }
+    /* Запись в выборку эталона. Берётся ВХОДЯЩЕЕ состояние, взвешенное потоком:
+     * именно оно есть «сколько диска видно этой ячейке». */
+    if (X->refpt != NULL && X->refn < X->refcap && X->refstride > 0 &&
+        (X->ncell % X->refstride) == 0 && w > 0.0) {
+      double fi = 0.0;
+      for (int a = 0; a < 3; a++) {
+        double wa = (X->dir[a] < 0.0) ? -X->dir[a] : X->dir[a];
+        fi += wa * in[a].c0;
+      }
+      for (int c = 0; c < 3; c++)
+        X->refpt[3 * (size_t)X->refn + (size_t)c] = 0.5 * (lo[c] + hi[c]);
+      X->refvis[X->refn] = fi / w;
+      X->refn++;
     }
     return;
   }

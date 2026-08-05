@@ -33,7 +33,7 @@ int main(int argc, char **argv) {
                     "[sun=dx,dy,dz] [shadow=0]\n");
     return 1;
   }
-  int leafmax = 0, maxlev = 0, grade = 1, shadow = 1;
+  int leafmax = 0, maxlev = 0, grade = 1, shadow = 1, cam = 0;
   double px = 9.1, sdir[3] = {0.3, -0.9, 0.3};
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "leaf=", 5) == 0) leafmax = (int)strtol(argv[i] + 5, NULL, 10);
@@ -41,6 +41,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "grade=", 6) == 0) grade = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "px=", 3) == 0) px = strtod(argv[i] + 3, NULL);
     if (strncmp(argv[i], "shadow=", 7) == 0) shadow = (int)strtol(argv[i] + 7, NULL, 10);
+    if (strncmp(argv[i], "cam=", 4) == 0) cam = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "sun=", 4) == 0) {
       char *e = NULL;
       sdir[0] = strtod(argv[i] + 4, &e);
@@ -150,6 +151,77 @@ int main(int argc, char **argv) {
     for (int c = 0; c < 3; c++)
       t += ((k & (1 << c)) ? T.nd[0].hi[c] : T.nd[0].lo[c]) * X.dir[c];
     if (t < X.t_entry) X.t_entry = t;
+  }
+  /* ПИРАМИДА КАМЕРЫ (ключ `cam=1`). Глаз и цель — из `scene_cfg.h`, где камеры
+   * НАЙДЕНЫ ЗАМЕРОМ, а не назначены (§187); поле зрения и разрешение оттуда же.
+   * Плоскости строятся нормалями ВНУТРЬ. */
+  if (cam) {
+    double e[3], at[3];
+    if (strstr(argv[1], "conference") != NULL) {
+      double a1[3] = HZ_CFG_HALL_EYE, a2[3] = HZ_CFG_HALL_AT;
+      memcpy(e, a1, sizeof e);
+      memcpy(at, a2, sizeof at);
+    } else if (strstr(argv[1], "rungholt") != NULL) {
+      double a1[3] = HZ_CFG_CITY_EYE, a2[3] = HZ_CFG_CITY_AT;
+      memcpy(e, a1, sizeof e);
+      memcpy(at, a2, sizeof at);
+    } else {
+      double a1[3] = HZ_CFG_MIGUEL_EYE, a2[3] = HZ_CFG_MIGUEL_AT;
+      memcpy(e, a1, sizeof e);
+      memcpy(at, a2, sizeof at);
+    }
+    double f[3], up[3] = {0.0, 1.0, 0.0}, r[3], u2[3];
+    double ln = 0.0;
+    for (int c = 0; c < 3; c++) {
+      f[c] = at[c] - e[c];
+      ln += f[c] * f[c];
+    }
+    ln = sqrt(ln);
+    if (!(ln > 0.0)) ln = 1.0;
+    for (int c = 0; c < 3; c++)
+      f[c] /= ln;
+    r[0] = f[1] * up[2] - f[2] * up[1];
+    r[1] = f[2] * up[0] - f[0] * up[2];
+    r[2] = f[0] * up[1] - f[1] * up[0];
+    ln = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+    if (!(ln > 0.0)) ln = 1.0;
+    for (int c = 0; c < 3; c++)
+      r[c] /= ln;
+    u2[0] = r[1] * f[2] - r[2] * f[1];
+    u2[1] = r[2] * f[0] - r[0] * f[2];
+    u2[2] = r[0] * f[1] - r[1] * f[0];
+    double th = 0.5 * HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0;
+    double cs = cos(th), sn = sin(th);
+    /* Четыре боковые: нормаль внутрь есть cs·(ось) ± sn·(вперёд) с точностью до
+     * знака; ближняя — плоскость через глаз вперёд. */
+    double nn[6][3];
+    for (int c = 0; c < 3; c++) {
+      nn[0][c] = cs * r[c] + sn * f[c];
+      nn[1][c] = -cs * r[c] + sn * f[c];
+      nn[2][c] = cs * u2[c] + sn * f[c];
+      nn[3][c] = -cs * u2[c] + sn * f[c];
+      nn[4][c] = f[c];
+      nn[5][c] = -f[c];
+    }
+    for (int k = 0; k < 6; k++) {
+      double d = 0.0;
+      for (int c = 0; c < 3; c++) {
+        X.fr[k][c] = nn[k][c];
+        d += nn[k][c] * e[c];
+      }
+      X.fr[k][3] = -d;
+    }
+    /* Дальняя плоскость: сцена целиком, то есть отодвинута за диагональ. */
+    double diag = 0.0;
+    for (int c = 0; c < 3; c++) {
+      double s = T.nd[0].hi[c] - T.nd[0].lo[c];
+      diag += s * s;
+    }
+    X.fr[5][3] += sqrt(diag);
+    X.usefrustum = 1;
+    printf("== ПИРАМИДА КАМЕРЫ: глаз %.2f,%.2f,%.2f, цель %.2f,%.2f,%.2f, поле %.0f°;\n"
+           "   ячейка ЦЕЛИКОМ снаружи берётся ОДНОЙ (огрубление), а не выбрасывается\n",
+           e[0], e[1], e[2], at[0], at[1], at[2], HZ_CFG_FOV_DEG);
   }
   printf("== ФРОНТ: направление %.3f,%.3f,%.3f, пол %g px ОТ ИСТОЧНИКА, потолок огрубления %d, "
          "заслонение %s\n",

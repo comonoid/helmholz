@@ -207,6 +207,11 @@ build/pstow: tools/pstow.c src/scene_obj.c src/ptree.c src/ptree.h src/pclip.c s
 build/pstowx: tools/pstow.c src/scene_obj.c src/ptree.c src/pclip.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pstow.c src/scene_obj.c src/ptree.c src/pclip.c -lm'
 
+# pmarchx — шаг О71 (Ф2, план §247): ОБХОД И ПУСТОТА. Марш луча по ячейкам среза;
+# касания как функция расстояния и распределение длины шага.
+build/pmarchx: tools/pmarchx.c src/scene_obj.c src/ptree.c src/ptree.h src/pclip.c src/pclip.h src/pmarch.c src/pmarch.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pmarchx.c src/scene_obj.c src/ptree.c src/pclip.c src/pmarch.c -lm'
+
 # pcam — камера сцены находится ЗАМЕРОМ, а не назначается (§187). Обе прежние
 # камеры были назначены на глаз и обе оказались негодными.
 build/pcam: tools/pcam.c src/scene_obj.c src/pgrid.c src/pgrid.h | build

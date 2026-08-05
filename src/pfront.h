@@ -38,6 +38,7 @@
 #ifndef HZ_PFRONT_H
 #define HZ_PFRONT_H
 
+#include "pclip.h"
 #include "ptree.h"
 
 /* ПОТОЛОК ОГРУБЛЕНИЯ ЗАСЛОНЁННОГО, В УРОВНЯХ. Не выведенная величина, а
@@ -76,5 +77,32 @@ static inline int hz_pfront_flat(const hz_pfront_face *F) {
   double s = (F->cu < 0.0 ? -F->cu : F->cu) + (F->cv < 0.0 ? -F->cv : F->cv);
   return s <= HZ_PFRONT_FRAC_TOL;
 }
+
+/* ШАГ ОПЕРАТОРА: по входящим граням, кускам ячейки и направлению даёт исходящие.
+ * Пустая ячейка (`npiece == 0`) — тождество, шаг во весь узел. */
+int hz_pfront_step(const hz_pfront_face in[3], hz_pfront_face out[3], const hz_pclip_poly *pieces,
+                   int npiece, const double *lo, const double *hi, const double *dir);
+/* ПРЕДЕЛ ЧИСЛА КУСКОВ, РАЗБИРАЕМЫХ В ЯЧЕЙКЕ. Остаток на дне может быть толстым
+ * (§241.6: куст — сотни кусков), и разбирать его поштучно незачем: перекрытие
+ * берётся максимумом, а не суммой. Срабатывание считается и печатается. */
+#define HZ_PFRONT_MAXPIECE 64
+
+#include "scene_obj.h"
+typedef struct {
+  const hz_ptree *T;
+  const hz_objmesh *m;
+  const double *tlo, *thi;
+  double dir[3], pxeps2, t_entry;
+  int fail;
+  int64_t ncell, ncell_geo, ncell_void, ncap, npclip;
+  int64_t stop_leaf, stop_floor, stop_flat, nlit, nshadow;
+} hz_pfront_ctx;
+
+void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const double *hi,
+                    const hz_pfront_face in[3], hz_pfront_face out[3], const int32_t *list,
+                    int32_t n, int coarsened);
+
+/* Оговорка о том, что в операторе приближено, — печатается в докладе. */
+const char *hz_pfront_note(void);
 
 #endif

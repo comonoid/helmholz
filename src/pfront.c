@@ -145,7 +145,10 @@ int hz_pfront_step(const hz_pfront_face in[3], hz_pfront_face out[3], const hz_p
     hz_pfront_face cov = {0.0, 0.0, 0.0}, best = {0.0, 0.0, 0.0};
     double ba = 0.0;
     for (int i = 0; i < npiece; i++) {
-      hz_pfront_face c;
+      /* Инициализация обязательна: `piece_cover` на ранних отказах возвращает 0 и
+       * коэффициентов не пишет, а анализатор связь «вернул 0 — не читаем» не
+       * видит (тот же класс, что выше). */
+      hz_pfront_face c = {0.0, 0.0, 0.0};
       double A = piece_cover(&pieces[i], lo, hi, dir, a, &c);
       if (A > ba) {
         ba = A;

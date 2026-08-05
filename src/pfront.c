@@ -60,20 +60,20 @@ static hz_pfront_face face_shift(const hz_pfront_face *F) {
   return *F;
 }
 
-/* КОНСЕРВАТИВНАЯ ОЦЕНКА ПЕРЕКРЫТИЯ (А517). Складывать доли отдельных кусков
- * нельзя: их проекции пересекаются, и сумма объявит закрытым угол, который
- * открыт, — ошибка несимметрична и гасит свет там, где он есть (класс А475).
- * Поэтому берётся МАКСИМУМ по кускам, то есть заведомая НИЖНЯЯ оценка
- * перекрытия. Следствие: тени выходят слабее настоящих, огрубления МЕНЬШЕ, и
- * измеренный выигрыш есть НИЖНЯЯ граница. Ошибаться в эту сторону безопасно. */
-static double cover_max(double m) {
-  return m > 1.0 ? 1.0 : m;
-}
-
-/* Площадь проекции куска на грань оси `a`, делённая на площадь грани. Проекция
- * идёт ВДОЛЬ НАПРАВЛЕНИЯ, а не по нормали: заслоняет то, что стоит на пути. */
+/* ПЕРЕКРЫТИЕ КАК ЛИНЕЙНАЯ ФУНКЦИЯ, А НЕ СКАЛЯР. Первый прогон О73 (§268) показал,
+ * зачем: скалярное перекрытие применяется ко ВСЕЙ грани разом, и стена,
+ * закрывающая пол-грани, тушит её всю вдвое вместо того, чтобы половина ушла в
+ * ноль. Состояние тогда затухает множительно, нуля не достигает никогда, и
+ * предикат «темно» не срабатывает — огрубление вышло 0.01…0.19 %% вместо 96 %%.
+ * Пространственная структура тени теряется ровно там, где линейное состояние и
+ * заведено, чтобы её нести.
+ *
+ * Проекция куска даёт МНОГОУГОЛЬНИК на грани; его площадь и первые моменты
+ * (контурными суммами, Грин) и суть коэффициенты: `c0 = A/4`,
+ * `cu = 0.75·∫u`, `cv = 0.75·∫v` в местных координатах `[-1,1]²`, где `∫1 = 4`,
+ * `∫u² = 4/3`. */
 static double piece_cover(const hz_pclip_poly *P, const double *lo, const double *hi,
-                          const double *dir, int a) {
+                          const double *dir, int a, hz_pfront_face *out) {
   int p, q;
   face_axes(a, &p, &q);
   /* Постусловие `nv ≤ 9` доказано в `pclip`, но СЮДА кусок приходит извне, и
@@ -97,48 +97,71 @@ static double piece_cover(const hz_pclip_poly *P, const double *lo, const double
     u[i] = (P->v[i][p] + t * dir[p] - lo[p]) / du;
     v[i] = (P->v[i][q] + t * dir[q] - lo[q]) / dv;
   }
-  double s = 0.0;
+  /* Площадь и первые моменты по Грину. Координаты переводятся в `[-1,1]`. */
+  double s = 0.0, mu = 0.0, mv = 0.0;
   for (int i = 0; i < nv; i++) {
     int j = (i + 1) % nv;
-    s += u[i] * v[j] - u[j] * v[i];
+    double x0 = 2.0 * u[i] - 1.0, y0 = 2.0 * v[i] - 1.0;
+    double x1 = 2.0 * u[j] - 1.0, y1 = 2.0 * v[j] - 1.0;
+    double cr = x0 * y1 - x1 * y0;
+    s += cr;
+    mu += (x0 + x1) * cr;
+    mv += (y0 + y1) * cr;
   }
-  s = 0.5 * (s < 0.0 ? -s : s);
-  return s > 1.0 ? 1.0 : s;
+  double A = 0.5 * s;
+  double sg = (A < 0.0) ? -1.0 : 1.0;
+  A *= sg;
+  if (!(A > 0.0)) return 0.0;
+  out->c0 = 0.25 * A;
+  out->cu = 0.75 * sg * mu / 6.0;
+  out->cv = 0.75 * sg * mv / 6.0;
+  return A;
 }
 
-/* Ослабить грань перекрытием `c` (доля [0,1]), сохраняя линейность. */
-static hz_pfront_face face_block(const hz_pfront_face *F, double c) {
+/* Ослабить грань перекрытием, которое САМО линейно. Произведение двух линейных
+ * функций квадратично, поэтому берётся его L²-проекция обратно на линейный базис:
+ * на квадрате `[-1,1]²` со средним `u² = 1/3` это даёт
+ * `c0 = f0·g0 + (fu·gu + fv·gv)/3`, `cu = f0·gu + fu·g0`, `cv = f0·gv + fv·g0`.
+ * Точная проекция, а не усечение: тот же приём, что Р2 у огрубления. */
+static hz_pfront_face face_block(const hz_pfront_face *F, const hz_pfront_face *C) {
+  /* g = 1 − C */
+  double g0 = 1.0 - C->c0, gu = -C->cu, gv = -C->cv;
   hz_pfront_face R;
-  double k = 1.0 - c;
-  R.c0 = F->c0 * k;
-  R.cu = F->cu * k;
-  R.cv = F->cv * k;
+  R.c0 = F->c0 * g0 + (F->cu * gu + F->cv * gv) / 3.0;
+  R.cu = F->c0 * gu + F->cu * g0;
+  R.cv = F->c0 * gv + F->cv * g0;
+  if (R.c0 < 0.0) R.c0 = 0.0;
   return R;
 }
 
 int hz_pfront_step(const hz_pfront_face in[3], hz_pfront_face out[3], const hz_pclip_poly *pieces,
                    int npiece, const double *lo, const double *hi, const double *dir) {
-  double cov[3];
   for (int a = 0; a < 3; a++) {
-    /* Максимум копится на месте: временный массив здесь не нужен, а cppcheck на
-     * нём справедливо ругался — при `npiece == 0` он оставался незаполненным. */
-    double m = 0.0;
+    /* КОНСЕРВАТИВНО (А517): берётся ОДИН кусок — с наибольшей проекцией, — а не
+     * сумма по всем. Сумма объявила бы закрытым угол, который открыт (проекции
+     * пересекаются), и погасила бы свет там, где он есть. Один кусок есть
+     * заведомо НИЖНЯЯ оценка объединения, и для главного случая — стена в
+     * ячейке — она ТОЧНАЯ, потому что кусок там один. */
+    hz_pfront_face cov = {0.0, 0.0, 0.0}, best = {0.0, 0.0, 0.0};
+    double ba = 0.0;
     for (int i = 0; i < npiece; i++) {
-      double c = piece_cover(&pieces[i], lo, hi, dir, a);
-      if (c > m) m = c;
+      hz_pfront_face c;
+      double A = piece_cover(&pieces[i], lo, hi, dir, a, &c);
+      if (A > ba) {
+        ba = A;
+        best = c;
+      }
     }
-    cov[a] = cover_max(m);
-  }
-  for (int a = 0; a < 3; a++) {
+    cov = best;
     hz_pfront_face f = face_shift(&in[a]);
-    out[a] = face_block(&f, cov[a]);
+    out[a] = face_block(&f, &cov);
   }
   return 0;
 }
 
 const char *hz_pfront_note(void) {
-  return "состояние линейное (Р1); перекрытие — МАКСИМУМ по кускам, то есть нижняя "
-         "оценка (А517), значит и выигрыш от огрубления — нижняя граница";
+  return "состояние и перекрытие ЛИНЕЙНЫ (Р1); перекрытие берётся по ОДНОМУ куску с "
+         "наибольшей проекцией — нижняя оценка объединения (А517), точная там, где кусок один";
 }
 
 /* ---- ОБХОД С ПЕРЕНОСОМ СОСТОЯНИЯ ------------------------------------------ */
@@ -149,6 +172,23 @@ const char *hz_pfront_note(void) {
  *             это и есть ОГРУБЛЕНИЕ ЗАСЛОНЁННОГО (и освещённого) вместо
  *             отсечения. Ограничено потолком `HZ_PFRONT_COARSEN_MAX`, и
  *             срабатывание потолка считается отдельно. */
+/* ТЕМНО ЛИ ВХОДЯЩЕЕ, СЧИТАЯ ПО ПОТОКУ. Грани взвешиваются `|dir[a]|`: у
+ * параллельного фронта грань, перпендикулярная которой составляющая направления
+ * равна нулю, потока НЕ НЕСЁТ ВОВСЕ, и требовать на ней темноты бессмысленно.
+ * Поймано прогоном с солнцем строго вниз: там осей с потоком одна из трёх, и
+ * невзвешенный предикат не срабатывал никогда. */
+static int pf_dark3(const hz_pfront_face in[3], const double *dir) {
+  double fl = 0.0, w = 0.0;
+  for (int a = 0; a < 3; a++) {
+    double wa = (dir[a] < 0.0) ? -dir[a] : dir[a];
+    double cu = (in[a].cu < 0.0) ? -in[a].cu : in[a].cu;
+    double cv = (in[a].cv < 0.0) ? -in[a].cv : in[a].cv;
+    w += wa;
+    fl += wa * (in[a].c0 + cu + cv);
+  }
+  return w > 0.0 && fl <= w * HZ_PFRONT_FRAC_TOL;
+}
+
 static int box_hits3(const double *bl, const double *bh, const double *clo, const double *chi) {
   for (int c = 0; c < 3; c++)
     if (!(bl[c] < chi[c]) || !(bh[c] >= clo[c])) return 0;
@@ -197,8 +237,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
     if (d2 > r2 && 4.0 * r2 <= X->pxeps2 * d2) {
       stop = 1;
       why = 1;
-    } else if (!X->noshadow && hz_pfront_dark(&in[0]) && hz_pfront_dark(&in[1]) &&
-               hz_pfront_dark(&in[2])) {
+    } else if (!X->noshadow && pf_dark3(in, X->dir)) {
       if (coarsened < HZ_PFRONT_COARSEN_MAX) {
         stop = 1;
         why = 2;
@@ -225,11 +264,19 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         out[a] = in[a];
     } else
       hz_pfront_step(in, out, pc, np, lo, hi, X->dir);
-    double f = out[0].c0 + out[1].c0 + out[2].c0;
-    if (f <= 3.0 * HZ_PFRONT_FRAC_TOL)
-      X->nshadow++;
-    else if (f >= 3.0 * (1.0 - HZ_PFRONT_FRAC_TOL))
-      X->nlit++;
+    /* Освещённость ячейки — тоже по ПОТОКУ, а не среднее по трём граням. */
+    double fl = 0.0, w = 0.0;
+    for (int a = 0; a < 3; a++) {
+      double wa = (X->dir[a] < 0.0) ? -X->dir[a] : X->dir[a];
+      w += wa;
+      fl += wa * out[a].c0;
+    }
+    if (w > 0.0) {
+      if (fl <= w * HZ_PFRONT_FRAC_TOL)
+        X->nshadow++;
+      else if (fl >= w * (1.0 - HZ_PFRONT_FRAC_TOL))
+        X->nlit++;
+    }
     return;
   }
 

@@ -123,9 +123,19 @@ typedef struct {
   const unsigned char *occ;
   unsigned char *seen; /* А509: «один визит на узел» ПРОВЕРЯЕТСЯ, а не заявляется */
   double src[3], eps, px;
-  double pxeps2; /* (px·ε)² — пол в квадрате, чтобы в горячем пути не было корней */
-  int lean;      /* 1 — обход БЕЗ диагностики: чистая стоимость индекса */
-  int voidfloor; /* негативный контроль: пол применяется и к пустоте */
+  /* СОЛНЦЕ: направление и глубина отсчёта. Точечных источников не бывает
+   * (пользователь 08-05), а у нашей же модели цены точечность есть сингулярность:
+   * при alpha -> 0 величина Omega/alpha² уходит в бесконечность. У параллельного
+   * источника пол задаётся УГЛОВЫМ РАЗМЕРОМ источника и пройденным путём, а не
+   * расстоянием до точки: полутень растёт как alpha·(d - d_рожд), §241.11. На
+   * уровне Ф2 за d_рожд берётся вход в коробку сцены — это верхняя оценка
+   * размытия, потому что настоящее d_рожд лежит позже. */
+  int sun;        /* 1 — параллельный фронт */
+  double dir[3];  /* направление распространения, нормировано */
+  double t_entry; /* проекция ближней грани корня на dir */
+  double pxeps2;  /* (px·ε)² — пол в квадрате, чтобы в горячем пути не было корней */
+  int lean;       /* 1 — обход БЕЗ диагностики: чистая стоимость индекса */
+  int voidfloor;  /* негативный контроль: пол применяется и к пустоте */
   int64_t ncell, nempty, ngeo, nrevisit, ncap;
   int64_t nnode; /* узлов ПРОЙДЕНО, включая внутренние: цена в обращениях к памяти */
   int64_t stop_void, stop_floor, stop_leaf;
@@ -323,11 +333,24 @@ static void front_walk(frontstat *S, int32_t nid) {
    * `sqrt` и деление НА КАЖДЫЙ УЗЕЛ, и это была не стоимость индекса, а
    * стоимость её записи (поправка пользователя 08-05). */
   double r2 = 0.0, d2 = 0.0;
-  for (int c = 0; c < 3; c++) {
-    double h = 0.5 * (N->hi[c] - N->lo[c]);
-    double dd = 0.5 * (N->lo[c] + N->hi[c]) - S->src[c];
-    r2 += h * h;
-    d2 += dd * dd;
+  if (S->sun) {
+    /* ПАРАЛЛЕЛЬНЫЙ ФРОНТ. Расстояние — ПРОЙДЕННЫЙ ПУТЬ от входа в сцену вдоль
+     * направления, а не удаление от точки. Радиус ячейки тот же. */
+    double t = 0.0;
+    for (int c = 0; c < 3; c++) {
+      double h = 0.5 * (N->hi[c] - N->lo[c]);
+      r2 += h * h;
+      t += 0.5 * (N->lo[c] + N->hi[c]) * S->dir[c];
+    }
+    double dep = t - S->t_entry;
+    d2 = dep * dep;
+  } else {
+    for (int c = 0; c < 3; c++) {
+      double h = 0.5 * (N->hi[c] - N->lo[c]);
+      double dd = 0.5 * (N->lo[c] + N->hi[c]) - S->src[c];
+      r2 += h * h;
+      d2 += dd * dd;
+    }
   }
   if (d2 > r2 && 4.0 * r2 <= S->pxeps2 * d2) {
     take(S, nid, 1);
@@ -423,8 +446,8 @@ int main(int argc, char **argv) {
     return 1;
   }
   int leafmax = 0, maxlev = 0, grade = 1, voidfloor = 0, bboxocc = 0, hassrc = 0, lean = 0,
-      compact = 0;
-  double px = 4.0, src[3] = {0.0, 0.0, 0.0};
+      compact = 0, sun = 0;
+  double px = 4.0, src[3] = {0.0, 0.0, 0.0}, sdir[3] = {0.0, -1.0, 0.0};
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "leaf=", 5) == 0) leafmax = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "lev=", 4) == 0) maxlev = (int)strtol(argv[i] + 4, NULL, 10);
@@ -434,6 +457,13 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "bboxocc=", 8) == 0) bboxocc = (int)strtol(argv[i] + 8, NULL, 10);
     if (strncmp(argv[i], "lean=", 5) == 0) lean = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "compact=", 8) == 0) compact = (int)strtol(argv[i] + 8, NULL, 10);
+    if (strncmp(argv[i], "sun=", 4) == 0) {
+      char *e = NULL;
+      sdir[0] = strtod(argv[i] + 4, &e);
+      if (e != NULL && *e == 44) sdir[1] = strtod(e + 1, &e);
+      if (e != NULL && *e == 44) sdir[2] = strtod(e + 1, NULL);
+      sun = 1;
+    }
     if (strncmp(argv[i], "src=", 4) == 0) {
       char *e = NULL;
       src[0] = strtod(argv[i] + 4, &e);
@@ -562,9 +592,41 @@ int main(int argc, char **argv) {
   S.px = px;
   S.pxeps2 = (px * HZ_CFG_EPS) * (px * HZ_CFG_EPS);
   S.lean = lean;
+  S.sun = sun;
+  if (sun) {
+    double L = sqrt(sdir[0] * sdir[0] + sdir[1] * sdir[1] + sdir[2] * sdir[2]);
+    if (!(L > 0.0)) L = 1.0;
+    for (int c = 0; c < 3; c++)
+      S.dir[c] = sdir[c] / L;
+    /* Вход в сцену — наименьшая проекция угла коробки на направление. */
+    S.t_entry = 1e300;
+    for (int k = 0; k < 8; k++) {
+      double t = 0.0;
+      for (int c = 0; c < 3; c++)
+        t += ((k & (1 << c)) ? T.nd[0].hi[c] : T.nd[0].lo[c]) * S.dir[c];
+      if (t < S.t_entry) S.t_entry = t;
+    }
+    printf("== ПАРАЛЛЕЛЬНЫЙ ФРОНТ (солнце): направление %.3f,%.3f,%.3f; пол по ПРОЙДЕННОМУ ПУТИ от "
+           "входа в сцену\n",
+           S.dir[0], S.dir[1], S.dir[2]);
+  }
   S.voidfloor = voidfloor;
   S.levmin = 99;
   S.levmax = -1;
+  /* КОМПАКТНЫЙ ОБХОД ВЕТКИ СОЛНЦА НЕ ЗНАЕТ, И МОЛЧА ДАВАТЬ ТОЧЕЧНЫЙ ОТВЕТ ОН НЕ
+   * БУДЕТ. Поймано тем, что `sun=…` при `compact=1` вернул числа точечного
+   * источника ДО ПОСЛЕДНЕЙ ЦИФРЫ — та же подпись «параметр в сбор не вошёл»,
+   * что в О67 и §253. Отказ вместо тихого неверного числа. */
+  if (compact && sun) {
+    fprintf(stderr, "compact=1 и sun=… вместе не считаются: компактный обход "
+                    "ведёт пол от ТОЧКИ. Уберите compact=1.\n");
+    free(occ);
+    free(bocc);
+    free(seen);
+    hz_ptree_free(&T);
+    hz_obj_free(&m);
+    return 2;
+  }
   t0 = now_s();
   if (compact) {
     int32_t *ch = malloc((size_t)T.nnd * sizeof *ch);

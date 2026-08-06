@@ -219,8 +219,10 @@ build/pfrontx: tools/pfrontx.c src/scene_obj.c src/ptree.c src/ptree.h src/pclip
 
 # psun — шаг О73 (Ф3, план §266): ФРОНТ ОТ СОЛНЦА с состоянием на гранях.
 # Огрубление вместо отсечения; shadow=0 — негативный контроль.
-build/psun: tools/psun.c src/scene_obj.c src/ptree.c src/pclip.c src/pfront.c src/pfront.h src/pocc.c src/pocc.h src/pmark.c src/pmark.h src/scene_cfg.h | build
-	$(RUN) 'gcc $(CFLAGS) -o $@ tools/psun.c src/scene_obj.c src/ptree.c src/pclip.c src/pfront.c src/pocc.c src/pmark.c -lm'
+# Пометки невидимости с mark=1 ставит `pcull` (§278, односторонние по
+# построению); mark=2 — прежний проход фронтом, оставленный ради сверки.
+build/psun: tools/psun.c src/scene_obj.c src/ptree.c src/pclip.c src/pfront.c src/pfront.h src/pocc.c src/pocc.h src/pmark.c src/pmark.h src/pcull.c src/pcull.h src/scene_cfg.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/psun.c src/scene_obj.c src/ptree.c src/pclip.c src/pfront.c src/pocc.c src/pmark.c src/pcull.c -lm'
 
 # pcam — камера сцены находится ЗАМЕРОМ, а не назначается (§187). Обе прежние
 # камеры были назначены на глаз и обе оказались негодными.
@@ -313,6 +315,7 @@ check:
 	  src/transport/krylov3.c src/transport/raster3.c src/transport/cut3.c \
 	  src/scene_obj.c src/poly_seg.c src/polygon.c src/prast.c src/psweep.c \
 	  src/pgrid.c src/ptrace.c tests/cbmc_ptrace.c \
+	  src/pcull.c tests/cbmc_pcull.c \
 	  tests/test_polygon.c tests/test_oven.c tests/cbmc_sceneobj.c \
 	  tools/lod3.c tools/pfmdiff.c tools/render3.c tools/segstat.c
 

@@ -302,10 +302,12 @@ int main(int argc, char **argv) {
     in[a].cu = 0.0;
     in[a].cv = 0.0;
   }
-  double *refpt = NULL, *refvis = NULL;
+  double *refpt = NULL, *refvis = NULL, *refh = NULL;
   if (nref > 0) {
     refpt = malloc(3 * (size_t)nref * sizeof *refpt);
     refvis = malloc((size_t)nref * sizeof *refvis);
+    refh = malloc((size_t)nref * sizeof *refh);
+    X.refh = refh;
     X.refpt = refpt;
     X.refvis = refvis;
     X.refcap = nref;
@@ -344,6 +346,124 @@ int main(int argc, char **argv) {
          X.nflatgeo > 0 ? 100.0 * (double)X.nflat1 / (double)X.nflatgeo : 0.0);
   printf("   ВРЕМЯ %.2f с, на ячейку %.1f нс\n", secs,
          X.ncell > 0 ? 1e9 * secs / (double)X.ncell : 0.0);
+
+  /* ЭТАЛОН ЛУЧАМИ (А519). Считает ТО ЖЕ — долю открытого диска источника, — но
+   * другим способом: прямым перебором треугольников. Перебор выбран сознательно:
+   * эталон обязан быть ПРОЩЕ проверяемого, иначе сверяются две одинаковые
+   * ошибки. Отсюда и ограничение по сцене — на зале это 124 тыс. треугольников
+   * на луч, и дальше растёт линейно.
+   * Диск источника выбирается спиралью Ферма: ДЕТЕРМИНИРОВАННО, без случайности,
+   * чтобы повтор давал те же числа. */
+  if (nref > 0 && X.refn > 0) {
+    double half = 0.5 * 9.3e-3; /* угловой радиус солнца, §241.4 */
+    double t1[3] = {0.0, 0.0, 1.0}, r1[3], r2[3];
+    if (fabs(X.dir[2]) > 0.9) {
+      t1[0] = 1.0;
+      t1[2] = 0.0;
+    }
+    r1[0] = X.dir[1] * t1[2] - X.dir[2] * t1[1];
+    r1[1] = X.dir[2] * t1[0] - X.dir[0] * t1[2];
+    r1[2] = X.dir[0] * t1[1] - X.dir[1] * t1[0];
+    double ln2 = sqrt(r1[0] * r1[0] + r1[1] * r1[1] + r1[2] * r1[2]);
+    if (!(ln2 > 0.0)) ln2 = 1.0;
+    for (int c = 0; c < 3; c++)
+      r1[c] /= ln2;
+    r2[0] = X.dir[1] * r1[2] - X.dir[2] * r1[1];
+    r2[1] = X.dir[2] * r1[0] - X.dir[0] * r1[2];
+    r2[2] = X.dir[0] * r1[1] - X.dir[1] * r1[0];
+    /* РАЗДЕЛЕНИЕ ПО СОСТОЯНИЮ (разбор 08-06). Две причины расхождения известны
+     * заранее и лечатся по-разному: перекрытие по ОДНОМУ куску (А517) недооценит
+     * тень ВЕЗДЕ, а линейность состояния (Р1) промахнётся только на КРАЮ тени.
+     * Поэтому ошибка считается порознь в трёх корзинах: глубокая тень, открытый
+     * свет и край. Если промахи только на краю — виновата линейность и это цена
+     * представления; если и в тени — виновато перекрытие. */
+    double sum3[3] = {0.0, 0.0, 0.0}, wor3[3] = {0.0, 0.0, 0.0};
+    int64_t cnt3[3] = {0, 0, 0}, bad3[3] = {0, 0, 0};
+    double sum = 0.0, worst = 0.0, tref = now_s();
+    int64_t nbad = 0;
+    for (int32_t s = 0; s < X.refn; s++) {
+      /* СВЕРЯТЬ НАДО СРЕДНЕЕ СО СРЕДНИМ (разбор 08-06). Наше состояние есть
+       * ЛИНЕЙНАЯ функция по грани, и `c0` — её среднее; эталон же стрелял из
+       * ЦЕНТРА, то есть сравнивал точку с проекцией. На краю тени это давало
+       * расхождение 0.248 при 100 %% ячеек вне приёмки — артефакт сверки, а не
+       * ошибка фронта. Теперь эталон берёт восемь точек по ячейке (углы
+       * полуразмера) и усредняет: величина становится той же, что у нас. */
+      const double *Pc = refpt + 3 * (size_t)s;
+      double hh = (refh != NULL) ? 0.5 * refh[s] : 0.0;
+      int open = 0, ntot = 0;
+      for (int pt = 0; pt < 8; pt++) {
+        double P0[3];
+        for (int c = 0; c < 3; c++)
+          P0[c] = Pc[c] + ((pt & (1 << c)) ? hh : -hh);
+        for (int k = 0; k < HZ_REF_RAYS / 2; k++) {
+          ntot++;
+          double rr = half * sqrt(((double)k + 0.5) / (double)(HZ_REF_RAYS / 2));
+          double ph = 2.39996322972865332 * (double)k;
+          double d2[3];
+          for (int c = 0; c < 3; c++)
+            d2[c] = -X.dir[c] + rr * (cos(ph) * r1[c] + sin(ph) * r2[c]);
+          int hit = 0;
+          for (int32_t t = 0; t < m.nt && !hit; t++) {
+            const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t + 0];
+            const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)t + 1];
+            const double *C = m.v + 3 * (size_t)m.f[3 * (size_t)t + 2];
+            double e1[3], e2[3], pv[3], tv[3], qv[3];
+            for (int c = 0; c < 3; c++) {
+              e1[c] = B[c] - A[c];
+              e2[c] = C[c] - A[c];
+            }
+            pv[0] = d2[1] * e2[2] - d2[2] * e2[1];
+            pv[1] = d2[2] * e2[0] - d2[0] * e2[2];
+            pv[2] = d2[0] * e2[1] - d2[1] * e2[0];
+            double det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+            if (det > -1e-12 && det < 1e-12) continue;
+            double inv = 1.0 / det;
+            for (int c = 0; c < 3; c++)
+              tv[c] = P0[c] - A[c];
+            double uu = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+            if (uu < 0.0 || uu > 1.0) continue;
+            qv[0] = tv[1] * e1[2] - tv[2] * e1[1];
+            qv[1] = tv[2] * e1[0] - tv[0] * e1[2];
+            qv[2] = tv[0] * e1[1] - tv[1] * e1[0];
+            double vv = (d2[0] * qv[0] + d2[1] * qv[1] + d2[2] * qv[2]) * inv;
+            if (vv < 0.0 || uu + vv > 1.0) continue;
+            double tt = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) * inv;
+            if (tt > 1e-6) hit = 1;
+          }
+          if (!hit) open++;
+        }
+      }
+      double vref = (ntot > 0) ? (double)open / (double)ntot : 0.0;
+      double d = refvis[s] - vref;
+      if (d < 0.0) d = -d;
+      sum += d;
+      if (d > worst) worst = d;
+      if (d > 0.02) nbad++;
+      int b = (refvis[s] < 0.05) ? 0 : ((refvis[s] > 0.95) ? 1 : 2);
+      cnt3[b]++;
+      sum3[b] += d;
+      if (d > wor3[b]) wor3[b] = d;
+      if (d > 0.02) bad3[b]++;
+    }
+    printf("   ЭТАЛОН ЛУЧАМИ (%d лучей по диску, перебор треугольников): выборка %d ячеек за "
+           "%.1f с\n",
+           HZ_REF_RAYS, X.refn, now_s() - tref);
+    printf("   расхождение среднее %.4f, наибольшее %.4f; выше приёмки 2 %% — %lld ячеек "
+           "(%.2f %%)\n",
+           sum / (double)X.refn, worst, (long long)nbad, 100.0 * (double)nbad / (double)X.refn);
+    {
+      static const char *nm[3] = {"глубокая тень", "открытый свет", "КРАЙ тени"};
+      for (int b = 0; b < 3; b++)
+        if (cnt3[b] > 0)
+          printf("     %-14s ячеек %4lld, среднее %.4f, наибольшее %.4f, выше 2 %%%% — %lld "
+                 "(%.1f %%%%)\n",
+                 nm[b], (long long)cnt3[b], sum3[b] / (double)cnt3[b], wor3[b], (long long)bad3[b],
+                 100.0 * (double)bad3[b] / (double)cnt3[b]);
+    }
+  }
+  free(refpt);
+  free(refh);
+  free(refvis);
   free(tlo);
   free(thi);
   free(tpl);

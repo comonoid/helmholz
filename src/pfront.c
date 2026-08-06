@@ -470,6 +470,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
       }
       for (int c = 0; c < 3; c++)
         X->refpt[3 * (size_t)X->refn + (size_t)c] = 0.5 * (lo[c] + hi[c]);
+      if (X->refh != NULL) X->refh[X->refn] = 0.5 * (hi[0] - lo[0]);
       X->refvis[X->refn] = fi / w;
       X->refn++;
     }

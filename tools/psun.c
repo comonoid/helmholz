@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
   int leafmax = 0, maxlev = 0, grade = 1, shadow = 1, cam = 0, nref = 0, cliplev = -1, camfull = 0,
       usemark = 0, relax = HZ_PMARK_OUT_LEVELS, refinemax = 0, nk = 1;
   double camo[3] = {0.0, 0.0, 0.0}, camf[3] = {0.0, 0.0, 1.0}, camat[3] = {0.0, 0.0, 1.0};
-  int loose = 0, bufside = HZ_CFG_W, eta = 1;
+  int loose = 0, bufside = HZ_CFG_W, eta = 1, mlev = HZ_PMARK_LEVEL;
   double px = 9.1, sdir[3] = {0.3, -0.9, 0.3};
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "leaf=", 5) == 0) leafmax = (int)strtol(argv[i] + 5, NULL, 10);
@@ -66,6 +66,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "loose=", 6) == 0) loose = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "buf=", 4) == 0) bufside = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "eta=", 4) == 0) eta = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "mlev=", 5) == 0) mlev = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "cover=", 6) == 0)
       hz_pfront_cover_sum = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "sun=", 4) == 0) {
@@ -332,7 +333,7 @@ int main(int argc, char **argv) {
     hz_pcull_draw(&C, &m);
     hz_pcull_pyramid(&C);
     int64_t nset = 0;
-    hz_pcull_marks(&C, &T, HZ_PMARK_LEVEL, mk);
+    hz_pcull_marks(&C, &T, mlev, mk);
     for (int32_t i = 0; i < T.nnd; i++)
       if (mk[i] != 255) nset++;
     printf("== БУФЕР ДАЛЬНОСТИ ОТ ГЛАЗА за %.2f с (%d²%s): пикселей занято %lld, треугольников "
@@ -361,10 +362,10 @@ int main(int argc, char **argv) {
       CX.sdir[0][c] = camf[c];
     CX.mark = NULL;
     CX.markout = mk;
-    CX.markoutlev = HZ_PMARK_LEVEL;
+    CX.markoutlev = mlev;
     CX.markrelax = relax;
     CX.depth = dep;
-    CX.cliplev = HZ_PMARK_LEVEL;
+    CX.cliplev = mlev;
     CX.usefrustum = 1;
     CX.nmarkset = 0;
     for (int c = 0; c < 3; c++)

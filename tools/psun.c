@@ -330,10 +330,74 @@ int main(int argc, char **argv) {
       return 2;
     }
     C.loose = loose;
+    /* Пирамида кадра отдаётся `pcull` ВСЕГДА, а не по ключу `cam`: она отвечает
+     * на вопрос «виден ли этот кусок пространства», а не служит послаблением
+     * пола. Вклады «вне кадра» и «заслонено» печатаются порознь. */
+    memcpy(C.fr, X.fr, sizeof C.fr);
+    C.usefr = 1;
     hz_pcull_draw(&C, &m);
     hz_pcull_pyramid(&C);
     int64_t nset = 0;
     hz_pcull_marks(&C, &T, mlev, mk);
+    /* ДОЛЯ СЦЕНЫ, ЗАСЛОНЁННАЯ ОТ КАМЕРЫ, — величина про ПРЕДСТАВЛЕНИЕ, а не про
+     * фронт (замечание пользователя 08-07). §279 мерил пометки против пола
+     * СОЛНЕЧНОГО прохода и получил полтора процента; но это пересечение двух
+     * разных множеств, а не размер заслонённого. Здесь считается прямо: сколько
+     * ЗАНЯТЫХ ЛИСТЬЕВ — то есть самой мелкой части представления — лежит под
+     * заслонёнными узлами. Лист взят мерой сознательно: он и есть то, что
+     * предлагается огрублять.
+     *
+     * ПИРАМИДА КАДРА В ЭТО ЧИСЛО НЕ ВХОДИТ: `pcull` судит невидимость ТОЛЬКО по
+     * заслонению одних тел другими, а всё, что за краем кадра, он не помечает
+     * вовсе. Значит доля НЕ ЗАВЫШЕНА за счёт того, что просто не попало в кадр. */
+    {
+      int64_t leaf_all = 0, leaf_hid = 0, occ_all = 0, occ_hid = 0, leaf_occl = 0, leaf_frust = 0;
+      int32_t *st = malloc((size_t)T.nnd * sizeof *st);
+      unsigned char *hid = malloc((size_t)T.nnd);
+      if (st != NULL && hid != NULL) {
+        int32_t sp = 0;
+        st[sp] = 0;
+        hid[0] = (unsigned char)(mk[0] != 255 ? mk[0] : 0);
+        sp = 1;
+        while (sp > 0) {
+          int32_t nid = st[--sp];
+          int h = hid[nid];
+          if (occ[nid]) {
+            occ_all++;
+            if (h) occ_hid++;
+            if (T.nd[nid].child < 0) {
+              leaf_all++;
+              if (h) leaf_hid++;
+              if (h == 1) leaf_occl++;
+              if (h == 2) leaf_frust++;
+            }
+          }
+          if (T.nd[nid].child >= 0)
+            for (int k = 0; k < 8; k++) {
+              int32_t c = T.nd[nid].child + k;
+              /* Причина наследуется вниз: заслонённый кусок пространства не
+               * становится видимым от того, что его поделили. `1` — заслонено
+               * телами, `2` — вне кадра; при споре побеждает та, что выше. */
+              hid[c] = (unsigned char)(h != 0 ? h : (mk[c] != 255 ? mk[c] : 0));
+              st[sp++] = c;
+            }
+        }
+        printf(
+            "== НЕ ВИДНО ИЗ КАМЕРЫ — ДОЛЯ ПРЕДСТАВЛЕНИЯ (занятый лист есть самое мелкое,\n"
+            "   что в дереве есть, и ровно то, что предлагается огрублять):\n"
+            "   ВСЕГО %lld из %lld (%.1f %%); из них ЗАСЛОНЕНО ТЕЛАМИ %lld (%.1f %%), вне "
+            "кадра %lld (%.1f %%)\n"
+            "   занятых узлов %lld из %lld (%.1f %%)\n",
+            (long long)leaf_hid, (long long)leaf_all,
+            leaf_all > 0 ? 100.0 * (double)leaf_hid / (double)leaf_all : 0.0, (long long)leaf_occl,
+            leaf_all > 0 ? 100.0 * (double)leaf_occl / (double)leaf_all : 0.0,
+            (long long)leaf_frust,
+            leaf_all > 0 ? 100.0 * (double)leaf_frust / (double)leaf_all : 0.0, (long long)occ_hid,
+            (long long)occ_all, occ_all > 0 ? 100.0 * (double)occ_hid / (double)occ_all : 0.0);
+      }
+      free(st);
+      free(hid);
+    }
     for (int32_t i = 0; i < T.nnd; i++)
       if (mk[i] != 255) nset++;
     printf("== БУФЕР ДАЛЬНОСТИ ОТ ГЛАЗА за %.2f с (%d²%s): пикселей занято %lld, треугольников "
@@ -343,10 +407,11 @@ int main(int argc, char **argv) {
            : loose == 2 ? ", НЕГАТИВНЫЙ КОНТРОЛЬ: БЛИЖНЯЯ точка пикселя"
                         : "",
            (long long)C.npix, (long long)C.ntri_off, (long long)C.ntri_near);
-    printf("== ПОМЕТКИ: узлов проверено %lld, ЗАСЛОНЕНО %lld (пометок %lld), за краем буфера %lld, "
-           "у ближней плоскости %lld; огрубление на %d уровня\n",
-           (long long)C.ntest, (long long)C.nhidden, (long long)nset, (long long)C.noff,
-           (long long)C.nnear, relax);
+    printf("== ПОМЕТКИ: узлов проверено %lld, НЕ ВИДНО %lld (из них ВНЕ КАДРА %lld, ЗАСЛОНЕНО "
+           "%lld), пометок %lld; отказов: за краем буфера %lld, у ближней плоскости %lld; "
+           "огрубление на %d уровня\n",
+           (long long)C.ntest, (long long)(C.nfrust + C.nhidden), (long long)C.nfrust,
+           (long long)C.nhidden, (long long)nset, (long long)C.noff, (long long)C.nnear, relax);
     hz_pcull_free(&C);
     X.mark = mk;
     X.markcur = -1;
@@ -452,7 +517,7 @@ int main(int argc, char **argv) {
    * Проверка независима от фронта: прямой луч от глаза к центру ячейки перебором
    * треугольников. Нарушений обязано быть НОЛЬ. */
   if (usemark && mk != NULL && nref > 0) {
-    int32_t nchk = 0, nbadv = 0;
+    int32_t nchk = 0, nbadv = 0, nbadbox = 0;
     double tchk = now_s();
     /* РАСПРЕДЕЛЕНИЕ НАРУШЕНИЙ ПО УГЛУ ОТ ОСИ ВЗГЛЯДА — РАЗЛИЧИТЕЛЬ ПРИЧИН.
      * Параллельное приближение камеры ошибается тем сильнее, чем дальше от оси:
@@ -483,18 +548,29 @@ int main(int argc, char **argv) {
       if (!(len > 0.0)) continue;
       for (int c = 0; c < 3; c++)
         d2[c] /= len;
-      /* ВНУТРИ ли пирамиды. Ячейка вне конуса лучом достижима, но НЕ ВИДИМА, и
-       * считать её нарушением нельзя: критерий — «не огрубить ВИДИМОЕ», а вне
-       * кадра видимого нет. */
-      int infr = 1;
-      for (int kf = 0; kf < 6 && infr; kf++) {
+      /* ВНУТРИ ли пирамиды — И ЗДЕСЬ ВАЖНО, ЧТО ИМЕННО ПРОВЕРЯЕТСЯ. Луч пускается
+       * в ЦЕНТР ячейки, значит и на видимость проверять надо ЭТУ ТОЧКУ, а не
+       * коробку: точка вне кадра лучом достижима, но не видима, и нарушением не
+       * является. Прежде проверялась КОРОБКА (перекрывает ли она пирамиду), и
+       * пара «коробка × луч в центр» была рассогласована.
+       *
+       * ЧЕСТНОСТЬ ТРЕБУЕТ ПЕЧАТАТЬ ОБА ЧИСЛА, потому что правило пометки в этом
+       * же шаге стало отвечать «не видно» и за краем кадра: если бы приёмка
+       * смягчалась вместе с правилом, она перестала бы что-либо проверять.
+       * Поэтому считаются нарушения ПО ТОЧКЕ (строгая пара) и ПО КОРОБКЕ
+       * (прежний, более широкий охват), и печатаются рядом. */
+      int inbox = 1, inpt = 1;
+      for (int kf = 0; kf < 6; kf++) {
         const double *PL = X.fr[kf];
-        double sf = PL[3];
-        for (int c = 0; c < 3; c++)
+        double sf = PL[3], sp = PL[3];
+        for (int c = 0; c < 3; c++) {
           sf += (PL[c] > 0.0 ? T.nd[i].hi[c] : T.nd[i].lo[c]) * PL[c];
-        if (sf < 0.0) infr = 0;
+          sp += P0[c] * PL[c];
+        }
+        if (sf < 0.0) inbox = 0;
+        if (sp < 0.0) inpt = 0;
       }
-      if (!infr) continue;
+      if (!inbox) continue;
       nchk++;
       int blocked = 0;
       for (int32_t t = 0; t < m.nt && !blocked; t++) {
@@ -534,12 +610,16 @@ int main(int argc, char **argv) {
       if (bin > 3) bin = 3;
       bin_chk[bin]++;
       if (!blocked) {
-        nbadv++;
-        bin_bad[bin]++;
+        nbadbox++;
+        if (inpt) {
+          nbadv++;
+          bin_bad[bin]++;
+        }
       }
     }
-    printf("   ПРИЁМКА: помеченных проверено %d за %.1f с; ВИДИМЫХ СРЕДИ НИХ %d (обязано 0)\n",
-           nchk, now_s() - tchk, nbadv);
+    printf("   ПРИЁМКА: помеченных проверено %d за %.1f с; ВИДИМЫХ СРЕДИ НИХ %d (обязано 0); "
+           "по прежнему, более широкому критерию коробки — %d\n",
+           nchk, now_s() - tchk, nbadv, nbadbox);
     printf("   по углу от оси взгляда (доля полуполя): ");
     for (int b = 0; b < 4; b++)
       printf("%d/4 %d из %d | ", b + 1, bin_bad[b], bin_chk[b]);

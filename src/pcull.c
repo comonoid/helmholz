@@ -281,6 +281,28 @@ static float rect_max(const hz_pcull *C, int i0, int i1, int j0, int j1) {
 
 int hz_pcull_hidden(hz_pcull *C, const double lo[3], const double hi[3]) {
   C->ntest++;
+  /* ВНЕ КАДРА — ЭТО ТОЖЕ «НЕ ВИДНО», И ОТВЕЧАТЬ НА ЭТО НАДО ЗДЕСЬ. Раньше такие
+   * куски пространства уходили в отказ («за краем буфера», «у ближней
+   * плоскости»), и на Сан-Мигеле отказом кончались девять проверок из десяти:
+   * `26.8` млн узлов у ближней плоскости и `10.7` млн за краем буфера из `41.8`
+   * млн. Для пола фронта это было безразлично (§279), для КЛАССИФИКАЦИИ
+   * ПРОСТРАНСТВА — решающе.
+   *
+   * Проверка обычная и консервативная: коробка целиком снаружи хотя бы одной
+   * плоскости. Ближняя плоскость входит в тот же набор, поэтому «позади глаза»
+   * ловится ею же, а не отдельным правилом. */
+  if (C->usefr) {
+    for (int k = 0; k < 6; k++) {
+      const double *P = C->fr[k];
+      double s = P[3];
+      for (int c = 0; c < 3; c++)
+        s += (P[c] > 0.0 ? hi[c] : lo[c]) * P[c];
+      if (s < 0.0) {
+        C->nfrust++;
+        return 2;
+      }
+    }
+  }
   /* Глаз внутри коробки — о заслонении речи нет. */
   int inside = 1;
   for (int c = 0; c < 3 && inside; c++)
@@ -302,14 +324,24 @@ int hz_pcull_hidden(hz_pcull *C, const double lo[3], const double hi[3]) {
   }
   /* Проекция коробки есть выпуклая оболочка проекций её углов (все они перед
    * глазом), поэтому габарит по углам накрывает её целиком. Отступ в пиксель —
-   * запас на округление; за краем буфера мы ничего не знаем и не помечаем. */
-  if (!(xmin >= 1.0) || !(ymin >= 1.0) || !(xmax <= (double)(C->side - 1)) ||
-      !(ymax <= (double)(C->side - 1))) {
+   * запас на округление.
+   *
+   * ЗА КРАЕМ БУФЕРА — НЕ «НЕИЗВЕСТНО», А «НЕ ВИДНО». Сперва тут стоял отказ, и
+   * он был лишней осторожностью: буфер накрывает РОВНО поле кадра, значит
+   * пиксели за его краем суть направления ВНЕ КАДРА, а вне кадра видимого нет.
+   * Поэтому прямоугольник запроса ОБРЕЗАЕТСЯ по буферу, и решается вопрос о той
+   * части куска пространства, которая в кадр попадает. Если не попадает ничего —
+   * кусок целиком вне кадра, и это ловится пирамидой выше. */
+  int i0 = (int)floor(xmin) - 1, i1 = (int)ceil(xmax), j0 = (int)floor(ymin) - 1,
+      j1 = (int)ceil(ymax);
+  if (i0 < 0) i0 = 0;
+  if (j0 < 0) j0 = 0;
+  if (i1 > C->side - 1) i1 = C->side - 1;
+  if (j1 > C->side - 1) j1 = C->side - 1;
+  if (i0 > i1 || j0 > j1) {
     C->noff++;
     return 0;
   }
-  int i0 = (int)floor(xmin) - 1, i1 = (int)ceil(xmax), j0 = (int)floor(ymin) - 1,
-      j1 = (int)ceil(ymax);
   float q = rect_max(C, i0, i1, j0, j1);
   double zn = znear * (1.0 - HZ_PCULL_ULP * DBL_EPSILON);
   if ((double)q < zn) {
@@ -321,8 +353,9 @@ int hz_pcull_hidden(hz_pcull *C, const double lo[3], const double hi[3]) {
 
 static void marks_walk(hz_pcull *C, const hz_ptree *T, int32_t nid, int maxlev,
                        unsigned char *mark) {
-  if (hz_pcull_hidden(C, T->nd[nid].lo, T->nd[nid].hi)) {
-    mark[nid] = 1;
+  int h = hz_pcull_hidden(C, T->nd[nid].lo, T->nd[nid].hi);
+  if (h != 0) {
+    mark[nid] = (unsigned char)h;
     return;
   }
   if (T->nd[nid].child < 0 || (int)T->lev[nid] >= maxlev) return;

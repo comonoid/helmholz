@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   int leafmax = 0, maxlev = 0, grade = 1, shadow = 1, cam = 0, nref = 0, cliplev = -1, camfull = 0,
-      usemark = 0, relax = HZ_PMARK_OUT_LEVELS;
+      usemark = 0, relax = HZ_PMARK_OUT_LEVELS, refinemax = 0;
   double camo[3] = {0.0, 0.0, 0.0}, camf[3] = {0.0, 0.0, 1.0};
   double px = 9.1, sdir[3] = {0.3, -0.9, 0.3};
   for (int i = 3; i < argc; i++) {
@@ -52,6 +52,8 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "camfull=", 8) == 0) camfull = (int)strtol(argv[i] + 8, NULL, 10);
     if (strncmp(argv[i], "mark=", 5) == 0) usemark = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "relax=", 6) == 0) relax = (int)strtol(argv[i] + 6, NULL, 10);
+    if (strncmp(argv[i], "cover=", 6) == 0)
+      hz_pfront_cover_sum = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "sun=", 4) == 0) {
       char *e = NULL;
       sdir[0] = strtod(argv[i] + 4, &e);
@@ -288,7 +290,7 @@ int main(int argc, char **argv) {
       ci[a].cv = 0.0;
     }
     double tmk = now_s();
-    hz_pfront_walk(&CX, 0, T.nd[0].lo, T.nd[0].hi, ci, co, list, m.nt, 0);
+    hz_pfront_walk(&CX, 0, T.nd[0].lo, T.nd[0].hi, ci, co, list, m.nt, 0, 0);
     printf("== ПРОХОД ОТ КАМЕРЫ за %.2f с: ячеек %lld, ПОМЕТОК ПОСТАВЛЕНО %lld (невидимое, "
            "огрубление на %d уровня)\n",
            now_s() - tmk, (long long)CX.ncell, (long long)CX.nmarkset, relax);
@@ -314,7 +316,8 @@ int main(int argc, char **argv) {
     X.refstride = 997; /* простое число: выборка не попадает в такт обхода */
   }
   t0 = now_s();
-  hz_pfront_walk(&X, 0, T.nd[0].lo, T.nd[0].hi, in, out, list, m.nt, 0);
+  X.refinemax = refinemax;
+  hz_pfront_walk(&X, 0, T.nd[0].lo, T.nd[0].hi, in, out, list, m.nt, 0, 0);
   double secs = now_s() - t0;
   if (X.fail) {
     fprintf(stderr, "отказ обхода\n");

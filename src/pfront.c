@@ -165,6 +165,8 @@ static hz_pfront_face face_block(const hz_pfront_face *F, const hz_pfront_face *
 
 /* Затенить грани ячейки прямо по КАНДИДАТАМ, без вывода кусков. Возврат: было ли
  * в ячейке хоть какое-то перекрытие. */
+int hz_pfront_cover_sum = 0; /* 1 — перекрытие СУММОЙ (верхняя оценка); опыт §274 */
+
 int hz_pfront_shade(const hz_pfront_face in[3], hz_pfront_face out[3], const hz_objmesh *m,
                     const int32_t *list, int32_t n, const double *lo, const double *hi,
                     const double *dir) {
@@ -175,6 +177,11 @@ int hz_pfront_shade(const hz_pfront_face in[3], hz_pfront_face out[3], const hz_
      * пересекаются), и погасила бы свет там, где он есть. Один кусок есть
      * заведомо НИЖНЯЯ оценка объединения, и для главного случая — стена в
      * ячейке — она ТОЧНАЯ, потому что кусок там один. */
+    /* ДВЕ ОЦЕНКИ ПЕРЕКРЫТИЯ, И ОБЕ НУЖНЫ КАК ГРАНИЦЫ. Максимум по кускам — НИЖНЯЯ
+     * оценка объединения (А517, безопасная); сумма с обрезанием — ВЕРХНЯЯ.
+     * Истина между ними, и опыт с обеими показывает, ЧТО именно виновато в
+     * расхождении с эталоном: если сумма его резко улучшает, дело в объединении,
+     * а не в линейности представления. */
     hz_pfront_face best = {0.0, 0.0, 0.0};
     double ba = 0.0;
     for (int32_t i = 0; i < n; i++) {
@@ -184,10 +191,21 @@ int hz_pfront_shade(const hz_pfront_face in[3], hz_pfront_face out[3], const hz_
       const double *C = m->v + 3 * (size_t)m->f[3 * (size_t)t + 2];
       hz_pfront_face c = {0.0, 0.0, 0.0};
       double Aa = tri_cover(A, B, C, lo, hi, dir, a, &c);
-      if (Aa > ba) {
+      if (hz_pfront_cover_sum) {
+        best.c0 += c.c0;
+        best.cu += c.cu;
+        best.cv += c.cv;
+        if (Aa > 0.0) ba = 1.0;
+      } else if (Aa > ba) {
         ba = Aa;
         best = c;
       }
+    }
+    if (hz_pfront_cover_sum && best.c0 > 1.0) {
+      double sc = 1.0 / best.c0;
+      best.c0 = 1.0;
+      best.cu *= sc;
+      best.cv *= sc;
     }
     if (ba > 0.0) any = 1;
     hz_pfront_face cov = best;
@@ -235,7 +253,7 @@ static int box_hits3(const double *bl, const double *bh, const double *clo, cons
 
 void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const double *hi,
                     const hz_pfront_face in[3], hz_pfront_face out[3], const int32_t *list,
-                    int32_t n, int coarsened) {
+                    int32_t n, int coarsened, int extra) {
   const hz_ptnode *N = &X->T->nd[nid];
   /* ПОМЕТКА НЕСЁТ ЧИСЛО СТУПЕНЕЙ ПОСЛАБЛЕНИЯ, А НЕ ПРЕДЕЛЬНЫЙ УРОВЕНЬ. Сперва
    * было наоборот, и скан вышел обратный: чем грубее просили, тем БОЛЬШЕ выходило
@@ -246,7 +264,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
   /* Предел уровня, унаследованный сверху либо поставленный здесь. `-1` — нет. */
   int save_on = X->markon;
   if (X->mark != NULL && X->mark[nid] != 255) X->markon = 1;
-  int stop = 0, why = 0;
+  int stop = 0, why = 0, refined = 0;
   /* ПИРАМИДА КАМЕРЫ. Ячейка целиком снаружи хотя бы одной плоскости — невидима
    * камере, и её собственная подробность этому проходу не нужна. Берётся целиком
    * (огрубление), а не отбрасывается: свет в ней есть, и другим проходам она
@@ -317,8 +335,27 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         pxe2 *= 4.0;
     }
     if (d2 > r2 && 4.0 * r2 <= pxe2 * d2) {
-      stop = 1;
-      why = 1;
+      /* Р3 §241.9 — УТОЧНЕНИЕ ТАМ, ГДЕ СОСТОЯНИЕ НЕ ПРЕДСТАВИМО. Зеркало правила
+       * огрубления: ровное и тёмное берём крупным, а НЕРОВНОЕ — мельчим НИЖЕ
+       * пола. Нужно оно потому, что эталон поймал расхождение `0.203` именно на
+       * КРАЮ тени, где доля открытого диска меняется от 0 до 1 на одной-двух
+       * ячейках, и линейная функция такого не несёт. Глубина уточнения
+       * ограничена: без предела край тени утянул бы спуск до листьев везде. */
+      double var = 0.0;
+      for (int a = 0; a < 3; a++) {
+        double wa = (X->dir[a] < 0.0) ? -X->dir[a] : X->dir[a];
+        double cu = (in[a].cu < 0.0) ? -in[a].cu : in[a].cu;
+        double cv = (in[a].cv < 0.0) ? -in[a].cv : in[a].cv;
+        var += wa * (cu + cv);
+      }
+      if (var > HZ_PFRONT_REFINE_TOL && extra < X->refinemax) {
+        stop = 0;
+        refined = 1;
+        X->nrefine++;
+      } else {
+        stop = 1;
+        why = 1;
+      }
     } else if (X->markon && X->depth != NULL && X->depth[nid] <= X->markrelax) {
       /* ОГРУБЛЕНИЕ НА `markrelax` УРОВНЕЙ ОТ ТОГО МЕСТА, ГДЕ ОСТАНОВИЛИСЬ БЫ
        * ИНАЧЕ. Дно поддерева отсюда — `depth`; значит «на два уровня грубее»
@@ -477,6 +514,8 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
     return;
   }
 
+  /* Если спускаемся ВОПРЕКИ полу (Р3), уровень уточнения растёт. */
+  int nextra = refined ? extra + 1 : extra;
   int32_t c0 = N->child;
   double mid[3];
   for (int c = 0; c < 3; c++)
@@ -525,7 +564,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         const double *bl = X->tlo + 3 * (size_t)list[i], *bh = X->thi + 3 * (size_t)list[i];
         if (box_hits3(bl, bh, clo, chi)) sub[ns++] = list[i];
       }
-      hz_pfront_walk(X, c0 + k, clo, chi, cin, cout[k], sub, ns, coarsened);
+      hz_pfront_walk(X, c0 + k, clo, chi, cin, cout[k], sub, ns, coarsened, nextra);
       if (X->fail) {
         free(sub);
         return;

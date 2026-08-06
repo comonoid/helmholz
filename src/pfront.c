@@ -167,7 +167,7 @@ static hz_pfront_face face_block(const hz_pfront_face *F, const hz_pfront_face *
  * в ячейке хоть какое-то перекрытие. */
 int hz_pfront_cover_sum = 0; /* 1 — перекрытие СУММОЙ (верхняя оценка); опыт §274 */
 
-int hz_pfront_shade(const hz_pfront_face in[3], hz_pfront_face out[3], const hz_objmesh *m,
+int hz_pfront_shade(const hz_pfront_face *in, hz_pfront_face *out, const hz_objmesh *m,
                     const int32_t *list, int32_t n, const double *lo, const double *hi,
                     const double *dir) {
   int any = 0;
@@ -233,7 +233,7 @@ const char *hz_pfront_note(void) {
  * равна нулю, потока НЕ НЕСЁТ ВОВСЕ, и требовать на ней темноты бессмысленно.
  * Поймано прогоном с солнцем строго вниз: там осей с потоком одна из трёх, и
  * невзвешенный предикат не срабатывал никогда. */
-static int pf_dark3(const hz_pfront_face in[3], const double *dir) {
+static int pf_dark3(const hz_pfront_face *in, const double *dir) {
   double fl = 0.0, w = 0.0;
   for (int a = 0; a < 3; a++) {
     double wa = (dir[a] < 0.0) ? -dir[a] : dir[a];
@@ -245,6 +245,18 @@ static int pf_dark3(const hz_pfront_face in[3], const double *dir) {
   return w > 0.0 && fl <= w * HZ_PFRONT_FRAC_TOL;
 }
 
+/* Темно ли по ВСЕМ выборкам диска: у протяжённого источника ячейка в тени лишь
+ * тогда, когда закрыт весь диск, а не одна его точка. */
+static int pf_darkK(const hz_pfront_ctx *X, const hz_pfront_face *in) {
+  for (int s = 0; s < X->nk; s++) {
+    hz_pfront_face f[3];
+    for (int a = 0; a < 3; a++)
+      f[a] = in[a * X->nk + s];
+    if (!pf_dark3(f, X->sdir[s])) return 0;
+  }
+  return 1;
+}
+
 static int box_hits3(const double *bl, const double *bh, const double *clo, const double *chi) {
   for (int c = 0; c < 3; c++)
     if (!(bl[c] < chi[c]) || !(bh[c] >= clo[c])) return 0;
@@ -252,8 +264,8 @@ static int box_hits3(const double *bl, const double *bh, const double *clo, cons
 }
 
 void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const double *hi,
-                    const hz_pfront_face in[3], hz_pfront_face out[3], const int32_t *list,
-                    int32_t n, int coarsened, int extra) {
+                    const hz_pfront_face *in, hz_pfront_face *out, const int32_t *list, int32_t n,
+                    int coarsened, int extra) {
   const hz_ptnode *N = &X->T->nd[nid];
   /* ПОМЕТКА НЕСЁТ ЧИСЛО СТУПЕНЕЙ ПОСЛАБЛЕНИЯ, А НЕ ПРЕДЕЛЬНЫЙ УРОВЕНЬ. Сперва
    * было наоборот, и скан вышел обратный: чем грубее просили, тем БОЛЬШЕ выходило
@@ -365,7 +377,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
       stop = 1;
       why = 4;
       X->nmarkstop++;
-    } else if (!X->noshadow && pf_dark3(in, X->dir)) {
+    } else if (!X->noshadow && pf_darkK(X, in)) {
       if (coarsened < HZ_PFRONT_COARSEN_MAX) {
         stop = 1;
         why = 2;
@@ -400,13 +412,23 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
      * берётся нулевым, то есть тень остаётся такой, какой её установил крупный
      * элемент. Это НИЖНЯЯ оценка заслонения, как и всё в А517. */
     int has = 0;
-    if (X->noshadow || !(n > 0) || why == 3 || pf_dark3(in, X->dir) ||
+    if (X->noshadow || !(n > 0) || why == 3 || pf_darkK(X, in) ||
         (X->cliplev >= 0 && (int)X->T->lev[nid] > X->cliplev)) {
-      for (int a = 0; a < 3; a++)
+      for (int a = 0; a < 3 * X->nk; a++)
         out[a] = in[a];
       has = (why != 3);
     } else {
-      has = hz_pfront_shade(in, out, X->m, list, n, lo, hi, X->dir);
+      /* ОДИН ТРАВЕРС, `K` СОСТОЯНИЙ (Ф4, §275). Выборки по диску отличаются
+       * только направлением, и знаки его у всех одни (А530), поэтому порядок
+       * октантов общий и обход делается однажды — множится лишь оператор. */
+      for (int s = 0; s < X->nk; s++) {
+        hz_pfront_face si[3], so[3];
+        for (int a = 0; a < 3; a++)
+          si[a] = in[a * X->nk + s];
+        if (hz_pfront_shade(si, so, X->m, list, n, lo, hi, X->sdir[s])) has = 1;
+        for (int a = 0; a < 3; a++)
+          out[a * X->nk + s] = so[a];
+      }
     }
     /* ДИАГНОСТИКА «СОБСТВЕННОЙ МЕЛКОСТИ» УЗЛА (разбор с пользователем 08-05:
      * сейчас тон задаёт общий уровень фронта, а менее детальный объект ничего не
@@ -472,13 +494,16 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
      * берётся `markrelax` ступеней. Пометка пишется ТОЛЬКО на крупных уровнях:
      * ниже она и не нужна, и стоила бы полного второго обхода. */
     if (X->markout != NULL && (int)X->T->lev[nid] <= X->markoutlev) {
-      double fo = 0.0, wo = 0.0;
-      for (int a = 0; a < 3; a++) {
-        double wa = (X->dir[a] < 0.0) ? -X->dir[a] : X->dir[a];
-        wo += wa;
-        fo += wa * in[a].c0;
-      }
-      if (wo > 0.0 && fo <= wo * HZ_PFRONT_FRAC_TOL) {
+      /* ПОМЕТКА СТАВИТСЯ ПО ХУДШЕЙ ТОЧКЕ ГРАНИ, А НЕ ПО СРЕДНЕЙ. Сперва бралось
+       * среднее (`c0`), и приёмка это поймала: среди помеченных оказалось
+       * `18.7 %` ячеек, ВИДИМЫХ от камеры (зал) и `11.6 %` (Сан-Мигель). Причина
+       * прямая: у крупного узла часть в тени, часть на свету, среднее темно — а
+       * светлая часть видна. Критерий обязан быть таким же, как у остановки по
+       * темноте: `c0 + |cu| + |cv|` ниже допуска, то есть темно ВЕЗДЕ на грани.
+       * Ошибка при этом смещается в безопасную сторону: не пометим часть
+       * невидимого — это по указанию пользователя 08-06 допустимо, а огрубить
+       * видимое — нет. */
+      if (pf_darkK(X, in)) {
         X->markout[nid] = 1;
         X->nmarkset++;
       }
@@ -500,15 +525,24 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
      * именно оно есть «сколько диска видно этой ячейке». */
     if (X->refpt != NULL && X->refn < X->refcap && X->refstride > 0 &&
         (X->ncell % X->refstride) == 0 && w > 0.0) {
-      double fi = 0.0;
-      for (int a = 0; a < 3; a++) {
-        double wa = (X->dir[a] < 0.0) ? -X->dir[a] : X->dir[a];
-        fi += wa * in[a].c0;
+      /* СРЕДНЕЕ ПО ДИСКУ, а не нулевая выборка: у протяжённого источника доля
+       * открытого диска и есть среднее по выборкам, и сверять с эталоном надо
+       * именно её. Брал нулевую — и потому `K` не был виден в замере вовсе. */
+      double fi = 0.0, wi = 0.0;
+      for (int s = 0; s < X->nk; s++)
+        for (int a = 0; a < 3; a++) {
+          double wa = (X->sdir[s][a] < 0.0) ? -X->sdir[s][a] : X->sdir[s][a];
+          wi += wa;
+          fi += wa * in[a * X->nk + s].c0;
+        }
+      if (wi > 0.0) {
+        fi /= wi;
+        wi = 1.0;
       }
       for (int c = 0; c < 3; c++)
         X->refpt[3 * (size_t)X->refn + (size_t)c] = 0.5 * (lo[c] + hi[c]);
       if (X->refh != NULL) X->refh[X->refn] = 0.5 * (hi[0] - lo[0]);
-      X->refvis[X->refn] = fi / w;
+      X->refvis[X->refn] = fi;
       X->refn++;
     }
     return;
@@ -532,7 +566,8 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
    * что сосед посчитан до чтения, но анализатору этот довод недоступен, и он
    * прав в том, что доказательства у него нет. Двадцать четыре записи на узел —
    * цена никакая. */
-  hz_pfront_face cout[8][3] = {{{0.0, 0.0, 0.0}}};
+  /* На каждую выборку по диску — своя тройка граней: `[ось · nk + выборка]`. */
+  hz_pfront_face cout[8][3 * HZ_PFRONT_MAXK] = {{{0.0, 0.0, 0.0}}};
   /* Порядок «ближние раньше дальних»: по числу осей, где ребёнок с дальней
    * стороны. Он делает зависимости ациклическими (§241.7). */
   for (int far = 0; far <= 3; far++) {
@@ -548,15 +583,17 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         clo[c] = b[c] ? mid[c] : lo[c];
         chi[c] = b[c] ? hi[c] : mid[c];
       }
-      hz_pfront_face cin[3];
+      hz_pfront_face cin[3 * HZ_PFRONT_MAXK];
       for (int a = 0; a < 3; a++) {
         int p, q;
         face_axes(a, &p, &q);
-        if (b[a] == e[a]) {
-          double su = b[p] ? 1.0 : -1.0, sv = b[q] ? 1.0 : -1.0;
-          cin[a] = face_quarter(&in[a], su, sv);
-        } else {
-          cin[a] = cout[k ^ (1 << a)][a];
+        for (int s = 0; s < X->nk; s++) {
+          if (b[a] == e[a]) {
+            double su = b[p] ? 1.0 : -1.0, sv = b[q] ? 1.0 : -1.0;
+            cin[a * X->nk + s] = face_quarter(&in[a * X->nk + s], su, sv);
+          } else {
+            cin[a * X->nk + s] = cout[k ^ (1 << a)][a * X->nk + s];
+          }
         }
       }
       int32_t ns = 0;
@@ -577,14 +614,16 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
   for (int a = 0; a < 3; a++) {
     int p, q;
     face_axes(a, &p, &q);
-    hz_pfront_face Q[4];
-    for (int j = 0; j < 4; j++) {
-      int b[3];
-      b[a] = 1 - e[a];
-      b[p] = j & 1;
-      b[q] = (j >> 1) & 1;
-      Q[j] = cout[(b[0]) | (b[1] << 1) | (b[2] << 2)][a];
+    for (int s = 0; s < X->nk; s++) {
+      hz_pfront_face Q[4];
+      for (int j = 0; j < 4; j++) {
+        int b[3];
+        b[a] = 1 - e[a];
+        b[p] = j & 1;
+        b[q] = (j >> 1) & 1;
+        Q[j] = cout[(b[0]) | (b[1] << 1) | (b[2] << 2)][a * X->nk + s];
+      }
+      out[a * X->nk + s] = face_join(Q);
     }
-    out[a] = face_join(Q);
   }
 }

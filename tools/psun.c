@@ -37,7 +37,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   int leafmax = 0, maxlev = 0, grade = 1, shadow = 1, cam = 0, nref = 0, cliplev = -1, camfull = 0,
-      usemark = 0, relax = HZ_PMARK_OUT_LEVELS, refinemax = 0;
+      usemark = 0, relax = HZ_PMARK_OUT_LEVELS, refinemax = 0, nk = 1;
   double camo[3] = {0.0, 0.0, 0.0}, camf[3] = {0.0, 0.0, 1.0};
   double px = 9.1, sdir[3] = {0.3, -0.9, 0.3};
   for (int i = 3; i < argc; i++) {
@@ -158,6 +158,40 @@ int main(int argc, char **argv) {
   if (!(L > 0.0)) L = 1.0;
   for (int c = 0; c < 3; c++)
     X.dir[c] = sdir[c] / L;
+  /* ВЫБОРКИ ПО ДИСКУ ИСТОЧНИКА (Ф4, §275). `K = 1` — в точности О73 и он же
+   * негативный контроль. Выборка — спираль Ферма, детерминированная; у эталона
+   * она ДРУГАЯ и вчетверо гуще (А533), иначе сверка сойдётся по построению. */
+  X.nk = (nk < 1) ? 1 : (nk > HZ_PFRONT_MAXK ? HZ_PFRONT_MAXK : nk);
+  {
+    double half = 0.5 * 9.3e-3, t1[3] = {0.0, 0.0, 1.0}, q1[3], q2[3];
+    if (fabs(X.dir[2]) > 0.9) {
+      t1[0] = 1.0;
+      t1[2] = 0.0;
+    }
+    q1[0] = X.dir[1] * t1[2] - X.dir[2] * t1[1];
+    q1[1] = X.dir[2] * t1[0] - X.dir[0] * t1[2];
+    q1[2] = X.dir[0] * t1[1] - X.dir[1] * t1[0];
+    double lq = sqrt(q1[0] * q1[0] + q1[1] * q1[1] + q1[2] * q1[2]);
+    if (!(lq > 0.0)) lq = 1.0;
+    for (int c = 0; c < 3; c++)
+      q1[c] /= lq;
+    q2[0] = X.dir[1] * q1[2] - X.dir[2] * q1[1];
+    q2[1] = X.dir[2] * q1[0] - X.dir[0] * q1[2];
+    q2[2] = X.dir[0] * q1[1] - X.dir[1] * q1[0];
+    for (int s = 0; s < X.nk; s++) {
+      double rr = (X.nk == 1) ? 0.0 : half * sqrt(((double)s + 0.5) / (double)X.nk);
+      double ph = 2.39996322972865332 * (double)s;
+      double nn = 0.0;
+      for (int c = 0; c < 3; c++) {
+        X.sdir[s][c] = X.dir[c] + rr * (cos(ph) * q1[c] + sin(ph) * q2[c]);
+        nn += X.sdir[s][c] * X.sdir[s][c];
+      }
+      nn = sqrt(nn);
+      if (!(nn > 0.0)) nn = 1.0;
+      for (int c = 0; c < 3; c++)
+        X.sdir[s][c] /= nn;
+    }
+  }
   X.pxeps2 = (px * HZ_CFG_EPS) * (px * HZ_CFG_EPS);
   X.t_entry = 1e300;
   for (int k = 0; k < 8; k++) {
@@ -266,6 +300,9 @@ int main(int argc, char **argv) {
     for (int32_t i = 0; i < T.nnd; i++)
       mk[i] = 255; /* 255 — пометки нет */
     hz_pfront_ctx CX = X;
+    CX.nk = 1; /* пометки ставит ОДНА выборка: невидимость двоична */
+    for (int c = 0; c < 3; c++)
+      CX.sdir[0][c] = camf[c];
     CX.mark = NULL;
     CX.markout = mk;
     CX.markoutlev = HZ_PMARK_LEVEL;
@@ -283,8 +320,8 @@ int main(int argc, char **argv) {
         tt += ((k & (1 << c)) ? T.nd[0].hi[c] : T.nd[0].lo[c]) * CX.dir[c];
       if (tt < CX.t_entry) CX.t_entry = tt;
     }
-    hz_pfront_face ci[3], co[3];
-    for (int a = 0; a < 3; a++) {
+    hz_pfront_face ci[3 * HZ_PFRONT_MAXK], co[3 * HZ_PFRONT_MAXK];
+    for (int a = 0; a < 3 * CX.nk; a++) {
       ci[a].c0 = 1.0;
       ci[a].cu = 0.0;
       ci[a].cv = 0.0;
@@ -298,8 +335,8 @@ int main(int argc, char **argv) {
     X.markcur = -1;
     X.markrelax = relax;
   }
-  hz_pfront_face in[3], out[3];
-  for (int a = 0; a < 3; a++) {
+  hz_pfront_face in[3 * HZ_PFRONT_MAXK], out[3 * HZ_PFRONT_MAXK];
+  for (int a = 0; a < 3 * X.nk; a++) {
     in[a].c0 = 1.0; /* на входе в сцену диск источника открыт целиком */
     in[a].cu = 0.0;
     in[a].cv = 0.0;
@@ -349,6 +386,84 @@ int main(int argc, char **argv) {
          X.nflatgeo > 0 ? 100.0 * (double)X.nflat1 / (double)X.nflatgeo : 0.0);
   printf("   ВРЕМЯ %.2f с, на ячейку %.1f нс\n", secs,
          X.ncell > 0 ? 1e9 * secs / (double)X.ncell : 0.0);
+
+  /* ПРИЁМКА ЭТОЙ ЛИНИИ ОПТИМИЗАЦИЙ — ОДНОСТОРОННЯЯ (указание пользователя 08-06):
+   * «нужно лишь, чтобы мы не огрубили ВИДИМЫЕ части; вполне допустимо, что часть
+   * невидимых останется неогрублённой». Значит проверять надо НЕ расхождение с
+   * эталоном по яркости — то физика тени, а у нас тень в смысле НЕВИДИМОСТИ, —
+   * а одно: нет ли среди помеченных ячейки, до которой камера ДОСТАЁТ.
+   * Проверка независима от фронта: прямой луч от глаза к центру ячейки перебором
+   * треугольников. Нарушений обязано быть НОЛЬ. */
+  if (usemark && mk != NULL && nref > 0) {
+    int32_t nchk = 0, nbadv = 0;
+    double tchk = now_s();
+    /* Перебирать надо ПОМЕЧЕННЫЕ, а не сетку по всем узлам: пометок 47 тыс. из
+     * 34 млн, и шаг по всем узлам не попал ни в одну (проверено 0). Считаем их
+     * сперва, потом берём каждую `stride`-ю ИЗ НИХ. */
+    int32_t nmk = 0;
+    for (int32_t i = 0; i < T.nnd; i++)
+      if (mk[i] != 255) nmk++;
+    int32_t stride = (nmk > nref) ? nmk / nref : 1;
+    int32_t seen = 0;
+    for (int32_t i = 0; i < T.nnd; i++) {
+      if (mk[i] == 255) continue;
+      if ((seen++ % stride) != 0) continue;
+      double P0[3], d2[3], len = 0.0;
+      for (int c = 0; c < 3; c++) {
+        P0[c] = 0.5 * (T.nd[i].lo[c] + T.nd[i].hi[c]);
+        d2[c] = P0[c] - camo[c];
+        len += d2[c] * d2[c];
+      }
+      len = sqrt(len);
+      if (!(len > 0.0)) continue;
+      for (int c = 0; c < 3; c++)
+        d2[c] /= len;
+      /* ВНУТРИ ли пирамиды. Ячейка вне конуса лучом достижима, но НЕ ВИДИМА, и
+       * считать её нарушением нельзя: критерий — «не огрубить ВИДИМОЕ», а вне
+       * кадра видимого нет. */
+      int infr = 1;
+      for (int kf = 0; kf < 6 && infr; kf++) {
+        const double *PL = X.fr[kf];
+        double sf = PL[3];
+        for (int c = 0; c < 3; c++)
+          sf += (PL[c] > 0.0 ? T.nd[i].hi[c] : T.nd[i].lo[c]) * PL[c];
+        if (sf < 0.0) infr = 0;
+      }
+      if (!infr) continue;
+      nchk++;
+      int blocked = 0;
+      for (int32_t t = 0; t < m.nt && !blocked; t++) {
+        const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t + 0];
+        const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)t + 1];
+        const double *C = m.v + 3 * (size_t)m.f[3 * (size_t)t + 2];
+        double e1[3], e2[3], pv[3], tv[3], qv[3];
+        for (int c = 0; c < 3; c++) {
+          e1[c] = B[c] - A[c];
+          e2[c] = C[c] - A[c];
+        }
+        pv[0] = d2[1] * e2[2] - d2[2] * e2[1];
+        pv[1] = d2[2] * e2[0] - d2[0] * e2[2];
+        pv[2] = d2[0] * e2[1] - d2[1] * e2[0];
+        double det = e1[0] * pv[0] + e1[1] * pv[1] + e1[2] * pv[2];
+        if (det > -1e-12 && det < 1e-12) continue;
+        double inv = 1.0 / det;
+        for (int c = 0; c < 3; c++)
+          tv[c] = camo[c] - A[c];
+        double uu = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+        if (uu < 0.0 || uu > 1.0) continue;
+        qv[0] = tv[1] * e1[2] - tv[2] * e1[1];
+        qv[1] = tv[2] * e1[0] - tv[0] * e1[2];
+        qv[2] = tv[0] * e1[1] - tv[1] * e1[0];
+        double vv = (d2[0] * qv[0] + d2[1] * qv[1] + d2[2] * qv[2]) * inv;
+        if (vv < 0.0 || uu + vv > 1.0) continue;
+        double tt = (e2[0] * qv[0] + e2[1] * qv[1] + e2[2] * qv[2]) * inv;
+        if (tt > 1e-6 && tt < len - 1e-6) blocked = 1;
+      }
+      if (!blocked) nbadv++;
+    }
+    printf("   ПРИЁМКА: помеченных проверено %d за %.1f с; ВИДИМЫХ СРЕДИ НИХ %d (обязано 0)\n",
+           nchk, now_s() - tchk, nbadv);
+  }
 
   /* ЭТАЛОН ЛУЧАМИ (А519). Считает ТО ЖЕ — долю открытого диска источника, — но
    * другим способом: прямым перебором треугольников. Перебор выбран сознательно:

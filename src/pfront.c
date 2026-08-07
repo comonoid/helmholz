@@ -457,7 +457,16 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
       int silh = 0;
       if (X->silh_a > 0.0 && n > 0) {
         double h = hi[0] - lo[0];
-        if (h > X->silh_a * X->silh_d) {
+        double dd = X->silh_d;
+        if (X->silh_local) {
+          double tc = 0.0;
+          for (int c = 0; c < 3; c++)
+            tc += 0.5 * (lo[c] + hi[c]) * X->dir[c];
+          dd = X->t_exit - tc;
+          if (dd < 0.0) dd = 0.0;
+          if (dd > X->silh_d) dd = X->silh_d;
+        }
+        if (h > X->silh_a * dd) {
           silh = 1;
           X->nsilh++;
         }
@@ -490,6 +499,8 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
       }
     } else if (X->markon && X->depth != NULL && X->depth[nid] <= X->markrelax &&
                !(X->silh_a > 0.0 && n > 0 && (hi[0] - lo[0]) > X->silh_a * X->silh_d)) {
+      /* Здесь оценка остаётся общей: ветвь «за N уровней до дна» срабатывает у
+       * мелких узлов, где локальное уточнение ничего не меняет. */
       /* ОГРУБЛЕНИЕ НА `markrelax` УРОВНЕЙ ОТ ТОГО МЕСТА, ГДЕ ОСТАНОВИЛИСЬ БЫ
        * ИНАЧЕ. Дно поддерева отсюда — `depth`; значит «на два уровня грубее»
        * есть «остановиться, когда до дна осталось два». Так формулировал

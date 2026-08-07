@@ -560,6 +560,14 @@ int main(int argc, char **argv) {
         dg += sdd * sdd;
       }
       X.silh_d = sqrt(dg);
+      X.silh_local = (silh >= 2);
+      X.t_exit = -1e300;
+      for (int k = 0; k < 8; k++) {
+        double tt = 0.0;
+        for (int c = 0; c < 3; c++)
+          tt += ((k & (1 << c)) ? T.nd[0].hi[c] : T.nd[0].lo[c]) * X.dir[c];
+        if (tt > X.t_exit) X.t_exit = tt;
+      }
     }
   } else if (usemark) {
     /* ПРЕЖНИЙ ПРОХОД ФРОНТОМ (`mark=2`) — оставлен ради воспроизводимости чисел

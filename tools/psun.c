@@ -50,7 +50,7 @@ int main(int argc, char **argv) {
   int leafmax = 0, maxlev = 0, grade = 1, shadow = 1, cam = 0, nref = 0, cliplev = -1, camfull = 0,
       usemark = 0, relax = HZ_PMARK_OUT_LEVELS, refinemax = 0, nk = 1;
   double camo[3] = {0.0, 0.0, 0.0}, camf[3] = {0.0, 0.0, 1.0}, camat[3] = {0.0, 0.0, 1.0};
-  int loose = 0, bufside = HZ_CFG_W, eta = 1, mlev = HZ_PMARK_LEVEL, img = 0;
+  int loose = 0, bufside = HZ_CFG_W, eta = 1, mlev = HZ_PMARK_LEVEL, img = 0, nrec = 0;
   double px = 9.1, sdir[3] = {0.3, -0.9, 0.3};
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "leaf=", 5) == 0) leafmax = (int)strtol(argv[i] + 5, NULL, 10);
@@ -69,6 +69,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "eta=", 4) == 0) eta = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "mlev=", 5) == 0) mlev = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "img=", 4) == 0) img = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "rec=", 4) == 0) nrec = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "cover=", 6) == 0)
       hz_pfront_cover_sum = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "sun=", 4) == 0) {
@@ -357,6 +358,30 @@ int main(int argc, char **argv) {
      * вовсе. Значит доля НЕ ЗАВЫШЕНА за счёт того, что просто не попало в кадр. */
     {
       int64_t leaf_all = 0, leaf_hid = 0, occ_all = 0, occ_hid = 0, leaf_occl = 0, leaf_frust = 0;
+      /* ПОЛНОТА МЕХАНИЗМА — ВТОРАЯ ПОЛОВИНА ВОПРОСА (пользователь 08-07: «а
+       * наоборот мерили? сколько невидимых, но непомеченных?»). Приёмка §278
+       * односторонняя и проверяет только, что среди ПОМЕЧЕННЫХ нет видимых;
+       * сколько НЕВИДИМОГО механизм пропускает, не мерилось ни разу.
+       *
+       * ЭТАЛОН ЗДЕСЬ ДРУГОЙ И НАРОЧНО ГРУБЫЙ: ячейка считается видимой, если
+       * ХОТЬ ОДНА из девяти её точек (центр и восемь углов) лежит в кадре и
+       * достижима лучом от глаза. Ошибается он в сторону «невидимых больше»
+       * (тонкий просвет между девятью точками он пропустит), а значит
+       * ЗАНИЖАЕТ измеряемую полноту — то есть работает против нужного ответа,
+       * как эталону и положено. */
+      int32_t recn = 0;
+      int32_t recstride = (nrec > 0) ? 1 : 1;
+      int32_t *recid = NULL;
+      unsigned char *recmk = NULL;
+      if (nrec > 0) {
+        recid = malloc((size_t)nrec * sizeof *recid);
+        recmk = malloc((size_t)nrec);
+        int64_t nleafocc = 0;
+        for (int32_t i2 = 0; i2 < T.nnd; i2++)
+          if (occ[i2] && T.nd[i2].child < 0) nleafocc++;
+        recstride = (int32_t)(nleafocc / (int64_t)nrec);
+        if (recstride < 1) recstride = 1;
+      }
       int32_t *st = malloc((size_t)T.nnd * sizeof *st);
       unsigned char *hid = malloc((size_t)T.nnd);
       if (st != NULL && hid != NULL) {
@@ -375,6 +400,13 @@ int main(int argc, char **argv) {
               if (h) leaf_hid++;
               if (h == 1) leaf_occl++;
               if (h == 2) leaf_frust++;
+              /* Выборка для замера ПОЛНОТЫ (см. ниже): каждый `recstride`-й
+               * занятый лист вместе с его пометкой. */
+              if (nrec > 0 && recn < nrec && (leaf_all % recstride) == 0) {
+                recid[recn] = nid;
+                recmk[recn] = (unsigned char)h;
+                recn++;
+              }
             }
           }
           if (T.nd[nid].child >= 0)
@@ -400,6 +432,84 @@ int main(int argc, char **argv) {
             leaf_all > 0 ? 100.0 * (double)leaf_frust / (double)leaf_all : 0.0, (long long)occ_hid,
             (long long)occ_all, occ_all > 0 ? 100.0 * (double)occ_hid / (double)occ_all : 0.0);
       }
+      /* ЗАМЕР ПОЛНОТЫ: по выборке занятых листьев сверяем пометку с эталоном. */
+      if (recid != NULL && recmk != NULL && recn > 0) {
+        double trec = now_s();
+        int64_t ninv = 0, ninv_mk = 0, nvis = 0, nvis_mk = 0;
+#pragma omp parallel for schedule(dynamic, 4) reduction(+ : ninv, ninv_mk, nvis, nvis_mk)
+        for (int32_t q = 0; q < recn; q++) {
+          const hz_ptnode *N2 = &T.nd[recid[q]];
+          int seen = 0;
+          for (int pt = 0; pt < 9 && !seen; pt++) {
+            double P0[3];
+            for (int c = 0; c < 3; c++)
+              P0[c] = (pt == 8) ? 0.5 * (N2->lo[c] + N2->hi[c])
+                                : ((pt & (1 << c)) ? N2->hi[c] : N2->lo[c]);
+            int infr = 1;
+            for (int kf = 0; kf < 6 && infr; kf++) {
+              const double *PL = X.fr[kf];
+              double sf = PL[3];
+              for (int c = 0; c < 3; c++)
+                sf += P0[c] * PL[c];
+              if (sf < 0.0) infr = 0;
+            }
+            if (!infr) continue;
+            double dv[3], len = 0.0;
+            for (int c = 0; c < 3; c++) {
+              dv[c] = P0[c] - camo[c];
+              len += dv[c] * dv[c];
+            }
+            len = sqrt(len);
+            if (!(len > 0.0)) continue;
+            for (int c = 0; c < 3; c++)
+              dv[c] /= len;
+            int blk = 0;
+            for (int32_t t = 0; t < m.nt && !blk; t++) {
+              const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t + 0];
+              const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)t + 1];
+              const double *Cc = m.v + 3 * (size_t)m.f[3 * (size_t)t + 2];
+              double q1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]};
+              double q2[3] = {Cc[0] - A[0], Cc[1] - A[1], Cc[2] - A[2]};
+              double pv[3], tv[3], qv[3];
+              pv[0] = dv[1] * q2[2] - dv[2] * q2[1];
+              pv[1] = dv[2] * q2[0] - dv[0] * q2[2];
+              pv[2] = dv[0] * q2[1] - dv[1] * q2[0];
+              double det = q1[0] * pv[0] + q1[1] * pv[1] + q1[2] * pv[2];
+              if (det > -1e-12 && det < 1e-12) continue;
+              double inv = 1.0 / det;
+              tv[0] = camo[0] - A[0];
+              tv[1] = camo[1] - A[1];
+              tv[2] = camo[2] - A[2];
+              double uu = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+              if (uu < 0.0 || uu > 1.0) continue;
+              qv[0] = tv[1] * q1[2] - tv[2] * q1[1];
+              qv[1] = tv[2] * q1[0] - tv[0] * q1[2];
+              qv[2] = tv[0] * q1[1] - tv[1] * q1[0];
+              double vv = (dv[0] * qv[0] + dv[1] * qv[1] + dv[2] * qv[2]) * inv;
+              if (vv < 0.0 || uu + vv > 1.0) continue;
+              double tt = (q2[0] * qv[0] + q2[1] * qv[1] + q2[2] * qv[2]) * inv;
+              if (tt > 1e-6 && tt < len - 1e-6) blk = 1;
+            }
+            if (!blk) seen = 1;
+          }
+          if (seen) {
+            nvis++;
+            if (recmk[q]) nvis_mk++;
+          } else {
+            ninv++;
+            if (recmk[q]) ninv_mk++;
+          }
+        }
+        printf("== ПОЛНОТА ПОМЕТОК (эталон лучами по 9 точкам ячейки, %d занятых листьев за "
+               "%.1f с):\n"
+               "   НЕВИДИМЫХ %lld, из них помечено %lld (%.1f %%) — пропущено %lld\n"
+               "   ВИДИМЫХ   %lld, из них помечено %lld (обязано 0)\n",
+               recn, now_s() - trec, (long long)ninv, (long long)ninv_mk,
+               ninv > 0 ? 100.0 * (double)ninv_mk / (double)ninv : 0.0, (long long)(ninv - ninv_mk),
+               (long long)nvis, (long long)nvis_mk);
+      }
+      free(recid);
+      free(recmk);
       free(st);
       free(hid);
     }

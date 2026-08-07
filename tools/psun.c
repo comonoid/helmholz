@@ -197,6 +197,44 @@ int main(int argc, char **argv) {
   printf("== ЗАНЯТОСТЬ за %.2f с: узлов с геометрией %lld (%.2f %%)\n", now_s() - t0,
          (long long)nocc, 100.0 * (double)nocc / (double)T.nnd);
 
+  /* СТРУКТУРНАЯ ПРОВЕРКА ДЕРЕВА (§306). §305 показал: обход накрывает треть
+   * листьев и `17 499` раз останавливается в узле повторно. Из устройства обхода
+   * это не следует, значит подозрение на САМО ДЕРЕВО: у каждого узла обязан быть
+   * ровно один родитель, у корня — ни одного. У `octree.c` такая проверка есть
+   * (`twoparent`, `unreachable`), у `ptree` её нет ни в каком виде. */
+  {
+    int32_t *par = calloc((size_t)T.nnd, sizeof *par);
+    if (par != NULL) {
+      int64_t bad_idx = 0;
+      for (int32_t q = 0; q < T.nnd; q++) {
+        if (T.nd[q].child < 0) continue;
+        for (int k = 0; k < 8; k++) {
+          int32_t ch = T.nd[q].child + k;
+          if (ch < 0 || ch >= T.nnd) {
+            bad_idx++;
+            continue;
+          }
+          par[ch]++;
+        }
+      }
+      int64_t p0 = 0, p1 = 0, p2 = 0, pmax = 0;
+      for (int32_t q = 0; q < T.nnd; q++) {
+        if (par[q] == 0)
+          p0++;
+        else if (par[q] == 1)
+          p1++;
+        else
+          p2++;
+        if (par[q] > pmax) pmax = par[q];
+      }
+      printf("== СТРУКТУРА ДЕРЕВА: узлов %d; БЕЗ РОДИТЕЛЯ %lld (обязан 1 — корень), с ОДНИМ "
+             "%lld, с ДВУМЯ И БОЛЕЕ %lld (обязано 0, наибольшее %lld); ссылок вне границ %lld\n",
+             T.nnd, (long long)p0, (long long)p1, (long long)p2, (long long)pmax,
+             (long long)bad_idx);
+    }
+    free(par);
+  }
+
   hz_pfront_ctx X;
   memset(&X, 0, sizeof X);
   X.T = &T;
@@ -728,12 +766,17 @@ int main(int argc, char **argv) {
   }
   t0 = now_s();
   X.refinemax = refinemax;
+  int32_t *vis = NULL;
+  if (img) {
+    vis = calloc((size_t)T.nnd, sizeof *vis);
+    X.visit = vis;
+  }
   /* Место, куда фронт положит свой ответ, — только если он кому-то нужен. */
   if (img) {
     X.cellf = malloc((size_t)T.nnd * sizeof *X.cellf);
     if (X.cellf != NULL)
       for (int32_t i = 0; i < T.nnd; i++)
-        X.cellf[i] = -1.0f;
+        X.cellf[i] = -2.0f; /* сторож «не записано»: отличаем от ОТРИЦАТЕЛЬНОГО ответа */
     /* Таблица глубин заслонителя внутри ячейки (§296). Запись — 64 числа на
      * ОСТАНОВИВШУЮСЯ ячейку; их доли процента от узлов, поэтому индекс на узел
      * плюс плотный массив записей, а не 64 числа на каждый узел. */
@@ -745,6 +788,7 @@ int main(int argc, char **argv) {
         for (int32_t i = 0; i < T.nnd; i++)
           X.cellslot[i] = -1;
       else {
+        free(vis);
         free(X.cellslot);
         free(X.celldep);
         X.cellslot = NULL;
@@ -785,6 +829,25 @@ int main(int argc, char **argv) {
          X.nflatgeo > 0 ? 100.0 * (double)X.nflat1 / (double)X.nflatgeo : 0.0);
   printf("   ВРЕМЯ %.2f с, на ячейку %.1f нс\n", secs,
          X.ncell > 0 ? 1e9 * secs / (double)X.ncell : 0.0);
+
+  if (vis != NULL) {
+    int64_t v0 = 0, v1 = 0, v2 = 0, vmax = 0, v0leaf = 0, v0occ = 0;
+    for (int32_t q = 0; q < T.nnd; q++) {
+      if (vis[q] == 0) {
+        v0++;
+        if (T.nd[q].child < 0) v0leaf++;
+        if (occ[q]) v0occ++;
+      } else if (vis[q] == 1)
+        v1++;
+      else
+        v2++;
+      if (vis[q] > vmax) vmax = vis[q];
+    }
+    printf("== ПОСЕЩЕНИЯ ОБХОДОМ: не посещено %lld узлов (из них листьев %lld, занятых %lld), "
+           "один раз %lld, БОЛЕЕ ОДНОГО %lld (наибольшее %lld)\n",
+           (long long)v0, (long long)v0leaf, (long long)v0occ, (long long)v1, (long long)v2,
+           (long long)vmax);
+  }
 
   /* ПОКРЫВАЕТ ЛИ ФРОНТ ВСЁ ПРОСТРАНСТВО (§303, шаг 1). Устройство обхода
    * утверждает: остановки фронта разбивают дерево без дыр — на листе остановка
@@ -829,12 +892,20 @@ int main(int argc, char **argv) {
             for (int k = 0; k < 8; k++)
               lv2[q] += lv2[T.nd[q].child + k];
         }
-        int64_t nstop = 0, sum2 = 0;
-        for (int32_t q = 0; q < T.nnd; q++)
-          if (X.cellf[q] >= 0.0f) {
+        int64_t nstop = 0, sum2 = 0, nneg = 0, sumneg = 0;
+        for (int32_t q = 0; q < T.nnd; q++) {
+          if (X.cellf[q] > -1.5f) { /* запись ЕСТЬ (в т.ч. отрицательная) */
             nstop++;
             sum2 += lv2[q];
+            if (X.cellf[q] < 0.0f) {
+              nneg++;
+              sumneg += lv2[q];
+            }
           }
+        }
+        printf("== ОТРИЦАТЕЛЬНОЕ СОСТОЯНИЕ: записей с f < 0 — %lld из %lld, листьев под ними "
+               "%lld\n",
+               (long long)nneg, (long long)nstop, (long long)sumneg);
         printf("== ВТОРОЙ СЧЁТ: остановок %lld (обход насчитал %lld), листьев под ними %lld из "
                "%lld (%.2f %%)\n",
                (long long)nstop, (long long)X.ncell, (long long)sum2, (long long)leaf_tot,
@@ -923,7 +994,7 @@ int main(int argc, char **argv) {
            * Правильно — брать ответ ближайшего предка, у которого запись ЕСТЬ:
            * он покрывает эту точку по построению, потому что фронт остановился
            * именно на нём. */
-          int32_t nid = 0, best = (X.cellf[0] >= 0.0f) ? 0 : -1;
+          int32_t nid = 0, best = (X.cellf[0] > -1.5f) ? 0 : -1;
           while (T.nd[nid].child >= 0) {
             double mid[3];
             int k = 0;
@@ -932,7 +1003,7 @@ int main(int argc, char **argv) {
               if (PL[c] >= mid[c]) k |= (1 << c);
             }
             nid = T.nd[nid].child + k;
-            if (X.cellf[nid] >= 0.0f) best = nid;
+            if (X.cellf[nid] > -1.5f) best = nid;
           }
           if (best >= 0) nid = best;
           /* Одноразовая печать ПУТИ для первого пикселя без записи: где именно
@@ -1627,6 +1698,7 @@ int main(int argc, char **argv) {
   free(dep);
   free(mk);
   free(X.cellf);
+  free(vis);
   free(X.cellslot);
   free(X.celldep);
   free(tlo);

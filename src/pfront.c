@@ -451,8 +451,20 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
      * Одна ветка без другой покрывает лишь свою половину случаев, что и было
      * измерено 08-06 порознь. */
     if (X->markon && X->markrelax > 0) {
-      for (int k = 0; k < X->markrelax && k < 16; k++)
-        pxe2 *= 4.0;
+      /* ПОЛ ОЧЕРКА: послабление отменяется, если ячейка НЕСЁТ ГЕОМЕТРИЮ и при
+       * этом крупнее полутени, которую она отбрасывает. Пустая ячейка тени не
+       * даёт — её послабление не трогается. */
+      int silh = 0;
+      if (X->silh_a > 0.0 && n > 0) {
+        double h = hi[0] - lo[0];
+        if (h > X->silh_a * X->silh_d) {
+          silh = 1;
+          X->nsilh++;
+        }
+      }
+      if (!silh)
+        for (int k = 0; k < X->markrelax && k < 16; k++)
+          pxe2 *= 4.0;
     }
     if (d2 > r2 && 4.0 * r2 <= pxe2 * d2) {
       /* Р3 §241.9 — УТОЧНЕНИЕ ТАМ, ГДЕ СОСТОЯНИЕ НЕ ПРЕДСТАВИМО. Зеркало правила
@@ -476,7 +488,8 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         stop = 1;
         why = 1;
       }
-    } else if (X->markon && X->depth != NULL && X->depth[nid] <= X->markrelax) {
+    } else if (X->markon && X->depth != NULL && X->depth[nid] <= X->markrelax &&
+               !(X->silh_a > 0.0 && n > 0 && (hi[0] - lo[0]) > X->silh_a * X->silh_d)) {
       /* ОГРУБЛЕНИЕ НА `markrelax` УРОВНЕЙ ОТ ТОГО МЕСТА, ГДЕ ОСТАНОВИЛИСЬ БЫ
        * ИНАЧЕ. Дно поддерева отсюда — `depth`; значит «на два уровня грубее»
        * есть «остановиться, когда до дна осталось два». Так формулировал

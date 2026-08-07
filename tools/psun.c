@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
       usemark = 0, relax = HZ_PMARK_OUT_LEVELS, refinemax = 0, nk = 1;
   double camo[3] = {0.0, 0.0, 0.0}, camf[3] = {0.0, 0.0, 1.0}, camat[3] = {0.0, 0.0, 1.0};
   int loose = 0, bufside = HZ_CFG_W, eta = 1, mlev = HZ_PMARK_LEVEL, img = 0, nrec = 0, ndbg = 0;
-  int indep = 0, intol = 8;
+  int indep = 0, intol = 8, silh = 0;
   /* УГЛОВОЙ РАДИУС ИСТОЧНИКА — ПАРАМЕТР, А НЕ КОНСТАНТА (замечание пользователя
    * 08-07). Он был зашит числом солнца в ДВУХ местах — у фронта и у эталона, — и
    * потому «протяжённый источник» из §275 означал лишь `K` выборок ТОГО ЖЕ
@@ -80,6 +80,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "dbg=", 4) == 0) ndbg = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "indep=", 6) == 0) indep = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "intol=", 6) == 0) intol = (int)strtol(argv[i] + 6, NULL, 10);
+    if (strncmp(argv[i], "silh=", 5) == 0) silh = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "flat=", 5) == 0) hz_ptree_flat_split = (int)strtol(argv[i] + 5, NULL, 10);
     /* ВЫБОРОК ПО ДИСКУ ИСТОЧНИКА. Механизм Ф4 (§275) был написан, но ключа не
      * имел, и `K` оставалось единицей — то есть источник точечным, а полутени в
@@ -549,6 +550,17 @@ int main(int argc, char **argv) {
     X.mark = mk;
     X.markcur = -1;
     X.markrelax = relax;
+    /* ПОЛ ОЧЕРКА (§297): угловой радиус источника и верхняя оценка расстояния до
+     * приёмника — поперечник сцены. Ключ `silh=0` выключает правило. */
+    if (silh) {
+      X.silh_a = asun;
+      double dg = 0.0;
+      for (int c = 0; c < 3; c++) {
+        double sdd = T.nd[0].hi[c] - T.nd[0].lo[c];
+        dg += sdd * sdd;
+      }
+      X.silh_d = sqrt(dg);
+    }
   } else if (usemark) {
     /* ПРЕЖНИЙ ПРОХОД ФРОНТОМ (`mark=2`) — оставлен ради воспроизводимости чисел
      * §271/§272 и как то, ЧТО ИМЕННО не проходит приёмку. Это ТОТ ЖЕ фронт,
@@ -741,7 +753,8 @@ int main(int argc, char **argv) {
          "кусков %lld раз\n",
          (long long)X.nlit, (long long)X.nshadow, (long long)X.ncap, (long long)X.npclip);
   printf("   вне пирамиды с ОТПУЩЕННЫМ полом %lld ячеек\n", (long long)X.noutside);
-  printf("   остановок ПО ПОМЕТКЕ %lld\n", (long long)X.nmarkstop);
+  printf("   остановок ПО ПОМЕТКЕ %lld; ПОЛ ОЧЕРКА запретил огрубление %lld раз\n",
+         (long long)X.nmarkstop, (long long)X.nsilh);
   printf("   ЯЧЕЕК С ГЕОМЕТРИЕЙ ОДНОЙ ПЛОСКОСТИ %lld из %lld (%.2f %%) — их дробить незачем ни при "
          "каком поле\n",
          (long long)X.nflat1, (long long)X.nflatgeo,

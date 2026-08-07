@@ -508,6 +508,19 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         X->nmarkset++;
       }
     }
+    /* ОТВЕТ ФРОНТА, ОСТАВЛЕННЫЙ СНАРУЖИ (см. `cellf` в заголовке). Берётся
+     * ВХОДЯЩЕЕ состояние по потоку — «сколько диска видно этой ячейке», то есть
+     * та же величина, что уходит в выборку эталона. */
+    if (X->cellf != NULL) {
+      double fi = 0.0, wi = 0.0;
+      for (int s = 0; s < X->nk; s++)
+        for (int a = 0; a < 3; a++) {
+          double wa = (X->sdir[s][a] < 0.0) ? -X->sdir[s][a] : X->sdir[s][a];
+          wi += wa;
+          fi += wa * in[a * X->nk + s].c0;
+        }
+      X->cellf[nid] = (float)((wi > 0.0) ? fi / wi : 0.0);
+    }
     /* Освещённость ячейки — тоже по ПОТОКУ, а не среднее по трём граням. */
     double fl = 0.0, w = 0.0;
     for (int a = 0; a < 3; a++) {

@@ -17,6 +17,7 @@
  *              ячейку перебором ВСЕХ треугольников и на Сан-Мигеле идёт
  *              десятки минут, тогда как приёмка пометок — один луч на ячейку.
  */
+#include "image.h"
 #include "pclip.h"
 #include "pcull.h"
 #include "pfront.h"
@@ -49,7 +50,7 @@ int main(int argc, char **argv) {
   int leafmax = 0, maxlev = 0, grade = 1, shadow = 1, cam = 0, nref = 0, cliplev = -1, camfull = 0,
       usemark = 0, relax = HZ_PMARK_OUT_LEVELS, refinemax = 0, nk = 1;
   double camo[3] = {0.0, 0.0, 0.0}, camf[3] = {0.0, 0.0, 1.0}, camat[3] = {0.0, 0.0, 1.0};
-  int loose = 0, bufside = HZ_CFG_W, eta = 1, mlev = HZ_PMARK_LEVEL;
+  int loose = 0, bufside = HZ_CFG_W, eta = 1, mlev = HZ_PMARK_LEVEL, img = 0;
   double px = 9.1, sdir[3] = {0.3, -0.9, 0.3};
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "leaf=", 5) == 0) leafmax = (int)strtol(argv[i] + 5, NULL, 10);
@@ -67,6 +68,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "buf=", 4) == 0) bufside = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "eta=", 4) == 0) eta = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "mlev=", 5) == 0) mlev = (int)strtol(argv[i] + 5, NULL, 10);
+    if (strncmp(argv[i], "img=", 4) == 0) img = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "cover=", 6) == 0)
       hz_pfront_cover_sum = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "sun=", 4) == 0) {
@@ -218,7 +220,10 @@ int main(int argc, char **argv) {
   /* ПИРАМИДА КАМЕРЫ (ключ `cam=1`). Глаз и цель — из `scene_cfg.h`, где камеры
    * НАЙДЕНЫ ЗАМЕРОМ, а не назначены (§187); поле зрения и разрешение оттуда же.
    * Плоскости строятся нормалями ВНУТРЬ. */
-  if (cam || usemark) {
+  /* Камера нужна и картинке (`img`), а не только пометкам: без этого условия
+   * прогон с `mark=0` снимал кадр из точки (0,0,0) — поймано сравнением
+   * картинок, где различие вышло во весь сигнал. */
+  if (cam || usemark || img) {
     double e[3], at[3];
     if (strstr(argv[1], "conference") != NULL) {
       double a1[3] = HZ_CFG_HALL_EYE, a2[3] = HZ_CFG_HALL_AT;
@@ -559,6 +564,13 @@ int main(int argc, char **argv) {
   }
   t0 = now_s();
   X.refinemax = refinemax;
+  /* Место, куда фронт положит свой ответ, — только если он кому-то нужен. */
+  if (img) {
+    X.cellf = malloc((size_t)T.nnd * sizeof *X.cellf);
+    if (X.cellf != NULL)
+      for (int32_t i = 0; i < T.nnd; i++)
+        X.cellf[i] = -1.0f;
+  }
   hz_pfront_walk(&X, 0, T.nd[0].lo, T.nd[0].hi, in, out, list, m.nt, 0, 0);
   double secs = now_s() - t0;
   if (X.fail) {
@@ -591,6 +603,111 @@ int main(int argc, char **argv) {
          X.nflatgeo > 0 ? 100.0 * (double)X.nflat1 / (double)X.nflatgeo : 0.0);
   printf("   ВРЕМЯ %.2f с, на ячейку %.1f нс\n", secs,
          X.ncell > 0 ? 1e9 * secs / (double)X.ncell : 0.0);
+
+  /* ПРОХОД 3 — СБОР ПО ПИКСЕЛЮ, ТО ЕСТЬ КАРТИНКА (ключ `img=1`).
+   *
+   * ЗАЧЕМ ОН ЗДЕСЬ И ПОЧЕМУ ТОЛЬКО ТЕПЕРЬ. У линии фронта не было ни одной
+   * картинки: фронт считал долю открытого диска и ВЫБРАСЫВАЛ её, поэтому всякий
+   * выигрыш оставался числом в счётчике. Замечание пользователя §277 («эти
+   * оптимизации ничего не позволили нового») упирается ровно в это. Теперь фронт
+   * оставляет ответ в `cellf`, и его можно посмотреть глазами.
+   *
+   * УСТРОЙСТВО, ПРОСТЕЙШЕЕ ИЗ ЗАКОННЫХ (§7: «камера на первое время как угодно»):
+   * обычный z-буфер с номером треугольника даёт видимую поверхность в пикселе,
+   * точка попадания — из дальности, ячейка — спуском по дереву до той, где фронт
+   * остановился, яркость — `ρ·f·|n·ω|/π`.
+   *
+   * ЛУЧЕЙ ЗДЕСЬ НЕТ И БЫТЬ НЕ МОЖЕТ: дерево строится укладкой резкой и ссылок на
+   * треугольники не хранит вовсе (А472), так что `ptrace` по нему не пойдёт.
+   * Проекция отвечает на тот же вопрос разом для всех пикселей. */
+  if (img) {
+    double timg = now_s();
+    size_t np = (size_t)bufside * (size_t)bufside;
+    float *zb = malloc(np * sizeof *zb);
+    int32_t *ib = malloc(np * sizeof *ib);
+    double *pix = malloc(np * sizeof *pix);
+    if (zb != NULL && ib != NULL && pix != NULL) {
+      double diag = 0.0;
+      for (int c = 0; c < 3; c++) {
+        double s = T.nd[0].hi[c] - T.nd[0].lo[c];
+        diag += s * s;
+      }
+      double upv[3] = HZ_CFG_UP;
+      hz_pcull C2;
+      if (hz_pcull_init(&C2, camo, camat, upv, HZ_CFG_FOV_DEG, bufside, sqrt(diag)) == 0) {
+        hz_pcull_shot(&C2, &m, zb, ib);
+        int64_t nsky = 0, nlit2 = 0, nsh2 = 0;
+        double sum = 0.0;
+        for (size_t p = 0; p < np; p++) {
+          pix[p] = 0.0;
+          if (ib[p] < 0) {
+            nsky++;
+            continue;
+          }
+          double d[3];
+          hz_pcull_ray(&C2, (int)(p % (size_t)bufside), (int)(p / (size_t)bufside), d);
+          double P[3];
+          for (int c = 0; c < 3; c++)
+            P[c] = camo[c] + (double)zb[p] * d[c];
+          /* Ячейка, в которой фронт остановился: спуск, пока ответа нет. */
+          int32_t nid = 0;
+          while (X.cellf[nid] < 0.0f && T.nd[nid].child >= 0) {
+            double mid[3];
+            int k = 0;
+            for (int c = 0; c < 3; c++) {
+              mid[c] = 0.5 * (T.nd[nid].lo[c] + T.nd[nid].hi[c]);
+              if (P[c] >= mid[c]) k |= (1 << c);
+            }
+            nid = T.nd[nid].child + k;
+          }
+          double f = (X.cellf[nid] >= 0.0f) ? (double)X.cellf[nid] : 0.0;
+          /* Косинус на поверхности — из нормали видимого треугольника. */
+          int32_t t = ib[p];
+          const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t + 0];
+          const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)t + 1];
+          const double *Cc = m.v + 3 * (size_t)m.f[3 * (size_t)t + 2];
+          double u1[3], u2[3], nn[3];
+          for (int c = 0; c < 3; c++) {
+            u1[c] = B[c] - A[c];
+            u2[c] = Cc[c] - A[c];
+          }
+          nn[0] = u1[1] * u2[2] - u1[2] * u2[1];
+          nn[1] = u1[2] * u2[0] - u1[0] * u2[2];
+          nn[2] = u1[0] * u2[1] - u1[1] * u2[0];
+          double ln2 = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+          if (!(ln2 > 0.0)) ln2 = 1.0;
+          double cs = 0.0;
+          for (int c = 0; c < 3; c++)
+            cs -= (nn[c] / ln2) * X.dir[c]; /* `dir` — направление ЛУЧЕЙ источника */
+          if (cs < 0.0) cs = -cs;           /* нормаль .obj может смотреть внутрь */
+          double kd = m.mtl[m.fm[t]].kd;
+          pix[p] = kd * f * cs;
+          sum += pix[p];
+          if (f > 0.5)
+            nlit2++;
+          else
+            nsh2++;
+        }
+        char path[256];
+        const char *base = strrchr(argv[1], '/');
+        snprintf(path, sizeof path, "img/psun_%s_mark%d.ppm", base ? base + 1 : argv[1], usemark);
+        hz_ppm_write(path, pix, bufside, bufside);
+        /* PFM рядом с PPM — чтобы сравнивать две картинки ЧИСЛАМИ (`pfmdiff`), а
+         * не глазами: приёмка огрубления невидимого есть «видимое не изменилось»,
+         * и глаз на такой вопрос не отвечает. */
+        snprintf(path, sizeof path, "img/psun_%s_mark%d.pfm", base ? base + 1 : argv[1], usemark);
+        hz_pfm_write(path, pix, pix, pix, bufside, bufside);
+        printf("== КАРТИНКА (проход 3, сбор по пикселю) за %.2f с: %s\n"
+               "   пикселей неба %lld, освещённых %lld, в тени %lld; средняя яркость %.6f\n",
+               now_s() - timg, path, (long long)nsky, (long long)nlit2, (long long)nsh2,
+               sum / (double)np);
+        hz_pcull_free(&C2);
+      }
+    }
+    free(zb);
+    free(ib);
+    free(pix);
+  }
 
   /* ПРИЁМКА ЭТОЙ ЛИНИИ ОПТИМИЗАЦИЙ — ОДНОСТОРОННЯЯ (указание пользователя 08-06):
    * «нужно лишь, чтобы мы не огрубили ВИДИМЫЕ части; вполне допустимо, что часть
@@ -837,6 +954,7 @@ int main(int argc, char **argv) {
    * гейте видна, и починить дешевле, чем оговаривать. */
   free(dep);
   free(mk);
+  free(X.cellf);
   free(tlo);
   free(thi);
   free(tpl);

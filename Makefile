@@ -227,8 +227,8 @@ build/pfrontx: tools/pfrontx.c src/scene_obj.c src/ptree.c src/ptree.h src/pclip
 # Огрубление вместо отсечения; shadow=0 — негативный контроль.
 # Пометки невидимости с mark=1 ставит `pcull` (§278, односторонние по
 # построению); mark=2 — прежний проход фронтом, оставленный ради сверки.
-build/psun: tools/psun.c src/scene_obj.c src/ptree.c src/pclip.c src/pfront.c src/pfront.h src/pocc.c src/pocc.h src/pmark.c src/pmark.h src/pcull.c src/pcull.h src/scene_cfg.h | build
-	$(RUN) 'gcc $(CFLAGS) -o $@ tools/psun.c src/scene_obj.c src/ptree.c src/pclip.c src/pfront.c src/pocc.c src/pmark.c src/pcull.c -lm'
+build/psun: tools/psun.c src/scene_obj.c src/ptree.c src/pclip.c src/pfront.c src/pfront.h src/pocc.c src/pocc.h src/pmark.c src/pmark.h src/pcull.c src/pcull.h src/image.c src/image.h src/scene_cfg.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/psun.c src/scene_obj.c src/ptree.c src/pclip.c src/pfront.c src/pocc.c src/pmark.c src/pcull.c src/image.c -lm'
 
 # pcam — камера сцены находится ЗАМЕРОМ, а не назначается (§187). Обе прежние
 # камеры были назначены на глаз и обе оказались негодными.

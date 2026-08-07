@@ -366,3 +366,91 @@ static void marks_walk(hz_pcull *C, const hz_ptree *T, int32_t nid, int maxlev,
 void hz_pcull_marks(hz_pcull *C, const hz_ptree *T, int maxlev, unsigned char *mark) {
   if (T->nnd > 0) marks_walk(C, T, 0, maxlev, mark);
 }
+
+/* --- КАМЕРА: ОБЫЧНЫЙ z-БУФЕР С НОМЕРОМ ТРЕУГОЛЬНИКА ------------------------ */
+/* Разбор — в `pcull.h`. Здесь важно одно: правила осторожности, на которых стоит
+ * односторонность пометок, тут НЕ ДЕЙСТВУЮТ и действовать не должны. */
+
+void hz_pcull_ray(const hz_pcull *C, int i, int j, double d[3]) {
+  double h = 0.5 * (double)C->side;
+  double as = C->tanh_ * (((double)i + 0.5) / h - 1.0);
+  double bs = C->tanh_ * (((double)j + 0.5) / h - 1.0);
+  for (int c = 0; c < 3; c++)
+    d[c] = C->fw[c] + as * C->rt[c] + bs * C->up[c];
+}
+
+void hz_pcull_shot(hz_pcull *C, const hz_objmesh *m, float *z, int32_t *id) {
+  const int S = C->side;
+  for (size_t p = 0; p < (size_t)S * (size_t)S; p++) {
+    z[p] = INFINITY;
+    id[p] = -1;
+  }
+  for (int32_t t = 0; t < m->nt; t++) {
+    const double *V[3];
+    for (int i = 0; i < 3; i++)
+      V[i] = m->v + 3 * (size_t)m->f[3 * (size_t)t + (size_t)i];
+    double sx[3], sy[3], sz[3];
+    int ok = 1;
+    for (int i = 0; i < 3 && ok; i++)
+      ok = project(C, V[i], &sx[i], &sy[i], &sz[i]);
+    if (!ok) continue; /* пересекает ближнюю плоскость — не рисуется */
+    double xmin = sx[0], xmax = sx[0], ymin = sy[0], ymax = sy[0];
+    for (int i = 1; i < 3; i++) {
+      if (sx[i] < xmin) xmin = sx[i];
+      if (sx[i] > xmax) xmax = sx[i];
+      if (sy[i] < ymin) ymin = sy[i];
+      if (sy[i] > ymax) ymax = sy[i];
+    }
+    if (!(xmax > 0.0) || !(ymax > 0.0) || !(xmin < (double)S) || !(ymin < (double)S)) continue;
+    int i0 = (int)floor(xmin), i1 = (int)ceil(xmax), j0 = (int)floor(ymin), j1 = (int)ceil(ymax);
+    if (i0 < 0) i0 = 0;
+    if (j0 < 0) j0 = 0;
+    if (i1 > S) i1 = S;
+    if (j1 > S) j1 = S;
+    double a2 = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sy[1] - sy[0]) * (sx[2] - sx[0]);
+    if (!(a2 > 0.0) && !(a2 < 0.0)) continue;
+    double sg = (a2 > 0.0) ? 1.0 : -1.0;
+    double e1[3], e2[3], nw[3];
+    for (int c = 0; c < 3; c++) {
+      e1[c] = V[1][c] - V[0][c];
+      e2[c] = V[2][c] - V[0][c];
+    }
+    nw[0] = e1[1] * e2[2] - e1[2] * e2[1];
+    nw[1] = e1[2] * e2[0] - e1[0] * e2[2];
+    nw[2] = e1[0] * e2[1] - e1[1] * e2[0];
+    double num = 0.0;
+    for (int c = 0; c < 3; c++)
+      num += nw[c] * (V[0][c] - C->eye[c]);
+    if (num < 0.0) {
+      num = -num;
+      for (int c = 0; c < 3; c++)
+        nw[c] = -nw[c];
+    }
+    if (!(num > 0.0)) continue;
+    double nr = 0.0, nu = 0.0, nf = 0.0;
+    for (int c = 0; c < 3; c++) {
+      nr += nw[c] * C->rt[c];
+      nu += nw[c] * C->up[c];
+      nf += nw[c] * C->fw[c];
+    }
+    for (int j = j0; j < j1; j++)
+      for (int i = i0; i < i1; i++) {
+        double cx = (double)i + 0.5, cy = (double)j + 0.5;
+        int in = 1;
+        for (int k = 0; k < 3 && in; k++) {
+          int k2 = (k + 1) % 3;
+          double ex = sx[k2] - sx[k], ey = sy[k2] - sy[k];
+          double ev = (cx - sx[k]) * ey - (cy - sy[k]) * ex;
+          if (!(sg * ev < 0.0)) in = 0;
+        }
+        if (!in) continue;
+        double zz;
+        if (!plane_z(C, cx, cy, num, nr, nu, nf, &zz)) continue;
+        size_t p = (size_t)j * (size_t)S + (size_t)i;
+        if ((float)zz < z[p]) {
+          z[p] = (float)zz;
+          id[p] = t;
+        }
+      }
+  }
+}

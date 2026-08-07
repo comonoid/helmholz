@@ -51,6 +51,12 @@ int main(int argc, char **argv) {
       usemark = 0, relax = HZ_PMARK_OUT_LEVELS, refinemax = 0, nk = 1;
   double camo[3] = {0.0, 0.0, 0.0}, camf[3] = {0.0, 0.0, 1.0}, camat[3] = {0.0, 0.0, 1.0};
   int loose = 0, bufside = HZ_CFG_W, eta = 1, mlev = HZ_PMARK_LEVEL, img = 0, nrec = 0;
+  /* УГЛОВОЙ РАДИУС ИСТОЧНИКА — ПАРАМЕТР, А НЕ КОНСТАНТА (замечание пользователя
+   * 08-07). Он был зашит числом солнца в ДВУХ местах — у фронта и у эталона, — и
+   * потому «протяжённый источник» из §275 означал лишь `K` выборок ТОГО ЖЕ
+   * крошечного диска: полутень оставалась ýже ячейки, и §289 мерил не то.
+   * Настоящая проверка — источник, у которого полутень ШИРЕ ячейки. */
+  double asun = 0.5 * 9.3e-3;
   double px = 9.1, sdir[3] = {0.3, -0.9, 0.3};
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "leaf=", 5) == 0) leafmax = (int)strtol(argv[i] + 5, NULL, 10);
@@ -76,6 +82,7 @@ int main(int argc, char **argv) {
      * источнике отлаживать проще, потому что поле СГЛАЖИВАЕТСЯ, а линейное
      * состояние на грани (Р1) для гладкого поля и заведено. */
     if (strncmp(argv[i], "nk=", 3) == 0) nk = (int)strtol(argv[i] + 3, NULL, 10);
+    if (strncmp(argv[i], "asun=", 5) == 0) asun = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "cover=", 6) == 0)
       hz_pfront_cover_sum = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "sun=", 4) == 0) {
@@ -187,7 +194,7 @@ int main(int argc, char **argv) {
    * она ДРУГАЯ и вчетверо гуще (А533), иначе сверка сойдётся по построению. */
   X.nk = (nk < 1) ? 1 : (nk > HZ_PFRONT_MAXK ? HZ_PFRONT_MAXK : nk);
   {
-    double half = 0.5 * 9.3e-3, t1[3] = {0.0, 0.0, 1.0}, q1[3], q2[3];
+    double half = asun, t1[3] = {0.0, 0.0, 1.0}, q1[3], q2[3];
     if (fabs(X.dir[2]) > 0.9) {
       t1[0] = 1.0;
       t1[2] = 0.0;
@@ -1117,7 +1124,7 @@ int main(int argc, char **argv) {
    * Приёмка невидимости стоит один луч на ячейку и ни от чего этого не зависит.
    * Поэтому эталон включается отдельным ключом `eta=1`. */
   if (eta && nref > 0 && X.refn > 0) {
-    double half = 0.5 * 9.3e-3; /* угловой радиус солнца, §241.4 */
+    double half = asun; /* угловой радиус источника; у солнца 0.5·9.3e-3 (§241.4) */
     double t1[3] = {0.0, 0.0, 1.0}, r1[3], r2[3];
     if (fabs(X.dir[2]) > 0.9) {
       t1[0] = 1.0;

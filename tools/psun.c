@@ -51,7 +51,18 @@ int main(int argc, char **argv) {
       usemark = 0, relax = HZ_PMARK_OUT_LEVELS, refinemax = 0, nk = 1;
   double camo[3] = {0.0, 0.0, 0.0}, camf[3] = {0.0, 0.0, 1.0}, camat[3] = {0.0, 0.0, 1.0};
   int loose = 0, bufside = HZ_CFG_W, eta = 1, mlev = HZ_PMARK_LEVEL, img = 0, nrec = 0, ndbg = 0;
-  int indep = 0, intol = 8, silh = 0;
+  /* УМОЛЧАНИЯ ПОСТАВЛЕНЫ ПО ЗАМЕРАМ 08-07, А НЕ ПО ИСТОРИИ (§302). Каждое из
+   * трёх измерено и каждое улучшает ответ; правило §13 требует, чтобы умолчание
+   * ошибалось в сторону ВИДИМОГО отказа, то есть было точным, а не быстрым.
+   *   перекрытие ОБЪЕДИНЕНИЕМ (§292): среднее 0.0470 -> 0.0376 на большом
+   *     источнике, и это единственная из трёх оценок, правильная по определению;
+   *   ГЛУБИНА В ЯЧЕЙКЕ (§296) с допуском ребро/128: 6.91 % -> 0.19 % неверных
+   *     пикселей при том же числе ячеек;
+   *   ПОЛ ОЧЕРКА (§300): цена огрубления 7.1e-4 -> 1.6e-6.
+   * Прежние числа §271…§295 воспроизводятся ключами `cover=0 indep=0 silh=0`. */
+  int indep = 1, intol = 128, silh = 1;
+  double ooff = 1e-5;
+  int coverset = 0;
   /* УГЛОВОЙ РАДИУС ИСТОЧНИКА — ПАРАМЕТР, А НЕ КОНСТАНТА (замечание пользователя
    * 08-07). Он был зашит числом солнца в ДВУХ местах — у фронта и у эталона, — и
    * потому «протяжённый источник» из §275 означал лишь `K` выборок ТОГО ЖЕ
@@ -81,6 +92,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "indep=", 6) == 0) indep = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "intol=", 6) == 0) intol = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "silh=", 5) == 0) silh = (int)strtol(argv[i] + 5, NULL, 10);
+    if (strncmp(argv[i], "ooff=", 5) == 0) ooff = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "flat=", 5) == 0) hz_ptree_flat_split = (int)strtol(argv[i] + 5, NULL, 10);
     /* ВЫБОРОК ПО ДИСКУ ИСТОЧНИКА. Механизм Ф4 (§275) был написан, но ключа не
      * имел, и `K` оставалось единицей — то есть источник точечным, а полутени в
@@ -89,8 +101,10 @@ int main(int argc, char **argv) {
      * состояние на грани (Р1) для гладкого поля и заведено. */
     if (strncmp(argv[i], "nk=", 3) == 0) nk = (int)strtol(argv[i] + 3, NULL, 10);
     if (strncmp(argv[i], "asun=", 5) == 0) asun = strtod(argv[i] + 5, NULL);
-    if (strncmp(argv[i], "cover=", 6) == 0)
+    if (strncmp(argv[i], "cover=", 6) == 0) {
       hz_pfront_cover_sum = (int)strtol(argv[i] + 6, NULL, 10);
+      coverset = 1;
+    }
     if (strncmp(argv[i], "sun=", 4) == 0) {
       char *e = NULL;
       sdir[0] = strtod(argv[i] + 4, &e);
@@ -98,6 +112,7 @@ int main(int argc, char **argv) {
       if (e != NULL && *e == ',') sdir[2] = strtod(e + 1, NULL);
     }
   }
+  if (!coverset) hz_pfront_cover_sum = 2; /* объединение — умолчание, см. выше */
   hz_objmesh m;
   double t0 = now_s();
   if (hz_obj_load(&m, argv[1], strtod(argv[2], NULL)) != 0) {
@@ -820,14 +835,27 @@ int main(int argc, char **argv) {
           double P[3];
           for (int c = 0; c < 3; c++)
             P[c] = camo[c] + (double)zb[p] * d[c];
-          /* Ячейка, в которой фронт остановился: спуск, пока ответа нет. */
+          /* ЯЧЕЙКА, В КОТОРОЙ ФРОНТ ОСТАНОВИЛСЯ. Точка берётся СДВИНУТОЙ К
+           * ИСТОЧНИКУ, и это не мелочь: поверхность часто лежит ровно на границе
+           * ячеек, гасит свет для нижней — а точка попадания геометрически
+           * принадлежит именно нижней, и читается ноль там, где поверхность
+           * освещена. Досье обратной популяции показало этот случай прямо: ячейки
+           * уровня 9…11 (ребро 4…16 мм), кусков в них НЕТ (`глубина в ячейке =
+           * нет`), нормаль смотрит на солнце (`|n·ω| = 0.93`), а `f = 0`.
+           * Сдвиг — тот же приём и та же величина, что у теневого луча эталона. */
+          double PL[3];
+          {
+            double eo = ooff * (fabs(P[0]) + fabs(P[1]) + fabs(P[2]) + 1.0);
+            for (int c = 0; c < 3; c++)
+              PL[c] = P[c] - eo * X.dir[c];
+          }
           int32_t nid = 0;
           while (X.cellf[nid] < 0.0f && T.nd[nid].child >= 0) {
             double mid[3];
             int k = 0;
             for (int c = 0; c < 3; c++) {
               mid[c] = 0.5 * (T.nd[nid].lo[c] + T.nd[nid].hi[c]);
-              if (P[c] >= mid[c]) k |= (1 << c);
+              if (PL[c] >= mid[c]) k |= (1 << c);
             }
             nid = T.nd[nid].child + k;
           }
@@ -1054,11 +1082,20 @@ int main(int argc, char **argv) {
          * ЗАСЛОНИТЕЛЬ: если он внутри той же ячейки, промахнулось перекрытие;
          * если выше по пути — свет протёк сквозь другую ячейку, и виновата
          * передача состояния, а не оператор. */
-        if (ndbg > 0) {
-          printf("== ДОСЬЕ НА %d РАСХОДЯЩИХСЯ ПИКСЕЛЕЙ (мы даём свет, луч даёт тень)\n", ndbg);
+        if (ndbg != 0) {
+          printf("== ДОСЬЕ НА %d ПИКСЕЛЕЙ (%s)\n", ndbg < 0 ? -ndbg : ndbg,
+                 ndbg < 0 ? "ОБРАТНАЯ популяция: мы даём ТЕНЬ, луч даёт СВЕТ"
+                          : "мы даём свет, луч даёт тень");
           int shown = 0;
-          for (size_t p = 0; p < np && shown < ndbg; p += 997) {
-            if (ib[p] < 0 || !(fpix[p] > 0.5)) continue;
+          /* `dbg > 0` — прямая популяция («мы светло, луч тень»); `dbg < 0` —
+           * ОБРАТНАЯ («мы тень, луч светло»), та самая, что не сдвинулась ни от
+           * чего за весь день. */
+          int rev = (ndbg < 0);
+          int nwant = rev ? -ndbg : ndbg;
+          for (size_t p = 0; p < np && shown < nwant; p += 97) {
+            if (ib[p] < 0) continue;
+            if (!rev && !(fpix[p] > 0.5)) continue;
+            if (rev && (fpix[p] > 0.5)) continue;
             double d[3];
             hz_pcull_ray(&C2, (int)(p % (size_t)bufside), (int)(p / (size_t)bufside), d);
             double P[3];
@@ -1101,7 +1138,8 @@ int main(int argc, char **argv) {
                 blkt = tt;
               }
             }
-            if (blk < 0) continue; /* согласие, не наш случай */
+            if (!rev && blk < 0) continue; /* согласие, не наш случай */
+            if (rev && blk >= 0) continue; /* тень и у нас, и у эталона */
             /* Ячейка фронта, накрывшая точку. */
             int32_t nid = 0, lev = 0;
             while (X.cellf[nid] < 0.0f && T.nd[nid].child >= 0) {
@@ -1122,21 +1160,54 @@ int main(int argc, char **argv) {
             int inside = 1;
             for (int c = 0; c < 3 && inside; c++)
               if (Q[c] < T.nd[nid].lo[c] || Q[c] > T.nd[nid].hi[c]) inside = 0;
-            /* Размер заслонителя против размера ячейки. */
-            const double *A2 = m.v + 3 * (size_t)m.f[3 * (size_t)blk + 0];
-            const double *B2 = m.v + 3 * (size_t)m.f[3 * (size_t)blk + 1];
-            const double *C2v = m.v + 3 * (size_t)m.f[3 * (size_t)blk + 2];
-            double u1[3] = {B2[0] - A2[0], B2[1] - A2[1], B2[2] - A2[2]};
-            double u2[3] = {C2v[0] - A2[0], C2v[1] - A2[1], C2v[2] - A2[2]};
-            double cr[3];
-            cr[0] = u1[1] * u2[2] - u1[2] * u2[1];
-            cr[1] = u1[2] * u2[0] - u1[0] * u2[2];
-            cr[2] = u1[0] * u2[1] - u1[1] * u2[0];
-            double area = 0.5 * sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
-            printf("   пиксель %6d: f=%.3f  ЯЧЕЙКА ур.%2d ребро %.4f м  ЗАСЛОНИТЕЛЬ на %.4f м "
-                   "%s, площадь %.3e м² (ребро ~%.4f м)\n",
-                   (int)p, fpix[p], lev, hcell, blkt, inside ? "ВНУТРИ ячейки" : "ВЫШЕ по лучу",
-                   area, sqrt(2.0 * area));
+            /* Размер заслонителя против размера ячейки. В ОБРАТНОЙ популяции
+             * заслонителя нет вовсе (`blk = -1`), и читать его нельзя — это и
+             * был SIGSEGV при первом прогоне. */
+            double area = 0.0;
+            if (blk >= 0) {
+              const double *A2 = m.v + 3 * (size_t)m.f[3 * (size_t)blk + 0];
+              const double *B2 = m.v + 3 * (size_t)m.f[3 * (size_t)blk + 1];
+              const double *C2v = m.v + 3 * (size_t)m.f[3 * (size_t)blk + 2];
+              double u1[3] = {B2[0] - A2[0], B2[1] - A2[1], B2[2] - A2[2]};
+              double u2[3] = {C2v[0] - A2[0], C2v[1] - A2[1], C2v[2] - A2[2]};
+              double cr[3];
+              cr[0] = u1[1] * u2[2] - u1[2] * u2[1];
+              cr[1] = u1[2] * u2[0] - u1[0] * u2[2];
+              cr[2] = u1[0] * u2[1] - u1[1] * u2[0];
+              area = 0.5 * sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+            }
+            if (rev) {
+              /* Заслонителя нет вовсе — печатать про него нечего; печатается то,
+               * что могло погасить свет у НАС: состояние ячейки и её вид. */
+              /* СКОЛЬЗЯЩАЯ ЛИ ПОВЕРХНОСТЬ. Подозрение: свет гасится МНОГОКРАТНО
+               * одной и той же стеной — почти параллельная лучу поверхность
+               * попадает в десятки ячеек подряд, и каждая применяет своё
+               * `(1 − c)`. Тогда `|n·ω|` у этих пикселей обязан быть мал. */
+              int32_t tv2 = ib[p];
+              const double *Av = m.v + 3 * (size_t)m.f[3 * (size_t)tv2 + 0];
+              const double *Bv = m.v + 3 * (size_t)m.f[3 * (size_t)tv2 + 1];
+              const double *Cv2 = m.v + 3 * (size_t)m.f[3 * (size_t)tv2 + 2];
+              double g1[3] = {Bv[0] - Av[0], Bv[1] - Av[1], Bv[2] - Av[2]};
+              double g2[3] = {Cv2[0] - Av[0], Cv2[1] - Av[1], Cv2[2] - Av[2]};
+              double gn[3];
+              gn[0] = g1[1] * g2[2] - g1[2] * g2[1];
+              gn[1] = g1[2] * g2[0] - g1[0] * g2[2];
+              gn[2] = g1[0] * g2[1] - g1[1] * g2[0];
+              double gl = sqrt(gn[0] * gn[0] + gn[1] * gn[1] + gn[2] * gn[2]);
+              if (!(gl > 0.0)) gl = 1.0;
+              double cw = 0.0;
+              for (int c = 0; c < 3; c++)
+                cw += (gn[c] / gl) * X.dir[c];
+              if (cw < 0.0) cw = -cw;
+              printf("   пиксель %6d: f=%.3f  ЯЧЕЙКА ур.%2d ребро %.4f м  занята=%d  "
+                     "глубина в ячейке=%s  |n·ω| = %.4f (скользящая при малом)\n",
+                     (int)p, fpix[p], lev, hcell, (int)occ[nid],
+                     (X.cellslot != NULL && X.cellslot[nid] >= 0) ? "есть" : "нет", cw);
+            } else
+              printf("   пиксель %6d: f=%.3f  ЯЧЕЙКА ур.%2d ребро %.4f м  ЗАСЛОНИТЕЛЬ на %.4f м "
+                     "%s, площадь %.3e м² (ребро ~%.4f м)\n",
+                     (int)p, fpix[p], lev, hcell, blkt, inside ? "ВНУТРИ ячейки" : "ВЫШЕ по лучу",
+                     area, sqrt(2.0 * area));
             shown++;
           }
         }

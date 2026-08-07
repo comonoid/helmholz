@@ -50,7 +50,7 @@ int main(int argc, char **argv) {
   int leafmax = 0, maxlev = 0, grade = 1, shadow = 1, cam = 0, nref = 0, cliplev = -1, camfull = 0,
       usemark = 0, relax = HZ_PMARK_OUT_LEVELS, refinemax = 0, nk = 1;
   double camo[3] = {0.0, 0.0, 0.0}, camf[3] = {0.0, 0.0, 1.0}, camat[3] = {0.0, 0.0, 1.0};
-  int loose = 0, bufside = HZ_CFG_W, eta = 1, mlev = HZ_PMARK_LEVEL, img = 0, nrec = 0;
+  int loose = 0, bufside = HZ_CFG_W, eta = 1, mlev = HZ_PMARK_LEVEL, img = 0, nrec = 0, ndbg = 0;
   /* УГЛОВОЙ РАДИУС ИСТОЧНИКА — ПАРАМЕТР, А НЕ КОНСТАНТА (замечание пользователя
    * 08-07). Он был зашит числом солнца в ДВУХ местах — у фронта и у эталона, — и
    * потому «протяжённый источник» из §275 означал лишь `K` выборок ТОГО ЖЕ
@@ -76,6 +76,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "mlev=", 5) == 0) mlev = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "img=", 4) == 0) img = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "rec=", 4) == 0) nrec = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "dbg=", 4) == 0) ndbg = (int)strtol(argv[i] + 4, NULL, 10);
     /* ВЫБОРОК ПО ДИСКУ ИСТОЧНИКА. Механизм Ф4 (§275) был написан, но ключа не
      * имел, и `K` оставалось единицей — то есть источник точечным, а полутени в
      * постановке не было вовсе (§274). Довод пользователя 08-07: на протяжённом
@@ -978,6 +979,99 @@ int main(int argc, char **argv) {
             }
           }
           free(emap);
+        }
+        /* ДОСЬЕ НА РАСХОДЯЩИЕСЯ ПИКСЕЛИ (ключ `dbg=N`, §293). Три названные
+         * мною причины подряд оказались не теми, и каждый раз это выяснялось
+         * замером. Значит гадать нельзя: надо взять конкретные пиксели и
+         * посмотреть, ЧТО в них происходит. Главный вопрос к каждому — ГДЕ
+         * ЗАСЛОНИТЕЛЬ: если он внутри той же ячейки, промахнулось перекрытие;
+         * если выше по пути — свет протёк сквозь другую ячейку, и виновата
+         * передача состояния, а не оператор. */
+        if (ndbg > 0) {
+          printf("== ДОСЬЕ НА %d РАСХОДЯЩИХСЯ ПИКСЕЛЕЙ (мы даём свет, луч даёт тень)\n", ndbg);
+          int shown = 0;
+          for (size_t p = 0; p < np && shown < ndbg; p += 997) {
+            if (ib[p] < 0 || !(fpix[p] > 0.5)) continue;
+            double d[3];
+            hz_pcull_ray(&C2, (int)(p % (size_t)bufside), (int)(p / (size_t)bufside), d);
+            double P[3];
+            for (int c = 0; c < 3; c++)
+              P[c] = camo[c] + (double)zb[p] * d[c];
+            double ofs = 1e-5 * (fabs(P[0]) + fabs(P[1]) + fabs(P[2]) + 1.0);
+            double O[3], S[3];
+            for (int c = 0; c < 3; c++) {
+              S[c] = -X.dir[c];
+              O[c] = P[c] + ofs * S[c];
+            }
+            int32_t blk = -1;
+            double blkt = 0.0;
+            for (int32_t t = 0; t < m.nt && blk < 0; t++) {
+              const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t + 0];
+              const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)t + 1];
+              const double *Cc = m.v + 3 * (size_t)m.f[3 * (size_t)t + 2];
+              double q1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]};
+              double q2[3] = {Cc[0] - A[0], Cc[1] - A[1], Cc[2] - A[2]};
+              double pv[3], tv[3], qv[3];
+              pv[0] = S[1] * q2[2] - S[2] * q2[1];
+              pv[1] = S[2] * q2[0] - S[0] * q2[2];
+              pv[2] = S[0] * q2[1] - S[1] * q2[0];
+              double det = q1[0] * pv[0] + q1[1] * pv[1] + q1[2] * pv[2];
+              if (det > -1e-12 && det < 1e-12) continue;
+              double inv = 1.0 / det;
+              tv[0] = O[0] - A[0];
+              tv[1] = O[1] - A[1];
+              tv[2] = O[2] - A[2];
+              double uu = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+              if (uu < 0.0 || uu > 1.0) continue;
+              qv[0] = tv[1] * q1[2] - tv[2] * q1[1];
+              qv[1] = tv[2] * q1[0] - tv[0] * q1[2];
+              qv[2] = tv[0] * q1[1] - tv[1] * q1[0];
+              double vv = (S[0] * qv[0] + S[1] * qv[1] + S[2] * qv[2]) * inv;
+              if (vv < 0.0 || uu + vv > 1.0) continue;
+              double tt = (q2[0] * qv[0] + q2[1] * qv[1] + q2[2] * qv[2]) * inv;
+              if (tt > 0.0) {
+                blk = t;
+                blkt = tt;
+              }
+            }
+            if (blk < 0) continue; /* согласие, не наш случай */
+            /* Ячейка фронта, накрывшая точку. */
+            int32_t nid = 0, lev = 0;
+            while (X.cellf[nid] < 0.0f && T.nd[nid].child >= 0) {
+              double mid[3];
+              int k = 0;
+              for (int c = 0; c < 3; c++) {
+                mid[c] = 0.5 * (T.nd[nid].lo[c] + T.nd[nid].hi[c]);
+                if (P[c] >= mid[c]) k |= (1 << c);
+              }
+              nid = T.nd[nid].child + k;
+              lev++;
+            }
+            double hcell = T.nd[nid].hi[0] - T.nd[nid].lo[0];
+            /* Где заслонитель: внутри этой ячейки или выше по лучу? */
+            double Q[3];
+            for (int c = 0; c < 3; c++)
+              Q[c] = O[c] + blkt * S[c];
+            int inside = 1;
+            for (int c = 0; c < 3 && inside; c++)
+              if (Q[c] < T.nd[nid].lo[c] || Q[c] > T.nd[nid].hi[c]) inside = 0;
+            /* Размер заслонителя против размера ячейки. */
+            const double *A2 = m.v + 3 * (size_t)m.f[3 * (size_t)blk + 0];
+            const double *B2 = m.v + 3 * (size_t)m.f[3 * (size_t)blk + 1];
+            const double *C2v = m.v + 3 * (size_t)m.f[3 * (size_t)blk + 2];
+            double u1[3] = {B2[0] - A2[0], B2[1] - A2[1], B2[2] - A2[2]};
+            double u2[3] = {C2v[0] - A2[0], C2v[1] - A2[1], C2v[2] - A2[2]};
+            double cr[3];
+            cr[0] = u1[1] * u2[2] - u1[2] * u2[1];
+            cr[1] = u1[2] * u2[0] - u1[0] * u2[2];
+            cr[2] = u1[0] * u2[1] - u1[1] * u2[0];
+            double area = 0.5 * sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+            printf("   пиксель %6d: f=%.3f  ЯЧЕЙКА ур.%2d ребро %.4f м  ЗАСЛОНИТЕЛЬ на %.4f м "
+                   "%s, площадь %.3e м² (ребро ~%.4f м)\n",
+                   (int)p, fpix[p], lev, hcell, blkt, inside ? "ВНУТРИ ячейки" : "ВЫШЕ по лучу",
+                   area, sqrt(2.0 * area));
+            shown++;
+          }
         }
         char path[256];
         const char *base = strrchr(argv[1], '/');

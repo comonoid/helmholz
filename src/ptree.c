@@ -340,17 +340,79 @@ static int pt_flat_node(const hz_objmesh *m, const int32_t *list, int32_t n, con
   return 1;
 }
 
-/* `1` — второй критерий действует (умолчание `0`: прежнее поведение до единицы,
- * чтобы числа §271…§293 воспроизводились). */
+/* ТРЕТИЙ КРИТЕРИЙ — ЗАЗОР, А НЕ КОМПЛАНАРНОСТЬ (§295).
+ *
+ * §294 измерил, что требование компланарности снимает ошибку в 86 раз и растит
+ * дерево в 16 раз: точная компланарность не выполняется почти нигде, и угол
+ * «стена — пол» дробится до предела глубины, хотя заслоняет сам себя лишь у
+ * линии стыка — на доли пикселя.
+ *
+ * РАЗЛИЧИТЕЛЬ ПРЯМОЙ: ячейка может заслонить сама себя ЗАМЕТНО тогда, когда в
+ * ней есть два куска, РАЗНЕСЁННЫЕ зазором. У угла плоскости ПЕРЕСЕКАЮТСЯ внутри
+ * ячейки, и зазора нет; у пола с потолком зазор равен ребру. Проверка — для
+ * каждой пары кусков наименьшее расстояние от вершин одного до плоскости
+ * другого: если оно велико, куски разнесены.
+ *
+ * ЗАЗОР МЕРИТСЯ ДОЛЕЙ РЕБРА ЯЧЕЙКИ, и это не порог «на глаз»: щель тоньше
+ * четверти ребра даёт тень тоньше четверти ячейки, а состояние на грани у
+ * фронта ЛИНЕЙНО (Р1) и такой тени всё равно не несёт. То есть дробить ради неё
+ * бессмысленно — ответ от этого не улучшится. */
+#define HZ_PTREE_GAP 0.25
+
+static int pt_selfshadow_node(const hz_objmesh *m, const int32_t *list, int32_t n, const double *lo,
+                              const double *hi) {
+  if (n < 2) return 0;
+  double h0 = hi[0] - lo[0];
+  double gap = HZ_PTREE_GAP * h0;
+  int32_t nn = (n > 24) ? 24 : n;    /* пар квадратично; двадцати четырёх довольно, */
+  for (int32_t i = 0; i < nn; i++) { /* чтобы поймать разнесённые куски */
+    int32_t ti = list[i];
+    const double *A = m->v + 3 * (size_t)m->f[3 * (size_t)ti + 0];
+    const double *B = m->v + 3 * (size_t)m->f[3 * (size_t)ti + 1];
+    const double *C = m->v + 3 * (size_t)m->f[3 * (size_t)ti + 2];
+    double e1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]};
+    double e2[3] = {C[0] - A[0], C[1] - A[1], C[2] - A[2]};
+    double nr[3];
+    nr[0] = e1[1] * e2[2] - e1[2] * e2[1];
+    nr[1] = e1[2] * e2[0] - e1[0] * e2[2];
+    nr[2] = e1[0] * e2[1] - e1[1] * e2[0];
+    double ln = nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2];
+    if (!(ln > 0.0)) continue;
+    ln = 1.0 / sqrt(ln);
+    for (int c = 0; c < 3; c++)
+      nr[c] *= ln;
+    double d0 = nr[0] * A[0] + nr[1] * A[1] + nr[2] * A[2];
+    for (int32_t j = 0; j < nn; j++) {
+      if (j == i) continue;
+      int32_t tj = list[j];
+      double mind = 1e300;
+      for (int k = 0; k < 3; k++) {
+        const double *P = m->v + 3 * (size_t)m->f[3 * (size_t)tj + (size_t)k];
+        double dd = nr[0] * P[0] + nr[1] * P[1] + nr[2] * P[2] - d0;
+        if (dd < 0.0) dd = -dd;
+        if (dd < mind) mind = dd;
+      }
+      /* Кусок `j` ЦЕЛИКОМ отстоит от плоскости куска `i` дальше зазора — значит
+       * они разнесены, и один может заслонить другой внутри ячейки. */
+      if (mind > gap) return 1;
+    }
+  }
+  return 0;
+}
+
+/* `1` — компланарность (§294, дорого); `2` — зазор (§295). Умолчание `0`:
+ * прежнее поведение до единицы, чтобы числа §271…§293 воспроизводились. */
 int hz_ptree_flat_split = 0;
 
 static int pt_cut_split(hz_ptree *t, const hz_objmesh *m, int32_t nid, int32_t *list, int32_t n,
                         int lev, const double *tlo, const double *thi) {
   t->nvisited++;
   if ((int32_t)t->lev[nid] > t->depth) t->depth = (int32_t)t->lev[nid];
-  int flat = (!hz_ptree_flat_split || m == NULL)
-                 ? 1
-                 : pt_flat_node(m, list, n, t->nd[nid].lo, t->nd[nid].hi);
+  int flat = 1;
+  if (m != NULL && hz_ptree_flat_split == 1)
+    flat = pt_flat_node(m, list, n, t->nd[nid].lo, t->nd[nid].hi);
+  else if (m != NULL && hz_ptree_flat_split == 2)
+    flat = !pt_selfshadow_node(m, list, n, t->nd[nid].lo, t->nd[nid].hi);
   if ((n <= t->leafmax && flat) || lev >= t->maxlev) {
     t->nd[nid].child = -1;
     t->nd[nid].t0 = 0;

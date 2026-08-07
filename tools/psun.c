@@ -626,7 +626,11 @@ int main(int argc, char **argv) {
     float *zb = malloc(np * sizeof *zb);
     int32_t *ib = malloc(np * sizeof *ib);
     double *pix = malloc(np * sizeof *pix);
-    if (zb != NULL && ib != NULL && pix != NULL) {
+    /* Доля открытого диска ОТДЕЛЬНО от яркости: эталон спрашивает «видно ли
+     * солнце», а не «насколько ярко», и мешать в одну величину косинус с
+     * альбедо значило бы сверять три вещи разом. */
+    double *fpix = malloc(np * sizeof *fpix);
+    if (zb != NULL && ib != NULL && pix != NULL && fpix != NULL) {
       double diag = 0.0;
       for (int c = 0; c < 3; c++) {
         double s = T.nd[0].hi[c] - T.nd[0].lo[c];
@@ -640,6 +644,7 @@ int main(int argc, char **argv) {
         double sum = 0.0;
         for (size_t p = 0; p < np; p++) {
           pix[p] = 0.0;
+          fpix[p] = 0.0;
           if (ib[p] < 0) {
             nsky++;
             continue;
@@ -682,11 +687,88 @@ int main(int argc, char **argv) {
           if (cs < 0.0) cs = -cs;           /* нормаль .obj может смотреть внутрь */
           double kd = m.mtl[m.fm[t]].kd;
           pix[p] = kd * f * cs;
+          fpix[p] = f;
           sum += pix[p];
           if (f > 0.5)
             nlit2++;
           else
             nsh2++;
+        }
+        /* ЭТАЛОН ПО ПИКСЕЛЯМ — НАСКОЛЬКО КАРТИНКА НЕВЕРНА. До сих пор у линии
+         * фронта сверялись ЯЧЕЙКИ (§272, выборка по обходу), а картинки не было
+         * вовсе; теперь спрашивается прямо: в этом пикселе солнце видно или нет?
+         * Эталон — теневой луч из точки попадания перебором ВСЕХ треугольников,
+         * то есть заведомо проще проверяемого (правило эталона).
+         *
+         * ЛУЧ ОДИН, А НЕ ШЕСТНАДЦАТЬ, И ЭТО НЕ ЭКОНОМИЯ. При `nk = 1` фронт
+         * несёт видимость ЦЕНТРА диска, то есть точечное солнце; сверять его с
+         * усреднением по диску значило бы мерить полутень, которой в этой
+         * постановке нет (§274). Диск вернётся вместе с `nk > 1`. */
+        if (nref > 0) {
+          double tref2 = now_s();
+          int32_t step = (int32_t)(np / (size_t)(nref > 0 ? nref : 1));
+          if (step < 1) step = 1;
+          int64_t nch = 0, nlitbad = 0, nshbad = 0;
+          double sumd = 0.0, maxd = 0.0;
+          for (size_t p = 0; p < np; p += (size_t)step) {
+            if (ib[p] < 0) continue;
+            double d[3];
+            hz_pcull_ray(&C2, (int)(p % (size_t)bufside), (int)(p / (size_t)bufside), d);
+            double P[3];
+            for (int c = 0; c < 3; c++)
+              P[c] = camo[c] + (double)zb[p] * d[c];
+            /* Отступ от поверхности вдоль луча НА СОЛНЦЕ, а не по нормали:
+             * нормаль у .obj может смотреть внутрь, и отступ по ней уводил бы
+             * точку под поверхность ровно в половине случаев. */
+            double ofs = 1e-5 * (fabs(P[0]) + fabs(P[1]) + fabs(P[2]) + 1.0);
+            double O[3], S[3];
+            for (int c = 0; c < 3; c++) {
+              S[c] = -X.dir[c];
+              O[c] = P[c] + ofs * S[c];
+            }
+            int blk = 0;
+            for (int32_t t = 0; t < m.nt && !blk; t++) {
+              const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t + 0];
+              const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)t + 1];
+              const double *Cc = m.v + 3 * (size_t)m.f[3 * (size_t)t + 2];
+              double q1[3], q2[3], pv[3], tv[3], qv[3];
+              for (int c = 0; c < 3; c++) {
+                q1[c] = B[c] - A[c];
+                q2[c] = Cc[c] - A[c];
+              }
+              pv[0] = S[1] * q2[2] - S[2] * q2[1];
+              pv[1] = S[2] * q2[0] - S[0] * q2[2];
+              pv[2] = S[0] * q2[1] - S[1] * q2[0];
+              double det = q1[0] * pv[0] + q1[1] * pv[1] + q1[2] * pv[2];
+              if (det > -1e-12 && det < 1e-12) continue;
+              double inv = 1.0 / det;
+              for (int c = 0; c < 3; c++)
+                tv[c] = O[c] - A[c];
+              double uu = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+              if (uu < 0.0 || uu > 1.0) continue;
+              qv[0] = tv[1] * q1[2] - tv[2] * q1[1];
+              qv[1] = tv[2] * q1[0] - tv[0] * q1[2];
+              qv[2] = tv[0] * q1[1] - tv[1] * q1[0];
+              double vv = (S[0] * qv[0] + S[1] * qv[1] + S[2] * qv[2]) * inv;
+              if (vv < 0.0 || uu + vv > 1.0) continue;
+              double tt = (q2[0] * qv[0] + q2[1] * qv[1] + q2[2] * qv[2]) * inv;
+              if (tt > 0.0) blk = 1;
+            }
+            double ftrue = blk ? 0.0 : 1.0;
+            double four = fpix[p];
+            double dd = fabs(four - ftrue);
+            nch++;
+            sumd += dd;
+            if (dd > maxd) maxd = dd;
+            if (ftrue < 0.5 && four > 0.5) nlitbad++; /* светло у нас, тень у эталона */
+            if (ftrue > 0.5 && four < 0.5) nshbad++;  /* тень у нас, светло у эталона */
+          }
+          printf("   ЭТАЛОН ПО ПИКСЕЛЯМ (теневой луч перебором, %lld пикселей за %.1f с):\n"
+                 "     |Δдоли| среднее %.4f, наибольшее %.4f; РАЗОШЛИСЬ ЗНАКОМ: у нас светло "
+                 "а в тени %lld (%.2f %%), у нас тень а на свету %lld (%.2f %%)\n",
+                 (long long)nch, now_s() - tref2, nch > 0 ? sumd / (double)nch : 0.0, maxd,
+                 (long long)nlitbad, nch > 0 ? 100.0 * (double)nlitbad / (double)nch : 0.0,
+                 (long long)nshbad, nch > 0 ? 100.0 * (double)nshbad / (double)nch : 0.0);
         }
         char path[256];
         const char *base = strrchr(argv[1], '/');
@@ -707,6 +789,7 @@ int main(int argc, char **argv) {
     free(zb);
     free(ib);
     free(pix);
+    free(fpix);
   }
 
   /* ПРИЁМКА ЭТОЙ ЛИНИИ ОПТИМИЗАЦИЙ — ОДНОСТОРОННЯЯ (указание пользователя 08-06):

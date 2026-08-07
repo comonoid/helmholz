@@ -51,6 +51,7 @@ int main(int argc, char **argv) {
       usemark = 0, relax = HZ_PMARK_OUT_LEVELS, refinemax = 0, nk = 1;
   double camo[3] = {0.0, 0.0, 0.0}, camf[3] = {0.0, 0.0, 1.0}, camat[3] = {0.0, 0.0, 1.0};
   int loose = 0, bufside = HZ_CFG_W, eta = 1, mlev = HZ_PMARK_LEVEL, img = 0, nrec = 0, ndbg = 0;
+  int indep = 0, intol = 8;
   /* УГЛОВОЙ РАДИУС ИСТОЧНИКА — ПАРАМЕТР, А НЕ КОНСТАНТА (замечание пользователя
    * 08-07). Он был зашит числом солнца в ДВУХ местах — у фронта и у эталона, — и
    * потому «протяжённый источник» из §275 означал лишь `K` выборок ТОГО ЖЕ
@@ -77,6 +78,8 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "img=", 4) == 0) img = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "rec=", 4) == 0) nrec = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "dbg=", 4) == 0) ndbg = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "indep=", 6) == 0) indep = (int)strtol(argv[i] + 6, NULL, 10);
+    if (strncmp(argv[i], "intol=", 6) == 0) intol = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "flat=", 5) == 0) hz_ptree_flat_split = (int)strtol(argv[i] + 5, NULL, 10);
     /* ВЫБОРОК ПО ДИСКУ ИСТОЧНИКА. Механизм Ф4 (§275) был написан, но ключа не
      * имел, и `K` оставалось единицей — то есть источник точечным, а полутени в
@@ -695,6 +698,23 @@ int main(int argc, char **argv) {
     if (X.cellf != NULL)
       for (int32_t i = 0; i < T.nnd; i++)
         X.cellf[i] = -1.0f;
+    /* Таблица глубин заслонителя внутри ячейки (§296). Запись — 64 числа на
+     * ОСТАНОВИВШУЮСЯ ячейку; их доли процента от узлов, поэтому индекс на узел
+     * плюс плотный массив записей, а не 64 числа на каждый узел. */
+    if (indep) {
+      X.cellslot = malloc((size_t)T.nnd * sizeof *X.cellslot);
+      X.capslot = 4000000;
+      X.celldep = malloc(64 * (size_t)X.capslot * sizeof *X.celldep);
+      if (X.cellslot != NULL && X.celldep != NULL)
+        for (int32_t i = 0; i < T.nnd; i++)
+          X.cellslot[i] = -1;
+      else {
+        free(X.cellslot);
+        free(X.celldep);
+        X.cellslot = NULL;
+        X.celldep = NULL;
+      }
+    }
   }
   hz_pfront_walk(&X, 0, T.nd[0].lo, T.nd[0].hi, in, out, list, m.nt, 0, 0);
   double secs = now_s() - t0;
@@ -791,6 +811,31 @@ int main(int argc, char **argv) {
             nid = T.nd[nid].child + k;
           }
           double f = (X.cellf[nid] >= 0.0f) ? (double)X.cellf[nid] : 0.0;
+          /* ЗАСЛОНЕНИЕ ВНУТРИ ЯЧЕЙКИ (§296): спрашиваем свой столбик сетки, есть
+           * ли геометрия БЛИЖЕ к источнику, чем мы сами. Дробить ячейку для
+           * этого не нужно — нужна лишь глубина, посчитанная фронтом на месте. */
+          if (X.cellslot != NULL && X.cellslot[nid] >= 0) {
+            int a2 = X.celldepax;
+            int p2 = (a2 + 1) % 3, q2 = (a2 + 2) % 3;
+            const hz_ptnode *NN = &T.nd[nid];
+            double fa = (X.dir[a2] > 0.0) ? NN->lo[a2] : NN->hi[a2];
+            double du2 = NN->hi[p2] - NN->lo[p2], dv2 = NN->hi[q2] - NN->lo[q2];
+            /* Своя глубина: путь от входной грани до точки вдоль света. */
+            double tp = (P[a2] - fa) / X.dir[a2];
+            double up = P[p2] - tp * X.dir[p2], vp = P[q2] - tp * X.dir[q2];
+            int gi = (int)(8.0 * (up - NN->lo[p2]) / du2);
+            int gj = (int)(8.0 * (vp - NN->lo[q2]) / dv2);
+            if (gi < 0) gi = 0;
+            if (gj < 0) gj = 0;
+            if (gi > 7) gi = 7;
+            if (gj > 7) gj = 7;
+            double dq = (double)X.celldep[64 * (size_t)X.cellslot[nid] + (size_t)(gj * 8 + gi)];
+            /* Допуск — ширина столбика: собственная поверхность точки внутри
+             * столбика имеет разброс глубины того же порядка, и без допуска она
+             * заслоняла бы сама себя. */
+            double tolz = (du2 > dv2 ? du2 : dv2) / (double)intol;
+            if (dq < tp - tolz) f = 0.0;
+          }
           /* Косинус на поверхности — из нормали видимого треугольника. */
           int32_t t = ib[p];
           const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t + 0];
@@ -1345,6 +1390,8 @@ int main(int argc, char **argv) {
   free(dep);
   free(mk);
   free(X.cellf);
+  free(X.cellslot);
+  free(X.celldep);
   free(tlo);
   free(thi);
   free(tpl);

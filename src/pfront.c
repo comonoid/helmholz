@@ -616,6 +616,61 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         X->nmarkset++;
       }
     }
+    /* ГЛУБИНА ЗАСЛОНИТЕЛЯ ПО СТОЛБИКАМ (§296). Считается там же, где перекрытие,
+     * и по той же сетке: для каждой клетки 8x8 входной грани — наименьшая
+     * глубина, на которой столбик встречает геометрию ячейки. */
+    if (X->cellslot != NULL && n > 0 && X->nslot < X->capslot) {
+      int a = 0;
+      double ma = 0.0;
+      for (int c = 0; c < 3; c++) {
+        double v = (X->dir[c] < 0.0) ? -X->dir[c] : X->dir[c];
+        if (v > ma) {
+          ma = v;
+          a = c;
+        }
+      }
+      X->celldepax = a;
+      int p2, q2;
+      face_axes(a, &p2, &q2);
+      double fa = (X->dir[a] > 0.0) ? lo[a] : hi[a]; /* ВХОДНАЯ грань */
+      float *dep = X->celldep + 64 * (size_t)X->nslot;
+      for (int k = 0; k < 64; k++)
+        dep[k] = INFINITY;
+      double du = hi[p2] - lo[p2], dv = hi[q2] - lo[q2];
+      for (int32_t i = 0; i < n; i++) {
+        int32_t t = list[i];
+        const double *A = X->m->v + 3 * (size_t)X->m->f[3 * (size_t)t + 0];
+        const double *B = X->m->v + 3 * (size_t)X->m->f[3 * (size_t)t + 1];
+        const double *C = X->m->v + 3 * (size_t)X->m->f[3 * (size_t)t + 2];
+        double e1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]};
+        double e2[3] = {C[0] - A[0], C[1] - A[1], C[2] - A[2]};
+        double nw[3];
+        nw[0] = e1[1] * e2[2] - e1[2] * e2[1];
+        nw[1] = e1[2] * e2[0] - e1[0] * e2[2];
+        nw[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        double nd = nw[0] * X->dir[0] + nw[1] * X->dir[1] + nw[2] * X->dir[2];
+        if (nd > -1e-300 && nd < 1e-300) continue; /* параллелен свету */
+        double dpl = nw[0] * A[0] + nw[1] * A[1] + nw[2] * A[2];
+        uint64_t mk = tri_mask(A, B, C, lo, hi, X->dir, a);
+        while (mk != 0) {
+          int b = 0;
+          uint64_t lsb = mk & (~mk + 1);
+          while ((lsb >> b) != 1)
+            b++;
+          mk &= mk - 1;
+          int gi = b % 8, gj = b / 8;
+          double X0[3];
+          X0[a] = fa;
+          X0[p2] = lo[p2] + du * ((double)gi + 0.5) / 8.0;
+          X0[q2] = lo[q2] + dv * ((double)gj + 0.5) / 8.0;
+          double num = dpl - (nw[0] * X0[0] + nw[1] * X0[1] + nw[2] * X0[2]);
+          double tt = num / nd;
+          if (tt > 0.0 && (float)tt < dep[b]) dep[b] = (float)tt;
+        }
+      }
+      X->cellslot[nid] = X->nslot;
+      X->nslot++;
+    }
     /* ОТВЕТ ФРОНТА, ОСТАВЛЕННЫЙ СНАРУЖИ (см. `cellf` в заголовке). Берётся
      * ВХОДЯЩЕЕ состояние по потоку — «сколько диска видно этой ячейке», то есть
      * та же величина, что уходит в выборку эталона. */

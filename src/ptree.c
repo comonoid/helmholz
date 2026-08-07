@@ -276,11 +276,82 @@ static int pt_inside(const double *bl, const double *bh, const double *clo, cons
   return 1;
 }
 
-static int pt_cut_split(hz_ptree *t, int32_t nid, int32_t *list, int32_t n, int lev,
-                        const double *tlo, const double *thi) {
+/* ВТОРОЙ КРИТЕРИЙ ДРОБЛЕНИЯ: ЛЕЖИТ ЛИ ГЕОМЕТРИЯ УЗЛА В ОДНОЙ ПЛОСКОСТИ (§294).
+ *
+ * ЗАЧЕМ. §293 нашёл досье на расходящихся пикселях: фронт несёт состояние на
+ * ГРАНЯХ ячейки и заслонения ВНУТРИ неё не видит; а ячейки огромны там, где
+ * геометрия плоская, потому что дробление шло ТОЛЬКО по числу треугольников.
+ * Плита пола из двух треугольников — лист на третьем уровне, и поверхность
+ * вместе со своим заслонителем попадает в одну ячейку.
+ *
+ * ПОЧЕМУ ИМЕННО КОМПЛАНАРНОСТЬ. Ячейка, вся геометрия которой лежит в одной
+ * плоскости, САМА СЕБЯ ЗАСЛОНИТЬ НЕ МОЖЕТ — заслонять внутри неё нечему. Как
+ * только плоскостей две, внутри ячейки появляется «перед» и «за», а фронт этого
+ * различить не в состоянии. Значит критерий отвечает ровно на тот вопрос, из-за
+ * которого ошибка и возникает.
+ *
+ * КАМЕРОНЕЗАВИСИМО (А470): про свет и камеру здесь не спрашивается ничего,
+ * только про взаимное положение кусков геометрии.
+ *
+ * ДОПУСК — ТОТ ЖЕ, ЧТО У `nflat1` В `pfront.c`: шестнадцатая доля ребра ячейки.
+ * Не новое число, а уже принятое в проекте для того же вопроса. */
+static int pt_flat_node(const hz_objmesh *m, const int32_t *list, int32_t n, const double *lo,
+                        const double *hi) {
+  if (n < 2) return 1;
+  double h0 = hi[0] - lo[0];
+  double tol = 0.0625 * h0;
+  double n0[3] = {0.0, 0.0, 0.0}, d0 = 0.0;
+  int first = 1;
+  for (int32_t i = 0; i < n; i++) {
+    int32_t tt = list[i];
+    const double *A = m->v + 3 * (size_t)m->f[3 * (size_t)tt + 0];
+    const double *B = m->v + 3 * (size_t)m->f[3 * (size_t)tt + 1];
+    const double *C = m->v + 3 * (size_t)m->f[3 * (size_t)tt + 2];
+    double e1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]};
+    double e2[3] = {C[0] - A[0], C[1] - A[1], C[2] - A[2]};
+    double nr[3];
+    nr[0] = e1[1] * e2[2] - e1[2] * e2[1];
+    nr[1] = e1[2] * e2[0] - e1[0] * e2[2];
+    nr[2] = e1[0] * e2[1] - e1[1] * e2[0];
+    double ln = nr[0] * nr[0] + nr[1] * nr[1] + nr[2] * nr[2];
+    if (!(ln > 0.0)) continue;
+    ln = 1.0 / sqrt(ln);
+    for (int c = 0; c < 3; c++)
+      nr[c] *= ln;
+    double dd = nr[0] * A[0] + nr[1] * A[1] + nr[2] * A[2];
+    if (first) {
+      for (int c = 0; c < 3; c++)
+        n0[c] = nr[c];
+      d0 = dd;
+      first = 0;
+      continue;
+    }
+    double dot = n0[0] * nr[0] + n0[1] * nr[1] + n0[2] * nr[2];
+    double sg = (dot < 0.0) ? -1.0 : 1.0;
+    double gap = 0.0;
+    for (int c = 0; c < 3; c++) {
+      double dn = n0[c] - sg * nr[c];
+      gap += (dn < 0.0 ? -dn : dn) * 0.5 * h0;
+    }
+    double dd2 = d0 - sg * dd;
+    gap += (dd2 < 0.0 ? -dd2 : dd2);
+    if (gap > tol) return 0;
+  }
+  return 1;
+}
+
+/* `1` — второй критерий действует (умолчание `0`: прежнее поведение до единицы,
+ * чтобы числа §271…§293 воспроизводились). */
+int hz_ptree_flat_split = 0;
+
+static int pt_cut_split(hz_ptree *t, const hz_objmesh *m, int32_t nid, int32_t *list, int32_t n,
+                        int lev, const double *tlo, const double *thi) {
   t->nvisited++;
   if ((int32_t)t->lev[nid] > t->depth) t->depth = (int32_t)t->lev[nid];
-  if (n <= t->leafmax || lev >= t->maxlev) {
+  int flat = (!hz_ptree_flat_split || m == NULL)
+                 ? 1
+                 : pt_flat_node(m, list, n, t->nd[nid].lo, t->nd[nid].hi);
+  if ((n <= t->leafmax && flat) || lev >= t->maxlev) {
     t->nd[nid].child = -1;
     t->nd[nid].t0 = 0;
     t->nd[nid].ntri = 0;
@@ -317,7 +388,7 @@ static int pt_cut_split(hz_ptree *t, int32_t nid, int32_t *list, int32_t n, int 
       const double *bl = tlo + 3 * (size_t)list[i], *bh = thi + 3 * (size_t)list[i];
       if (pt_hits(bl, bh, clo[k], chi[k])) sub[ns++] = list[i];
     }
-    if (pt_cut_split(t, c0 + k, sub, ns, lev + 1, tlo, thi) != 0) {
+    if (pt_cut_split(t, m, c0 + k, sub, ns, lev + 1, tlo, thi) != 0) {
       free(sub);
       return 1;
     }
@@ -438,7 +509,7 @@ int hz_ptree_build_cut(hz_ptree *t, const hz_objmesh *m, int leafmax, int maxlev
   t->nd[0].ntri = 0;
   t->lev[0] = 0;
   double t0 = pt_now();
-  int rc = pt_cut_split(t, 0, list, m->nt, 0, tlo, thi);
+  int rc = pt_cut_split(t, m, 0, list, m->nt, 0, tlo, thi);
   t->t_build = pt_now() - t0;
   free(tlo);
   free(thi);

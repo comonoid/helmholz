@@ -77,6 +77,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "img=", 4) == 0) img = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "rec=", 4) == 0) nrec = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "dbg=", 4) == 0) ndbg = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "flat=", 5) == 0) hz_ptree_flat_split = (int)strtol(argv[i] + 5, NULL, 10);
     /* ВЫБОРОК ПО ДИСКУ ИСТОЧНИКА. Механизм Ф4 (§275) был написан, но ключа не
      * имел, и `K` оставалось единицей — то есть источник точечным, а полутени в
      * постановке не было вовсе (§274). Довод пользователя 08-07: на протяжённом

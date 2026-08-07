@@ -91,6 +91,12 @@ int hz_ptree_build_ex(hz_ptree *t, const hz_objmesh *m, int leafmax, int maxlev,
  * `grade` — строить ли градуированное дерево (перепад не более 2:1 между
  * соседями по грани, §241.3); добавленные узлы считаются в `ngrade`. */
 int hz_ptree_build_cut(hz_ptree *t, const hz_objmesh *m, int leafmax, int maxlev, int grade);
+
+/* ВТОРОЙ КРИТЕРИЙ ДРОБЛЕНИЯ (§294): узел, чья геометрия НЕ лежит в одной
+ * плоскости, дробится независимо от числа треугольников. Разбор — в `ptree.c`.
+ * `0` — прежнее поведение (умолчание): числа §271…§293 обязаны воспроизводиться
+ * до единицы. */
+extern int hz_ptree_flat_split;
 void hz_ptree_free(hz_ptree *t);
 
 #endif

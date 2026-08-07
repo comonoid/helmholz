@@ -763,7 +763,7 @@ int main(int argc, char **argv) {
       hz_pcull C2;
       if (hz_pcull_init(&C2, camo, camat, upv, HZ_CFG_FOV_DEG, bufside, sqrt(diag)) == 0) {
         hz_pcull_shot(&C2, &m, zb, ib);
-        int64_t nsky = 0, nlit2 = 0, nsh2 = 0;
+        int64_t nsky = 0, nlit2 = 0, nsh2 = 0, nback = 0;
         double sum = 0.0;
         for (size_t p = 0; p < np; p++) {
           pix[p] = 0.0;
@@ -817,6 +817,14 @@ int main(int argc, char **argv) {
           double vn = 0.0;
           for (int c = 0; c < 3; c++)
             vn += (nn[c] / ln2) * d[c];
+          /* СКОЛЬКО ВИДИМЫХ ПИКСЕЛЕЙ ПОКАЗЫВАЮТ ТЫЛЬНУЮ ПО НОРМАЛИ ГРАНЬ.
+           * Предложение пользователя 08-07 — считать невидимыми все обратные по
+           * нормали поверхности — верно ТОЛЬКО для замкнутой геометрии с
+           * согласованными нормалями: у открытого листа тыльная сторона видна, и
+           * пометив её, мы пометим видимое, то есть сломаем односторонность.
+           * Проверка прямая: если тыльных среди ВИДИМЫХ заметная доля, правило
+           * на этих сценах незаконно. */
+          if (vn > 0.0) nback++;
           double sgn = (vn > 0.0) ? -1.0 : 1.0; /* нормаль к глазу */
           double cs = 0.0;
           for (int c = 0; c < 3; c++)
@@ -981,9 +989,12 @@ int main(int argc, char **argv) {
         snprintf(path, sizeof path, "img/psun_%s_mark%d.pfm", base ? base + 1 : argv[1], usemark);
         hz_pfm_write(path, pix, pix, pix, bufside, bufside);
         printf("== КАРТИНКА (проход 3, сбор по пикселю) за %.2f с: %s\n"
+               "   ТЫЛЬНЫХ ПО НОРМАЛИ СРЕДИ ВИДИМЫХ: %lld из %lld (%.2f %%) — столько показало "
+               "бы невидимым правило «обратные по нормали»\n"
                "   пикселей неба %lld, освещённых %lld, в тени %lld; средняя яркость %.6f\n",
-               now_s() - timg, path, (long long)nsky, (long long)nlit2, (long long)nsh2,
-               sum / (double)np);
+               now_s() - timg, path, (long long)nback, (long long)(np - (size_t)nsky),
+               (np - (size_t)nsky) > 0 ? 100.0 * (double)nback / (double)(np - (size_t)nsky) : 0.0,
+               (long long)nsky, (long long)nlit2, (long long)nsh2, sum / (double)np);
         hz_pcull_free(&C2);
       }
     }

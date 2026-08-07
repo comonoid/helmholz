@@ -70,6 +70,12 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "mlev=", 5) == 0) mlev = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "img=", 4) == 0) img = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "rec=", 4) == 0) nrec = (int)strtol(argv[i] + 4, NULL, 10);
+    /* ВЫБОРОК ПО ДИСКУ ИСТОЧНИКА. Механизм Ф4 (§275) был написан, но ключа не
+     * имел, и `K` оставалось единицей — то есть источник точечным, а полутени в
+     * постановке не было вовсе (§274). Довод пользователя 08-07: на протяжённом
+     * источнике отлаживать проще, потому что поле СГЛАЖИВАЕТСЯ, а линейное
+     * состояние на грани (Р1) для гладкого поля и заведено. */
+    if (strncmp(argv[i], "nk=", 3) == 0) nk = (int)strtol(argv[i] + 3, NULL, 10);
     if (strncmp(argv[i], "cover=", 6) == 0)
       hz_pfront_cover_sum = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "sun=", 4) == 0) {

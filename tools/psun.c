@@ -814,6 +814,33 @@ int main(int argc, char **argv) {
           st2[sp2++] = ch;
         }
       }
+      /* ВТОРОЙ СЧЁТ, НАПИСАННЫЙ НЕЗАВИСИМО (§305). Первый распространяет признак
+       * «накрыт» СВЕРХУ ВНИЗ; этот считает листья ПОД каждой остановкой СНИЗУ
+       * ВВЕРХ и складывает. Вложенных остановок быть не может — ниже остановки
+       * обход не идёт, — поэтому у разбиения сумма обязана дать ровно все листья.
+       * Два счёта, устроенные по-разному, отвечают на один вопрос: если сойдутся,
+       * дефект в обходе; если разойдутся, дефект в счёте. */
+      int64_t *lv2 = calloc((size_t)T.nnd, sizeof *lv2);
+      if (lv2 != NULL) {
+        for (int32_t q = T.nnd - 1; q >= 0; q--) {
+          if (T.nd[q].child < 0)
+            lv2[q] = 1;
+          else
+            for (int k = 0; k < 8; k++)
+              lv2[q] += lv2[T.nd[q].child + k];
+        }
+        int64_t nstop = 0, sum2 = 0;
+        for (int32_t q = 0; q < T.nnd; q++)
+          if (X.cellf[q] >= 0.0f) {
+            nstop++;
+            sum2 += lv2[q];
+          }
+        printf("== ВТОРОЙ СЧЁТ: остановок %lld (обход насчитал %lld), листьев под ними %lld из "
+               "%lld (%.2f %%)\n",
+               (long long)nstop, (long long)X.ncell, (long long)sum2, (long long)leaf_tot,
+               leaf_tot > 0 ? 100.0 * (double)sum2 / (double)leaf_tot : 0.0);
+      }
+      free(lv2);
       printf("== ПОКРЫТИЕ ФРОНТОМ: листьев %lld, накрыто остановками %lld (%.2f %%), ДЫРА %lld\n",
              (long long)leaf_tot, (long long)leaf_cov,
              leaf_tot > 0 ? 100.0 * (double)leaf_cov / (double)leaf_tot : 0.0,

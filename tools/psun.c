@@ -786,6 +786,43 @@ int main(int argc, char **argv) {
   printf("   ВРЕМЯ %.2f с, на ячейку %.1f нс\n", secs,
          X.ncell > 0 ? 1e9 * secs / (double)X.ncell : 0.0);
 
+  /* ПОКРЫВАЕТ ЛИ ФРОНТ ВСЁ ПРОСТРАНСТВО (§303, шаг 1). Устройство обхода
+   * утверждает: остановки фронта разбивают дерево без дыр — на листе остановка
+   * безусловна. Утверждение НИ РАЗУ не проверялось, а §303 нашёл `86 845`
+   * пикселей, читающих пустоту. Счёт прямой: у каждого листа обязан быть предок
+   * (или он сам) с записью. */
+  if (img && X.cellf != NULL) {
+    int64_t leaf_tot = 0, leaf_cov = 0;
+    int32_t *st2 = malloc((size_t)T.nnd * sizeof *st2);
+    unsigned char *cv = malloc((size_t)T.nnd);
+    if (st2 != NULL && cv != NULL) {
+      int32_t sp2 = 0;
+      st2[sp2] = 0;
+      cv[0] = (unsigned char)(X.cellf[0] >= 0.0f);
+      sp2 = 1;
+      while (sp2 > 0) {
+        int32_t q = st2[--sp2];
+        int c2 = cv[q];
+        if (T.nd[q].child < 0) {
+          leaf_tot++;
+          if (c2) leaf_cov++;
+          continue;
+        }
+        for (int k = 0; k < 8; k++) {
+          int32_t ch = T.nd[q].child + k;
+          cv[ch] = (unsigned char)(c2 || X.cellf[ch] >= 0.0f);
+          st2[sp2++] = ch;
+        }
+      }
+      printf("== ПОКРЫТИЕ ФРОНТОМ: листьев %lld, накрыто остановками %lld (%.2f %%), ДЫРА %lld\n",
+             (long long)leaf_tot, (long long)leaf_cov,
+             leaf_tot > 0 ? 100.0 * (double)leaf_cov / (double)leaf_tot : 0.0,
+             (long long)(leaf_tot - leaf_cov));
+    }
+    free(st2);
+    free(cv);
+  }
+
   /* ПРОХОД 3 — СБОР ПО ПИКСЕЛЮ, ТО ЕСТЬ КАРТИНКА (ключ `img=1`).
    *
    * ЗАЧЕМ ОН ЗДЕСЬ И ПОЧЕМУ ТОЛЬКО ТЕПЕРЬ. У линии фронта не было ни одной

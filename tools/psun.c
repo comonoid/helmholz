@@ -61,7 +61,7 @@ int main(int argc, char **argv) {
    *   ПОЛ ОЧЕРКА (§300): цена огрубления 7.1e-4 -> 1.6e-6.
    * Прежние числа §271…§295 воспроизводятся ключами `cover=0 indep=0 silh=0`. */
   int indep = 1, intol = 128, silh = 1;
-  double ooff = 1e-5;
+  double ooff = 1e-5, nofrec = 0.0;
   int coverset = 0;
   /* УГЛОВОЙ РАДИУС ИСТОЧНИКА — ПАРАМЕТР, А НЕ КОНСТАНТА (замечание пользователя
    * 08-07). Он был зашит числом солнца в ДВУХ местах — у фронта и у эталона, — и
@@ -93,6 +93,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "intol=", 6) == 0) intol = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "silh=", 5) == 0) silh = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "ooff=", 5) == 0) ooff = strtod(argv[i] + 5, NULL);
+    if (strncmp(argv[i], "nofrec=", 7) == 0) nofrec = strtod(argv[i] + 7, NULL);
     if (strncmp(argv[i], "flat=", 5) == 0) hz_ptree_flat_split = (int)strtol(argv[i] + 5, NULL, 10);
     /* ВЫБОРОК ПО ДИСКУ ИСТОЧНИКА. Механизм Ф4 (§275) был написан, но ключа не
      * имел, и `K` оставалось единицей — то есть источник точечным, а полутени в
@@ -821,7 +822,8 @@ int main(int argc, char **argv) {
       hz_pcull C2;
       if (hz_pcull_init(&C2, camo, camat, upv, HZ_CFG_FOV_DEG, bufside, sqrt(diag)) == 0) {
         hz_pcull_shot(&C2, &m, zb, ib);
-        int64_t nsky = 0, nlit2 = 0, nsh2 = 0, nback = 0;
+        int64_t nsky = 0, nlit2 = 0, nsh2 = 0, nback = 0, nmiss = 0;
+        int pathshown = 0;
         double sum = 0.0;
         for (size_t p = 0; p < np; p++) {
           pix[p] = 0.0;
@@ -849,8 +851,16 @@ int main(int argc, char **argv) {
             for (int c = 0; c < 3; c++)
               PL[c] = P[c] - eo * X.dir[c];
           }
-          int32_t nid = 0;
-          while (X.cellf[nid] < 0.0f && T.nd[nid].child >= 0) {
+          /* СПУСК ДО ЛИСТА С ПАМЯТЬЮ О ПОСЛЕДНЕЙ ЗАПИСИ. Раньше спуск
+           * останавливался на первом узле с записью, а если её не было нигде —
+           * картинка УГАДЫВАЛА темноту. Замер показал цену угадывания: `86 845`
+           * пикселей (15 % поверхностных) записи не имеют, и угадывание «темно»
+           * даёт `117` ложных теней, «светло» — `5 290` ложных светов (§303).
+           * Правильно — брать ответ ближайшего предка, у которого запись ЕСТЬ:
+           * он покрывает эту точку по построению, потому что фронт остановился
+           * именно на нём. */
+          int32_t nid = 0, best = (X.cellf[0] >= 0.0f) ? 0 : -1;
+          while (T.nd[nid].child >= 0) {
             double mid[3];
             int k = 0;
             for (int c = 0; c < 3; c++) {
@@ -858,8 +868,31 @@ int main(int argc, char **argv) {
               if (PL[c] >= mid[c]) k |= (1 << c);
             }
             nid = T.nd[nid].child + k;
+            if (X.cellf[nid] >= 0.0f) best = nid;
           }
-          double f = (X.cellf[nid] >= 0.0f) ? (double)X.cellf[nid] : 0.0;
+          if (best >= 0) nid = best;
+          /* Одноразовая печать ПУТИ для первого пикселя без записи: где именно
+           * фронт не оставил ответа (§303). */
+          if (best < 0 && ndbg != 0 && !pathshown) {
+            pathshown = 1;
+            printf("   ПУТЬ ДЛЯ ПИКСЕЛЯ БЕЗ ЗАПИСИ (%d):\n", (int)p);
+            int32_t q = 0;
+            for (int lv = 0; lv < 16; lv++) {
+              printf("      ур.%2d узел %9d  ребро %.5f  занят=%d  запись=%s  дети=%s\n", lv, q,
+                     T.nd[q].hi[0] - T.nd[q].lo[0], (int)occ[q],
+                     X.cellf[q] >= 0.0f ? "ЕСТЬ" : "нет", T.nd[q].child >= 0 ? "есть" : "ЛИСТ");
+              if (T.nd[q].child < 0) break;
+              double mid[3];
+              int k = 0;
+              for (int c = 0; c < 3; c++) {
+                mid[c] = 0.5 * (T.nd[q].lo[c] + T.nd[q].hi[c]);
+                if (PL[c] >= mid[c]) k |= (1 << c);
+              }
+              q = T.nd[q].child + k;
+            }
+          }
+          double f = (X.cellf[nid] >= 0.0f) ? (double)X.cellf[nid] : nofrec;
+          if (X.cellf[nid] < 0.0f) nmiss++;
           /* ЗАСЛОНЕНИЕ ВНУТРИ ЯЧЕЙКИ (§296): спрашиваем свой столбик сетки, есть
            * ли геометрия БЛИЖЕ к источнику, чем мы сами. Дробить ячейку для
            * этого не нужно — нужна лишь глубина, посчитанная фронтом на месте. */
@@ -1200,9 +1233,55 @@ int main(int argc, char **argv) {
                 cw += (gn[c] / gl) * X.dir[c];
               if (cw < 0.0) cw = -cw;
               printf("   пиксель %6d: f=%.3f  ЯЧЕЙКА ур.%2d ребро %.4f м  занята=%d  "
-                     "глубина в ячейке=%s  |n·ω| = %.4f (скользящая при малом)\n",
+                     "глубина в ячейке=%s  |n·ω| = %.4f\n",
                      (int)p, fpix[p], lev, hcell, (int)occ[nid],
                      (X.cellslot != NULL && X.cellslot[nid] >= 0) ? "есть" : "нет", cw);
+              /* ПРОСЛЕЖИВАНИЕ ЛУЧА ПО ЯЧЕЙКАМ (§303). Ноль приходит СВЕРХУ, и
+               * две гипотезы о том, почему, опровергнуты (§302). Значит надо не
+               * гадать, а пройти путь от точки НАЗАД К ИСТОЧНИКУ и найти ячейку,
+               * в которой свет погас: печатается место перехода `f > 0 → f = 0`
+               * вместе с уровнем и занятостью этой ячейки. */
+              {
+                double dg2 = 0.0;
+                for (int c = 0; c < 3; c++) {
+                  double sd2 = T.nd[0].hi[c] - T.nd[0].lo[c];
+                  dg2 += sd2 * sd2;
+                }
+                dg2 = sqrt(dg2);
+                int32_t prev = -1;
+                double fprev = 0.0;
+                for (int st2 = 1; st2 <= 400; st2++) {
+                  double Q2[3];
+                  double back = dg2 * (double)st2 / 400.0;
+                  for (int c = 0; c < 3; c++)
+                    Q2[c] = P[c] - back * X.dir[c];
+                  int out2 = 0;
+                  for (int c = 0; c < 3 && !out2; c++)
+                    if (Q2[c] < T.nd[0].lo[c] || Q2[c] > T.nd[0].hi[c]) out2 = 1;
+                  if (out2) break;
+                  int32_t q3 = 0, lv2 = 0;
+                  while (X.cellf[q3] < 0.0f && T.nd[q3].child >= 0) {
+                    double md[3];
+                    int kk = 0;
+                    for (int c = 0; c < 3; c++) {
+                      md[c] = 0.5 * (T.nd[q3].lo[c] + T.nd[q3].hi[c]);
+                      if (Q2[c] >= md[c]) kk |= (1 << c);
+                    }
+                    q3 = T.nd[q3].child + kk;
+                    lv2++;
+                  }
+                  if (q3 == prev) continue;
+                  double fq = (X.cellf[q3] >= 0.0f) ? (double)X.cellf[q3] : -1.0;
+                  if (fq > 0.01 && fprev <= 0.01 && prev >= 0) {
+                    printf("        СВЕТ ПОГАС на %.3f м выше по лучу: ячейка ур.%2d ребро "
+                           "%.4f м, занята=%d, f=%.3f -> %.3f\n",
+                           back, lv2, T.nd[q3].hi[0] - T.nd[q3].lo[0], (int)occ[prev], fq, fprev);
+                    break;
+                  }
+                  prev = q3;
+                  fprev = fq;
+                }
+              }
             } else
               printf("   пиксель %6d: f=%.3f  ЯЧЕЙКА ур.%2d ребро %.4f м  ЗАСЛОНИТЕЛЬ на %.4f м "
                      "%s, площадь %.3e м² (ребро ~%.4f м)\n",
@@ -1221,10 +1300,12 @@ int main(int argc, char **argv) {
         snprintf(path, sizeof path, "img/psun_%s_mark%d.pfm", base ? base + 1 : argv[1], usemark);
         hz_pfm_write(path, pix, pix, pix, bufside, bufside);
         printf("== КАРТИНКА (проход 3, сбор по пикселю) за %.2f с: %s\n"
+               "   ПИКСЕЛЕЙ БЕЗ ЗАПИСИ ФРОНТА: %lld\n"
                "   ТЫЛЬНЫХ ПО НОРМАЛИ СРЕДИ ВИДИМЫХ: %lld из %lld (%.2f %%) — столько показало "
                "бы невидимым правило «обратные по нормали»\n"
                "   пикселей неба %lld, освещённых %lld, в тени %lld; средняя яркость %.6f\n",
-               now_s() - timg, path, (long long)nback, (long long)(np - (size_t)nsky),
+               now_s() - timg, path, (long long)nmiss, (long long)nback,
+               (long long)(np - (size_t)nsky),
                (np - (size_t)nsky) > 0 ? 100.0 * (double)nback / (double)(np - (size_t)nsky) : 0.0,
                (long long)nsky, (long long)nlit2, (long long)nsh2, sum / (double)np);
         hz_pcull_free(&C2);

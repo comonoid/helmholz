@@ -163,6 +163,105 @@ static hz_pfront_face face_block(const hz_pfront_face *F, const hz_pfront_face *
   return R;
 }
 
+/* ОБЪЕДИНЕНИЕ ПРОЕКЦИЙ — БИТОВОЙ МАСКОЙ 8x8 (§292).
+ *
+ * ЗАЧЕМ. Замер §290 показал, что ОБЕ прежние оценки перекрытия суть ГРАНИЦЫ и
+ * обе неверны с разных сторон: максимум по кускам занижает тень в глубине
+ * (кусков много, берётся один), сумма завышает её на краю (проекции кусков
+ * пересекаются именно там). Нужна ПЛОЩАДЬ ОБЪЕДИНЕНИЯ, а её нельзя получить
+ * выбором между двумя приближениями.
+ *
+ * ПОЧЕМУ МАСКА, А НЕ ГЕОМЕТРИЧЕСКОЕ ОБЪЕДИНЕНИЕ МНОГОУГОЛЬНИКОВ. Точное
+ * объединение N многоугольников стоит `O(N log N)` со списком пересечений и
+ * живёт в самой горячей точке обхода. Сетка 8x8 на грань даёт объединение
+ * ОДНОЙ БИТОВОЙ ОПЕРАЦИЕЙ: у каждого куска своя маска в `uint64_t`, объединение
+ * — `|`, площадь — `popcount`. Ошибка при этом есть КВАНТОВАНИЕ (шаг 1/8
+ * грани), а не смещение в одну сторону, и она измеряется тем же эталоном.
+ *
+ * МОМЕНТЫ БЕРУТСЯ ИЗ ТОЙ ЖЕ МАСКИ, а не считаются отдельно: `c0 = popcount/64`,
+ * `cu = (3/64)·Σu_k`, `cv = (3/64)·Σv_k` по установленным битам — это ровно
+ * L²-проекция показателя на `{1, u, v}`, та же нормировка, что у `tri_cover`.
+ *
+ * СЕТКА 8x8, А НЕ ДРУГАЯ: `64` бита есть ровно один регистр, и объединение
+ * становится одной инструкцией. Шаг сетки `1/8` грани — та же величина, что
+ * `HZ_PFRONT_FRAC_TOL`, умноженная на `64`; мельче даёт `16x16` в четырёх
+ * словах, и это следующая ступень скана, а не переделка. */
+#define HZ_PFRONT_COVN 8
+
+/* Маска проекции треугольника на грань `a`. Возврат `0`, если проекции нет. */
+static uint64_t tri_mask(const double *A, const double *B, const double *C, const double *lo,
+                         const double *hi, const double *dir, int a) {
+  int p, q;
+  face_axes(a, &p, &q);
+  if (dir[a] < 1e-300 && dir[a] > -1e-300) return 0;
+  double du = hi[p] - lo[p], dv = hi[q] - lo[q];
+  if (!(du > 0.0) || !(dv > 0.0)) return 0;
+  double fa = (dir[a] > 0.0) ? hi[a] : lo[a];
+  const double *V[3] = {A, B, C};
+  double x[3], y[3];
+  for (int i = 0; i < 3; i++) {
+    double t = (fa - V[i][a]) / dir[a];
+    /* Координаты сразу в СЕТКЕ: `[0, N]` вместо `[-1, 1]`. */
+    x[i] = (double)HZ_PFRONT_COVN * (V[i][p] + t * dir[p] - lo[p]) / du;
+    y[i] = (double)HZ_PFRONT_COVN * (V[i][q] + t * dir[q] - lo[q]) / dv;
+  }
+  double xmin = x[0], xmax = x[0], ymin = y[0], ymax = y[0];
+  for (int i = 1; i < 3; i++) {
+    if (x[i] < xmin) xmin = x[i];
+    if (x[i] > xmax) xmax = x[i];
+    if (y[i] < ymin) ymin = y[i];
+    if (y[i] > ymax) ymax = y[i];
+  }
+  if (!(xmax > 0.0) || !(ymax > 0.0)) return 0;
+  if (!(xmin < (double)HZ_PFRONT_COVN) || !(ymin < (double)HZ_PFRONT_COVN)) return 0;
+  int i0 = (int)xmin, i1 = (int)xmax, j0 = (int)ymin, j1 = (int)ymax;
+  if (i0 < 0) i0 = 0;
+  if (j0 < 0) j0 = 0;
+  if (i1 > HZ_PFRONT_COVN - 1) i1 = HZ_PFRONT_COVN - 1;
+  if (j1 > HZ_PFRONT_COVN - 1) j1 = HZ_PFRONT_COVN - 1;
+  double ar = (x[1] - x[0]) * (y[2] - y[0]) - (y[1] - y[0]) * (x[2] - x[0]);
+  if (!(ar > 0.0) && !(ar < 0.0)) return 0;
+  double sg = (ar > 0.0) ? 1.0 : -1.0;
+  uint64_t mk = 0;
+  for (int j = j0; j <= j1; j++)
+    for (int i = i0; i <= i1; i++) {
+      /* Клетка засчитывается по СЕРЕДИНЕ: односторонности здесь не требуется —
+       * это оценка ПЛОЩАДИ, и середина не смещает её ни в одну сторону
+       * (в отличие от буфера пометок, где сторона ошибки решает всё). */
+      double cx = (double)i + 0.5, cy = (double)j + 0.5;
+      int in = 1;
+      for (int k = 0; k < 3 && in; k++) {
+        int k2 = (k + 1) % 3;
+        double ex = x[k2] - x[k], ey = y[k2] - y[k];
+        double ev = (cx - x[k]) * ey - (cy - y[k]) * ex;
+        if (!(sg * ev <= 0.0)) in = 0;
+      }
+      if (in) mk |= (uint64_t)1 << (j * HZ_PFRONT_COVN + i);
+    }
+  return mk;
+}
+
+/* Моменты маски: `c0`, `cu`, `cv` в той же нормировке, что у `tri_cover`. */
+static hz_pfront_face mask_face(uint64_t mk) {
+  hz_pfront_face R = {0.0, 0.0, 0.0};
+  int cnt = 0;
+  double su = 0.0, sv = 0.0;
+  for (int j = 0; j < HZ_PFRONT_COVN; j++)
+    for (int i = 0; i < HZ_PFRONT_COVN; i++)
+      if (mk & ((uint64_t)1 << (j * HZ_PFRONT_COVN + i))) {
+        double u = 2.0 * ((double)i + 0.5) / (double)HZ_PFRONT_COVN - 1.0;
+        double v = 2.0 * ((double)j + 0.5) / (double)HZ_PFRONT_COVN - 1.0;
+        cnt++;
+        su += u;
+        sv += v;
+      }
+  double nn = (double)(HZ_PFRONT_COVN * HZ_PFRONT_COVN);
+  R.c0 = (double)cnt / nn;
+  R.cu = 3.0 * su / nn;
+  R.cv = 3.0 * sv / nn;
+  return R;
+}
+
 /* Затенить грани ячейки прямо по КАНДИДАТАМ, без вывода кусков. Возврат: было ли
  * в ячейке хоть какое-то перекрытие. */
 int hz_pfront_cover_sum = 0; /* 1 — перекрытие СУММОЙ (верхняя оценка); опыт §274 */
@@ -184,12 +283,17 @@ int hz_pfront_shade(const hz_pfront_face *in, hz_pfront_face *out, const hz_objm
      * а не в линейности представления. */
     hz_pfront_face best = {0.0, 0.0, 0.0};
     double ba = 0.0;
+    uint64_t umask = 0;
     for (int32_t i = 0; i < n; i++) {
       int32_t t = list[i];
       const double *A = m->v + 3 * (size_t)m->f[3 * (size_t)t + 0];
       const double *B = m->v + 3 * (size_t)m->f[3 * (size_t)t + 1];
       const double *C = m->v + 3 * (size_t)m->f[3 * (size_t)t + 2];
       hz_pfront_face c = {0.0, 0.0, 0.0};
+      if (hz_pfront_cover_sum == 2) {
+        umask |= tri_mask(A, B, C, lo, hi, dir, a);
+        continue;
+      }
       double Aa = tri_cover(A, B, C, lo, hi, dir, a, &c);
       if (hz_pfront_cover_sum) {
         best.c0 += c.c0;
@@ -201,7 +305,11 @@ int hz_pfront_shade(const hz_pfront_face *in, hz_pfront_face *out, const hz_objm
         best = c;
       }
     }
-    if (hz_pfront_cover_sum && best.c0 > 1.0) {
+    if (hz_pfront_cover_sum == 2) {
+      best = mask_face(umask);
+      ba = (umask != 0) ? 1.0 : 0.0;
+    }
+    if (hz_pfront_cover_sum == 1 && best.c0 > 1.0) {
       double sc = 1.0 / best.c0;
       best.c0 = 1.0;
       best.cu *= sc;

@@ -681,13 +681,29 @@ int main(int argc, char **argv) {
           nn[2] = u1[0] * u2[1] - u1[1] * u2[0];
           double ln2 = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
           if (!(ln2 > 0.0)) ln2 = 1.0;
+          /* СТОРОНА ПОВЕРХНОСТИ РЕШАЕТ, А НЕ МОДУЛЬ КОСИНУСА. Сперва здесь стояло
+           * `|n·ω|` с оговоркой «нормаль .obj может смотреть внутрь», и это был
+           * настоящий дефект: тыльная к солнцу сторона стены освещалась как
+           * лицевая. Поймано КАРТОЙ ошибки — расхождение с эталоном шло не по
+           * краям теней, а сплошными поверхностями (§287).
+           *
+           * Правильно так: `f` есть свойство ЯЧЕЙКИ («сколько диска ей видно»), а
+           * не стороны поверхности; сторону задаёт геометрия. Нормаль
+           * ориентируется НА КАМЕРУ — мы видим именно эту сторону, — и если она
+           * отвёрнута от солнца, света нет, сколько бы ни было `f`. */
+          double vn = 0.0;
+          for (int c = 0; c < 3; c++)
+            vn += (nn[c] / ln2) * d[c];
+          double sgn = (vn > 0.0) ? -1.0 : 1.0; /* нормаль к глазу */
           double cs = 0.0;
           for (int c = 0; c < 3; c++)
-            cs -= (nn[c] / ln2) * X.dir[c]; /* `dir` — направление ЛУЧЕЙ источника */
-          if (cs < 0.0) cs = -cs;           /* нормаль .obj может смотреть внутрь */
+            cs -= sgn * (nn[c] / ln2) * X.dir[c]; /* `dir` — направление ЛУЧЕЙ источника */
+          if (cs < 0.0) cs = 0.0;                 /* отвёрнута от солнца — темно */
           double kd = m.mtl[m.fm[t]].kd;
           pix[p] = kd * f * cs;
-          fpix[p] = f;
+          /* Эталон спрашивает «видно ли отсюда солнце», и ответ у отвёрнутой
+           * стороны — НЕТ, независимо от `f`. Сверять надо ту же величину. */
+          fpix[p] = (cs > 0.0) ? f : 0.0;
           sum += pix[p];
           if (f > 0.5)
             nlit2++;
@@ -705,70 +721,132 @@ int main(int argc, char **argv) {
          * усреднением по диску значило бы мерить полутень, которой в этой
          * постановке нет (§274). Диск вернётся вместе с `nk > 1`. */
         if (nref > 0) {
+          /* ЭТАЛОН СЧИТАЕТСЯ ПО СЕТКЕ, А НЕ ПО ВЫБОРКЕ ВРАЗБРОС, И ЭТО НЕ ВКУС.
+           * Две гипотезы о причине расхождения (разрешение — §286; сдвиг в
+           * `face_shift`) обе ОПРОВЕРГНУТЫ замером, а третью гадать нельзя:
+           * правило §271 велит смотреть, а не рассуждать. Смотреть можно только
+           * КАРТОЙ ошибки, а карта требует сетки. Шаг `estep` пикселей;
+           * `ref = N` читается теперь как «сторона карты N x N». */
           double tref2 = now_s();
-          int32_t step = (int32_t)(np / (size_t)(nref > 0 ? nref : 1));
-          if (step < 1) step = 1;
-          int64_t nch = 0, nlitbad = 0, nshbad = 0;
-          double sumd = 0.0, maxd = 0.0;
-          for (size_t p = 0; p < np; p += (size_t)step) {
-            if (ib[p] < 0) continue;
-            double d[3];
-            hz_pcull_ray(&C2, (int)(p % (size_t)bufside), (int)(p / (size_t)bufside), d);
-            double P[3];
-            for (int c = 0; c < 3; c++)
-              P[c] = camo[c] + (double)zb[p] * d[c];
-            /* Отступ от поверхности вдоль луча НА СОЛНЦЕ, а не по нормали:
-             * нормаль у .obj может смотреть внутрь, и отступ по ней уводил бы
-             * точку под поверхность ровно в половине случаев. */
-            double ofs = 1e-5 * (fabs(P[0]) + fabs(P[1]) + fabs(P[2]) + 1.0);
-            double O[3], S[3];
-            for (int c = 0; c < 3; c++) {
-              S[c] = -X.dir[c];
-              O[c] = P[c] + ofs * S[c];
-            }
-            int blk = 0;
-            for (int32_t t = 0; t < m.nt && !blk; t++) {
-              const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t + 0];
-              const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)t + 1];
-              const double *Cc = m.v + 3 * (size_t)m.f[3 * (size_t)t + 2];
-              double q1[3], q2[3], pv[3], tv[3], qv[3];
-              for (int c = 0; c < 3; c++) {
-                q1[c] = B[c] - A[c];
-                q2[c] = Cc[c] - A[c];
+          int32_t es = bufside / (nref > 0 ? nref : 1);
+          if (es < 1) es = 1;
+          int32_t ew = bufside / es;
+          double *emap = malloc((size_t)ew * (size_t)ew * sizeof *emap);
+          if (emap != NULL) {
+            int64_t nch = 0, nlitbad = 0, nshbad = 0;
+            double sumd = 0.0, maxd = 0.0;
+#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nch, nlitbad, nshbad, sumd)            \
+    reduction(max : maxd)
+            for (int32_t jj = 0; jj < ew; jj++)
+              for (int32_t ii = 0; ii < ew; ii++) {
+                size_t p = (size_t)(jj * es) * (size_t)bufside + (size_t)(ii * es);
+                emap[(size_t)jj * (size_t)ew + (size_t)ii] = 0.0;
+                if (ib[p] < 0) continue;
+                double d[3];
+                hz_pcull_ray(&C2, (int)(ii * es), (int)(jj * es), d);
+                double P[3];
+                for (int c = 0; c < 3; c++)
+                  P[c] = camo[c] + (double)zb[p] * d[c];
+                /* СТОРОНА — ЧАСТЬ ОПРЕДЕЛЯЕМОЙ ВЕЛИЧИНЫ, И ОБЕ СТОРОНЫ СВЕРКИ
+                 * ОБЯЗАНЫ СЧИТАТЬ ОДНО И ТО ЖЕ. Сперва проверяемое брало
+                 * `|n·ω|`, а эталон — только луч; ошибки шли навстречу и
+                 * частично гасили друг друга. Величина определяется так:
+                 * «доля диска, видимая из точки С ТОЙ СТОРОНЫ, которую мы
+                 * видим». У отвёрнутой от солнца стороны она НОЛЬ, и луч тут ни
+                 * при чём — у тонкого треугольника он просто уходит в небо. */
+                int32_t te = ib[p];
+                const double *Ae = m.v + 3 * (size_t)m.f[3 * (size_t)te + 0];
+                const double *Be = m.v + 3 * (size_t)m.f[3 * (size_t)te + 1];
+                const double *Ce = m.v + 3 * (size_t)m.f[3 * (size_t)te + 2];
+                /* Рёбра выписаны поимённо, а не циклом: `gcc -fanalyzer` не
+                 * связывает заполнение массива циклом с его чтением сразу за
+                 * циклом и объявляет `w1[1]` неинициализированным. Известный
+                 * класс (CLAUDE.md), и лечится он не обходом вокруг, а тем,
+                 * чтобы не давать анализатору повода. */
+                double w1[3] = {Be[0] - Ae[0], Be[1] - Ae[1], Be[2] - Ae[2]};
+                double w2[3] = {Ce[0] - Ae[0], Ce[1] - Ae[1], Ce[2] - Ae[2]};
+                double ne[3];
+                ne[0] = w1[1] * w2[2] - w1[2] * w2[1];
+                ne[1] = w1[2] * w2[0] - w1[0] * w2[2];
+                ne[2] = w1[0] * w2[1] - w1[1] * w2[0];
+                double vne = 0.0, sne = 0.0;
+                for (int c = 0; c < 3; c++)
+                  vne += ne[c] * d[c];
+                double sg2 = (vne > 0.0) ? -1.0 : 1.0;
+                for (int c = 0; c < 3; c++)
+                  sne -= sg2 * ne[c] * X.dir[c];
+                if (!(sne > 0.0)) {
+                  double dd0 = fabs(fpix[p] - 0.0);
+                  emap[(size_t)jj * (size_t)ew + (size_t)ii] = dd0;
+                  nch++;
+                  sumd += dd0;
+                  if (dd0 > maxd) maxd = dd0;
+                  if (fpix[p] > 0.5) nlitbad++;
+                  continue;
+                }
+                /* Отступ вдоль луча НА СОЛНЦЕ, а не по нормали: нормаль у .obj
+                 * может смотреть внутрь, и отступ по ней уводил бы точку под
+                 * поверхность ровно в половине случаев. */
+                double ofs = 1e-5 * (fabs(P[0]) + fabs(P[1]) + fabs(P[2]) + 1.0);
+                double O[3], S[3];
+                for (int c = 0; c < 3; c++) {
+                  S[c] = -X.dir[c];
+                  O[c] = P[c] + ofs * S[c];
+                }
+                int blk = 0;
+                for (int32_t t = 0; t < m.nt && !blk; t++) {
+                  const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t + 0];
+                  const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)t + 1];
+                  const double *Cc = m.v + 3 * (size_t)m.f[3 * (size_t)t + 2];
+                  /* Поимённо, а не циклом, — тот же класс ложных находок
+                   * `-fanalyzer`, что и выше. */
+                  double q1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]};
+                  double q2[3] = {Cc[0] - A[0], Cc[1] - A[1], Cc[2] - A[2]};
+                  double pv[3], tv[3], qv[3];
+                  pv[0] = S[1] * q2[2] - S[2] * q2[1];
+                  pv[1] = S[2] * q2[0] - S[0] * q2[2];
+                  pv[2] = S[0] * q2[1] - S[1] * q2[0];
+                  double det = q1[0] * pv[0] + q1[1] * pv[1] + q1[2] * pv[2];
+                  if (det > -1e-12 && det < 1e-12) continue;
+                  double inv = 1.0 / det;
+                  tv[0] = O[0] - A[0];
+                  tv[1] = O[1] - A[1];
+                  tv[2] = O[2] - A[2];
+                  double uu = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+                  if (uu < 0.0 || uu > 1.0) continue;
+                  qv[0] = tv[1] * q1[2] - tv[2] * q1[1];
+                  qv[1] = tv[2] * q1[0] - tv[0] * q1[2];
+                  qv[2] = tv[0] * q1[1] - tv[1] * q1[0];
+                  double vv = (S[0] * qv[0] + S[1] * qv[1] + S[2] * qv[2]) * inv;
+                  if (vv < 0.0 || uu + vv > 1.0) continue;
+                  double tt = (q2[0] * qv[0] + q2[1] * qv[1] + q2[2] * qv[2]) * inv;
+                  if (tt > 0.0) blk = 1;
+                }
+                double ftrue = blk ? 0.0 : 1.0;
+                double four = fpix[p];
+                double dd = fabs(four - ftrue);
+                emap[(size_t)jj * (size_t)ew + (size_t)ii] = dd;
+                nch++;
+                sumd += dd;
+                if (dd > maxd) maxd = dd;
+                if (ftrue < 0.5 && four > 0.5) nlitbad++;
+                if (ftrue > 0.5 && four < 0.5) nshbad++;
               }
-              pv[0] = S[1] * q2[2] - S[2] * q2[1];
-              pv[1] = S[2] * q2[0] - S[0] * q2[2];
-              pv[2] = S[0] * q2[1] - S[1] * q2[0];
-              double det = q1[0] * pv[0] + q1[1] * pv[1] + q1[2] * pv[2];
-              if (det > -1e-12 && det < 1e-12) continue;
-              double inv = 1.0 / det;
-              for (int c = 0; c < 3; c++)
-                tv[c] = O[c] - A[c];
-              double uu = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
-              if (uu < 0.0 || uu > 1.0) continue;
-              qv[0] = tv[1] * q1[2] - tv[2] * q1[1];
-              qv[1] = tv[2] * q1[0] - tv[0] * q1[2];
-              qv[2] = tv[0] * q1[1] - tv[1] * q1[0];
-              double vv = (S[0] * qv[0] + S[1] * qv[1] + S[2] * qv[2]) * inv;
-              if (vv < 0.0 || uu + vv > 1.0) continue;
-              double tt = (q2[0] * qv[0] + q2[1] * qv[1] + q2[2] * qv[2]) * inv;
-              if (tt > 0.0) blk = 1;
+            printf("   ЭТАЛОН ПО СЕТКЕ %dx%d (теневой луч перебором, %lld пикселей за %.1f с):\n"
+                   "     |Δдоли| среднее %.4f, наибольшее %.4f; РАЗОШЛИСЬ ЗНАКОМ: у нас светло "
+                   "а в тени %lld (%.2f %%), у нас тень а на свету %lld (%.2f %%)\n",
+                   ew, ew, (long long)nch, now_s() - tref2, nch > 0 ? sumd / (double)nch : 0.0,
+                   maxd, (long long)nlitbad, nch > 0 ? 100.0 * (double)nlitbad / (double)nch : 0.0,
+                   (long long)nshbad, nch > 0 ? 100.0 * (double)nshbad / (double)nch : 0.0);
+            {
+              char ep[256];
+              const char *b2 = strrchr(argv[1], '/');
+              snprintf(ep, sizeof ep, "img/psun_%s_err.ppm", b2 ? b2 + 1 : argv[1]);
+              hz_ppm_write(ep, emap, ew, ew);
+              printf("     КАРТА ОШИБКИ: %s (ярко — там, где мы расходимся с эталоном)\n", ep);
             }
-            double ftrue = blk ? 0.0 : 1.0;
-            double four = fpix[p];
-            double dd = fabs(four - ftrue);
-            nch++;
-            sumd += dd;
-            if (dd > maxd) maxd = dd;
-            if (ftrue < 0.5 && four > 0.5) nlitbad++; /* светло у нас, тень у эталона */
-            if (ftrue > 0.5 && four < 0.5) nshbad++;  /* тень у нас, светло у эталона */
           }
-          printf("   ЭТАЛОН ПО ПИКСЕЛЯМ (теневой луч перебором, %lld пикселей за %.1f с):\n"
-                 "     |Δдоли| среднее %.4f, наибольшее %.4f; РАЗОШЛИСЬ ЗНАКОМ: у нас светло "
-                 "а в тени %lld (%.2f %%), у нас тень а на свету %lld (%.2f %%)\n",
-                 (long long)nch, now_s() - tref2, nch > 0 ? sumd / (double)nch : 0.0, maxd,
-                 (long long)nlitbad, nch > 0 ? 100.0 * (double)nlitbad / (double)nch : 0.0,
-                 (long long)nshbad, nch > 0 ? 100.0 * (double)nshbad / (double)nch : 0.0);
+          free(emap);
         }
         char path[256];
         const char *base = strrchr(argv[1], '/');

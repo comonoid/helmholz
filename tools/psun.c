@@ -92,6 +92,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "indep=", 6) == 0) indep = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "intol=", 6) == 0) intol = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "silh=", 5) == 0) silh = (int)strtol(argv[i] + 5, NULL, 10);
+    if (strncmp(argv[i], "shift=", 6) == 0) hz_pfront_shift = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "ooff=", 5) == 0) ooff = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "nofrec=", 7) == 0) nofrec = strtod(argv[i] + 7, NULL);
     if (strncmp(argv[i], "flat=", 5) == 0) hz_ptree_flat_split = (int)strtol(argv[i] + 5, NULL, 10);
@@ -1384,7 +1385,7 @@ int main(int argc, char **argv) {
                 }
                 dg2 = sqrt(dg2);
                 int32_t prev = -1;
-                double fprev = 0.0;
+                int nprof = 0;
                 for (int st2 = 1; st2 <= 400; st2++) {
                   double Q2[3];
                   double back = dg2 * (double)st2 / 400.0;
@@ -1407,14 +1408,17 @@ int main(int argc, char **argv) {
                   }
                   if (q3 == prev) continue;
                   double fq = (X.cellf[q3] >= 0.0f) ? (double)X.cellf[q3] : -1.0;
-                  if (fq > 0.01 && fprev <= 0.01 && prev >= 0) {
-                    printf("        СВЕТ ПОГАС на %.3f м выше по лучу: ячейка ур.%2d ребро "
-                           "%.4f м, занята=%d, f=%.3f -> %.3f\n",
-                           back, lv2, T.nd[q3].hi[0] - T.nd[q3].lo[0], (int)occ[prev], fq, fprev);
+                  /* ПРОФИЛЬ ПО ПУТИ, а не только точка гашения: §307 показал,
+                   * что свет входит в ячейку уже ослабленным, значит гасит не
+                   * одна ячейка, а затухание НАКАПЛИВАЕТСЯ. Печатаются первые
+                   * ячейки от точки назад к источнику вместе с их долей. */
+                  if (nprof < 10) {
+                    printf("        %5.3f м назад: ур.%2d ребро %.4f занята=%d  f=%.4f\n", back,
+                           lv2, T.nd[q3].hi[0] - T.nd[q3].lo[0], (int)occ[q3], fq);
+                    nprof++;
+                  } else
                     break;
-                  }
                   prev = q3;
-                  fprev = fq;
                 }
               }
             } else

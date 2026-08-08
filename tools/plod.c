@@ -893,9 +893,13 @@ int main(int argc, char **argv) {
      * сознательно: без этого числа вердикт §319 держался бы на прокси. */
     int32_t *lcut = malloc((size_t)L.np * sizeof *lcut);
     int64_t *nbv = malloc((size_t)L.nlev * sizeof *nbv);
-    if (lcut != NULL && nbv != NULL) {
+    int64_t *nbvs = malloc((size_t)L.nlev * sizeof *nbvs);
+    int64_t *nloop = malloc((size_t)L.nlev * sizeof *nloop);
+    if (lcut != NULL && nbv != NULL && nbvs != NULL && nloop != NULL) {
       for (int lev = 0; lev < L.nlev; lev++) {
         nbv[lev] = 0;
+        nbvs[lev] = 0;
+        nloop[lev] = 0;
         for (int32_t k = 0; k < L.np; k++)
           lcut[k] = L.lab[(size_t)lev * (size_t)L.np + (size_t)k];
         hz_pseglist so;
@@ -903,25 +907,70 @@ int main(int argc, char **argv) {
         hz_polyset pc;
         if (hz_poly_build(&pc, &m, &so) == 0) {
           nbv[lev] = pc.nbv;
+          /* КРАЙ УРОВНЯ УПРОЩАЕТСЯ ДОПУСКОМ ЭТОГО УРОВНЯ (§324). Прежний замер
+           * (§323) считал вершины края БЕЗ упрощения на всех уровнях сразу и
+           * получил `Σ V/V₀ = 6.4…7.7×` — но это цена не пирамиды, а лестницы,
+           * которая огрубляет ГРУППИРОВКУ и не огрубляет КРАЙ: на городе
+           * уровень 8 нёс 4280 вершин на элемент. Допуск берётся ТОТ ЖЕ, что
+           * гейтит поверхность уровня (`δ_L`), а не новый порог: у грубого
+           * уровня обе ошибки — смещения поверхности и спрямления края —
+           * ограничены одним числом. */
+          /* ПЕТЛИ СЧИТАЮТСЯ ОТДЕЛЬНО, И ЭТО НЕ ЛЮБОПЫТСТВО (§324). Спрямление
+           * края не может убрать петлю целиком: у всякой петли остаётся не
+           * менее трёх вершин при любом допуске. Значит `V ≥ 3 · (число
+           * НЕСВЯЗНЫХ кусков)`, и если лестница число кусков не сокращает, а
+           * лишь переклеивает на них ярлык группы, край упрётся в этот пол. */
+          for (int32_t q = 0; q < pc.np; q++)
+            nloop[lev] += pc.p[q].nloop;
+          hz_edgestat es;
+          if (hz_edge_simplify(&pc, L.delta0 * pow(ladb, lev), HZ_EDGE_SHARED, &es) == 0)
+            nbvs[lev] = es.nbv_out;
           hz_poly_free(&pc);
         }
         hz_seg_free(&so);
       }
       if (nbv[0] > 0) {
-        printf("      доли V_L/V_0 (ВЕРШИН КРАЯ, хранимая величина); V_0 = %lld:",
+        printf("      доли V_L/V_0 (ВЕРШИН КРАЯ, край НЕ огрублён); V_0 = %lld:",
                (long long)nbv[0]);
         for (int lev = 0; lev < L.nlev; lev++)
           printf(" %.3f", (double)nbv[lev] / (double)nbv[0]);
+        printf("\n      вершин края НА ЭЛЕМЕНТ:");
+        for (int lev = 0; lev < L.nlev; lev++)
+          printf(" %.0f", (double)nbv[lev] / (double)(ncnt[lev] ? ncnt[lev] : 1));
+        printf("\n");
+      }
+      if (nbvs[0] > 0) {
+        printf("      доли Vs_L/Vs_0 (край ОГРУБЛЁН допуском уровня); Vs_0 = %lld:",
+               (long long)nbvs[0]);
+        for (int lev = 0; lev < L.nlev; lev++)
+          printf(" %.3f", (double)nbvs[lev] / (double)nbvs[0]);
+        printf("\n      вершин края НА ЭЛЕМЕНТ после огрубления:");
+        for (int lev = 0; lev < L.nlev; lev++)
+          printf(" %.0f", (double)nbvs[lev] / (double)(ncnt[lev] ? ncnt[lev] : 1));
+        printf("\n");
+      }
+      if (nloop[0] > 0) {
+        printf("      ПЕТЕЛЬ края (несвязных кусков) всего:");
+        for (int lev = 0; lev < L.nlev; lev++)
+          printf(" %lld", (long long)nloop[lev]);
+        printf("\n      петель НА ЭЛЕМЕНТ:");
+        for (int lev = 0; lev < L.nlev; lev++)
+          printf(" %.0f", (double)nloop[lev] / (double)(ncnt[lev] ? ncnt[lev] : 1));
+        printf("\n      вершин на ПЕТЛЮ после огрубления (пол — три):");
+        for (int lev = 0; lev < L.nlev; lev++)
+          printf(" %.1f", (double)nbvs[lev] / (double)(nloop[lev] ? nloop[lev] : 1));
         printf("\n");
       }
     }
+    free(nloop);
     for (int step = 1; step <= 3; step++) {
-      double sum = 0.0, sump = 0.0, sumv = 0.0;
+      double sum = 0.0, sump = 0.0, sumv = 0.0, sumvs = 0.0;
       int nkeep = 0;
       for (int lev = 0; lev < L.nlev; lev += step) {
         sum += (double)ncnt[lev] / (double)ncnt[0];
         if (nper[0] > 0.0) sump += nper[lev] / nper[0];
         if (nbv != NULL && nbv[0] > 0) sumv += (double)nbv[lev] / (double)nbv[0];
+        if (nbvs != NULL && nbvs[0] > 0) sumvs += (double)nbvs[lev] / (double)nbvs[0];
         nkeep++;
       }
       /* самый грубый уровень обязателен во всякой подлестнице */
@@ -929,14 +978,17 @@ int main(int argc, char **argv) {
         sum += (double)ncnt[L.nlev - 1] / (double)ncnt[0];
         if (nper[0] > 0.0) sump += nper[L.nlev - 1] / nper[0];
         if (nbv != NULL && nbv[0] > 0) sumv += (double)nbv[L.nlev - 1] / (double)nbv[0];
+        if (nbvs != NULL && nbvs[0] > 0) sumvs += (double)nbvs[L.nlev - 1] / (double)nbvs[0];
         nkeep++;
       }
       printf("      шаг по уровням %d (основание %.0f): уровней %d, Σ N_L/N_0 = %.2f×, "
-             "Σ P_L/P_0 = %.2f×, Σ V_L/V_0 = %.2f×\n",
-             step, pow(ladb, step), nkeep, sum, sump, sumv);
+             "Σ P_L/P_0 = %.2f×, Σ V_L/V_0 = %.2f× (край не огрублён), "
+             "Σ Vs_L/Vs_0 = %.2f× (ОГРУБЛЁН)\n",
+             step, pow(ladb, step), nkeep, sum, sump, sumv, sumvs);
     }
     free(lcut);
     free(nbv);
+    free(nbvs);
     if (L.nlev > 1 && ncnt[L.nlev - 1] > 0)
       printf("      среднее геометрическое сокращение %.2f× на уровень (от N_0 к самому "
              "грубому)\n",

@@ -530,8 +530,16 @@ static void plane_ceiling(const hz_polyset *ps) {
 }
 
 int main(int argc, char **argv) {
-  int city = (argc > 1 && strcmp(argv[1], "city") == 0);
-  double dseg = city ? 0.05 : 0.045;
+  int city = 0, miguel = 0, miglow = 0, levels = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "city") == 0) city = 1;
+    if (strcmp(argv[i], "miguel") == 0) miguel = 1;
+    if (strcmp(argv[i], "miglow") == 0) miguel = miglow = 1;
+  }
+  /* Допуск сегментации. Сан-Мигелю берётся ГОРОДСКОЙ `0.05` м, а не зальный: он
+   * в метрах, как и город, тогда как зальные `45` мм привязаны к масштабу зала
+   * `0.003` (тот же довод, что в `tools/pcoarse.c`). */
+  double dseg = (city || miguel) ? 0.05 : 0.045;
   int simp = 0, vfit = 0, maxlev = 9, uniform = 0, viamerge = 0, bands = 0, bycount = 0,
       byangle = 0, curve = 0, auto0 = 0, nosin = 0;
   double epsmul = 1.0, radmul = 1.0, eyemul = 1.0, ang0 = 0.0, vfitlim = 0.0;
@@ -543,6 +551,15 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; i++) {
     int ok = 0;
     if (strcmp(argv[i], "city") == 0 || strcmp(argv[i], "hall") == 0) ok = 1;
+    /* ТРЕТЬЯ СЦЕНА В ЛЕСТНИЧНОМ СТЕНДЕ (§321). До сих пор Сан-Мигель знали
+     * только `pcoarse`/`pcell`/`pstow`, и лестница на нём не мерилась ни разу —
+     * а §319 требует условие постройки грубых уровней на ВСЕХ ТРЁХ сценах. */
+    if (strcmp(argv[i], "miguel") == 0 || strcmp(argv[i], "miglow") == 0) ok = 1;
+    /* ТОЛЬКО ТАБЛИЦА УРОВНЕЙ (§321). Срез, лучевая метрика и зондирование сцены
+     * лучами (§70.2/§70.3) к выходу этого шага отношения не имеют, а на
+     * Сан-Мигеле стоят дороже самого замера: метрика гоняет лучи против
+     * `9.96` млн треугольников дважды. */
+    if (strcmp(argv[i], "levels") == 0) ok = levels = 1;
     if (strcmp(argv[i], "simp") == 0) ok = simp = 1;
     if (strcmp(argv[i], "vfit") == 0) ok = vfit = 1;
     /* §73: ПРЕДЕЛ СМЕЩЕНИЯ ВЕРШИНЫ, МЕТРЫ. Прежде он брался как допуск САМОГО
@@ -628,7 +645,8 @@ int main(int argc, char **argv) {
     if (!ok) {
       fprintf(stderr,
               "plod: неизвестный аргумент «%s»\n"
-              "  ожидается: [city|hall] [simp] [vfit] [uniform] [viamerge] [bands]\n"
+              "  ожидается: [city|hall|miguel|miglow] [levels] [simp] [vfit] [uniform] [viamerge] "
+              "[bands]\n"
               "             [bycount] [byangle] [curve] [rad=X] [eye=X] [ang0=X] [vfit=X] [auto0] "
               "[lev=N] "
               "[eps=X] "
@@ -639,8 +657,13 @@ int main(int argc, char **argv) {
     }
   }
   hz_objmesh m;
-  if (hz_obj_load(&m, city ? HZ_CFG_CITY_OBJ : HZ_CFG_HALL_OBJ,
-                  city ? HZ_CFG_CITY_SCALE : HZ_CFG_HALL_SCALE) != 0) {
+  const char *scene =
+      miguel ? (miglow ? "САН-МИГЕЛЬ low-poly" : "САН-МИГЕЛЬ") : (city ? "ГОРОД" : "зал");
+  if (hz_obj_load(&m,
+                  miguel ? (miglow ? HZ_CFG_MIGUEL_LOW_OBJ : HZ_CFG_MIGUEL_OBJ)
+                         : (city ? HZ_CFG_CITY_OBJ : HZ_CFG_HALL_OBJ),
+                  miguel ? HZ_CFG_MIGUEL_SCALE : (city ? HZ_CFG_CITY_SCALE : HZ_CFG_HALL_SCALE)) !=
+      0) {
     fprintf(stderr, "нет сцены\n");
     return 1;
   }
@@ -653,24 +676,29 @@ int main(int argc, char **argv) {
     if (hz_edge_simplify(&psf, 0.25 * dseg, HZ_EDGE_SHARED, &es) != 0) return 1;
   }
   plane_ceiling(&psf);
-  double cal_ang = adj_angles(&m, &sg, &psf);
+  /* Зондирование сцены лучами (§70.2/§70.3) и угловая калибровка стоят дорого и
+   * к таблице уровней отношения не имеют — под `levels` они снимаются. Угол
+   * остаётся, если его просит `auto0`: он там вход, а не доклад. */
+  double cal_ang = (!levels || auto0) ? adj_angles(&m, &sg, &psf) : 0.0;
   double cal_delta = face_sizes(&psf, dseg);
-  buried_faces(&psf);
-  enclosed_faces(&psf, 32);
+  if (!levels) {
+    buried_faces(&psf);
+    enclosed_faces(&psf, 32);
+  }
   tr3_camera cam;
   double eyeh[3] = HZ_CFG_HALL_EYE, ath[3] = HZ_CFG_HALL_AT;
   double eyec[3] = HZ_CFG_CITY_EYE, atc[3] = HZ_CFG_CITY_AT, up[3] = HZ_CFG_UP;
+  double eyem[3] = HZ_CFG_MIGUEL_EYE, atm[3] = HZ_CFG_MIGUEL_AT;
+  double *eyes = miguel ? eyem : (city ? eyec : eyeh);
+  const double *ats = miguel ? atm : (city ? atc : ath);
   if (!(eyemul >= 1.0 && eyemul <= 1.0)) {
-    double *e = city ? eyec : eyeh;
-    const double *a = city ? atc : ath;
     for (int c = 0; c < 3; c++)
-      e[c] = a[c] + (e[c] - a[c]) * eyemul;
-    printf("== КАМЕРА ОТОДВИНУТА в %.1f раз: глаз (%.1f %.1f %.1f)\n", eyemul, e[0], e[1], e[2]);
+      eyes[c] = ats[c] + (eyes[c] - ats[c]) * eyemul;
+    printf("== КАМЕРА ОТОДВИНУТА в %.1f раз: глаз (%.1f %.1f %.1f)\n", eyemul, eyes[0], eyes[1],
+           eyes[2]);
   }
   const int W = 512, H = 512;
-  if (tr3_camera_look(&cam, city ? eyec : eyeh, city ? atc : ath, up, HZ_CFG_FOV_DEG * M_PI / 180.0,
-                      W, H) != 0)
-    return 1;
+  if (tr3_camera_look(&cam, eyes, ats, up, HZ_CFG_FOV_DEG * M_PI / 180.0, W, H) != 0) return 1;
   const double eps_px = (HZ_CFG_FOV_DEG * M_PI / 180.0) / (double)H;
   const double eps = eps_px * epsmul;
 
@@ -736,8 +764,8 @@ int main(int argc, char **argv) {
     }
   }
   double t1 = now_s();
-  printf("== ЛЕСТНИЦА: %s, δ0 %g м, уровней %d, узлов %d, %s за %.1f с\n", city ? "ГОРОД" : "зал",
-         dseg, L.nlev, L.nnd, load ? "ПРОЧИТАНА" : "построена", t1 - t0);
+  printf("== ЛЕСТНИЦА: %s, δ0 %g м, уровней %d, узлов %d, %s за %.1f с\n", scene, dseg, L.nlev,
+         L.nnd, load ? "ПРОЧИТАНА" : "построена", t1 - t0);
   if (save != NULL) {
     /* ЗАПИСЬ СРАЗУ ПОСЛЕ ПОСТРОЙКИ, ДО всякого замера: если дальше что-то упадёт,
      * двести секунд постройки уже не потеряны. */
@@ -757,6 +785,21 @@ int main(int argc, char **argv) {
   fflush(stdout);
 
   /* --- по уровням --- */
+  /* ДОПУСК УРОВНЯ ПЕЧАТАЕТСЯ ФАКТИЧЕСКИЙ, А НЕ `dseg·2^L` (§321, А555). Основание
+   * лестницы — параметр (§78), и при `base=1` (негативный контроль этого шага)
+   * прежняя строка показывала бы удвоение там, где допуск не растёт вовсе. */
+  const double ladb = (ladbase > 0.0) ? ladbase : 2.0;
+  int32_t *ncnt = malloc((size_t)(L.nlev > 0 ? L.nlev : 1) * sizeof *ncnt);
+  double *nper = malloc((size_t)(L.nlev > 0 ? L.nlev : 1) * sizeof *nper);
+  if (ncnt == NULL || nper == NULL) {
+    free(ncnt);
+    free(nper);
+    return 1;
+  }
+  for (int lev = 0; lev < L.nlev; lev++) {
+    ncnt[lev] = 0;
+    nper[lev] = 0.0;
+  }
   int32_t prevn = 0;
   for (int lev = 0; lev < L.nlev; lev++) {
     const int32_t *lab = L.lab + (size_t)lev * (size_t)L.np;
@@ -780,6 +823,7 @@ int main(int argc, char **argv) {
       const hz_lodnode *n = &L.nd[id];
       dm[nd] = n->dmax;
       sh[nd] = (n->area_surf > 0.0 && n->perim > 0.0) ? n->perim / sqrt(n->area_surf) : 0.0;
+      nper[lev] += n->perim;
       nd++;
     }
     qsort(dm, (size_t)nd, sizeof *dm, cmp_dbl);
@@ -790,20 +834,117 @@ int main(int argc, char **argv) {
              lev, cnt, pct(dm, nd, 0.5), pct(dm, nd, 0.9), pct(dm, nd, 1.0), pct(sh, nd, 0.5),
              pct(sh, nd, 0.9));
     else
-      printf("   уровень %d (допуск %.3f м): элементов %d; dmax p50 %.4f p90 %.4f макс %.4f; "
+      printf("   уровень %d (допуск %.4f м): элементов %d; dmax p50 %.4f p90 %.4f макс %.4f; "
              "форма P/√A p50 %.2f p90 %.2f\n",
-             lev, dseg * pow(2.0, lev), cnt, pct(dm, nd, 0.5), pct(dm, nd, 0.9), pct(dm, nd, 1.0),
-             pct(sh, nd, 0.5), pct(sh, nd, 0.9));
+             lev, L.delta0 * pow(ladb, lev), cnt, pct(dm, nd, 0.5), pct(dm, nd, 0.9),
+             pct(dm, nd, 1.0), pct(sh, nd, 0.5), pct(sh, nd, 0.9));
     if (lev > 0 && cnt > 0)
       printf("      сокращение к предыдущему %.2f× (%s)\n", (double)prevn / (double)cnt,
              L.bycount ? "четвёрка — ТРЕБОВАНИЕ: §60"
                        : "четвёрка — структура, не требование: §54.2");
     prevn = cnt;
+    ncnt[lev] = cnt;
     fflush(stdout);
     free(seen);
     free(dm);
     free(sh);
   }
+
+  /* --- ЦЕНА ПИРАМИДЫ УРОВНЕЙ (§319, поправка; шаг §321) ---
+   *
+   * ЧТО ЭТО ЗА ЧИСЛО. Грубые уровни несут СВОЮ геометрию, то есть хранится
+   * больше, чем `N_0`; §319 считает цену пирамиды при сокращении вчетверо на
+   * уровень равной `1 + 1/4 + 1/16 + … = 4/3`, и это ровно тот предел
+   * «20…40 %», который назван допустимым. Здесь та же сумма берётся ЗАМЕРОМ:
+   * `Σ_L N_L / N_0`. Все слагаемые считались и раньше, но не печатались ни разу
+   * (правило §317).
+   *
+   * ПОДЛЕСТНИЦЫ — СЕМЕЙСТВО, А НЕ ПОРОГ (А554). Уровень, на котором сливать
+   * нечего, копию геометрии заводить не обязан; вместо порога «полезный
+   * уровень» печатается цена лестниц с основанием `2`, `4` и `8` (шаг по
+   * уровням 1, 2, 3). САМЫЙ ГРУБЫЙ УРОВЕНЬ ВХОДИТ ВО ВСЕ ТРИ — иначе они
+   * покрывали бы разный диапазон масштабов и были бы несравнимы. */
+  if (L.nlev > 0 && ncnt[0] > 0) {
+    printf("   ЦЕНА ПИРАМИДЫ (§319: при сокращении вчетверо на уровень было бы 1.33×)\n");
+    printf("      уровней %d, N_0 = %d, самый грубый уровень %d: N = %d, допуск %.4f м\n", L.nlev,
+           ncnt[0], L.nlev - 1, ncnt[L.nlev - 1], L.delta0 * pow(ladb, L.nlev - 1));
+    printf("      доли N_L/N_0:");
+    for (int lev = 0; lev < L.nlev; lev++)
+      printf(" %.3f", (double)ncnt[lev] / (double)ncnt[0]);
+    printf("\n");
+    /* ВТОРАЯ ОСЬ ЦЕНЫ — ПЕРИМЕТР КРАЯ (А550). Счёт КУСКОВ занижает складскую
+     * цену: край грубого элемента рваный (`P/√A` растёт по лестнице), а хранится
+     * именно край. Периметр к тому же РАЗЛИЧАЕТ два разных слияния, которых счёт
+     * не различает: при настоящем огрублении смежные куски сливаются и общий
+     * край ИСЧЕЗАЕТ (Σ P падает), а при сборе разрозненной мелочи в одну
+     * плоскость границы остаются все до одной (Σ P стоит на месте). */
+    if (nper[0] > 0.0) {
+      printf("      доли ΣP_L/ΣP_0 (периметр края):");
+      for (int lev = 0; lev < L.nlev; lev++)
+        printf(" %.3f", nper[lev] / nper[0]);
+      printf("\n");
+    }
+    /* ВЕРШИНЫ КРАЯ — САМА ХРАНИМАЯ ВЕЛИЧИНА, А НЕ ПРОКСИ (А550, А558). Счёт
+     * кусков и периметр — две оценки с разных сторон, и на зале они разошлись в
+     * три раза (`1.59×` против `5.01×`). Элемент хранится как плоскость плюс
+     * КРАЙ, значит спор решает число вершин края, и оно тут считается прямо:
+     * разметка уровня → полигоны → `nbv`. Цена — пересборка полигонов на каждом
+     * уровне (на Сан-Мигеле около двух минут при прогоне в 38), и она заплачена
+     * сознательно: без этого числа вердикт §319 держался бы на прокси. */
+    int32_t *lcut = malloc((size_t)L.np * sizeof *lcut);
+    int64_t *nbv = malloc((size_t)L.nlev * sizeof *nbv);
+    if (lcut != NULL && nbv != NULL) {
+      for (int lev = 0; lev < L.nlev; lev++) {
+        nbv[lev] = 0;
+        for (int32_t k = 0; k < L.np; k++)
+          lcut[k] = L.lab[(size_t)lev * (size_t)L.np + (size_t)k];
+        hz_pseglist so;
+        if (hz_lod_seglist(&L, &m, &sg, lcut, &so) != 0) continue;
+        hz_polyset pc;
+        if (hz_poly_build(&pc, &m, &so) == 0) {
+          nbv[lev] = pc.nbv;
+          hz_poly_free(&pc);
+        }
+        hz_seg_free(&so);
+      }
+      if (nbv[0] > 0) {
+        printf("      доли V_L/V_0 (ВЕРШИН КРАЯ, хранимая величина); V_0 = %lld:",
+               (long long)nbv[0]);
+        for (int lev = 0; lev < L.nlev; lev++)
+          printf(" %.3f", (double)nbv[lev] / (double)nbv[0]);
+        printf("\n");
+      }
+    }
+    for (int step = 1; step <= 3; step++) {
+      double sum = 0.0, sump = 0.0, sumv = 0.0;
+      int nkeep = 0;
+      for (int lev = 0; lev < L.nlev; lev += step) {
+        sum += (double)ncnt[lev] / (double)ncnt[0];
+        if (nper[0] > 0.0) sump += nper[lev] / nper[0];
+        if (nbv != NULL && nbv[0] > 0) sumv += (double)nbv[lev] / (double)nbv[0];
+        nkeep++;
+      }
+      /* самый грубый уровень обязателен во всякой подлестнице */
+      if ((L.nlev - 1) % step != 0) {
+        sum += (double)ncnt[L.nlev - 1] / (double)ncnt[0];
+        if (nper[0] > 0.0) sump += nper[L.nlev - 1] / nper[0];
+        if (nbv != NULL && nbv[0] > 0) sumv += (double)nbv[L.nlev - 1] / (double)nbv[0];
+        nkeep++;
+      }
+      printf("      шаг по уровням %d (основание %.0f): уровней %d, Σ N_L/N_0 = %.2f×, "
+             "Σ P_L/P_0 = %.2f×, Σ V_L/V_0 = %.2f×\n",
+             step, pow(ladb, step), nkeep, sum, sump, sumv);
+    }
+    free(lcut);
+    free(nbv);
+    if (L.nlev > 1 && ncnt[L.nlev - 1] > 0)
+      printf("      среднее геометрическое сокращение %.2f× на уровень (от N_0 к самому "
+             "грубому)\n",
+             pow((double)ncnt[0] / (double)ncnt[L.nlev - 1], 1.0 / (double)(L.nlev - 1)));
+    fflush(stdout);
+  }
+  free(ncnt);
+  free(nper);
 
   /* --- ДВУГРАННЫЙ УГОЛ ПАР-КАНДИДАТОВ (§59) ---
    * Печатается характеристика СЦЕНЫ, а не алгоритма: где стоят изломы и с какой
@@ -842,10 +983,20 @@ int main(int argc, char **argv) {
            bad ? "НАРУШЕНА — разбиения уровней не вложены" : "держится на всех уровнях");
   }
 
+  /* ТОЛЬКО ТАБЛИЦА УРОВНЕЙ (§321): всё ниже — срез, лучевая метрика и негативный
+   * контроль СРЕЗА, то есть другой вопрос и другая цена. */
+  if (levels) {
+    hz_lod_free(&L);
+    hz_poly_free(&psf);
+    hz_seg_free(&sg);
+    hz_obj_free(&m);
+    return 0;
+  }
+
   /* --- срез и однородные уровни --- */
   int32_t *cut = malloc((size_t)L.np * sizeof *cut);
   if (cut == NULL) return 1;
-  const double *eye = city ? eyec : eyeh;
+  const double *eye = eyes;
   int32_t ncut = hz_lod_cut(&L, eye, eps, nosin, cut);
   printf("   СРЕЗ при камере §2 (ε = %.3e рад): элементов %d\n", eps, ncut);
   {

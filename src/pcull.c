@@ -478,7 +478,9 @@ static void shot_tri(shot_ctx *S, int32_t t) {
   const double *V[3];
   for (int i = 0; i < 3; i++)
     V[i] = m->v + 3 * (size_t)m->f[3 * (size_t)t + (size_t)i];
-  double sx[3], sy[3], sz[3];
+  /* Обнуление явное: `project` может вернуть отказ, и анализатор прав, что
+   * доказательства заполненности у него нет (тот же класс, что в `psun`). */
+  double sx[3] = {0.0, 0.0, 0.0}, sy[3] = {0.0, 0.0, 0.0}, sz[3] = {0.0, 0.0, 0.0};
   for (int i = 0; i < 3; i++)
     if (!project(C, V[i], &sx[i], &sy[i], &sz[i])) return;
   double xmin = sx[0], xmax = sx[0], ymin = sy[0], ymax = sy[0];

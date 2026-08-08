@@ -31,22 +31,16 @@ static void face_axes(int a, int *p, int *q) {
  * четверти лежит в `±1/2` местных координат, полуразмер вдвое меньше — отсюда
  * наклоны делятся пополам, а центр смещается на половину наклона. */
 static hz_pfront_face face_quarter(const hz_pfront_face *F, double su, double sv) {
+  /* Р3 НА СЕТКЕ: четверть грани есть блок `N/2 × N/2`, размноженный обратно до
+   * `N × N`. Это точное «вычисление полинома» для кусочно-постоянного поля: у
+   * ребёнка клетки вдвое мельче родительских, и каждая родительская клетка
+   * покрывает ровно четыре детских. */
   hz_pfront_face R;
-  R.c0 = F->c0 + 0.5 * su * F->cu + 0.5 * sv * F->cv;
-  R.cu = 0.5 * F->cu;
-  R.cv = 0.5 * F->cv;
-  /* ДОЛЯ ОТКРЫТОГО ДИСКА НЕ БЫВАЕТ ОТРИЦАТЕЛЬНОЙ (§307). Здесь наклоны
-   * ВЫЧИТАЮТСЯ из среднего, и ограничения снизу не было: у четверти грани,
-   * лежащей с тёмной стороны крутого наклона, `c0` уходило ниже нуля.
-   * Замерено ДО починки: `17 499` остановок из `194 965` несли `f < 0`, и под
-   * ними `19 882 869` листьев — две трети сцены. Читатель (картинка) принимал
-   * отрицательное за «ответа нет» и угадывал темноту; `117` ложных теней из
-   * §302 — это места, где угадывание не совпало.
-   *
-   * ОГРАНИЧЕНИЕ СТАВИТСЯ НА СРЕДНЕЕ, А НЕ НА ЗНАЧЕНИЕ В ТОЧКЕ: значение в точке
-   * и так обрезается `hz_pfront_at`; отрицательным же не должно быть само
-   * представление, иначе ошибка идёт дальше по переносу и складывается. */
-  if (R.c0 < 0.0) R.c0 = 0.0;
+  const int H = HZ_PFRONT_COVN / 2;
+  int i0 = (su > 0.0) ? H : 0, j0 = (sv > 0.0) ? H : 0;
+  for (int j = 0; j < HZ_PFRONT_COVN; j++)
+    for (int i = 0; i < HZ_PFRONT_COVN; i++)
+      R.g[j * HZ_PFRONT_COVN + i] = F->g[(j0 + j / 2) * HZ_PFRONT_COVN + (i0 + i / 2)];
   return R;
 }
 
@@ -54,14 +48,23 @@ static hz_pfront_face face_quarter(const hz_pfront_face *F, double su, double sv
  * линейной функции с четырёх подквадратов на один: среднее даёт `c0`, а наклон
  * складывается из наклонов четвертей и из разности их средних. */
 static hz_pfront_face face_join(const hz_pfront_face *Q) {
-  /* Q[0] = (−,−), Q[1] = (+,−), Q[2] = (−,+), Q[3] = (+,+) */
+  /* Р2 НА СЕТКЕ: грань родителя вдвое крупнее детской, поэтому каждая её клетка
+   * есть среднее блока `2×2` соответствующего ребёнка. Точная L²-проекция для
+   * кусочно-постоянного поля — и, в отличие от сложения моментов, она не может
+   * дать отрицательного значения (§307). */
   hz_pfront_face R;
-  R.c0 = 0.25 * (Q[0].c0 + Q[1].c0 + Q[2].c0 + Q[3].c0);
-  R.cu = 0.25 * (Q[0].cu + Q[1].cu + Q[2].cu + Q[3].cu) +
-         0.5 * (Q[1].c0 + Q[3].c0 - Q[0].c0 - Q[2].c0) * 0.5;
-  R.cv = 0.25 * (Q[0].cv + Q[1].cv + Q[2].cv + Q[3].cv) +
-         0.5 * (Q[2].c0 + Q[3].c0 - Q[0].c0 - Q[1].c0) * 0.5;
-  if (R.c0 < 0.0) R.c0 = 0.0; /* та же причина, что в `face_quarter` */
+  const int H = HZ_PFRONT_COVN / 2;
+  for (int j = 0; j < HZ_PFRONT_COVN; j++)
+    for (int i = 0; i < HZ_PFRONT_COVN; i++) {
+      int qi = (i >= H) ? 1 : 0, qj = (j >= H) ? 1 : 0;
+      const hz_pfront_face *C = &Q[qj * 2 + qi];
+      int bi = 2 * (i - qi * H), bj = 2 * (j - qj * H);
+      double v = 0.0;
+      for (int dj = 0; dj < 2; dj++)
+        for (int di = 0; di < 2; di++)
+          v += (double)C->g[(bj + dj) * HZ_PFRONT_COVN + (bi + di)];
+      R.g[j * HZ_PFRONT_COVN + i] = (float)(0.25 * v);
+    }
   return R;
 }
 
@@ -80,34 +83,7 @@ static hz_pfront_face face_join(const hz_pfront_face *Q) {
  * ЧЕГО СНОС ВСЁ ЕЩЁ НЕ ДЕЛАЕТ: при `|Δ| > 2` луч покидает ячейку через БОКОВУЮ
  * грань, и это перераспределение между гранями здесь не выражено — снос
  * обрезается. То есть починка неполная, и граница названа. */
-int hz_pfront_shift = 0; /* `1` — сносить грань (см. §308: пока делает ХУЖЕ) */
-
-static hz_pfront_face face_shift(const hz_pfront_face *F, const double *lo, const double *hi,
-                                 const double *dir, int a) {
-  hz_pfront_face R = *F;
-  if (!hz_pfront_shift) return R;
-  double da = (dir[a] < 0.0) ? -dir[a] : dir[a];
-  if (!(da > 1e-300)) return R;
-  int p, q;
-  face_axes(a, &p, &q);
-  double ha = hi[a] - lo[a], hp = hi[p] - lo[p], hq = hi[q] - lo[q];
-  if (!(hp > 0.0) || !(hq > 0.0)) return R;
-  /* СНОС ВДОЛЬ ЛУЧА В МЕСТНЫХ КООРДИНАТАХ ГРАНИ. Луч, вошедший в точке `(u, v)`,
-   * выходит в `(u + Δu, v + Δv)`: за время пересечения ячейки по оси `a` он
-   * смещается вбок на `ha·dir[p]/|dir[a]|`. Грань нормирована на `[-1, 1]`,
-   * отсюда двойка. */
-  double du = 2.0 * ha * dir[p] / (da * hp);
-  double dv = 2.0 * ha * dir[q] / (da * hq);
-  if (du > 2.0) du = 2.0;
-  if (du < -2.0) du = -2.0;
-  if (dv > 2.0) dv = 2.0;
-  if (dv < -2.0) dv = -2.0;
-  /* Состояние ЛИНЕЙНО, поэтому снос точен: значение на выходе в точке `(u, v)`
-   * есть значение на входе в `(u − Δu, v − Δv)`. Наклоны не меняются. */
-  R.c0 = F->c0 - F->cu * du - F->cv * dv;
-  if (R.c0 < 0.0) R.c0 = 0.0;
-  return R;
-}
+int hz_pfront_shift = 2; /* оставлен для совместимости ключа; перенос всегда полный */
 
 /* Прежний точный вариант через `hz_pclip_tri` убран: он строил вершину ПО
  * ПРОИСХОЖДЕНИЮ ради побитового совпадения у соседей (Г50), а тени это не нужно
@@ -122,92 +98,17 @@ static hz_pfront_face face_shift(const hz_pfront_face *F, const double *lo, cons
  * стык. Здесь треугольник СНОСИТСЯ вдоль направления на грань и отсекается
  * КВАДРАТОМ в двумерии — четыре полуплоскости, не более семи вершин, ни одного
  * трёхмерного отсечения и ни одной записи о происхождении. */
-static double tri_cover(const double *A, const double *B, const double *C, const double *lo,
-                        const double *hi, const double *dir, int a, hz_pfront_face *out) {
-  int p, q;
-  face_axes(a, &p, &q);
-  if (dir[a] < 1e-300 && dir[a] > -1e-300) return 0.0;
-  double du = hi[p] - lo[p], dv = hi[q] - lo[q];
-  if (!(du > 0.0) || !(dv > 0.0)) return 0.0;
-  double fa = (dir[a] > 0.0) ? hi[a] : lo[a];
-  const double *V[3] = {A, B, C};
-  double x[8], y[8];
-  int n = 3;
-  for (int i = 0; i < 3; i++) {
-    double t = (fa - V[i][a]) / dir[a];
-    x[i] = 2.0 * (V[i][p] + t * dir[p] - lo[p]) / du - 1.0;
-    y[i] = 2.0 * (V[i][q] + t * dir[q] - lo[q]) / dv - 1.0;
-  }
-  /* Отсечение квадратом [-1,1]²: четыре полуплоскости, Сазерленд—Ходжман. */
-  for (int e = 0; e < 4; e++) {
-    double x2[8], y2[8];
-    int m = 0;
-    for (int i = 0; i < n; i++) {
-      int j = (i + 1) % n;
-      double si, sj;
-      if (e == 0) {
-        si = x[i] + 1.0;
-        sj = x[j] + 1.0;
-      } else if (e == 1) {
-        si = 1.0 - x[i];
-        sj = 1.0 - x[j];
-      } else if (e == 2) {
-        si = y[i] + 1.0;
-        sj = y[j] + 1.0;
-      } else {
-        si = 1.0 - y[i];
-        sj = 1.0 - y[j];
-      }
-      if (si >= 0.0 && m < 8) {
-        x2[m] = x[i];
-        y2[m] = y[i];
-        m++;
-      }
-      if ((si >= 0.0) != (sj >= 0.0) && m < 8) {
-        double d = si - sj;
-        double t = (d > 1e-300 || d < -1e-300) ? si / d : 0.0;
-        x2[m] = x[i] + t * (x[j] - x[i]);
-        y2[m] = y[i] + t * (y[j] - y[i]);
-        m++;
-      }
-    }
-    n = m;
-    if (n < 3) return 0.0;
-    for (int i = 0; i < n; i++) {
-      x[i] = x2[i];
-      y[i] = y2[i];
-    }
-  }
-  double s = 0.0, mu = 0.0, mv = 0.0;
-  for (int i = 0; i < n; i++) {
-    int j = (i + 1) % n;
-    double cr = x[i] * y[j] - x[j] * y[i];
-    s += cr;
-    mu += (x[i] + x[j]) * cr;
-    mv += (y[i] + y[j]) * cr;
-  }
-  double Ar = 0.5 * s, sg = (Ar < 0.0) ? -1.0 : 1.0;
-  Ar *= sg;
-  if (!(Ar > 0.0)) return 0.0;
-  out->c0 = 0.25 * Ar;
-  out->cu = 0.75 * sg * mu / 6.0;
-  out->cv = 0.75 * sg * mv / 6.0;
-  return Ar;
-}
-
-/* Ослабить грань перекрытием, которое САМО линейно. Произведение двух линейных
- * функций квадратично, поэтому берётся его L²-проекция обратно на линейный базис:
- * на квадрате `[-1,1]²` со средним `u² = 1/3` это даёт
- * `c0 = f0·g0 + (fu·gu + fv·gv)/3`, `cu = f0·gu + fu·g0`, `cv = f0·gv + fv·g0`.
- * Точная проекция, а не усечение: тот же приём, что Р2 у огрубления. */
-static hz_pfront_face face_block(const hz_pfront_face *F, const hz_pfront_face *C) {
-  /* g = 1 − C */
-  double g0 = 1.0 - C->c0, gu = -C->cu, gv = -C->cv;
+/* ОСЛАБИТЬ ГРАНЬ ПЕРЕКРЫТИЕМ — ПОЭЛЕМЕНТНО (О76). Раньше здесь перемножались две
+ * линейные функции и результат проецировался обратно на линейный базис, отчего
+ * щель размазывалась в равномерное затемнение по всей грани; затемнения потом
+ * перемножались вдоль пути, и ячейка, видимая насквозь, объявлялась тёмной
+ * (§278 — именно это сломало односторонность пометок). На сетке умножение
+ * поклеточное и точное: где клетка закрыта — там ноль, где открыта — там
+ * исходное значение. */
+static hz_pfront_face face_block(const hz_pfront_face *F, uint64_t mask) {
   hz_pfront_face R;
-  R.c0 = F->c0 * g0 + (F->cu * gu + F->cv * gv) / 3.0;
-  R.cu = F->c0 * gu + F->cu * g0;
-  R.cv = F->c0 * gv + F->cv * g0;
-  if (R.c0 < 0.0) R.c0 = 0.0;
+  for (int k = 0; k < HZ_PFRONT_NCELL; k++)
+    R.g[k] = (mask & ((uint64_t)1 << k)) ? 0.0f : F->g[k];
   return R;
 }
 
@@ -289,48 +190,19 @@ static uint64_t tri_mask(const double *A, const double *B, const double *C, cons
   return mk;
 }
 
-/* Моменты маски: `c0`, `cu`, `cv` в той же нормировке, что у `tri_cover`. */
-static hz_pfront_face mask_face(uint64_t mk) {
-  hz_pfront_face R = {0.0, 0.0, 0.0};
-  int cnt = 0;
-  double su = 0.0, sv = 0.0;
-  for (int j = 0; j < HZ_PFRONT_COVN; j++)
-    for (int i = 0; i < HZ_PFRONT_COVN; i++)
-      if (mk & ((uint64_t)1 << (j * HZ_PFRONT_COVN + i))) {
-        double u = 2.0 * ((double)i + 0.5) / (double)HZ_PFRONT_COVN - 1.0;
-        double v = 2.0 * ((double)j + 0.5) / (double)HZ_PFRONT_COVN - 1.0;
-        cnt++;
-        su += u;
-        sv += v;
-      }
-  double nn = (double)(HZ_PFRONT_COVN * HZ_PFRONT_COVN);
-  R.c0 = (double)cnt / nn;
-  R.cu = 3.0 * su / nn;
-  R.cv = 3.0 * sv / nn;
-  return R;
-}
-
-/* Затенить грани ячейки прямо по КАНДИДАТАМ, без вывода кусков. Возврат: было ли
- * в ячейке хоть какое-то перекрытие. */
 int hz_pfront_cover_sum = 0; /* 1 — перекрытие СУММОЙ (верхняя оценка); опыт §274 */
 
-/* ПОЛНЫЙ ПЕРЕНОС ЧЕРЕЗ ЯЧЕЙКУ (§310, `shift = 2`).
+/* ПОЛНЫЙ ПЕРЕНОС ЧЕРЕЗ ЯЧЕЙКУ, НА СЕТКЕ (§310 + О76).
  *
- * §308 намерил, что состояние НЕ СОХРАНЯЕТСЯ в пустоте при косом направлении, а
+ * §308 намерил, что состояние НЕ СОХРАНЯЕТСЯ в пустоте при косом направлении;
  * §309 — что снос ВНУТРИ грани делает хуже, потому что при большом сносе луч
- * покидает ячейку через БОКОВУЮ грань, и это в модели не выражено вовсе.
+ * покидает ячейку через БОКОВУЮ грань, а это не выражено вовсе.
  *
- * Здесь выражено. Для каждой точки ИСХОДЯЩЕЙ грани луч прослеживается НАЗАД до
- * первой встреченной ВХОДЯЩЕЙ грани — какой бы из трёх она ни оказалась, — и
- * оттуда берётся значение. Поле на исходящей грани выходит кусочно-линейным
- * (кусков столько, сколько входящих граней участвует), а состояние линейно
- * (Р1), поэтому берётся его L²-проекция: моменты по сетке `8×8`, той же, что у
- * маски перекрытия.
- *
- * ЭТО ПОЛНЫЙ ОПЕРАТОР, А НЕ ПОЛОВИНА: уход вбок не обрезается, он попадает на
- * ту грань, которой принадлежит. Приближение осталось одно и оно названо —
- * проекция кусочно-линейного на линейное, то есть цена самого представления Р1.
- */
+ * Здесь выражено без остатка: для каждой КЛЕТКИ исходящей грани луч
+ * прослеживается назад до первой встреченной ВХОДЯЩЕЙ грани — какой бы из трёх
+ * она ни была, — и значение берётся оттуда. На сетке результат пишется ПРЯМО В
+ * КЛЕТКУ; проекции на линейный базис, бывшей последним приближением §310,
+ * больше нет. */
 static void face_transport(const hz_pfront_face *in, hz_pfront_face *out, const double *lo,
                            const double *hi, const double *dir) {
   for (int a = 0; a < 3; a++) {
@@ -342,8 +214,6 @@ static void face_transport(const hz_pfront_face *in, hz_pfront_face *out, const 
       out[a] = in[a];
       continue;
     }
-    double s0 = 0.0, su = 0.0, sv = 0.0;
-    int nn = 0;
     for (int j = 0; j < HZ_PFRONT_COVN; j++)
       for (int i = 0; i < HZ_PFRONT_COVN; i++) {
         double u = 2.0 * ((double)i + 0.5) / (double)HZ_PFRONT_COVN - 1.0;
@@ -352,7 +222,6 @@ static void face_transport(const hz_pfront_face *in, hz_pfront_face *out, const 
         P[a] = fa;
         P[p] = 0.5 * (lo[p] + hi[p]) + 0.5 * u * hp;
         P[q] = 0.5 * (lo[q] + hi[q]) + 0.5 * v * hq;
-        /* Назад по лучу до ПЕРВОЙ входящей грани: наименьшее положительное `t`. */
         double tb = 1e300;
         int bax = a;
         for (int c = 0; c < 3; c++) {
@@ -374,91 +243,41 @@ static void face_transport(const hz_pfront_face *in, hz_pfront_face *out, const 
         double hbp = hi[bp] - lo[bp], hbq = hi[bq] - lo[bq];
         double uu = (hbp > 0.0) ? (2.0 * (Q[bp] - lo[bp]) / hbp - 1.0) : 0.0;
         double vv = (hbq > 0.0) ? (2.0 * (Q[bq] - lo[bq]) / hbq - 1.0) : 0.0;
-        if (uu < -1.0) uu = -1.0;
-        if (uu > 1.0) uu = 1.0;
-        if (vv < -1.0) vv = -1.0;
-        if (vv > 1.0) vv = 1.0;
-        double val = hz_pfront_at(&in[bax], uu, vv);
-        s0 += val;
-        su += val * u;
-        sv += val * v;
-        nn++;
+        out[a].g[j * HZ_PFRONT_COVN + i] = (float)hz_pfront_at(&in[bax], uu, vv);
       }
-    if (nn > 0) {
-      out[a].c0 = s0 / (double)nn;
-      out[a].cu = 3.0 * su / (double)nn;
-      out[a].cv = 3.0 * sv / (double)nn;
-      if (out[a].c0 < 0.0) out[a].c0 = 0.0;
-    } else
-      out[a] = in[a];
   }
 }
 
 int hz_pfront_shade(const hz_pfront_face *in, hz_pfront_face *out, const hz_objmesh *m,
                     const int32_t *list, int32_t n, const double *lo, const double *hi,
                     const double *dir) {
+  /* ШАГ ОПЕРАТОРА НА СЕТКЕ (О76). Две части, и обе теперь точные поклеточно:
+   *   ПЕРЕНОС    — обратная прослежка до входящей грани (§310), пишет прямо в
+   *                клетку, без проекции на линейный базис;
+   *   ПЕРЕКРЫТИЕ — объединение масок кусков (§292) и поэлементное гашение.
+   * Выбора между «максимумом» и «суммой» (А517) больше НЕ СУЩЕСТВУЕТ: маска
+   * есть объединение по построению, и она же применяется без усреднения. */
   int any = 0;
   hz_pfront_face tr[3];
-  if (hz_pfront_shift == 2) {
-    face_transport(in, tr, lo, hi, dir);
-    in = tr; /* дальше перекрытие накладывается на ПЕРЕНЕСЁННОЕ состояние */
-  }
+  face_transport(in, tr, lo, hi, dir);
   for (int a = 0; a < 3; a++) {
-    /* КОНСЕРВАТИВНО (А517): берётся ОДИН кусок — с наибольшей проекцией, — а не
-     * сумма по всем. Сумма объявила бы закрытым угол, который открыт (проекции
-     * пересекаются), и погасила бы свет там, где он есть. Один кусок есть
-     * заведомо НИЖНЯЯ оценка объединения, и для главного случая — стена в
-     * ячейке — она ТОЧНАЯ, потому что кусок там один. */
-    /* ДВЕ ОЦЕНКИ ПЕРЕКРЫТИЯ, И ОБЕ НУЖНЫ КАК ГРАНИЦЫ. Максимум по кускам — НИЖНЯЯ
-     * оценка объединения (А517, безопасная); сумма с обрезанием — ВЕРХНЯЯ.
-     * Истина между ними, и опыт с обеими показывает, ЧТО именно виновато в
-     * расхождении с эталоном: если сумма его резко улучшает, дело в объединении,
-     * а не в линейности представления. */
-    hz_pfront_face best = {0.0, 0.0, 0.0};
-    double ba = 0.0;
     uint64_t umask = 0;
     for (int32_t i = 0; i < n; i++) {
       int32_t t = list[i];
       const double *A = m->v + 3 * (size_t)m->f[3 * (size_t)t + 0];
       const double *B = m->v + 3 * (size_t)m->f[3 * (size_t)t + 1];
       const double *C = m->v + 3 * (size_t)m->f[3 * (size_t)t + 2];
-      hz_pfront_face c = {0.0, 0.0, 0.0};
-      if (hz_pfront_cover_sum == 2) {
-        umask |= tri_mask(A, B, C, lo, hi, dir, a);
-        continue;
-      }
-      double Aa = tri_cover(A, B, C, lo, hi, dir, a, &c);
-      if (hz_pfront_cover_sum) {
-        best.c0 += c.c0;
-        best.cu += c.cu;
-        best.cv += c.cv;
-        if (Aa > 0.0) ba = 1.0;
-      } else if (Aa > ba) {
-        ba = Aa;
-        best = c;
-      }
+      umask |= tri_mask(A, B, C, lo, hi, dir, a);
     }
-    if (hz_pfront_cover_sum == 2) {
-      best = mask_face(umask);
-      ba = (umask != 0) ? 1.0 : 0.0;
-    }
-    if (hz_pfront_cover_sum == 1 && best.c0 > 1.0) {
-      double sc = 1.0 / best.c0;
-      best.c0 = 1.0;
-      best.cu *= sc;
-      best.cv *= sc;
-    }
-    if (ba > 0.0) any = 1;
-    hz_pfront_face cov = best;
-    hz_pfront_face f = face_shift(&in[a], lo, hi, dir, a);
-    out[a] = face_block(&f, &cov);
+    if (umask != 0) any = 1;
+    out[a] = face_block(&tr[a], umask);
   }
   return any;
 }
 
 const char *hz_pfront_note(void) {
-  return "состояние и перекрытие ЛИНЕЙНЫ (Р1); перекрытие берётся по ОДНОМУ куску с "
-         "наибольшей проекцией — нижняя оценка объединения (А517), точная там, где кусок один";
+  return "состояние — СЕТКА 8x8 на грань (О76); перенос обратной прослежкой до входящей грани, "
+         "перекрытие — ОБЪЕДИНЕНИЕ масок кусков, гашение поклеточное";
 }
 
 /* ---- ОБХОД С ПЕРЕНОСОМ СОСТОЯНИЯ ------------------------------------------ */
@@ -475,13 +294,17 @@ const char *hz_pfront_note(void) {
  * Поймано прогоном с солнцем строго вниз: там осей с потоком одна из трёх, и
  * невзвешенный предикат не срабатывал никогда. */
 static int pf_dark3(const hz_pfront_face *in, const double *dir) {
+  /* Взвешивание по потоку остаётся: грань, перпендикулярная которой составляющая
+   * направления нулевая, потока не несёт. Внутри грани критерий теперь ТОЧНЫЙ —
+   * наибольшая клетка, а не оценка сверху по линейной функции. */
   double fl = 0.0, w = 0.0;
   for (int a = 0; a < 3; a++) {
     double wa = (dir[a] < 0.0) ? -dir[a] : dir[a];
-    double cu = (in[a].cu < 0.0) ? -in[a].cu : in[a].cu;
-    double cv = (in[a].cv < 0.0) ? -in[a].cv : in[a].cv;
+    double mx = 0.0;
+    for (int k = 0; k < HZ_PFRONT_NCELL; k++)
+      if ((double)in[a].g[k] > mx) mx = (double)in[a].g[k];
     w += wa;
-    fl += wa * (in[a].c0 + cu + cv);
+    fl += wa * mx;
   }
   return w > 0.0 && fl <= w * HZ_PFRONT_FRAC_TOL;
 }
@@ -547,9 +370,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         X->stop_flat++;
         X->nshadow++;
         for (int a = 0; a < 3; a++) {
-          out[a].c0 = 0.0;
-          out[a].cu = 0.0;
-          out[a].cv = 0.0;
+          hz_pfront_set(&out[a], 0.0);
         }
         return;
       }
@@ -619,9 +440,15 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
       double var = 0.0;
       for (int a = 0; a < 3; a++) {
         double wa = (X->dir[a] < 0.0) ? -X->dir[a] : X->dir[a];
-        double cu = (in[a].cu < 0.0) ? -in[a].cu : in[a].cu;
-        double cv = (in[a].cv < 0.0) ? -in[a].cv : in[a].cv;
-        var += wa * (cu + cv);
+        /* Р3 НА СЕТКЕ: «неровно» есть разброс по клеткам грани, а не наклон
+         * линейной функции. Уточнять стоит там, где грань не однородна. */
+        double mn = 1e300, mx = -1e300;
+        for (int k = 0; k < HZ_PFRONT_NCELL; k++) {
+          double g = (double)in[a].g[k];
+          if (g < mn) mn = g;
+          if (g > mx) mx = g;
+        }
+        var += wa * (mx - mn);
       }
       if (var > HZ_PFRONT_REFINE_TOL && extra < X->refinemax) {
         stop = 0;
@@ -826,6 +653,13 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
           if (tt > 0.0 && (float)tt < dep[b]) dep[b] = (float)tt;
         }
       }
+      /* Заодно кладётся и само состояние входящей грани — картинка читает
+       * КЛЕТКУ под точкой, а не среднее по грани. */
+      if (X->cellval != NULL) {
+        float *cv2 = X->cellval + 64 * (size_t)X->nslot;
+        for (int k = 0; k < HZ_PFRONT_NCELL; k++)
+          cv2[k] = in[a * X->nk].g[k];
+      }
       X->cellslot[nid] = X->nslot;
       X->nslot++;
     }
@@ -838,7 +672,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         for (int a = 0; a < 3; a++) {
           double wa = (X->sdir[s][a] < 0.0) ? -X->sdir[s][a] : X->sdir[s][a];
           wi += wa;
-          fi += wa * in[a * X->nk + s].c0;
+          fi += wa * hz_pfront_mean(&in[a * X->nk + s]);
         }
       X->cellf[nid] = (float)((wi > 0.0) ? fi / wi : 0.0);
     }
@@ -847,7 +681,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
     for (int a = 0; a < 3; a++) {
       double wa = (X->dir[a] < 0.0) ? -X->dir[a] : X->dir[a];
       w += wa;
-      fl += wa * out[a].c0;
+      fl += wa * hz_pfront_mean(&out[a]);
     }
     if (w > 0.0) {
       if (fl <= w * HZ_PFRONT_FRAC_TOL)
@@ -867,7 +701,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         for (int a = 0; a < 3; a++) {
           double wa = (X->sdir[s][a] < 0.0) ? -X->sdir[s][a] : X->sdir[s][a];
           wi += wa;
-          fi += wa * in[a * X->nk + s].c0;
+          fi += wa * hz_pfront_mean(&in[a * X->nk + s]);
         }
       if (wi > 0.0) {
         fi /= wi;
@@ -901,7 +735,16 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
    * прав в том, что доказательства у него нет. Двадцать четыре записи на узел —
    * цена никакая. */
   /* На каждую выборку по диску — своя тройка граней: `[ось · nk + выборка]`. */
-  hz_pfront_face cout[8][3 * HZ_PFRONT_MAXK] = {{{0.0, 0.0, 0.0}}};
+  /* СОСТОЯНИЕ ДЕТЕЙ — В КУЧЕ (А540). На сетке оно есть `8 × 3 × K` граней по
+   * `N²` чисел: при `N = 8, K = 16` это `98` КБ НА УРОВЕНЬ и `1.2` МБ на глубину
+   * `12`. На стеке такому не место, и аудит потребовал вынести это ДО кода, а не
+   * после первого падения. Выделяется столько, сколько нужно при этом `K`. */
+  hz_pfront_face *cout = calloc((size_t)8 * 3 * (size_t)X->nk, sizeof *cout);
+  if (cout == NULL) {
+    X->fail = 1;
+    free(sub);
+    return;
+  }
   /* Порядок «ближние раньше дальних»: по числу осей, где ребёнок с дальней
    * стороны. Он делает зависимости ациклическими (§241.7). */
   for (int far = 0; far <= 3; far++) {
@@ -917,7 +760,9 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         clo[c] = b[c] ? mid[c] : lo[c];
         chi[c] = b[c] ? hi[c] : mid[c];
       }
-      hz_pfront_face cin[3 * HZ_PFRONT_MAXK];
+      /* Обнуление явное: при  цикл ниже не заполнил бы её вовсе, и
+       * cppcheck прав, что доказательства обратного у него нет. */
+      hz_pfront_face cin[3 * HZ_PFRONT_MAXK] = {{{0}}};
       for (int a = 0; a < 3; a++) {
         int p, q;
         face_axes(a, &p, &q);
@@ -926,7 +771,8 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
             double su = b[p] ? 1.0 : -1.0, sv = b[q] ? 1.0 : -1.0;
             cin[a * X->nk + s] = face_quarter(&in[a * X->nk + s], su, sv);
           } else {
-            cin[a * X->nk + s] = cout[k ^ (1 << a)][a * X->nk + s];
+            cin[a * X->nk + s] =
+                cout[(size_t)(k ^ (1 << a)) * 3 * (size_t)X->nk + (size_t)(a * X->nk + s)];
           }
         }
       }
@@ -935,9 +781,11 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         const double *bl = X->tlo + 3 * (size_t)list[i], *bh = X->thi + 3 * (size_t)list[i];
         if (box_hits3(bl, bh, clo, chi)) sub[ns++] = list[i];
       }
-      hz_pfront_walk(X, c0 + k, clo, chi, cin, cout[k], sub, ns, coarsened, nextra);
+      hz_pfront_walk(X, c0 + k, clo, chi, cin, cout + (size_t)k * 3 * (size_t)X->nk, sub, ns,
+                     coarsened, nextra);
       if (X->fail) {
         free(sub);
+        free(cout);
         return;
       }
     }
@@ -955,9 +803,11 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         b[a] = 1 - e[a];
         b[p] = j & 1;
         b[q] = (j >> 1) & 1;
-        Q[j] = cout[(b[0]) | (b[1] << 1) | (b[2] << 2)][a * X->nk + s];
+        Q[j] = cout[(size_t)((b[0]) | (b[1] << 1) | (b[2] << 2)) * 3 * (size_t)X->nk +
+                    (size_t)(a * X->nk + s)];
       }
       out[a * X->nk + s] = face_join(Q);
     }
   }
+  free(cout);
 }

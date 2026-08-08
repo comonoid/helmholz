@@ -653,11 +653,11 @@ int main(int argc, char **argv) {
         tt += ((k & (1 << c)) ? T.nd[0].hi[c] : T.nd[0].lo[c]) * CX.dir[c];
       if (tt < CX.t_entry) CX.t_entry = tt;
     }
-    hz_pfront_face ci[3 * HZ_PFRONT_MAXK], co[3 * HZ_PFRONT_MAXK];
+    /* Явное обнуление: заполняется цикл ниже лишь до , и доказательства
+     * этого у cppcheck нет — он прав. */
+    hz_pfront_face ci[3 * HZ_PFRONT_MAXK] = {{{0}}}, co[3 * HZ_PFRONT_MAXK] = {{{0}}};
     for (int a = 0; a < 3 * CX.nk; a++) {
-      ci[a].c0 = 1.0;
-      ci[a].cu = 0.0;
-      ci[a].cv = 0.0;
+      hz_pfront_set(&ci[a], 1.0);
     }
     double tmk = now_s();
     hz_pfront_walk(&CX, 0, T.nd[0].lo, T.nd[0].hi, ci, co, list, m.nt, 0, 0);
@@ -751,11 +751,10 @@ int main(int argc, char **argv) {
              (double)cnt[0] / (double)cnt[1], (double)cnt[0] / (double)cnt[2]);
   }
 
-  hz_pfront_face in[3 * HZ_PFRONT_MAXK], out[3 * HZ_PFRONT_MAXK];
+  /* Обнуление явное — по той же причине, что у `ci`/`co` выше. */
+  hz_pfront_face in[3 * HZ_PFRONT_MAXK] = {{{0}}}, out[3 * HZ_PFRONT_MAXK] = {{{0}}};
   for (int a = 0; a < 3 * X.nk; a++) {
-    in[a].c0 = 1.0; /* на входе в сцену диск источника открыт целиком */
-    in[a].cu = 0.0;
-    in[a].cv = 0.0;
+    hz_pfront_set(&in[a], 1.0); /* на входе в сцену диск источника открыт целиком */
   }
   double *refpt = NULL, *refvis = NULL, *refh = NULL;
   if (nref > 0) {
@@ -788,13 +787,15 @@ int main(int argc, char **argv) {
       X.cellslot = malloc((size_t)T.nnd * sizeof *X.cellslot);
       X.capslot = 4000000;
       X.celldep = malloc(64 * (size_t)X.capslot * sizeof *X.celldep);
-      if (X.cellslot != NULL && X.celldep != NULL)
+      X.cellval = malloc(64 * (size_t)X.capslot * sizeof *X.cellval);
+      if (X.cellslot != NULL && X.celldep != NULL && X.cellval != NULL)
         for (int32_t i = 0; i < T.nnd; i++)
           X.cellslot[i] = -1;
       else {
         free(vis);
         free(X.cellslot);
         free(X.celldep);
+        free(X.cellval);
         X.cellslot = NULL;
         X.celldep = NULL;
       }
@@ -1031,6 +1032,26 @@ int main(int argc, char **argv) {
             }
           }
           double f = (X.cellf[nid] >= 0.0f) ? (double)X.cellf[nid] : nofrec;
+          /* КЛЕТКА ПОД ТОЧКОЙ, А НЕ СРЕДНЕЕ ПО ГРАНИ (О76). Состояние — сетка,
+           * и поверхность обязана читать своё место на ней: иначе освещённая
+           * клетка получает усреднённую тень соседей, и вся выгода сетки до
+           * картинки не доходит. */
+          if (X.cellval != NULL && X.cellslot[nid] >= 0) {
+            int a3 = X.celldepax;
+            int p3 = (a3 + 1) % 3, q3v = (a3 + 2) % 3;
+            const hz_ptnode *N3 = &T.nd[nid];
+            double h3p = N3->hi[p3] - N3->lo[p3], h3q = N3->hi[q3v] - N3->lo[q3v];
+            double fa3 = (X.dir[a3] > 0.0) ? N3->lo[a3] : N3->hi[a3];
+            double t3 = (P[a3] - fa3) / X.dir[a3];
+            double up3 = P[p3] - t3 * X.dir[p3], vp3 = P[q3v] - t3 * X.dir[q3v];
+            int gi3 = (int)(8.0 * (up3 - N3->lo[p3]) / h3p);
+            int gj3 = (int)(8.0 * (vp3 - N3->lo[q3v]) / h3q);
+            if (gi3 < 0) gi3 = 0;
+            if (gj3 < 0) gj3 = 0;
+            if (gi3 > 7) gi3 = 7;
+            if (gj3 > 7) gj3 = 7;
+            f = (double)X.cellval[64 * (size_t)X.cellslot[nid] + (size_t)(gj3 * 8 + gi3)];
+          }
           if (X.cellf[nid] < 0.0f) nmiss++;
           /* ЗАСЛОНЕНИЕ ВНУТРИ ЯЧЕЙКИ (§296): спрашиваем свой столбик сетки, есть
            * ли геометрия БЛИЖЕ к источнику, чем мы сами. Дробить ячейку для
@@ -1708,6 +1729,7 @@ int main(int argc, char **argv) {
   free(vis);
   free(X.cellslot);
   free(X.celldep);
+  free(X.cellval);
   free(tlo);
   free(thi);
   free(tpl);

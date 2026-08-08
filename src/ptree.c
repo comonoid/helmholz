@@ -400,6 +400,40 @@ static int pt_selfshadow_node(const hz_objmesh *m, const int32_t *list, int32_t 
   return 0;
 }
 
+/* ЛИСТ ПО РАЗМЕРУ ГЕОМЕТРИИ (§318). Дробить, пока ребро ячейки крупнее местного
+ * среднего треугольника в `HZ_PTREE_TLEAF` раз. Десятка выведена, а не выбрана:
+ * `(1 + t/L)³` при `t/L = 1/10` даёт избыточность `1.33`, то есть ровно предел
+ * «20…40 %», за которым структура теряет смысл (пользователь 08-08). */
+#define HZ_PTREE_TLEAF 10.0
+/* ПРЕДОХРАНИТЕЛЬ: сколько кандидатов терпеть в листе при любом размере. Нужен
+ * потому, что правило по размеру ничего не говорит о ПЛОТНОСТИ: клубок мелких
+ * треугольников в одной ячейке удовлетворит его и оставит там тысячи кусков.
+ * Пятьсот двенадцать — заведомо больше рабочего (сейчас в листе ~27), и
+ * срабатывание считается отдельно. */
+#define HZ_PTREE_CAP 512
+
+int hz_ptree_geo_leaf = 1;
+
+/* Среднее наибольшее ребро треугольника по списку — местный размер геометрии. */
+static double pt_mean_edge(const hz_objmesh *m, const int32_t *list, int32_t n) {
+  if (n <= 0) return 0.0;
+  double s = 0.0;
+  for (int32_t i = 0; i < n; i++) {
+    int32_t t = list[i];
+    double e = 0.0;
+    for (int k = 0; k < 3; k++) {
+      const double *A = m->v + 3 * (size_t)m->f[3 * (size_t)t + (size_t)k];
+      const double *B = m->v + 3 * (size_t)m->f[3 * (size_t)t + (size_t)((k + 1) % 3)];
+      double d2 = 0.0;
+      for (int c = 0; c < 3; c++)
+        d2 += (B[c] - A[c]) * (B[c] - A[c]);
+      if (d2 > e) e = d2;
+    }
+    s += sqrt(e);
+  }
+  return s / (double)n;
+}
+
 /* `1` — компланарность (§294, дорого); `2` — зазор (§295). Умолчание `0`:
  * прежнее поведение до единицы, чтобы числа §271…§293 воспроизводились. */
 int hz_ptree_flat_split = 0;
@@ -413,7 +447,18 @@ static int pt_cut_split(hz_ptree *t, const hz_objmesh *m, int32_t nid, int32_t *
     flat = pt_flat_node(m, list, n, t->nd[nid].lo, t->nd[nid].hi);
   else if (m != NULL && hz_ptree_flat_split == 2)
     flat = !pt_selfshadow_node(m, list, n, t->nd[nid].lo, t->nd[nid].hi);
-  if ((n <= t->leafmax && flat) || lev >= t->maxlev) {
+  int stop;
+  if (hz_ptree_geo_leaf && m != NULL) {
+    double edge = t->nd[nid].hi[0] - t->nd[nid].lo[0];
+    double te = pt_mean_edge(m, list, n);
+    /* Дробим, пока ячейка КРУПНЕЕ местной геометрии в `TLEAF` раз, и пока
+     * кандидатов не слишком много. Одиночный треугольник дробить незачем никогда:
+     * мельче него ячейка ничего не разделит, а избыточность вырастет. */
+    stop = (n <= 1) || !(edge > HZ_PTREE_TLEAF * te) ? (n <= HZ_PTREE_CAP) : 0;
+    if (!(te > 0.0)) stop = 1;
+  } else
+    stop = (n <= t->leafmax && flat);
+  if (stop || lev >= t->maxlev) {
     t->nd[nid].child = -1;
     t->nd[nid].t0 = 0;
     t->nd[nid].ntri = 0;

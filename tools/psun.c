@@ -93,6 +93,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "intol=", 6) == 0) intol = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "silh=", 5) == 0) silh = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "zbuf=", 5) == 0) zbuf = (int)strtol(argv[i] + 5, NULL, 10);
+    if (strncmp(argv[i], "geo=", 4) == 0) hz_ptree_geo_leaf = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "shift=", 6) == 0) hz_pfront_shift = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "ooff=", 5) == 0) ooff = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "nofrec=", 7) == 0) nofrec = strtod(argv[i] + 7, NULL);
@@ -127,6 +128,37 @@ int main(int argc, char **argv) {
   }
   printf("== СЦЕНА %s: треугольников %d, габарит %.2f x %.2f x %.2f м, чтение %.1f с\n", argv[1],
          m.nt, m.hi[0] - m.lo[0], m.hi[1] - m.lo[1], m.hi[2] - m.lo[2], now_s() - t0);
+  /* РАЗМЕР ТРЕУГОЛЬНИКА ПРОТИВ РАЗМЕРА ЛИСТА (§318). Избыточность разбиения
+   * снизу ограничена геометрией: компактный треугольник размера `t` попадает
+   * примерно в `(1 + t/L)³` ячеек ребром `L`. Значит требование по избыточности
+   * ЗАДАЁТ размер листа, а тот — число треугольников в нём. Обе величины надо
+   * знать в метрах, а не в уровнях. */
+  {
+    double sm = 0.0, smx = 0.0;
+    for (int32_t t2 = 0; t2 < m.nt; t2++) {
+      double e = 0.0;
+      for (int i = 0; i < 3; i++) {
+        const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t2 + (size_t)i];
+        const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)t2 + (size_t)((i + 1) % 3)];
+        double d2 = 0.0;
+        for (int c = 0; c < 3; c++)
+          d2 += (B[c] - A[c]) * (B[c] - A[c]);
+        if (d2 > e) e = d2;
+      }
+      e = sqrt(e);
+      sm += e;
+      if (e > smx) smx = e;
+    }
+    double tm = sm / (double)m.nt;
+    double L = m.hi[0] - m.lo[0];
+    printf("== ТРЕУГОЛЬНИК: наибольшее ребро в среднем %.4f м, наибольшее в сцене %.3f м; "
+           "габарит %.2f м\n",
+           tm, smx, L);
+    printf("   лист ребром 10×треугольника (%.3f м) — это уровень %.1f, "
+           "треугольников в листе ~%.0f\n",
+           10.0 * tm, log2(L / (10.0 * tm)), 100.0);
+  }
+
   hz_ptree T;
   t0 = now_s();
   if (hz_ptree_build_cut(&T, &m, leafmax, maxlev, grade) != 0) {
@@ -878,6 +910,23 @@ int main(int argc, char **argv) {
       else
         v2++;
       if (vis[q] > vmax) vmax = vis[q];
+    }
+    /* ДО КАКОЙ ГЛУБИНЫ ДЕРЕВО ВООБЩЕ ЧИТАЕТСЯ (§318). Главное требование к
+     * иерархии — быстрый проход фронта и дешёвая правка при разрушении; оба
+     * зависят не от того, как глубоко дерево ПОСТРОЕНО, а от того, как глубоко
+     * его ЧИТАЮТ. Разница между этими двумя числами и есть чистые потери. */
+    {
+      int64_t vl[16] = {0};
+      for (int32_t q = 0; q < T.nnd; q++)
+        if (vis[q] > 0) {
+          int lv = (int)T.lev[q];
+          if (lv > 15) lv = 15;
+          vl[lv]++;
+        }
+      printf("   ПОСЕЩЕНО ПО УРОВНЯМ:");
+      for (int lv = 0; lv < 16; lv++)
+        if (vl[lv] > 0) printf(" %d:%lld", lv, (long long)vl[lv]);
+      printf("\n");
     }
     printf("== ПОСЕЩЕНИЯ ОБХОДОМ: не посещено %lld узлов (из них листьев %lld, занятых %lld), "
            "один раз %lld, БОЛЕЕ ОДНОГО %lld (наибольшее %lld)\n",

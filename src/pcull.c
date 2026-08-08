@@ -471,7 +471,7 @@ typedef struct {
 
 /* Нарисовать один треугольник в уже закрытый-незакрытый буфер: пишем только в
  * ОТКРЫТЫЕ пиксели, потому что всё, что впереди, уже нарисовано. */
-static void shot_tri(shot_ctx *S, int32_t t) {
+static void shot_tri(shot_ctx *S, int32_t t, int ci0, int ci1, int cj0, int cj1) {
   hz_pcull *C = S->C;
   const hz_objmesh *m = S->m;
   const int SD = C->side;
@@ -492,10 +492,20 @@ static void shot_tri(shot_ctx *S, int32_t t) {
   }
   if (!(xmax > 0.0) || !(ymax > 0.0) || !(xmin < (double)SD) || !(ymin < (double)SD)) return;
   int i0 = (int)floor(xmin), i1 = (int)ceil(xmax), j0 = (int)floor(ymin), j1 = (int)ceil(ymax);
+  /* ОГРАНИЧЕНИЕ ГАБАРИТОМ ЯЧЕЙКИ — НЕ ОПТИМИЗАЦИЯ, А ПРАВИЛЬНОСТЬ. При укладке
+   * резкой (А472) треугольник лежит во ВСЕХ ячейках, которых касается, и каждая
+   * его копия обязана красить только СВОЮ часть кадра; иначе копия из ближней
+   * ячейки затирает пиксели, принадлежащие дальним, и порядок спереди назад
+   * закрепляет неверное. Вместе копии покрывают треугольник ровно один раз. */
+  if (i0 < ci0) i0 = ci0;
+  if (j0 < cj0) j0 = cj0;
+  if (i1 > ci1) i1 = ci1;
+  if (j1 > cj1) j1 = cj1;
   if (i0 < 0) i0 = 0;
   if (j0 < 0) j0 = 0;
   if (i1 > SD) i1 = SD;
   if (j1 > SD) j1 = SD;
+  if (i0 >= i1 || j0 >= j1) return;
   double a2 = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sy[1] - sy[0]) * (sx[2] - sx[0]);
   if (!(a2 > 0.0) && !(a2 < 0.0)) return;
   double sg = (a2 > 0.0) ? 1.0 : -1.0;
@@ -546,6 +556,42 @@ static void shot_tri(shot_ctx *S, int32_t t) {
 }
 
 /* Обход узла: дети в порядке БЛИЖНИЙ-К-ГЛАЗУ ПЕРВЫМ. */
+/* Экранный габарит коробки: все восемь углов. Возврат `0` — коробка не видна
+ * (за глазом либо мимо кадра). */
+static int box_screen(const hz_pcull *C, const double *lo, const double *hi, int *i0, int *i1,
+                      int *j0, int *j1) {
+  double xmin = 1e300, xmax = -1e300, ymin = 1e300, ymax = -1e300;
+  int anyfront = 0;
+  for (int k = 0; k < 8; k++) {
+    double P[3] = {(k & 1) ? hi[0] : lo[0], (k & 2) ? hi[1] : lo[1], (k & 4) ? hi[2] : lo[2]};
+    double px, py, pz;
+    if (!project(C, P, &px, &py, &pz)) continue;
+    anyfront = 1;
+    if (px < xmin) xmin = px;
+    if (px > xmax) xmax = px;
+    if (py < ymin) ymin = py;
+    if (py > ymax) ymax = py;
+  }
+  if (!anyfront) {
+    /* Хоть один угол за глазом — габарит не строится; берём весь кадр, то есть
+     * отказываемся и от остановки, и от ограничения. Осторожно и редко. */
+    *i0 = 0;
+    *j0 = 0;
+    *i1 = C->side;
+    *j1 = C->side;
+    return 1;
+  }
+  *i0 = (int)floor(xmin) - 1;
+  *j0 = (int)floor(ymin) - 1;
+  *i1 = (int)ceil(xmax) + 1;
+  *j1 = (int)ceil(ymax) + 1;
+  if (*i0 < 0) *i0 = 0;
+  if (*j0 < 0) *j0 = 0;
+  if (*i1 > C->side) *i1 = C->side;
+  if (*j1 > C->side) *j1 = C->side;
+  return (*i0 < *i1) && (*j0 < *j1);
+}
+
 static void shot_walk(shot_ctx *S, int32_t nid, const int32_t *list, int32_t n) {
   if (S->nopen <= 0 || n <= 0) return;
   const hz_ptnode *N = &S->T->nd[nid];
@@ -560,10 +606,25 @@ static void shot_walk(shot_ctx *S, int32_t nid, const int32_t *list, int32_t n) 
       if (s < 0.0) return;
     }
   }
+  int ci0, ci1, cj0, cj1;
+  if (!box_screen(S->C, N->lo, N->hi, &ci0, &ci1, &cj0, &cj1)) return;
+  /* ВЕСЬ ГАБАРИТ УЖЕ ЗАКРЫТ — заходить незачем: всё, что впереди, нарисовано.
+   * Это и есть выигрыш порядка, ради которого он затевался. */
+  int anyopen = 0;
+  for (int j = cj0; j < cj1 && !anyopen; j++)
+    for (int i = ci0; i < ci1; i++)
+      if (!S->done[(size_t)j * (size_t)S->C->side + (size_t)i]) {
+        anyopen = 1;
+        break;
+      }
+  if (!anyopen) return;
   S->ncell++;
-  if (N->child < 0) {
+  /* ПРЕДЕЛ СПУСКА: ячейка мельче пикселя дробить незачем — её содержимое всё
+   * равно ляжет в один пиксель. Без этого предела обход шёл до листьев везде и
+   * ставил один треугольник сотни раз (замер §316: 546 млн постановок). */
+  if (N->child < 0 || (ci1 - ci0 <= 1 && cj1 - cj0 <= 1)) {
     for (int32_t i = 0; i < n; i++)
-      shot_tri(S, list[i]);
+      shot_tri(S, list[i], ci0, ci1, cj0, cj1);
     return;
   }
   double mid[3];

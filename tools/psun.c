@@ -136,6 +136,36 @@ int main(int argc, char **argv) {
   }
   printf("== ДЕРЕВО за %.2f с: узлов %d, листьев %lld, глубина %d\n", now_s() - t0, T.nnd,
          (long long)T.nleaf, T.depth);
+  /* ИЗБЫТОЧНОСТЬ ДУБЛИРОВАНИЯ — величина, которую построитель считает, но никто
+   * не печатал (§317, подозрение пользователя 08-08, что дерево строится не так).
+   * `n_leaf_tri` есть сумма кандидатов по листьям, то есть сколько ссылок было бы,
+   * если бы их хранили. Отношение к числу треугольников и говорит, во сколько раз
+   * геометрия размножена по ячейкам. */
+  printf("   КАНДИДАТОВ ПО ЛИСТЬЯМ %lld при %d треугольниках — избыточность %.1f× ; "
+         "узлов на треугольник %.1f; добавлено градуировкой %lld\n",
+         (long long)T.n_leaf_tri, m.nt, (double)T.n_leaf_tri / (double)m.nt,
+         (double)T.nnd / (double)m.nt, (long long)T.ngrade);
+
+  /* ЧЕМ ОСТАНАВЛИВАЕТСЯ ДРОБЛЕНИЕ (§317): числом кандидатов или ПРЕДЕЛОМ ГЛУБИНЫ.
+   * Если вторым — дерево дробится не потому, что надо, а потому, что ему не дали
+   * дробиться дальше, и избыточность есть следствие, а не причина. */
+  {
+    int64_t byl[16] = {0};
+    int64_t leafs = 0;
+    for (int32_t q = 0; q < T.nnd; q++)
+      if (T.nd[q].child < 0) {
+        int lv = (int)T.lev[q];
+        if (lv > 15) lv = 15;
+        byl[lv]++;
+        leafs++;
+      }
+    printf("   ЛИСТЬЯ ПО УРОВНЯМ:");
+    for (int lv = 0; lv < 16; lv++)
+      if (byl[lv] > 0) printf(" %d:%lld", lv, (long long)byl[lv]);
+    printf("\n   на ПРЕДЕЛЕ ГЛУБИНЫ (%d) — %lld из %lld (%.1f %%)\n", T.maxlev,
+           (long long)byl[T.maxlev < 16 ? T.maxlev : 15], (long long)leafs,
+           leafs > 0 ? 100.0 * (double)byl[T.maxlev < 16 ? T.maxlev : 15] / (double)leafs : 0.0);
+  }
 
   double *tlo = malloc(3 * (size_t)m.nt * sizeof *tlo);
   double *thi = malloc(3 * (size_t)m.nt * sizeof *thi);

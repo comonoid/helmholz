@@ -898,6 +898,14 @@ int main(int argc, char **argv) {
   printf("   ВРЕМЯ %.2f с, на ячейку %.1f нс\n", secs,
          X.ncell > 0 ? 1e9 * secs / (double)X.ncell : 0.0);
 
+  {
+    printf("== КАНДИДАТОВ У ФРОНТА ПО УРОВНЯМ (узлов / кандидатов / в среднем):\n");
+    for (int lv = 0; lv < 16; lv++)
+      if (X.nodelev[lv] > 0)
+        printf("   ур.%2d  узлов %8lld  кандидатов %12lld  в среднем %8.1f\n", lv,
+               (long long)X.nodelev[lv], (long long)X.candlev[lv],
+               (double)X.candlev[lv] / (double)X.nodelev[lv]);
+  }
   if (vis != NULL) {
     int64_t v0 = 0, v1 = 0, v2 = 0, vmax = 0, v0leaf = 0, v0occ = 0;
     for (int32_t q = 0; q < T.nnd; q++) {

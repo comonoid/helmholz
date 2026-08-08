@@ -331,6 +331,12 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
                     int coarsened, int extra) {
   const hz_ptnode *N = &X->T->nd[nid];
   if (X->visit != NULL) X->visit[nid]++;
+  {
+    int lv = (int)X->T->lev[nid];
+    if (lv > 15) lv = 15;
+    X->candlev[lv] += n;
+    X->nodelev[lv]++;
+  }
   /* ПОМЕТКА НЕСЁТ ЧИСЛО СТУПЕНЕЙ ПОСЛАБЛЕНИЯ, А НЕ ПРЕДЕЛЬНЫЙ УРОВЕНЬ. Сперва
    * было наоборот, и скан вышел обратный: чем грубее просили, тем БОЛЬШЕ выходило
    * ячеек, а при шести ступенях пометка не срабатывала вовсе. Причина в том, что

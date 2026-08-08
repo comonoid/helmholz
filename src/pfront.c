@@ -135,7 +135,6 @@ static hz_pfront_face face_block(const hz_pfront_face *F, uint64_t mask) {
  * становится одной инструкцией. Шаг сетки `1/8` грани — та же величина, что
  * `HZ_PFRONT_FRAC_TOL`, умноженная на `64`; мельче даёт `16x16` в четырёх
  * словах, и это следующая ступень скана, а не переделка. */
-#define HZ_PFRONT_COVN 8
 
 /* Маска проекции треугольника на грань `a`. Возврат `0`, если проекции нет. */
 static uint64_t tri_mask(const double *A, const double *B, const double *C, const double *lo,
@@ -618,8 +617,8 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
       int p2, q2;
       face_axes(a, &p2, &q2);
       double fa = (X->dir[a] > 0.0) ? lo[a] : hi[a]; /* ВХОДНАЯ грань */
-      float *dep = X->celldep + 64 * (size_t)X->nslot;
-      for (int k = 0; k < 64; k++)
+      float *dep = X->celldep + HZ_PFRONT_NCELL * (size_t)X->nslot;
+      for (int k = 0; k < HZ_PFRONT_NCELL; k++)
         dep[k] = INFINITY;
       double du = hi[p2] - lo[p2], dv = hi[q2] - lo[q2];
       for (int32_t i = 0; i < n; i++) {
@@ -643,11 +642,11 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
           while ((lsb >> b) != 1)
             b++;
           mk &= mk - 1;
-          int gi = b % 8, gj = b / 8;
+          int gi = b % HZ_PFRONT_COVN, gj = b / HZ_PFRONT_COVN;
           double X0[3];
           X0[a] = fa;
-          X0[p2] = lo[p2] + du * ((double)gi + 0.5) / 8.0;
-          X0[q2] = lo[q2] + dv * ((double)gj + 0.5) / 8.0;
+          X0[p2] = lo[p2] + du * ((double)gi + 0.5) / (double)HZ_PFRONT_COVN;
+          X0[q2] = lo[q2] + dv * ((double)gj + 0.5) / (double)HZ_PFRONT_COVN;
           double num = dpl - (nw[0] * X0[0] + nw[1] * X0[1] + nw[2] * X0[2]);
           double tt = num / nd;
           if (tt > 0.0 && (float)tt < dep[b]) dep[b] = (float)tt;
@@ -656,7 +655,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
       /* Заодно кладётся и само состояние входящей грани — картинка читает
        * КЛЕТКУ под точкой, а не среднее по грани. */
       if (X->cellval != NULL) {
-        float *cv2 = X->cellval + 64 * (size_t)X->nslot;
+        float *cv2 = X->cellval + HZ_PFRONT_NCELL * (size_t)X->nslot;
         for (int k = 0; k < HZ_PFRONT_NCELL; k++)
           cv2[k] = in[a * X->nk].g[k];
       }

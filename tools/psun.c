@@ -786,8 +786,8 @@ int main(int argc, char **argv) {
     if (indep) {
       X.cellslot = malloc((size_t)T.nnd * sizeof *X.cellslot);
       X.capslot = 4000000;
-      X.celldep = malloc(64 * (size_t)X.capslot * sizeof *X.celldep);
-      X.cellval = malloc(64 * (size_t)X.capslot * sizeof *X.cellval);
+      X.celldep = malloc(HZ_PFRONT_NCELL * (size_t)X.capslot * sizeof *X.celldep);
+      X.cellval = malloc(HZ_PFRONT_NCELL * (size_t)X.capslot * sizeof *X.cellval);
       if (X.cellslot != NULL && X.celldep != NULL && X.cellval != NULL)
         for (int32_t i = 0; i < T.nnd; i++)
           X.cellslot[i] = -1;
@@ -1044,13 +1044,14 @@ int main(int argc, char **argv) {
             double fa3 = (X.dir[a3] > 0.0) ? N3->lo[a3] : N3->hi[a3];
             double t3 = (P[a3] - fa3) / X.dir[a3];
             double up3 = P[p3] - t3 * X.dir[p3], vp3 = P[q3v] - t3 * X.dir[q3v];
-            int gi3 = (int)(8.0 * (up3 - N3->lo[p3]) / h3p);
-            int gj3 = (int)(8.0 * (vp3 - N3->lo[q3v]) / h3q);
+            int gi3 = (int)((double)HZ_PFRONT_COVN * (up3 - N3->lo[p3]) / h3p);
+            int gj3 = (int)((double)HZ_PFRONT_COVN * (vp3 - N3->lo[q3v]) / h3q);
             if (gi3 < 0) gi3 = 0;
             if (gj3 < 0) gj3 = 0;
-            if (gi3 > 7) gi3 = 7;
-            if (gj3 > 7) gj3 = 7;
-            f = (double)X.cellval[64 * (size_t)X.cellslot[nid] + (size_t)(gj3 * 8 + gi3)];
+            if (gi3 > HZ_PFRONT_COVN - 1) gi3 = HZ_PFRONT_COVN - 1;
+            if (gj3 > HZ_PFRONT_COVN - 1) gj3 = HZ_PFRONT_COVN - 1;
+            f = (double)X.cellval[HZ_PFRONT_NCELL * (size_t)X.cellslot[nid] +
+                                  (size_t)(gj3 * HZ_PFRONT_COVN + gi3)];
           }
           if (X.cellf[nid] < 0.0f) nmiss++;
           /* ЗАСЛОНЕНИЕ ВНУТРИ ЯЧЕЙКИ (§296): спрашиваем свой столбик сетки, есть
@@ -1065,13 +1066,14 @@ int main(int argc, char **argv) {
             /* Своя глубина: путь от входной грани до точки вдоль света. */
             double tp = (P[a2] - fa) / X.dir[a2];
             double up = P[p2] - tp * X.dir[p2], vp = P[q2] - tp * X.dir[q2];
-            int gi = (int)(8.0 * (up - NN->lo[p2]) / du2);
-            int gj = (int)(8.0 * (vp - NN->lo[q2]) / dv2);
+            int gi = (int)((double)HZ_PFRONT_COVN * (up - NN->lo[p2]) / du2);
+            int gj = (int)((double)HZ_PFRONT_COVN * (vp - NN->lo[q2]) / dv2);
             if (gi < 0) gi = 0;
             if (gj < 0) gj = 0;
-            if (gi > 7) gi = 7;
-            if (gj > 7) gj = 7;
-            double dq = (double)X.celldep[64 * (size_t)X.cellslot[nid] + (size_t)(gj * 8 + gi)];
+            if (gi > HZ_PFRONT_COVN - 1) gi = HZ_PFRONT_COVN - 1;
+            if (gj > HZ_PFRONT_COVN - 1) gj = HZ_PFRONT_COVN - 1;
+            double dq = (double)X.celldep[HZ_PFRONT_NCELL * (size_t)X.cellslot[nid] +
+                                          (size_t)(gj * HZ_PFRONT_COVN + gi)];
             /* Допуск — ширина столбика: собственная поверхность точки внутри
              * столбика имеет разброс глубины того же порядка, и без допуска она
              * заслоняла бы сама себя. */
@@ -1437,8 +1439,31 @@ int main(int argc, char **argv) {
                    * одна ячейка, а затухание НАКАПЛИВАЕТСЯ. Печатаются первые
                    * ячейки от точки назад к источнику вместе с их долей. */
                   if (nprof < 10) {
-                    printf("        %5.3f м назад: ур.%2d ребро %.4f занята=%d  f=%.4f\n", back,
-                           lv2, T.nd[q3].hi[0] - T.nd[q3].lo[0], (int)occ[q3], fq);
+                    /* КЛЕТКА СЕТКИ, через которую идёт луч, — та же величина,
+                     * что читает картинка. Среднее по грани здесь обманывает:
+                     * грань может быть тёмной в среднем и светлой в нужной
+                     * клетке (О76). */
+                    double fcell = -1.0;
+                    if (X.cellval != NULL && X.cellslot[q3] >= 0) {
+                      int a4 = X.celldepax;
+                      int p4 = (a4 + 1) % 3, q4 = (a4 + 2) % 3;
+                      const hz_ptnode *N4 = &T.nd[q3];
+                      double h4p = N4->hi[p4] - N4->lo[p4], h4q = N4->hi[q4] - N4->lo[q4];
+                      double fa4 = (X.dir[a4] > 0.0) ? N4->lo[a4] : N4->hi[a4];
+                      double t4 = (Q2[a4] - fa4) / X.dir[a4];
+                      double u4 = Q2[p4] - t4 * X.dir[p4], v4 = Q2[q4] - t4 * X.dir[q4];
+                      int gi4 = (int)((double)HZ_PFRONT_COVN * (u4 - N4->lo[p4]) / h4p);
+                      int gj4 = (int)((double)HZ_PFRONT_COVN * (v4 - N4->lo[q4]) / h4q);
+                      if (gi4 < 0) gi4 = 0;
+                      if (gj4 < 0) gj4 = 0;
+                      if (gi4 > HZ_PFRONT_COVN - 1) gi4 = HZ_PFRONT_COVN - 1;
+                      if (gj4 > HZ_PFRONT_COVN - 1) gj4 = HZ_PFRONT_COVN - 1;
+                      fcell = (double)X.cellval[HZ_PFRONT_NCELL * (size_t)X.cellslot[q3] +
+                                                (size_t)(gj4 * HZ_PFRONT_COVN + gi4)];
+                    }
+                    printf("        %5.3f м назад: ур.%2d ребро %.4f занята=%d  среднее=%.4f  "
+                           "КЛЕТКА=%.4f\n",
+                           back, lv2, T.nd[q3].hi[0] - T.nd[q3].lo[0], (int)occ[q3], fq, fcell);
                     nprof++;
                   } else
                     break;

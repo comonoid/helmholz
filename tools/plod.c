@@ -895,11 +895,16 @@ int main(int argc, char **argv) {
     int64_t *nbv = malloc((size_t)L.nlev * sizeof *nbv);
     int64_t *nbvs = malloc((size_t)L.nlev * sizeof *nbvs);
     int64_t *nloop = malloc((size_t)L.nlev * sizeof *nloop);
-    if (lcut != NULL && nbv != NULL && nbvs != NULL && nloop != NULL) {
+    int64_t *nouter = malloc((size_t)L.nlev * sizeof *nouter);
+    int64_t *nhole = malloc((size_t)L.nlev * sizeof *nhole);
+    if (lcut != NULL && nbv != NULL && nbvs != NULL && nloop != NULL && nouter != NULL &&
+        nhole != NULL) {
       for (int lev = 0; lev < L.nlev; lev++) {
         nbv[lev] = 0;
         nbvs[lev] = 0;
         nloop[lev] = 0;
+        nouter[lev] = 0;
+        nhole[lev] = 0;
         for (int32_t k = 0; k < L.np; k++)
           lcut[k] = L.lab[(size_t)lev * (size_t)L.np + (size_t)k];
         hz_pseglist so;
@@ -920,8 +925,29 @@ int main(int argc, char **argv) {
            * менее трёх вершин при любом допуске. Значит `V ≥ 3 · (число
            * НЕСВЯЗНЫХ кусков)`, и если лестница число кусков не сокращает, а
            * лишь переклеивает на них ярлык группы, край упрётся в этот пол. */
-          for (int32_t q = 0; q < pc.np; q++)
-            nloop[lev] += pc.p[q].nloop;
+          /* ВНЕШНИЙ КОНТУР ОТДЕЛЬНО ОТ ДЫРКИ (§326). Петля есть граничный ЦИКЛ,
+           * и это ЛИБО внешний обвод куска, ЛИБО дырка в нём; §324 назвал петли
+           * «несвязными кусками» и ошибся — на нулевом уровне зала их `3` на
+           * элемент, где элемент связен по построению. Различает ЗНАК площади в
+           * местной раме: у внешнего обвода и у дырки обходы противоположны.
+           * Число внешних обводов и есть число СВЯЗНЫХ КУСКОВ элемента. */
+          for (int32_t q = 0; q < pc.np; q++) {
+            const hz_poly *P = &pc.p[q];
+            nloop[lev] += P->nloop;
+            for (int32_t l = 0; l < P->nloop; l++) {
+              int32_t a = pc.loop[P->l0 + l], b = pc.loop[P->l0 + l + 1];
+              double s2 = 0.0;
+              for (int32_t v = a; v < b; v++) {
+                int32_t w = (v + 1 < b) ? v + 1 : a;
+                s2 += pc.bv[2 * (size_t)v] * pc.bv[2 * (size_t)w + 1] -
+                      pc.bv[2 * (size_t)w] * pc.bv[2 * (size_t)v + 1];
+              }
+              if (s2 > 0.0)
+                nouter[lev]++;
+              else if (s2 < 0.0)
+                nhole[lev]++;
+            }
+          }
           hz_edgestat es;
           if (hz_edge_simplify(&pc, L.delta0 * pow(ladb, lev), HZ_EDGE_SHARED, &es) == 0)
             nbvs[lev] = es.nbv_out;
@@ -950,9 +976,15 @@ int main(int argc, char **argv) {
         printf("\n");
       }
       if (nloop[0] > 0) {
-        printf("      ПЕТЕЛЬ края (несвязных кусков) всего:");
+        printf("      ПЕТЕЛЬ края (граничных циклов) всего:");
         for (int lev = 0; lev < L.nlev; lev++)
           printf(" %lld", (long long)nloop[lev]);
+        printf("\n      из них ВНЕШНИХ ОБВОДОВ (= СВЯЗНЫХ КУСКОВ):");
+        for (int lev = 0; lev < L.nlev; lev++)
+          printf(" %lld", (long long)nouter[lev]);
+        printf("\n      СВЯЗНЫХ КУСКОВ НА ЭЛЕМЕНТ:");
+        for (int lev = 0; lev < L.nlev; lev++)
+          printf(" %.1f", (double)nouter[lev] / (double)(ncnt[lev] ? ncnt[lev] : 1));
         printf("\n      петель НА ЭЛЕМЕНТ:");
         for (int lev = 0; lev < L.nlev; lev++)
           printf(" %.0f", (double)nloop[lev] / (double)(ncnt[lev] ? ncnt[lev] : 1));
@@ -963,6 +995,8 @@ int main(int argc, char **argv) {
       }
     }
     free(nloop);
+    free(nouter);
+    free(nhole);
     for (int step = 1; step <= 3; step++) {
       double sum = 0.0, sump = 0.0, sumv = 0.0, sumvs = 0.0;
       int nkeep = 0;

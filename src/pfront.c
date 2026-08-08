@@ -314,10 +314,95 @@ static hz_pfront_face mask_face(uint64_t mk) {
  * в ячейке хоть какое-то перекрытие. */
 int hz_pfront_cover_sum = 0; /* 1 — перекрытие СУММОЙ (верхняя оценка); опыт §274 */
 
+/* ПОЛНЫЙ ПЕРЕНОС ЧЕРЕЗ ЯЧЕЙКУ (§310, `shift = 2`).
+ *
+ * §308 намерил, что состояние НЕ СОХРАНЯЕТСЯ в пустоте при косом направлении, а
+ * §309 — что снос ВНУТРИ грани делает хуже, потому что при большом сносе луч
+ * покидает ячейку через БОКОВУЮ грань, и это в модели не выражено вовсе.
+ *
+ * Здесь выражено. Для каждой точки ИСХОДЯЩЕЙ грани луч прослеживается НАЗАД до
+ * первой встреченной ВХОДЯЩЕЙ грани — какой бы из трёх она ни оказалась, — и
+ * оттуда берётся значение. Поле на исходящей грани выходит кусочно-линейным
+ * (кусков столько, сколько входящих граней участвует), а состояние линейно
+ * (Р1), поэтому берётся его L²-проекция: моменты по сетке `8×8`, той же, что у
+ * маски перекрытия.
+ *
+ * ЭТО ПОЛНЫЙ ОПЕРАТОР, А НЕ ПОЛОВИНА: уход вбок не обрезается, он попадает на
+ * ту грань, которой принадлежит. Приближение осталось одно и оно названо —
+ * проекция кусочно-линейного на линейное, то есть цена самого представления Р1.
+ */
+static void face_transport(const hz_pfront_face *in, hz_pfront_face *out, const double *lo,
+                           const double *hi, const double *dir) {
+  for (int a = 0; a < 3; a++) {
+    int p, q;
+    face_axes(a, &p, &q);
+    double fa = (dir[a] > 0.0) ? hi[a] : lo[a]; /* ИСХОДЯЩАЯ грань по оси a */
+    double hp = hi[p] - lo[p], hq = hi[q] - lo[q];
+    if (!(hp > 0.0) || !(hq > 0.0)) {
+      out[a] = in[a];
+      continue;
+    }
+    double s0 = 0.0, su = 0.0, sv = 0.0;
+    int nn = 0;
+    for (int j = 0; j < HZ_PFRONT_COVN; j++)
+      for (int i = 0; i < HZ_PFRONT_COVN; i++) {
+        double u = 2.0 * ((double)i + 0.5) / (double)HZ_PFRONT_COVN - 1.0;
+        double v = 2.0 * ((double)j + 0.5) / (double)HZ_PFRONT_COVN - 1.0;
+        double P[3];
+        P[a] = fa;
+        P[p] = 0.5 * (lo[p] + hi[p]) + 0.5 * u * hp;
+        P[q] = 0.5 * (lo[q] + hi[q]) + 0.5 * v * hq;
+        /* Назад по лучу до ПЕРВОЙ входящей грани: наименьшее положительное `t`. */
+        double tb = 1e300;
+        int bax = a;
+        for (int c = 0; c < 3; c++) {
+          double dc = dir[c];
+          if (dc > -1e-300 && dc < 1e-300) continue;
+          double pin = (dc > 0.0) ? lo[c] : hi[c]; /* ВХОДЯЩАЯ грань по оси c */
+          double t = (P[c] - pin) / dc;
+          if (t > 1e-12 && t < tb) {
+            tb = t;
+            bax = c;
+          }
+        }
+        if (!(tb < 1e299)) tb = 0.0;
+        double Q[3];
+        for (int c = 0; c < 3; c++)
+          Q[c] = P[c] - tb * dir[c];
+        int bp, bq;
+        face_axes(bax, &bp, &bq);
+        double hbp = hi[bp] - lo[bp], hbq = hi[bq] - lo[bq];
+        double uu = (hbp > 0.0) ? (2.0 * (Q[bp] - lo[bp]) / hbp - 1.0) : 0.0;
+        double vv = (hbq > 0.0) ? (2.0 * (Q[bq] - lo[bq]) / hbq - 1.0) : 0.0;
+        if (uu < -1.0) uu = -1.0;
+        if (uu > 1.0) uu = 1.0;
+        if (vv < -1.0) vv = -1.0;
+        if (vv > 1.0) vv = 1.0;
+        double val = hz_pfront_at(&in[bax], uu, vv);
+        s0 += val;
+        su += val * u;
+        sv += val * v;
+        nn++;
+      }
+    if (nn > 0) {
+      out[a].c0 = s0 / (double)nn;
+      out[a].cu = 3.0 * su / (double)nn;
+      out[a].cv = 3.0 * sv / (double)nn;
+      if (out[a].c0 < 0.0) out[a].c0 = 0.0;
+    } else
+      out[a] = in[a];
+  }
+}
+
 int hz_pfront_shade(const hz_pfront_face *in, hz_pfront_face *out, const hz_objmesh *m,
                     const int32_t *list, int32_t n, const double *lo, const double *hi,
                     const double *dir) {
   int any = 0;
+  hz_pfront_face tr[3];
+  if (hz_pfront_shift == 2) {
+    face_transport(in, tr, lo, hi, dir);
+    in = tr; /* дальше перекрытие накладывается на ПЕРЕНЕСЁННОЕ состояние */
+  }
   for (int a = 0; a < 3; a++) {
     /* КОНСЕРВАТИВНО (А517): берётся ОДИН кусок — с наибольшей проекцией, — а не
      * сумма по всем. Сумма объявила бы закрытым угол, который открыт (проекции

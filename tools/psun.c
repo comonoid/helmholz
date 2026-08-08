@@ -62,7 +62,7 @@ int main(int argc, char **argv) {
    * Прежние числа §271…§295 воспроизводятся ключами `cover=0 indep=0 silh=0`. */
   int indep = 1, intol = 128, silh = 1;
   double ooff = 1e-5, nofrec = 0.0;
-  int coverset = 0, shiftset = 0;
+  int coverset = 0, shiftset = 0, zbuf = 1;
   /* УГЛОВОЙ РАДИУС ИСТОЧНИКА — ПАРАМЕТР, А НЕ КОНСТАНТА (замечание пользователя
    * 08-07). Он был зашит числом солнца в ДВУХ местах — у фронта и у эталона, — и
    * потому «протяжённый источник» из §275 означал лишь `K` выборок ТОГО ЖЕ
@@ -92,6 +92,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "indep=", 6) == 0) indep = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "intol=", 6) == 0) intol = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "silh=", 5) == 0) silh = (int)strtol(argv[i] + 5, NULL, 10);
+    if (strncmp(argv[i], "zbuf=", 5) == 0) zbuf = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "shift=", 6) == 0) hz_pfront_shift = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "ooff=", 5) == 0) ooff = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "nofrec=", 7) == 0) nofrec = strtod(argv[i] + 7, NULL);
@@ -961,7 +962,23 @@ int main(int argc, char **argv) {
       double upv[3] = HZ_CFG_UP;
       hz_pcull C2;
       if (hz_pcull_init(&C2, camo, camat, upv, HZ_CFG_FOV_DEG, bufside, sqrt(diag)) == 0) {
-        hz_pcull_shot(&C2, &m, zb, ib);
+        /* РИСОВАНИЕ СПЕРЕДИ НАЗАД ПО ДЕРЕВУ (§316) вместо z-буфера: пиксель,
+         * однажды закрытый, больше не трогается, и когда закрыты все — обход
+         * прекращается. Ключ `zbuf=1` возвращает прежний перебор ВСЕХ
+         * треугольников — он же негативный контроль: картинки обязаны совпасть
+         * ПОБИТОВО, иначе порядок обхода неверен. */
+        int64_t sh_tri = 0, sh_cell = 0;
+        double tsh = now_s();
+        memcpy(C2.fr, X.fr, sizeof C2.fr);
+        C2.usefr = 1;
+        if (zbuf)
+          hz_pcull_shot(&C2, &m, zb, ib);
+        else
+          hz_pcull_shot_tree(&C2, &m, &T, tlo, thi, zb, ib, &sh_tri, &sh_cell);
+        printf("== РИСОВАНИЕ %s за %.2f с: треугольников поставлено %lld, ячеек обойдено %lld "
+               "(всего в сцене %d)\n",
+               zbuf ? "z-БУФЕРОМ (перебор всех)" : "СПЕРЕДИ НАЗАД по дереву", now_s() - tsh,
+               (long long)sh_tri, (long long)sh_cell, m.nt);
         int64_t nsky = 0, nlit2 = 0, nsh2 = 0, nback = 0, nmiss = 0;
         int pathshown = 0;
         double sum = 0.0;

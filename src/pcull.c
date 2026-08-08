@@ -454,3 +454,181 @@ void hz_pcull_shot(hz_pcull *C, const hz_objmesh *m, float *z, int32_t *id) {
       }
   }
 }
+
+/* --- РИСОВАНИЕ ПО ДЕРЕВУ, СПЕРЕДИ НАЗАД (§316) ------------------------------ */
+
+typedef struct {
+  hz_pcull *C;
+  const hz_objmesh *m;
+  const hz_ptree *T;
+  const double *tlo, *thi;
+  float *z;
+  int32_t *id;
+  unsigned char *done; /* закрыт ли пиксель — один байт вместо глубины */
+  int64_t nopen;       /* сколько пикселей ещё открыто: ранний выход */
+  int64_t ntri, ncell;
+} shot_ctx;
+
+/* Нарисовать один треугольник в уже закрытый-незакрытый буфер: пишем только в
+ * ОТКРЫТЫЕ пиксели, потому что всё, что впереди, уже нарисовано. */
+static void shot_tri(shot_ctx *S, int32_t t) {
+  hz_pcull *C = S->C;
+  const hz_objmesh *m = S->m;
+  const int SD = C->side;
+  const double *V[3];
+  for (int i = 0; i < 3; i++)
+    V[i] = m->v + 3 * (size_t)m->f[3 * (size_t)t + (size_t)i];
+  double sx[3], sy[3], sz[3];
+  for (int i = 0; i < 3; i++)
+    if (!project(C, V[i], &sx[i], &sy[i], &sz[i])) return;
+  double xmin = sx[0], xmax = sx[0], ymin = sy[0], ymax = sy[0];
+  for (int i = 1; i < 3; i++) {
+    if (sx[i] < xmin) xmin = sx[i];
+    if (sx[i] > xmax) xmax = sx[i];
+    if (sy[i] < ymin) ymin = sy[i];
+    if (sy[i] > ymax) ymax = sy[i];
+  }
+  if (!(xmax > 0.0) || !(ymax > 0.0) || !(xmin < (double)SD) || !(ymin < (double)SD)) return;
+  int i0 = (int)floor(xmin), i1 = (int)ceil(xmax), j0 = (int)floor(ymin), j1 = (int)ceil(ymax);
+  if (i0 < 0) i0 = 0;
+  if (j0 < 0) j0 = 0;
+  if (i1 > SD) i1 = SD;
+  if (j1 > SD) j1 = SD;
+  double a2 = (sx[1] - sx[0]) * (sy[2] - sy[0]) - (sy[1] - sy[0]) * (sx[2] - sx[0]);
+  if (!(a2 > 0.0) && !(a2 < 0.0)) return;
+  double sg = (a2 > 0.0) ? 1.0 : -1.0;
+  double e1[3], e2[3], nw[3];
+  for (int c = 0; c < 3; c++) {
+    e1[c] = V[1][c] - V[0][c];
+    e2[c] = V[2][c] - V[0][c];
+  }
+  nw[0] = e1[1] * e2[2] - e1[2] * e2[1];
+  nw[1] = e1[2] * e2[0] - e1[0] * e2[2];
+  nw[2] = e1[0] * e2[1] - e1[1] * e2[0];
+  double num = 0.0;
+  for (int c = 0; c < 3; c++)
+    num += nw[c] * (V[0][c] - C->eye[c]);
+  if (num < 0.0) {
+    num = -num;
+    for (int c = 0; c < 3; c++)
+      nw[c] = -nw[c];
+  }
+  if (!(num > 0.0)) return;
+  double nr = 0.0, nu = 0.0, nf = 0.0;
+  for (int c = 0; c < 3; c++) {
+    nr += nw[c] * C->rt[c];
+    nu += nw[c] * C->up[c];
+    nf += nw[c] * C->fw[c];
+  }
+  S->ntri++;
+  for (int j = j0; j < j1; j++)
+    for (int i = i0; i < i1; i++) {
+      size_t p = (size_t)j * (size_t)SD + (size_t)i;
+      if (S->done[p]) continue; /* впереди уже нарисовано — это и есть порядок */
+      double cx = (double)i + 0.5, cy = (double)j + 0.5;
+      int in = 1;
+      for (int k = 0; k < 3 && in; k++) {
+        int k2 = (k + 1) % 3;
+        double ex = sx[k2] - sx[k], ey = sy[k2] - sy[k];
+        double ev = (cx - sx[k]) * ey - (cy - sy[k]) * ex;
+        if (!(sg * ev < 0.0)) in = 0;
+      }
+      if (!in) continue;
+      double zz;
+      if (!plane_z(C, cx, cy, num, nr, nu, nf, &zz)) continue;
+      S->z[p] = (float)zz;
+      S->id[p] = t;
+      S->done[p] = 1;
+      S->nopen--;
+    }
+}
+
+/* Обход узла: дети в порядке БЛИЖНИЙ-К-ГЛАЗУ ПЕРВЫМ. */
+static void shot_walk(shot_ctx *S, int32_t nid, const int32_t *list, int32_t n) {
+  if (S->nopen <= 0 || n <= 0) return;
+  const hz_ptnode *N = &S->T->nd[nid];
+  /* Ячейка целиком вне кадра — пропускается; это не отсечение света, а лишь
+   * рисование, и вне кадра рисовать нечего. */
+  if (S->C->usefr) {
+    for (int k = 0; k < 6; k++) {
+      const double *P = S->C->fr[k];
+      double s = P[3];
+      for (int c = 0; c < 3; c++)
+        s += (P[c] > 0.0 ? N->hi[c] : N->lo[c]) * P[c];
+      if (s < 0.0) return;
+    }
+  }
+  S->ncell++;
+  if (N->child < 0) {
+    for (int32_t i = 0; i < n; i++)
+      shot_tri(S, list[i]);
+    return;
+  }
+  double mid[3];
+  for (int c = 0; c < 3; c++)
+    mid[c] = 0.5 * (N->lo[c] + N->hi[c]);
+  /* Ближний октант задаётся положением ГЛАЗА относительно середины: это и есть
+   * «порядок октантов от источника» (§241.7), только источник здесь — камера. */
+  int e[3];
+  for (int c = 0; c < 3; c++)
+    e[c] = (S->C->eye[c] >= mid[c]) ? 1 : 0;
+  int32_t *sub = malloc(((size_t)n + 1) * sizeof *sub);
+  if (sub == NULL) return;
+  for (int far = 0; far <= 3 && S->nopen > 0; far++)
+    for (int k = 0; k < 8 && S->nopen > 0; k++) {
+      int b[3], nf = 0;
+      for (int c = 0; c < 3; c++) {
+        b[c] = (k >> c) & 1;
+        if (b[c] != e[c]) nf++;
+      }
+      if (nf != far) continue;
+      int32_t ch = N->child + k;
+      const hz_ptnode *Cn = &S->T->nd[ch];
+      int32_t ns = 0;
+      for (int32_t i = 0; i < n; i++) {
+        const double *bl = S->tlo + 3 * (size_t)list[i], *bh = S->thi + 3 * (size_t)list[i];
+        int hit = 1;
+        for (int c = 0; c < 3 && hit; c++)
+          if (!(bl[c] < Cn->hi[c]) || !(bh[c] >= Cn->lo[c])) hit = 0;
+        if (hit) sub[ns++] = list[i];
+      }
+      shot_walk(S, ch, sub, ns);
+    }
+  free(sub);
+}
+
+void hz_pcull_shot_tree(hz_pcull *C, const hz_objmesh *m, const hz_ptree *T, const double *tlo,
+                        const double *thi, float *z, int32_t *id, int64_t *ntri_done,
+                        int64_t *ncell_done) {
+  const int SD = C->side;
+  size_t np = (size_t)SD * (size_t)SD;
+  unsigned char *done = calloc(np, 1);
+  int32_t *list = malloc((size_t)m->nt * sizeof *list);
+  if (done == NULL || list == NULL) {
+    free(done);
+    free(list);
+    return;
+  }
+  for (size_t p = 0; p < np; p++) {
+    z[p] = INFINITY;
+    id[p] = -1;
+  }
+  for (int32_t t = 0; t < m->nt; t++)
+    list[t] = t;
+  shot_ctx S;
+  memset(&S, 0, sizeof S);
+  S.C = C;
+  S.m = m;
+  S.T = T;
+  S.tlo = tlo;
+  S.thi = thi;
+  S.z = z;
+  S.id = id;
+  S.done = done;
+  S.nopen = (int64_t)np;
+  shot_walk(&S, 0, list, m->nt);
+  if (ntri_done != NULL) *ntri_done = S.ntri;
+  if (ncell_done != NULL) *ncell_done = S.ncell;
+  free(done);
+  free(list);
+}

@@ -328,11 +328,20 @@ static int box_hits3(const double *bl, const double *bh, const double *clo, cons
 
 void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const double *hi,
                     const hz_pfront_face *in, hz_pfront_face *out, const int32_t *list, int32_t n,
-                    int coarsened, int extra) {
-  const hz_ptnode *N = &X->T->nd[nid];
-  if (X->visit != NULL) X->visit[nid]++;
+                    int coarsened, int extra, int lev) {
+  /* ВИРТУАЛЬНАЯ ЯЧЕЙКА (§338): узла нет, глубина ленивого спуска есть `-nid-1`.
+   * Всё, что живёт МАССИВОМ ПО УЗЛУ (посещения, пометки, занятость, глубина
+   * поддерева, слот записи), у неё отсутствует по построению — и это не
+   * умолчание, а решение: узел заводить незачем, значит и хранить в нём нечего.
+   * Занятость виртуальной ячейки берётся из СПИСКА (`n > 0`), а не из массива:
+   * список уже отфильтрован коробкой, и другого источника у неё нет. */
+  const int isvirt = (nid < 0);
+  const int vdep = isvirt ? (-nid - 1) : 0;
+  const hz_ptnode *N = isvirt ? NULL : &X->T->nd[nid];
+  if (isvirt) X->nvirt++;
+  if (!isvirt && X->visit != NULL) X->visit[nid]++;
   {
-    int lv = (int)X->T->lev[nid];
+    int lv = lev;
     if (lv > 15) lv = 15;
     X->candlev[lv] += n;
     X->nodelev[lv]++;
@@ -345,7 +354,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
    * впитывается либо согласно LOD, либо на столько-то ступеней грубее. */
   /* Предел уровня, унаследованный сверху либо поставленный здесь. `-1` — нет. */
   int save_on = X->markon;
-  if (X->mark != NULL && X->mark[nid] != 255) X->markon = 1;
+  if (!isvirt && X->mark != NULL && X->mark[nid] != 255) X->markon = 1;
   int stop = 0, why = 0, refined = 0;
   /* ПИРАМИДА КАМЕРЫ. Ячейка целиком снаружи хотя бы одной плоскости — невидима
    * камере, и её собственная подробность этому проходу не нужна. Берётся целиком
@@ -388,10 +397,17 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
    * пустого — тождество, и спускаться незачем: линейное состояние проходит
    * сквозь пустоту ТОЧНО. Правило измерено негативным контролем §263: без него
    * спуск в пустоте упирается в потолок 150 млн ячеек. */
-  if (X->occ != NULL && !X->occ[nid]) {
+  int isempty = isvirt ? (n == 0) : (X->occ != NULL && !X->occ[nid]);
+  int isleaf = isvirt ? 1 : (N->child < 0);
+  /* ЛЕНИВЫЙ СПУСК (§338): лист перестаёт быть ПРИЧИНОЙ остановки, если проход
+   * просит мельче и потолок не исчерпан. Решение о том, спускаться ли, принимает
+   * пол — тот же, что и выше по дереву; лист теперь ограничивает не глубину
+   * обхода, а лишь наличие узлов. */
+  int canvirt = X->virt && vdep < HZ_PFRONT_VIRT_MAX;
+  if (isempty) {
     stop = 1;
     why = 3;
-  } else if (N->child < 0) {
+  } else if (isleaf && !canvirt) {
     stop = 1;
     why = 0;
   } else {
@@ -463,7 +479,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         stop = 1;
         why = 1;
       }
-    } else if (X->markon && X->depth != NULL && X->depth[nid] <= X->markrelax &&
+    } else if (!isvirt && X->markon && X->depth != NULL && X->depth[nid] <= X->markrelax &&
                !(X->silh_a > 0.0 && n > 0 && (hi[0] - lo[0]) > X->silh_a * X->silh_d)) {
       /* Здесь оценка остаётся общей: ветвь «за N уровней до дна» срабатывает у
        * мелких узлов, где локальное уточнение ничего не меняет. */
@@ -609,7 +625,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
     /* ГЛУБИНА ЗАСЛОНИТЕЛЯ ПО СТОЛБИКАМ (§296). Считается там же, где перекрытие,
      * и по той же сетке: для каждой клетки 8x8 входной грани — наименьшая
      * глубина, на которой столбик встречает геометрию ячейки. */
-    if (X->cellslot != NULL && n > 0 && X->nslot < X->capslot) {
+    if (!isvirt && X->cellslot != NULL && n > 0 && X->nslot < X->capslot) {
       int a = 0;
       double ma = 0.0;
       for (int c = 0; c < 3; c++) {
@@ -671,7 +687,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
     /* ОТВЕТ ФРОНТА, ОСТАВЛЕННЫЙ СНАРУЖИ (см. `cellf` в заголовке). Берётся
      * ВХОДЯЩЕЕ состояние по потоку — «сколько диска видно этой ячейке», то есть
      * та же величина, что уходит в выборку эталона. */
-    if (X->cellf != NULL) {
+    if (!isvirt && X->cellf != NULL) {
       double fi = 0.0, wi = 0.0;
       for (int s = 0; s < X->nk; s++)
         for (int a = 0; a < 3; a++) {
@@ -723,7 +739,7 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
 
   /* Если спускаемся ВОПРЕКИ полу (Р3), уровень уточнения растёт. */
   int nextra = refined ? extra + 1 : extra;
-  int32_t c0 = N->child;
+  int32_t c0 = isvirt ? -1 : N->child;
   double mid[3];
   for (int c = 0; c < 3; c++)
     mid[c] = 0.5 * (lo[c] + hi[c]);
@@ -786,8 +802,11 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         const double *bl = X->tlo + 3 * (size_t)list[i], *bh = X->thi + 3 * (size_t)list[i];
         if (box_hits3(bl, bh, clo, chi)) sub[ns++] = list[i];
       }
-      hz_pfront_walk(X, c0 + k, clo, chi, cin, cout + (size_t)k * 3 * (size_t)X->nk, sub, ns,
-                     coarsened, nextra);
+      /* Настоящий ребёнок, если узлы ещё есть; иначе ВИРТУАЛЬНЫЙ, и его номер
+       * несёт глубину ленивого спуска (§338). */
+      int32_t cnid = (c0 >= 0) ? (c0 + k) : (int32_t)(-(vdep + 2));
+      hz_pfront_walk(X, cnid, clo, chi, cin, cout + (size_t)k * 3 * (size_t)X->nk, sub, ns,
+                     coarsened, nextra, lev + 1);
       if (X->fail) {
         free(sub);
         free(cout);

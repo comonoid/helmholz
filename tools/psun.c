@@ -63,6 +63,7 @@ int main(int argc, char **argv) {
   int indep = 1, intol = 128, silh = 1;
   double ooff = 1e-5, nofrec = 0.0;
   int coverset = 0, shiftset = 0, zbuf = 1;
+  int g_virt = 0; /* §338 */
   /* УГЛОВОЙ РАДИУС ИСТОЧНИКА — ПАРАМЕТР, А НЕ КОНСТАНТА (замечание пользователя
    * 08-07). Он был зашит числом солнца в ДВУХ местах — у фронта и у эталона, — и
    * потому «протяжённый источник» из §275 означал лишь `K` выборок ТОГО ЖЕ
@@ -105,6 +106,11 @@ int main(int argc, char **argv) {
      * состояние на грани (Р1) для гладкого поля и заведено. */
     if (strncmp(argv[i], "nk=", 3) == 0) nk = (int)strtol(argv[i] + 3, NULL, 10);
     if (strncmp(argv[i], "asun=", 5) == 0) asun = strtod(argv[i] + 5, NULL);
+    /* §338: ленивый спуск ниже листа; умолчание — прежнее поведение. */
+    if (strncmp(argv[i], "virt=", 5) == 0) {
+      g_virt = (int)strtol(argv[i] + 5, NULL, 10);
+      continue;
+    }
     if (strncmp(argv[i], "cover=", 6) == 0) {
       hz_pfront_cover_sum = (int)strtol(argv[i] + 6, NULL, 10);
       coverset = 1;
@@ -723,7 +729,8 @@ int main(int argc, char **argv) {
       hz_pfront_set(&ci[a], 1.0);
     }
     double tmk = now_s();
-    hz_pfront_walk(&CX, 0, T.nd[0].lo, T.nd[0].hi, ci, co, list, m.nt, 0, 0);
+    CX.virt = g_virt;
+    hz_pfront_walk(&CX, 0, T.nd[0].lo, T.nd[0].hi, ci, co, list, m.nt, 0, 0, 0);
     printf("== ПРОХОД ОТ КАМЕРЫ за %.2f с: ячеек %lld, ПОМЕТОК ПОСТАВЛЕНО %lld (невидимое, "
            "огрубление на %d уровня)\n",
            now_s() - tmk, (long long)CX.ncell, (long long)CX.nmarkset, relax);
@@ -864,7 +871,8 @@ int main(int argc, char **argv) {
       }
     }
   }
-  hz_pfront_walk(&X, 0, T.nd[0].lo, T.nd[0].hi, in, out, list, m.nt, 0, 0);
+  X.virt = g_virt;
+  hz_pfront_walk(&X, 0, T.nd[0].lo, T.nd[0].hi, in, out, list, m.nt, 0, 0, 0);
   double secs = now_s() - t0;
   if (X.fail) {
     fprintf(stderr, "отказ обхода\n");
@@ -879,6 +887,8 @@ int main(int argc, char **argv) {
   }
   printf("   ЯЧЕЕК %lld (с геометрией %lld, пустых %lld)\n", (long long)X.ncell,
          (long long)X.ncell_geo, (long long)X.ncell_void);
+  printf("   из них ВИРТУАЛЬНЫХ (без узла, §338): %lld (%.2f %%)\n", (long long)X.nvirt,
+         X.ncell > 0 ? 100.0 * (double)X.nvirt / (double)X.ncell : 0.0);
   printf("   спуск остановлен: ПУСТОТОЙ %lld (%.2f %%), ЛИСТОМ %lld (%.2f %%), ПОЛОМ %lld "
          "(%.2f %%), ТЕМНЫМ %lld (%.2f %%)\n",
          (long long)X.stop_void, 100.0 * (double)X.stop_void / (double)X.ncell,

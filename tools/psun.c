@@ -35,6 +35,11 @@
 
 #define HZ_REF_RAYS 16 /* лучей на точку выборки: диск солнца мал, шестнадцать дают шаг ~2 % */
 
+static int cmp_dbl_psun(const void *x, const void *y) {
+  double a = *(const double *)x, b = *(const double *)y;
+  return (a < b) ? -1 : ((a > b) ? 1 : 0);
+}
+
 static double now_s(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1284,6 +1289,10 @@ int main(int argc, char **argv) {
             int64_t nch = 0, nlitbad = 0, nshbad = 0;
             double sumd = 0.0, maxd = 0.0;
             /* §344: разложение ошибки — без знаковых пикселей и контроль наугад. */
+            /* §346: зазор до второго попадания вдоль луча камеры. */
+            double *gapr = malloc((size_t)ew * (size_t)ew * sizeof *gapr);
+            double *gaps = malloc((size_t)ew * (size_t)ew * sizeof *gaps);
+            int64_t ngapr = 0, ngaps = 0, ncop = 0, nopp = 0, nmid = 0;
             int64_t nch_ns = 0, nch_rn = 0;
             double sumd_ns = 0.0, sumd_rn = 0.0;
 #pragma omp parallel for schedule(dynamic, 8) reduction(+ : nch, nlitbad, nshbad, sumd)            \
@@ -1380,6 +1389,89 @@ int main(int argc, char **argv) {
                 nch++;
                 sumd += dd;
                 if (dd > maxd) maxd = dd;
+                /* ВТОРОЕ ПОПАДАНИЕ ВДОЛЬ ЛУЧА КАМЕРЫ (§346, указание пользователя
+                 * 08-09). Считается ЗДЕСЬ, а не в досье, и это исправление
+                 * первой редакции: там классификация шла по `fpix > 0.5`, то
+                 * есть по «мы даём тень», а не по расхождению с эталоном —
+                 * контроль вышел пустым (0 согласных пикселей), что и выдало
+                 * поломку. Здесь известны ОБЕ величины, `ftrue` и `four`.
+                 *
+                 * Что ищем: если сразу за видимой поверхностью стоит вторая,
+                 * почти совпадающая, то точка `P` из z-буфера лежит на границе
+                 * двух поверхностей, и ячейка фронта под ней перекрыта по
+                 * праву — тогда дефект не в операторе, а в постановке сверки. */
+                if (gapr != NULL && gaps != NULL) {
+                  double t1 = 1e300, t2 = 1e300;
+                  int32_t k1 = -1, k2 = -1;
+                  for (int32_t tq = 0; tq < m.nt; tq++) {
+                    const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)tq + 0];
+                    const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)tq + 1];
+                    const double *Cc = m.v + 3 * (size_t)m.f[3 * (size_t)tq + 2];
+                    double q1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]};
+                    double q2[3] = {Cc[0] - A[0], Cc[1] - A[1], Cc[2] - A[2]};
+                    double pv[3], tv[3], qv[3];
+                    pv[0] = d[1] * q2[2] - d[2] * q2[1];
+                    pv[1] = d[2] * q2[0] - d[0] * q2[2];
+                    pv[2] = d[0] * q2[1] - d[1] * q2[0];
+                    double det = q1[0] * pv[0] + q1[1] * pv[1] + q1[2] * pv[2];
+                    if (det > -1e-12 && det < 1e-12) continue;
+                    double inv = 1.0 / det;
+                    tv[0] = camo[0] - A[0];
+                    tv[1] = camo[1] - A[1];
+                    tv[2] = camo[2] - A[2];
+                    double uu2 = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+                    if (uu2 < 0.0 || uu2 > 1.0) continue;
+                    qv[0] = tv[1] * q1[2] - tv[2] * q1[1];
+                    qv[1] = tv[2] * q1[0] - tv[0] * q1[2];
+                    qv[2] = tv[0] * q1[1] - tv[1] * q1[0];
+                    double vv2 = (d[0] * qv[0] + d[1] * qv[1] + d[2] * qv[2]) * inv;
+                    if (vv2 < 0.0 || uu2 + vv2 > 1.0) continue;
+                    double tt2 = (q2[0] * qv[0] + q2[1] * qv[1] + q2[2] * qv[2]) * inv;
+                    if (!(tt2 > 0.0)) continue;
+                    if (tt2 < t1) {
+                      t2 = t1;
+                      k2 = k1;
+                      t1 = tt2;
+                      k1 = tq;
+                    } else if (tt2 < t2) {
+                      t2 = tt2;
+                      k2 = tq;
+                    }
+                  }
+                  if (k2 >= 0) {
+                    double gap = t2 - t1;
+                    if (ftrue > 0.5 && four < 0.5) {
+                      gapr[ngapr++] = gap;
+                      double nn1[3], nn2[3];
+                      for (int qq = 0; qq < 2; qq++) {
+                        int32_t tq = qq ? k2 : k1;
+                        const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)tq + 0];
+                        const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)tq + 1];
+                        const double *Cc = m.v + 3 * (size_t)m.f[3 * (size_t)tq + 2];
+                        double e1[3], e2[3], cr[3];
+                        for (int c = 0; c < 3; c++) {
+                          e1[c] = B[c] - A[c];
+                          e2[c] = Cc[c] - A[c];
+                        }
+                        cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
+                        cr[1] = e1[2] * e2[0] - e1[0] * e2[2];
+                        cr[2] = e1[0] * e2[1] - e1[1] * e2[0];
+                        double l2 = sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+                        if (!(l2 > 0.0)) l2 = 1.0;
+                        for (int c = 0; c < 3; c++)
+                          (qq ? nn2 : nn1)[c] = cr[c] / l2;
+                      }
+                      double cs = nn1[0] * nn2[0] + nn1[1] * nn2[1] + nn1[2] * nn2[2];
+                      if (cs > 0.9)
+                        ncop++;
+                      else if (cs < -0.9)
+                        nopp++;
+                      else
+                        nmid++;
+                    } else if (dd < 1e-6)
+                      gaps[ngaps++] = gap;
+                  }
+                }
                 if (ftrue < 0.5 && four > 0.5) nlitbad++;
                 if (ftrue > 0.5 && four < 0.5) nshbad++;
                 /* §344: та же ошибка БЕЗ пикселей, разошедшихся знаком, и
@@ -1400,6 +1492,21 @@ int main(int argc, char **argv) {
                   nch_rn++;
                 }
               }
+            if (gapr != NULL && gaps != NULL) {
+              qsort(gapr, (size_t)ngapr, sizeof *gapr, cmp_dbl_psun);
+              qsort(gaps, (size_t)ngaps, sizeof *gaps, cmp_dbl_psun);
+              printf("     ВТОРОЕ ПОПАДАНИЕ (§346): ОБРАТНЫХ %lld, зазор p50 %.6f p90 %.6f мин "
+                     "%.6f м; "
+                     "нормали пары: сонаправленных %lld, встречных %lld, прочих %lld\n",
+                     (long long)ngapr, ngapr ? gapr[ngapr / 2] : 0.0,
+                     ngapr ? gapr[(ngapr * 9) / 10] : 0.0, ngapr ? gapr[0] : 0.0, (long long)ncop,
+                     (long long)nopp, (long long)nmid);
+              printf("     КОНТРОЛЬ — СОГЛАСНЫЕ: %lld, зазор p50 %.6f p90 %.6f м\n",
+                     (long long)ngaps, ngaps ? gaps[ngaps / 2] : 0.0,
+                     ngaps ? gaps[(ngaps * 9) / 10] : 0.0);
+            }
+            free(gapr);
+            free(gaps);
             printf("     БЕЗ ЗНАКОВЫХ ПИКСЕЛЕЙ (§344): |Δ| среднее %.6f по %lld пикселям; "
                    "КОНТРОЛЬ (столько же наугад): %.6f по %lld\n",
                    nch_ns > 0 ? sumd_ns / (double)nch_ns : 0.0, (long long)nch_ns,

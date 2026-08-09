@@ -47,6 +47,139 @@ static double now_s(void) {
   return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
+typedef struct {
+  int64_t k;
+  int32_t t;
+} hz_pair;
+
+static int cmp_pair(const void *x, const void *y) {
+  const hz_pair *a = (const hz_pair *)x, *b = (const hz_pair *)y;
+  return (a->k < b->k) ? -1 : ((a->k > b->k) ? 1 : 0);
+}
+
+/* Нормаль треугольника, ненормированная; возврат — удвоенная площадь. */
+static double tri_normal(const hz_objmesh *m, int32_t t, double cr[3]) {
+  const double *A = m->v + (size_t)m->f[3 * (size_t)t + (size_t)0] * 3;
+  const double *B = m->v + (size_t)m->f[3 * (size_t)t + (size_t)1] * 3;
+  const double *C = m->v + (size_t)m->f[3 * (size_t)t + (size_t)2] * 3;
+  double e1[3], e2[3];
+  for (int c = 0; c < 3; c++) {
+    e1[c] = B[c] - A[c];
+    e2[c] = C[c] - A[c];
+  }
+  cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
+  cr[1] = e1[2] * e2[0] - e1[0] * e2[2];
+  cr[2] = e1[0] * e2[1] - e1[1] * e2[0];
+  return sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+}
+
+/* Плоскость по подмножеству (средняя по площади) и её dmax по вершинам. */
+static double fit_group(const hz_objmesh *m, const hz_pair *p, int64_t n, const unsigned char *sel,
+                        unsigned char want) {
+  double nn[3] = {0, 0, 0};
+  int64_t cnt = 0;
+  for (int64_t s = 0; s < n; s++) {
+    if (sel != NULL && sel[s] != want) continue;
+    double cr[3];
+    if (!(tri_normal(m, p[s].t, cr) > 0.0)) continue;
+    for (int c = 0; c < 3; c++)
+      nn[c] += cr[c];
+    cnt++;
+  }
+  if (cnt == 0) return 0.0;
+  double ln = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+  if (!(ln > 0.0)) return 0.0;
+  for (int c = 0; c < 3; c++)
+    nn[c] /= ln;
+  double off = 0.0;
+  int64_t nv = 0;
+  for (int64_t s = 0; s < n; s++) {
+    if (sel != NULL && sel[s] != want) continue;
+    for (int v = 0; v < 3; v++) {
+      const double *V = m->v + (size_t)m->f[3 * (size_t)p[s].t + (size_t)v] * 3;
+      off += nn[0] * V[0] + nn[1] * V[1] + nn[2] * V[2];
+      nv++;
+    }
+  }
+  if (nv == 0) return 0.0;
+  off /= (double)nv;
+  double e = 0.0;
+  for (int64_t s = 0; s < n; s++) {
+    if (sel != NULL && sel[s] != want) continue;
+    for (int v = 0; v < 3; v++) {
+      const double *V = m->v + (size_t)m->f[3 * (size_t)p[s].t + (size_t)v] * 3;
+      double d = fabs(nn[0] * V[0] + nn[1] * V[1] + nn[2] * V[2] - off);
+      if (d > e) e = d;
+    }
+  }
+  return e;
+}
+
+/* Бюджет ДВА: раскол по ближайшему из двух семян нормалей. */
+static double fit_two(const hz_objmesh *m, const hz_pair *p, int64_t n, const double a[3],
+                      const double b[3]) {
+  unsigned char *sel = malloc((size_t)n);
+  if (sel == NULL) return 0.0;
+  for (int64_t s = 0; s < n; s++) {
+    double cr[3];
+    double l = tri_normal(m, p[s].t, cr);
+    if (!(l > 0.0)) {
+      sel[s] = 0;
+      continue;
+    }
+    double da = (cr[0] * a[0] + cr[1] * a[1] + cr[2] * a[2]) / l;
+    double db = (cr[0] * b[0] + cr[1] * b[1] + cr[2] * b[2]) / l;
+    sel[s] = (db > da) ? 1 : 0;
+  }
+  double e0 = fit_group(m, p, n, sel, 0), e1 = fit_group(m, p, n, sel, 1);
+  free(sel);
+  return (e0 > e1) ? e0 : e1;
+}
+
+/* Сколько плоскостей ПРОСИТ содержимое при допуске `tol`: жадное покрытие от
+ * самого крупного непокрытого треугольника. Порога нет — только допуск. */
+static int32_t greedy_cover(const hz_objmesh *m, const hz_pair *p, int64_t n, double tol) {
+  unsigned char *done = calloc((size_t)n, 1);
+  if (done == NULL) return 0;
+  int32_t np = 0;
+  for (;;) {
+    int64_t best = -1;
+    double ba = 0.0;
+    for (int64_t s = 0; s < n; s++) {
+      if (done[s]) continue;
+      double cr[3];
+      double l = tri_normal(m, p[s].t, cr);
+      if (l > ba) {
+        ba = l;
+        best = s;
+      }
+    }
+    if (best < 0) break;
+    double cr[3];
+    double l = tri_normal(m, p[best].t, cr);
+    if (!(l > 0.0)) {
+      done[best] = 1;
+      continue;
+    }
+    double nn[3] = {cr[0] / l, cr[1] / l, cr[2] / l};
+    const double *A0 = m->v + (size_t)m->f[3 * (size_t)p[best].t + (size_t)0] * 3;
+    double off = nn[0] * A0[0] + nn[1] * A0[1] + nn[2] * A0[2];
+    np++;
+    for (int64_t s = 0; s < n; s++) {
+      if (done[s]) continue;
+      int ok = 1;
+      for (int v = 0; v < 3 && ok; v++) {
+        const double *V = m->v + (size_t)m->f[3 * (size_t)p[s].t + (size_t)v] * 3;
+        if (fabs(nn[0] * V[0] + nn[1] * V[1] + nn[2] * V[2] - off) > tol) ok = 0;
+      }
+      if (ok) done[s] = 1;
+    }
+    if (!done[best]) done[best] = 1;
+  }
+  free(done);
+  return np;
+}
+
 static int cmp_i64(const void *x, const void *y) {
   int64_t a = *(const int64_t *)x, b = *(const int64_t *)y;
   return (a < b) ? -1 : ((a > b) ? 1 : 0);
@@ -557,6 +690,7 @@ int main(int argc, char **argv) {
   double cgate = 0.0, ladbase = 0.0;
   const char *save = NULL, *load = NULL;
   int cellsj = 0; /* §330: показатель мелкой ячейки для замера занятости */
+  int fitj = 0;   /* §333: показатель самой мелкой ячейки для замера бюджета */
   /* НЕИЗВЕСТНЫЙ АРГУМЕНТ — ОШИБКА, А НЕ ПРОПУСК (§60, дефект оснастки). Флаг,
    * который не совпал, молчал, и конфигурация вышла тождественной другой; поймать
    * это удалось лишь по совпадению всех семи чисел. Обрыв дешевле. */
@@ -617,6 +751,10 @@ int main(int argc, char **argv) {
      * уровне, то есть сравниваются сцены, совпадающие на 87 %. Сравнивать надо
      * при РАВНОЙ ЦЕНЕ, а цена задаётся ε. */
     if (strcmp(argv[i], "curve") == 0) ok = curve = 1;
+    if (strncmp(argv[i], "fit=", 4) == 0) {
+      fitj = (int)strtol(argv[i] + 4, NULL, 10);
+      ok = 1;
+    }
     if (strncmp(argv[i], "cells=", 6) == 0) {
       cellsj = (int)strtol(argv[i] + 6, NULL, 10);
       ok = 1;
@@ -712,9 +850,9 @@ int main(int argc, char **argv) {
     double t0c = now_s();
     int64_t nemit = 0;
     for (int32_t t = 0; t < m.nt; t++) {
-      const double *A = m.v + (size_t)m.f[3 * (size_t)t + 0] * 3;
-      const double *B = m.v + (size_t)m.f[3 * (size_t)t + 1] * 3;
-      const double *C = m.v + (size_t)m.f[3 * (size_t)t + 2] * 3;
+      const double *A = m.v + (size_t)m.f[3 * (size_t)t + (size_t)0] * 3;
+      const double *B = m.v + (size_t)m.f[3 * (size_t)t + (size_t)1] * 3;
+      const double *C = m.v + (size_t)m.f[3 * (size_t)t + (size_t)2] * 3;
       int64_t i0[3], i1[3];
       for (int c = 0; c < 3; c++) {
         double a = A[c] < B[c] ? A[c] : B[c];
@@ -770,6 +908,223 @@ int main(int argc, char **argv) {
       }
     }
     free(key);
+    hz_obj_free(&m);
+    return 0;
+  }
+  /* БЮДЖЕТ ЗАПИСЕЙ НА ЯЧЕЙКУ ПРОТИВ ОШИБКИ (§333 и поправка к нему).
+   *
+   * Требование пользователя 08-09: адаптация должна быть МАЛОЙ, иначе разброс
+   * работы на ячейку даёт неравномерность кадра. Значит бюджет `k` назначается,
+   * а ошибка измеряется. Здесь считаются обе стороны за один проход:
+   *   `k = 1` и `k = 2` — фиксированный бюджет, ошибка `dmax` есть результат;
+   *   `k` при допуске `h/10` — сколько содержимое ПРОСИТ (для сравнения).
+   *
+   * ПЛОСКОСТЬ ЯЧЕЙКИ — СРЕДНЯЯ ПО ПЛОЩАДИ, А НЕ МИНИМАКСНАЯ, И ЭТО СКАЗАНО
+   * ПРЯМО: нормаль есть взвешенная площадью сумма нормалей кусков, смещение —
+   * взвешенное среднее `n·c`. Такой `dmax` есть ВЕРХНЯЯ оценка минимаксного,
+   * то есть промах в консервативную сторону; минимакс потребовал бы `hz_vfit`,
+   * а он привязан к участкам. Оговорка обязана стоять рядом с числом (Г40). */
+  if (fitj > 0) {
+    double lo3[3] = {1e300, 1e300, 1e300}, hi3[3] = {-1e300, -1e300, -1e300};
+    for (int32_t k = 0; k < m.nv; k++)
+      for (int c = 0; c < 3; c++) {
+        double x = m.v[3 * (size_t)k + (size_t)c];
+        if (x < lo3[c]) lo3[c] = x;
+        if (x > hi3[c]) hi3[c] = x;
+      }
+    double diag =
+        sqrt((hi3[0] - lo3[0]) * (hi3[0] - lo3[0]) + (hi3[1] - lo3[1]) * (hi3[1] - lo3[1]) +
+             (hi3[2] - lo3[2]) * (hi3[2] - lo3[2]));
+    printf("== БЮДЖЕТ ЗАПИСЕЙ ПРОТИВ ОШИБКИ (§333), %s: габарит %.3f м; допуск уровня h/10; "
+           "плоскость — средняя по площади (ВЕРХНЯЯ оценка dmax)\n",
+           scene, diag);
+    printf("   %9s %9s %9s %9s %9s %9s %9s %9s %9s\n", "ячейка,м", "занято", "dmax/h k1", "p90 k1",
+           "dmax/h k2", "p90 k2", "k при h/10", "p90 k", "в h/10,%");
+    for (int j = fitj; j >= 2; j--) {
+      double h = diag / pow(2.0, (double)j), tol = 0.1 * h;
+      /* инцидентности (ячейка, треугольник) честным отсечением */
+      int64_t cap = 1 << 16, ni = 0;
+      int64_t *ck = malloc((size_t)cap * sizeof *ck);
+      int32_t *ct = malloc((size_t)cap * sizeof *ct);
+      if (ck == NULL || ct == NULL) {
+        free(ck);
+        free(ct);
+        return 1;
+      }
+      for (int32_t t = 0; t < m.nt; t++) {
+        const double *A = m.v + (size_t)m.f[3 * (size_t)t + (size_t)0] * 3;
+        const double *B = m.v + (size_t)m.f[3 * (size_t)t + (size_t)1] * 3;
+        const double *C = m.v + (size_t)m.f[3 * (size_t)t + (size_t)2] * 3;
+        int64_t i0[3], i1[3];
+        for (int c = 0; c < 3; c++) {
+          double a = A[c] < B[c] ? A[c] : B[c];
+          if (C[c] < a) a = C[c];
+          double b = A[c] > B[c] ? A[c] : B[c];
+          if (C[c] > b) b = C[c];
+          i0[c] = (int64_t)floor((a - lo3[c]) / h);
+          i1[c] = (int64_t)floor((b - lo3[c]) / h);
+        }
+        for (int64_t z = i0[2]; z <= i1[2]; z++)
+          for (int64_t y = i0[1]; y <= i1[1]; y++)
+            for (int64_t x = i0[0]; x <= i1[0]; x++) {
+              double cl[3] = {lo3[0] + (double)x * h, lo3[1] + (double)y * h,
+                              lo3[2] + (double)z * h};
+              double ch[3] = {cl[0] + h, cl[1] + h, cl[2] + h};
+              hz_pclip_poly P;
+              if (hz_pclip_tri(A, B, C, cl, ch, &P) < 3) continue;
+              if (!(hz_pclip_area(&P) > 0.0)) continue;
+              if (ni == cap) {
+                int64_t nc = cap * 2;
+                int64_t *k2 = realloc(ck, (size_t)nc * sizeof *k2);
+                int32_t *t2 = realloc(ct, (size_t)nc * sizeof *t2);
+                if (k2 != NULL) ck = k2;
+                if (t2 != NULL) ct = t2;
+                if (k2 == NULL || t2 == NULL) {
+                  free(ck);
+                  free(ct);
+                  return 1;
+                }
+                cap = nc;
+              }
+              ck[ni] = (x << 42) | (y << 21) | z;
+              ct[ni] = t;
+              ni++;
+            }
+      }
+      /* сортировка пар по ключу ячейки — простым индексным проходом */
+      int64_t *ord = malloc((size_t)ni * sizeof *ord);
+      if (ord == NULL) {
+        free(ck);
+        free(ct);
+        return 1;
+      }
+      for (int64_t q = 0; q < ni; q++)
+        ord[q] = (ck[q] << 0);
+      /* пары (ключ, треугольник) упаковываются в один массив структур ради
+       * одной сортировки; отдельный компаратор не заводится */
+      hz_pair *pr = malloc((size_t)ni * sizeof *pr);
+      if (pr == NULL) {
+        free(ck);
+        free(ct);
+        free(ord);
+        return 1;
+      }
+      for (int64_t q = 0; q < ni; q++) {
+        pr[q].k = ck[q];
+        pr[q].t = ct[q];
+      }
+      qsort(pr, (size_t)ni, sizeof *pr, cmp_pair);
+      free(ord);
+      /* по ячейкам */
+      double *d1 = malloc((size_t)ni * sizeof *d1), *d2 = malloc((size_t)ni * sizeof *d2);
+      double *kk = malloc((size_t)ni * sizeof *kk);
+      if (d1 == NULL || d2 == NULL || kk == NULL) {
+        free(ck);
+        free(ct);
+        free(pr);
+        free(d1);
+        free(d2);
+        free(kk);
+        return 1;
+      }
+      int64_t ncell = 0, nfit = 0;
+      for (int64_t q = 0; q < ni;) {
+        int64_t r = q;
+        while (r < ni && pr[r].k == pr[q].k)
+          r++;
+        int64_t nt = r - q;
+        /* средняя по площади плоскость и её dmax */
+        double nn[3] = {0, 0, 0}, aw = 0.0, off = 0.0;
+        for (int64_t s = q; s < r; s++) {
+          const double *A = m.v + (size_t)m.f[3 * (size_t)pr[s].t + (size_t)0] * 3;
+          const double *B = m.v + (size_t)m.f[3 * (size_t)pr[s].t + (size_t)1] * 3;
+          const double *C = m.v + (size_t)m.f[3 * (size_t)pr[s].t + (size_t)2] * 3;
+          double e1[3], e2[3], cr[3];
+          for (int c = 0; c < 3; c++) {
+            e1[c] = B[c] - A[c];
+            e2[c] = C[c] - A[c];
+          }
+          cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
+          cr[1] = e1[2] * e2[0] - e1[0] * e2[2];
+          cr[2] = e1[0] * e2[1] - e1[1] * e2[0];
+          double a2 = sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+          if (!(a2 > 0.0)) continue;
+          for (int c = 0; c < 3; c++)
+            nn[c] += cr[c];
+          aw += a2;
+        }
+        double ln = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+        if (!(ln > 0.0) || !(aw > 0.0)) {
+          q = r;
+          continue;
+        }
+        for (int c = 0; c < 3; c++)
+          nn[c] /= ln;
+        for (int64_t s = q; s < r; s++)
+          for (int v = 0; v < 3; v++) {
+            const double *V = m.v + (size_t)m.f[3 * (size_t)pr[s].t + v] * 3;
+            off += (nn[0] * V[0] + nn[1] * V[1] + nn[2] * V[2]) / (double)(3 * nt);
+          }
+        double e1max = 0.0;
+        for (int64_t s = q; s < r; s++)
+          for (int v = 0; v < 3; v++) {
+            const double *V = m.v + (size_t)m.f[3 * (size_t)pr[s].t + v] * 3;
+            double d = fabs(nn[0] * V[0] + nn[1] * V[1] + nn[2] * V[2] - off);
+            if (d > e1max) e1max = d;
+          }
+        /* БЮДЖЕТ ДВА: раскол по нормали — семенем берётся треугольник с
+         * нормалью, наиболее удалённой от средней; каждый уходит к ближайшему
+         * из двух семян, плоскости считаются тем же правилом. */
+        double seed[3] = {nn[0], nn[1], nn[2]}, worst = 1.0;
+        for (int64_t s = q; s < r; s++) {
+          const double *A = m.v + (size_t)m.f[3 * (size_t)pr[s].t + (size_t)0] * 3;
+          const double *B = m.v + (size_t)m.f[3 * (size_t)pr[s].t + (size_t)1] * 3;
+          const double *C = m.v + (size_t)m.f[3 * (size_t)pr[s].t + (size_t)2] * 3;
+          double e1[3], e2[3], cr[3];
+          for (int c = 0; c < 3; c++) {
+            e1[c] = B[c] - A[c];
+            e2[c] = C[c] - A[c];
+          }
+          cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
+          cr[1] = e1[2] * e2[0] - e1[0] * e2[2];
+          cr[2] = e1[0] * e2[1] - e1[1] * e2[0];
+          double a2 = sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+          if (!(a2 > 0.0)) continue;
+          double dp = (cr[0] * nn[0] + cr[1] * nn[1] + cr[2] * nn[2]) / a2;
+          if (dp < worst) {
+            worst = dp;
+            for (int c = 0; c < 3; c++)
+              seed[c] = cr[c] / a2;
+          }
+        }
+        double e2max = fit_two(&m, pr + q, nt, nn, seed);
+        /* СКОЛЬКО ПРОСИТ СОДЕРЖИМОЕ: жадное покрытие плоскостями при `h/10`. */
+        int32_t kneed = greedy_cover(&m, pr + q, nt, tol);
+        d1[ncell] = e1max / h;
+        d2[ncell] = e2max / h;
+        kk[ncell] = (double)kneed;
+        if (e2max <= tol) nfit++;
+        ncell++;
+        q = r;
+      }
+      qsort(d1, (size_t)ncell, sizeof *d1, cmp_dbl);
+      qsort(d2, (size_t)ncell, sizeof *d2, cmp_dbl);
+      qsort(kk, (size_t)ncell, sizeof *kk, cmp_dbl);
+      double ksum = 0.0;
+      for (int64_t q2 = 0; q2 < ncell; q2++)
+        ksum += kk[q2];
+      printf("   %9.4f %9lld %9.3f %9.3f %9.3f %9.3f %9.2f %9.0f %9.1f\n", h, (long long)ncell,
+             pct(d1, ncell, 0.5), pct(d1, ncell, 0.9), pct(d2, ncell, 0.5), pct(d2, ncell, 0.9),
+             ncell ? ksum / (double)ncell : 0.0, pct(kk, ncell, 0.9),
+             ncell ? 100.0 * (double)nfit / (double)ncell : 0.0);
+      fflush(stdout);
+      free(ck);
+      free(ct);
+      free(pr);
+      free(d1);
+      free(d2);
+      free(kk);
+    }
     hz_obj_free(&m);
     return 0;
   }

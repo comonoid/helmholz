@@ -124,6 +124,13 @@ static void paint_cell(const hz_ptree *T, int32_t nid, const float *cellf, const
       if (sv < v0) v0 = sv;
       if (sv > v1) v1 = sv;
     }
+    /* Габарит зажимается ДО перевода в целое: при пустом многоугольнике `u0`
+     * остаётся `1e300`, и перевод такого в `int` есть неопределённое поведение
+     * (поймано cppcheck, а не глазами). */
+    if (!(u0 >= 0.0)) u0 = 0.0;
+    if (!(v0 >= 0.0)) v0 = 0.0;
+    if (!(u1 <= (double)side)) u1 = (double)side;
+    if (!(v1 <= (double)side)) v1 = (double)side;
     int i0 = (int)floor(u0), i1 = (int)ceil(u1);
     int j0 = (int)floor(v0), j1 = (int)ceil(v1);
     if (i0 < 0) i0 = 0;
@@ -227,6 +234,7 @@ int main(int argc, char **argv) {
    * крошечного диска: полутень оставалась ýже ячейки, и §289 мерил не то.
    * Настоящая проверка — источник, у которого полутень ШИРЕ ячейки. */
   double asun = 0.5 * 9.3e-3;
+  int refk = 1; /* §362: лучей по диску в ЭТАЛОНЕ; 1 — прежний бинарный */
   double px = 9.1, sdir[3] = {0.3, -0.9, 0.3};
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "leaf=", 5) == 0) leafmax = (int)strtol(argv[i] + 5, NULL, 10);
@@ -263,6 +271,7 @@ int main(int argc, char **argv) {
      * состояние на грани (Р1) для гладкого поля и заведено. */
     if (strncmp(argv[i], "nk=", 3) == 0) nk = (int)strtol(argv[i] + 3, NULL, 10);
     if (strncmp(argv[i], "asun=", 5) == 0) asun = strtod(argv[i] + 5, NULL);
+    if (strncmp(argv[i], "refk=", 5) == 0) refk = (int)strtol(argv[i] + 5, NULL, 10);
     /* §338: ленивый спуск ниже листа; умолчание — прежнее поведение. */
     if (strncmp(argv[i], "cellimg=", 8) == 0) {
       cellimg = (int)strtol(argv[i] + 8, NULL, 10);
@@ -1529,6 +1538,34 @@ int main(int argc, char **argv) {
             double *gapr = malloc((size_t)ew * (size_t)ew * sizeof *gapr);
             double *gaps = malloc((size_t)ew * (size_t)ew * sizeof *gaps);
             int64_t ngapr = 0, ngaps = 0, ncop = 0, nopp = 0, nmid = 0;
+            int64_t npartial = 0; /* §362: пикселей с ЧАСТИЧНОЙ видимостью — это и есть полутень */
+            /* Рама диска для эталона: те же две поперечные оси, что у выборок фронта. */
+            double rq1[3] = {0.0, 0.0, 1.0}, rq2[3];
+            {
+              double ax = fabs(X.dir[0]), ay = fabs(X.dir[1]), az = fabs(X.dir[2]);
+              if (ax <= ay && ax <= az) {
+                rq1[0] = 1.0;
+                rq1[1] = 0.0;
+                rq1[2] = 0.0;
+              } else if (ay <= az) {
+                rq1[0] = 0.0;
+                rq1[1] = 1.0;
+                rq1[2] = 0.0;
+              }
+              double d0 = rq1[0] * X.dir[0] + rq1[1] * X.dir[1] + rq1[2] * X.dir[2];
+              double ln0 = 0.0;
+              for (int c = 0; c < 3; c++) {
+                rq1[c] -= d0 * X.dir[c];
+                ln0 += rq1[c] * rq1[c];
+              }
+              ln0 = sqrt(ln0);
+              if (!(ln0 > 0.0)) ln0 = 1.0;
+              for (int c = 0; c < 3; c++)
+                rq1[c] /= ln0;
+              rq2[0] = X.dir[1] * rq1[2] - X.dir[2] * rq1[1];
+              rq2[1] = X.dir[2] * rq1[0] - X.dir[0] * rq1[2];
+              rq2[2] = X.dir[0] * rq1[1] - X.dir[1] * rq1[0];
+            }
             int64_t nch_ns = 0, nch_rn = 0;
             double sumd_ns = 0.0, sumd_rn = 0.0;
 /* §348: НОВЫЕ СЧЁТЧИКИ ОБЯЗАНЫ ВОЙТИ В РЕДУКЦИЮ. Первая редакция §344/§346
@@ -1536,8 +1573,8 @@ int main(int argc, char **argv) {
  * себя расхождением счётчиков между прогонами (26 554 против 26 615). Гейт
  * гонок не ловит: это дело санитайзера, а не -fanalyzer. */
 #pragma omp parallel for schedule(dynamic, 8)                                                      \
-    reduction(+ : nch, nlitbad, nshbad, sumd, nch_ns, sumd_ns, nch_rn, sumd_rn, ncop, nopp, nmid)  \
-    reduction(max : maxd)
+    reduction(+ : nch, nlitbad, nshbad, sumd, nch_ns, sumd_ns, nch_rn, sumd_rn, ncop, nopp, nmid,  \
+                  npartial) reduction(max : maxd)
             for (int32_t jj = 0; jj < ew; jj++)
               for (int32_t ii = 0; ii < ew; ii++) {
                 size_t p = (size_t)(jj * es) * (size_t)bufside + (size_t)(ii * es);
@@ -1585,45 +1622,67 @@ int main(int argc, char **argv) {
                   if (fpix[p] > 0.5) nlitbad++;
                   continue;
                 }
-                /* Отступ вдоль луча НА СОЛНЦЕ, а не по нормали: нормаль у .obj
-                 * может смотреть внутрь, и отступ по ней уводил бы точку под
-                 * поверхность ровно в половине случаев. */
-                double ofs = 1e-5 * (fabs(P[0]) + fabs(P[1]) + fabs(P[2]) + 1.0);
-                double O[3], S[3];
-                for (int c = 0; c < 3; c++) {
-                  S[c] = -X.dir[c];
-                  O[c] = P[c] + ofs * S[c];
+                /* ЭТАЛОН С ПОЛУТЕНЬЮ (§362). Один луч даёт `видно/не видно` —
+                 * величину БИНАРНУЮ, которой мягкая тень недоступна в принципе.
+                 * Здесь по диску источника пускается `refk` лучей той же
+                 * спиралью золотого угла, что и выборки фронта, и берётся ДОЛЯ
+                 * непрегражденных. При `refk = 1` возвращается прежнее
+                 * поведение ТОЧНО — это и есть проверка эквивалентности. */
+                int nvis = 0;
+                for (int sq = 0; sq < refk; sq++) {
+                  double S[3];
+                  if (refk == 1) {
+                    for (int c = 0; c < 3; c++)
+                      S[c] = -X.dir[c];
+                  } else {
+                    double rr = asun * sqrt(((double)sq + 0.5) / (double)refk);
+                    double ph = 2.39996322972865332 * (double)sq;
+                    double nn = 0.0;
+                    for (int c = 0; c < 3; c++) {
+                      S[c] = -X.dir[c] - rr * (cos(ph) * rq1[c] + sin(ph) * rq2[c]);
+                      nn += S[c] * S[c];
+                    }
+                    nn = sqrt(nn);
+                    if (!(nn > 0.0)) nn = 1.0;
+                    for (int c = 0; c < 3; c++)
+                      S[c] /= nn;
+                  }
+                  double ofs = 1e-5 * (fabs(P[0]) + fabs(P[1]) + fabs(P[2]) + 1.0);
+                  double O[3];
+                  for (int c = 0; c < 3; c++)
+                    O[c] = P[c] + ofs * S[c];
+                  int blk = 0;
+                  for (int32_t t = 0; t < m.nt && !blk; t++) {
+                    const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t + 0];
+                    const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)t + 1];
+                    const double *Cc = m.v + 3 * (size_t)m.f[3 * (size_t)t + 2];
+                    double q1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]};
+                    double q2[3] = {Cc[0] - A[0], Cc[1] - A[1], Cc[2] - A[2]};
+                    double pv[3], tv[3], qv[3];
+                    pv[0] = S[1] * q2[2] - S[2] * q2[1];
+                    pv[1] = S[2] * q2[0] - S[0] * q2[2];
+                    pv[2] = S[0] * q2[1] - S[1] * q2[0];
+                    double det = q1[0] * pv[0] + q1[1] * pv[1] + q1[2] * pv[2];
+                    if (det > -1e-12 && det < 1e-12) continue;
+                    double inv = 1.0 / det;
+                    tv[0] = O[0] - A[0];
+                    tv[1] = O[1] - A[1];
+                    tv[2] = O[2] - A[2];
+                    double uu = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
+                    if (uu < 0.0 || uu > 1.0) continue;
+                    qv[0] = tv[1] * q1[2] - tv[2] * q1[1];
+                    qv[1] = tv[2] * q1[0] - tv[0] * q1[2];
+                    qv[2] = tv[0] * q1[1] - tv[1] * q1[0];
+                    double vv = (S[0] * qv[0] + S[1] * qv[1] + S[2] * qv[2]) * inv;
+                    if (vv < 0.0 || uu + vv > 1.0) continue;
+                    double tt = (q2[0] * qv[0] + q2[1] * qv[1] + q2[2] * qv[2]) * inv;
+                    if (tt > 0.0) blk = 1;
+                  }
+                  if (!blk) nvis++;
                 }
-                int blk = 0;
-                for (int32_t t = 0; t < m.nt && !blk; t++) {
-                  const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)t + 0];
-                  const double *B = m.v + 3 * (size_t)m.f[3 * (size_t)t + 1];
-                  const double *Cc = m.v + 3 * (size_t)m.f[3 * (size_t)t + 2];
-                  /* Поимённо, а не циклом, — тот же класс ложных находок
-                   * `-fanalyzer`, что и выше. */
-                  double q1[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]};
-                  double q2[3] = {Cc[0] - A[0], Cc[1] - A[1], Cc[2] - A[2]};
-                  double pv[3], tv[3], qv[3];
-                  pv[0] = S[1] * q2[2] - S[2] * q2[1];
-                  pv[1] = S[2] * q2[0] - S[0] * q2[2];
-                  pv[2] = S[0] * q2[1] - S[1] * q2[0];
-                  double det = q1[0] * pv[0] + q1[1] * pv[1] + q1[2] * pv[2];
-                  if (det > -1e-12 && det < 1e-12) continue;
-                  double inv = 1.0 / det;
-                  tv[0] = O[0] - A[0];
-                  tv[1] = O[1] - A[1];
-                  tv[2] = O[2] - A[2];
-                  double uu = (tv[0] * pv[0] + tv[1] * pv[1] + tv[2] * pv[2]) * inv;
-                  if (uu < 0.0 || uu > 1.0) continue;
-                  qv[0] = tv[1] * q1[2] - tv[2] * q1[1];
-                  qv[1] = tv[2] * q1[0] - tv[0] * q1[2];
-                  qv[2] = tv[0] * q1[1] - tv[1] * q1[0];
-                  double vv = (S[0] * qv[0] + S[1] * qv[1] + S[2] * qv[2]) * inv;
-                  if (vv < 0.0 || uu + vv > 1.0) continue;
-                  double tt = (q2[0] * qv[0] + q2[1] * qv[1] + q2[2] * qv[2]) * inv;
-                  if (tt > 0.0) blk = 1;
-                }
-                double ftrue = blk ? 0.0 : 1.0;
+                double ftrue = (double)nvis / (double)refk;
+                if (ftrue > 0.0 && ftrue < 1.0) npartial++;
+
                 double four = fpix[p];
                 double dd = fabs(four - ftrue);
                 emap[(size_t)jj * (size_t)ew + (size_t)ii] = dd;

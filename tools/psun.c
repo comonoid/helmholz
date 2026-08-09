@@ -1072,7 +1072,7 @@ int main(int argc, char **argv) {
      * солнце», а не «насколько ярко», и мешать в одну величину косинус с
      * альбедо значило бы сверять три вещи разом. */
     double *fpix = malloc(np * sizeof *fpix);
-    double *fcell = NULL; /* §351: доля, собранная ИЗ ЯЧЕЕК */
+    double *fromcell = NULL; /* §351: доля, собранная ИЗ ЯЧЕЕК */
     if (zb != NULL && ib != NULL && pix != NULL && fpix != NULL) {
       double diag = 0.0;
       for (int c = 0; c < 3; c++) {
@@ -1107,14 +1107,14 @@ int main(int argc, char **argv) {
           double tci = now_s();
           float *zc = malloc(np * sizeof *zc);
           if (zc == NULL) return 2;
-          fcell = malloc(np * sizeof *fcell);
-          if (fcell == NULL) {
+          fromcell = malloc(np * sizeof *fromcell);
+          if (fromcell == NULL) {
             free(zc);
             return 2;
           }
           for (size_t p = 0; p < np; p++) {
             zc[p] = 1e30f;
-            fcell[p] = 0.0;
+            fromcell[p] = 0.0;
           }
           int64_t ndrawn = 0;
           for (int32_t q = 0; q < T.nnd; q++) {
@@ -1159,7 +1159,7 @@ int main(int argc, char **argv) {
                 size_t pp = (size_t)jj2 * (size_t)bufside + (size_t)ii2;
                 if ((float)tmin >= zc[pp]) continue;
                 zc[pp] = (float)tmin;
-                fcell[pp] = (X.cellf[q] >= 0.0f) ? (double)X.cellf[q] : 0.0;
+                fromcell[pp] = (X.cellf[q] >= 0.0f) ? (double)X.cellf[q] : 0.0;
               }
           }
           free(zc);
@@ -1345,7 +1345,7 @@ int main(int argc, char **argv) {
            * из поточечного обхода — иначе меряется прежний путь, что и вышло
            * трижды подряд. Сторона грани остаётся частью определения величины и
            * применяется к обоим путям одинаково. */
-          double fv = cellimg ? fcell[p] : f;
+          double fv = cellimg ? fromcell[p] : f;
           pix[p] = kd * fv * cs;
           /* Эталон спрашивает «видно ли отсюда солнце», и ответ у отвёрнутой
            * стороны — НЕТ, независимо от `f`. Сверять надо ту же величину. */
@@ -1866,7 +1866,7 @@ int main(int argc, char **argv) {
     free(zb);
     free(ib);
     free(pix);
-    free(fcell);
+    free(fromcell);
     free(fpix);
   }
 

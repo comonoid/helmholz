@@ -29,9 +29,11 @@
  * `L = 6` (А614).
  */
 #include "cut/dc.h"
+#include "image.h"
 #include "pclip.h"
 #include "scene_cfg.h"
 #include "scene_obj.h"
+#include "transport/cam3.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -727,6 +729,102 @@ static void surf_err(const hz_dctree *T, const frame *fr, const hz_objmesh *m, t
   free(vr);
 }
 
+/* --- 3b. КАРТИНКА ПОЛЯ (первая; §377) -------------------------------------- */
+
+/* ЗАЧЕМ. До сих пор поле проверялось только числами, а глазами смотрели на
+ * картинки ЛУЧЕВОГО пути (`prad`, полигональная сегментация). Пока поля не
+ * видно, «одно представление» проверяется вслепую, и §368 п. 4 («сегментация
+ * снимается, когда поле даёт картинку не хуже prad») не с чем сравнивать.
+ *
+ * ЧТО ЭТО НЕ ЕСТЬ. Это НЕ рендер переноса и не фронт: ни одного отскока, ни
+ * тени, ни цвета материала. Полигоны выдаёт `hz_dc_walk`, они растеризуются
+ * z-буфером, яркость — |n·l| от налобного источника. Единственное, что картинка
+ * проверяет, — ГЕОМЕТРИЮ поля, и говорить о ней надо только это. */
+typedef struct {
+  const tr3_camera *cam;
+  const frame *fr;
+  double *z, *v;
+  int64_t ntri, nclip;
+} rastctx;
+
+static void rast_tri(rastctx *R, const double a[3], const double b[3], const double c[3]) {
+  const tr3_camera *cm = R->cam;
+  double p[3][3] = {{a[0], a[1], a[2]}, {b[0], b[1], b[2]}, {c[0], c[1], c[2]}};
+  double sx[3], sy[3], sz[3];
+  for (int k = 0; k < 3; k++) {
+    double d[3];
+    for (int q = 0; q < 3; q++)
+      d[q] = p[k][q] - cm->eye[q];
+    double zz = d[0] * cm->fwd[0] + d[1] * cm->fwd[1] + d[2] * cm->fwd[2];
+    if (!(zz > 1e-6)) { /* за камерой или в ней: отсекать надо, а не сдвигать */
+      R->nclip++;
+      return;
+    }
+    double rr = d[0] * cm->right[0] + d[1] * cm->right[1] + d[2] * cm->right[2];
+    double uu = d[0] * cm->up[0] + d[1] * cm->up[1] + d[2] * cm->up[2];
+    sz[k] = zz;
+    sx[k] = ((rr / (zz * cm->tanx)) + 1.0) * 0.5 * (double)cm->w;
+    sy[k] = (1.0 - uu / (zz * cm->tany)) * 0.5 * (double)cm->h;
+  }
+  /* нормаль СЧИТАЕТСЯ по мировым вершинам, а не берётся у ячейки: картинка
+   * обязана показывать ту поверхность, которую выдал обход */
+  double e1[3], e2[3], nn[3];
+  for (int q = 0; q < 3; q++) {
+    e1[q] = b[q] - a[q];
+    e2[q] = c[q] - a[q];
+  }
+  nn[0] = e1[1] * e2[2] - e1[2] * e2[1];
+  nn[1] = e1[2] * e2[0] - e1[0] * e2[2];
+  nn[2] = e1[0] * e2[1] - e1[1] * e2[0];
+  double m = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+  if (!(m > 0.0)) return;
+  double lx = a[0] - cm->eye[0], ly = a[1] - cm->eye[1], lz = a[2] - cm->eye[2];
+  double lm = sqrt(lx * lx + ly * ly + lz * lz);
+  if (!(lm > 0.0)) return;
+  double cosv = fabs((nn[0] * lx + nn[1] * ly + nn[2] * lz) / (m * lm));
+  double shade = 0.15 + 0.85 * cosv;
+
+  double x0 = sx[0], x1 = sx[0], y0 = sy[0], y1 = sy[0];
+  for (int k = 1; k < 3; k++) {
+    if (sx[k] < x0) x0 = sx[k];
+    if (sx[k] > x1) x1 = sx[k];
+    if (sy[k] < y0) y0 = sy[k];
+    if (sy[k] > y1) y1 = sy[k];
+  }
+  int ix0 = (int)floor(x0), ix1 = (int)ceil(x1), iy0 = (int)floor(y0), iy1 = (int)ceil(y1);
+  if (ix0 < 0) ix0 = 0;
+  if (iy0 < 0) iy0 = 0;
+  if (ix1 > cm->w - 1) ix1 = cm->w - 1;
+  if (iy1 > cm->h - 1) iy1 = cm->h - 1;
+  double d21x = sx[1] - sx[0], d21y = sy[1] - sy[0], d31x = sx[2] - sx[0], d31y = sy[2] - sy[0];
+  double det = d21x * d31y - d21y * d31x;
+  if (!(fabs(det) > 0.0)) return;
+  R->ntri++;
+  for (int py = iy0; py <= iy1; py++)
+    for (int px = ix0; px <= ix1; px++) {
+      double qx = (double)px + 0.5 - sx[0], qy = (double)py + 0.5 - sy[0];
+      double u = (qx * d31y - qy * d31x) / det, v = (qy * d21x - qx * d21y) / det;
+      if (u < 0.0 || v < 0.0 || u + v > 1.0) continue;
+      double zz = sz[0] + u * (sz[1] - sz[0]) + v * (sz[2] - sz[0]);
+      size_t k = (size_t)py * (size_t)cm->w + (size_t)px;
+      if (zz >= R->z[k]) continue;
+      R->z[k] = zz;
+      R->v[k] = shade;
+    }
+}
+
+static int rast_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv) {
+  rastctx *R = (rastctx *)ctx;
+  (void)ref;
+  double w[4][3];
+  for (int i = 0; i < nv; i++)
+    for (int c = 0; c < 3; c++)
+      w[i][c] = R->fr->org[c] + v[i][c] * R->fr->h;
+  for (int i = 1; i + 1 < nv; i++)
+    rast_tri(R, w[0], w[i], w[i + 1]);
+  return 0;
+}
+
 /* --- 4. главная ------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
@@ -1225,6 +1323,37 @@ int main(int argc, char **argv) {
          (double)S.n * (double)sizeof(snode) / 1048576.0, (double)S.ntri * 4.0 / 1048576.0,
          (double)ht.n * (double)sizeof(hz_hedge) / 1048576.0);
   surf_err(&T, &fr, &m, sparse_tris, &S, "");
+
+  /* ---- КАРТИНКА ПОЛЯ: обход -> полигоны -> z-буфер -> img/ ---- */
+  {
+    tr3_camera cam;
+    double eye[3] = HZ_CFG_HALL_EYE, at[3] = HZ_CFG_HALL_AT, up[3] = HZ_CFG_UP;
+    /* 512² — разрешение, названное в бюджете кадра (§367) */
+    if (tr3_camera_look(&cam, eye, at, up, HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0, 512,
+                        512) == 0) {
+      size_t np = 512u * 512u;
+      double *zb = malloc(np * sizeof *zb), *vb = calloc(np, sizeof *vb);
+      if (zb == NULL || vb == NULL) exit(1);
+      for (size_t i = 0; i < np; i++)
+        zb[i] = 1e300;
+      rastctx R = {&cam, &fr, zb, vb, 0, 0};
+      t0 = now_s();
+      int wrc = hz_dc_walk(&T, NULL, NULL, rast_poly, &R);
+      double t_img = now_s() - t0;
+      int64_t nfill = 0;
+      for (size_t i = 0; i < np; i++)
+        if (zb[i] < 1e299) nfill++;
+      char path[256];
+      snprintf(path, sizeof path, "img/pfield_hall_L%d.ppm", lev);
+      int prc = hz_ppm_write(path, vb, 512, 512);
+      printf("   КАРТИНКА за %.2f с: обход код %d, треугольников %lld (за камерой %lld), "
+             "заполнено %lld из %zu пикселей (%.1f %%) -> %s (код %d)\n",
+             t_img, wrc, (long long)R.ntri, (long long)R.nclip, (long long)nfill, np,
+             100.0 * (double)nfill / (double)np, path, prc);
+      free(zb);
+      free(vb);
+    }
+  }
 
   /* ---- сверка двух путей: по КОРОБКЕ узла, побитово (А613) ---- */
   if (both && dense_v != NULL) {

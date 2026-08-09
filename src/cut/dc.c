@@ -598,6 +598,7 @@ typedef struct {
   hz_dc_poly emit;
   void *pctx;
   int rc;
+  int32_t nskip; /* пропущено полигонов у неманифолдных ячеек — СЧИТАЕТСЯ (§377) */
 } walkctx;
 
 static int leafish(const walkctx *w, const hz_dcref *r) {
@@ -683,8 +684,17 @@ static void process_edge(walkctx *w, const hz_dcref q[4], int e, const int32_t q
     const hz_dcnode *nd = &w->t->nd[q[k].ni];
     if (!(nd->flags & HZ_DC_HASVERT)) {
       /* Ячейка у ребра со сменой знака ОБЯЗАНА иметь вершину; её нет только у
-       * неманифолдной (Г47). Полигон не выдаём и сообщаем — fail closed. */
-      w->rc = HZ_DC_EMULTI;
+       * неманифолдной (Г47). Полигон не выдаём — fail closed.
+       *
+       * НО ОБХОД ПРОДОЛЖАЕТСЯ, И ЭТО ПОПРАВКА, А НЕ ПОСЛАБЛЕНИЕ (§377). Прежде
+       * здесь ставился код возврата, и вся рекурсия сворачивалась: ОДНА
+       * неманифолдная ячейка отменяла ВСЮ поверхность. Замерено — на зале при
+       * L = 8 таких ячеек 2 538, и обход выдавал 170 треугольников вместо
+       * ~200 тысяч, то есть картинки не было вовсе. «Fail closed» значит «не
+       * выдать НЕВЕРНЫЙ полигон», а не «не выдать ни одного»: дыра в месте
+       * отказа честнее пустого экрана. Отказ по-прежнему НЕ МОЛЧАЛИВ — он
+       * считается в w->nskip и возвращается кодом HZ_DC_EMULTI в конце. */
+      w->nskip++;
       return;
     }
     if (nv > 0 && rr[nv - 1].ni == q[k].ni) continue; /* крупная ячейка на двух квадрантах */
@@ -856,9 +866,10 @@ static void cell_proc(walkctx *w, const hz_dcref *r) {
 }
 
 int hz_dc_walk(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_dc_poly emit, void *pctx) {
-  walkctx w = {t, stop, sctx, emit, pctx, HZ_DC_OK};
+  walkctx w = {t, stop, sctx, emit, pctx, HZ_DC_OK, 0};
   hz_dcref root = {0, {0, 0, 0}, (int32_t)1 << t->log2size};
   cell_proc(&w, &root);
+  if (w.rc == HZ_DC_OK && w.nskip > 0) return HZ_DC_EMULTI;
   return w.rc;
 }
 
@@ -876,7 +887,7 @@ static void locate(const walkctx *w, const int32_t cell[3], hz_dcref *out) {
 
 int hz_dc_walk_ref(const hz_dctree *t, const hz_htab *ht, hz_dc_stop stop, void *sctx,
                    hz_dc_poly emit, void *pctx) {
-  walkctx w = {t, stop, sctx, emit, pctx, HZ_DC_OK};
+  walkctx w = {t, stop, sctx, emit, pctx, HZ_DC_OK, 0};
   int32_t n = (int32_t)1 << t->log2size;
   for (int32_t i = 0; i < ht->n && w.rc == HZ_DC_OK; i++) {
     const hz_hedge *e = &ht->e[i];

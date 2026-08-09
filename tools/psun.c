@@ -51,7 +51,7 @@ static int cmp_dbl_psun(const void *x, const void *y) {
  * (на 1024² это 4 МБ чтения и записи за кадр — чистая полоса памяти), и
  * сравнения на пиксель тоже нет. */
 static void paint_cell(const hz_ptree *T, int32_t nid, const float *cellf, const hz_pcull *C,
-                       const double *eye, int side, double *out, int64_t *ndrawn) {
+                       const double *eye, int side, int32_t *out, int64_t *ndrawn) {
   const hz_ptnode *N = &T->nd[nid];
   if (cellf[nid] > -1.5f) {
     /* Экранный след коробки — по восьми углам, той же рамой, что `hz_pcull_ray`. */
@@ -80,10 +80,11 @@ static void paint_cell(const hz_ptree *T, int32_t nid, const float *cellf, const
     if (j1 >= side) j1 = side - 1;
     if (i1 < i0 || j1 < j0) return;
     (*ndrawn)++;
-    double f = (cellf[nid] >= 0.0f) ? (double)cellf[nid] : 0.0;
+    /* Пишется НОМЕР ЯЧЕЙКИ, а не значение: из ячейки счёту нужны три вещи —
+     * доля, нормаль и материал (§354), и держать их врозь незачем. */
     for (int jj = j0; jj <= j1; jj++)
       for (int ii = i0; ii <= i1; ii++)
-        out[(size_t)jj * (size_t)side + (size_t)ii] = f;
+        out[(size_t)jj * (size_t)side + (size_t)ii] = nid;
     return;
   }
   if (N->child < 0) return;
@@ -133,8 +134,10 @@ int main(int argc, char **argv) {
   int indep = 1, intol = 128, silh = 1;
   double ooff = 1e-5, nofrec = 0.0;
   int coverset = 0, shiftset = 0, zbuf = 1;
-  int g_virt = 0;      /* §338 */
-  int cellimg = 0;     /* §349: картинка из ячеек фронта, без второй видимости */
+  int g_virt = 0; /* §338 */
+  /* §353/§354, решение пользователя 08-09: УМОЛЧАНИЕ — счёт по ячейкам, без
+   * z-буфера. Прежний путь остаётся ключом `cellimg=0` как точка отсчёта. */
+  int cellimg = 1;
   int g_camfloor = -1; /* §340: −1 — «как virt» */
   /* УГЛОВОЙ РАДИУС ИСТОЧНИКА — ПАРАМЕТР, А НЕ КОНСТАНТА (замечание пользователя
    * 08-07). Он был зашит числом солнца в ДВУХ местах — у фронта и у эталона, — и
@@ -933,6 +936,12 @@ int main(int argc, char **argv) {
   }
   /* Место, куда фронт положит свой ответ, — только если он кому-то нужен. */
   if (img) {
+    /* §354: запись ячейки — нормаль и материал, рядом с долей. */
+    X.celln = calloc((size_t)T.nnd * 3, sizeof *X.celln);
+    X.cellmt = malloc((size_t)T.nnd * sizeof *X.cellmt);
+    if (X.cellmt != NULL)
+      for (int32_t i = 0; i < T.nnd; i++)
+        X.cellmt[i] = -1;
     X.cellf = malloc((size_t)T.nnd * sizeof *X.cellf);
     if (X.cellf != NULL)
       for (int32_t i = 0; i < T.nnd; i++)
@@ -1137,7 +1146,7 @@ int main(int argc, char **argv) {
      * солнце», а не «насколько ярко», и мешать в одну величину косинус с
      * альбедо значило бы сверять три вещи разом. */
     double *fpix = malloc(np * sizeof *fpix);
-    double *fromcell = NULL; /* §351: доля, собранная ИЗ ЯЧЕЕК */
+    int32_t *idcell = NULL; /* §354: НОМЕР ЯЧЕЙКИ на пиксель — из него доля, нормаль, материал */
     if (zb != NULL && ib != NULL && pix != NULL && fpix != NULL) {
       double diag = 0.0;
       for (int c = 0; c < 3; c++) {
@@ -1170,12 +1179,12 @@ int main(int argc, char **argv) {
          * диска в видимой точке, и разность есть цена квантования ячейкой. */
         if (cellimg) {
           double tci = now_s();
-          fromcell = malloc(np * sizeof *fromcell);
-          if (fromcell == NULL) return 2;
+          idcell = malloc(np * sizeof *idcell);
+          if (idcell == NULL) return 2;
           for (size_t p = 0; p < np; p++)
-            fromcell[p] = 0.0;
+            idcell[p] = -1;
           int64_t ndrawn = 0;
-          paint_cell(&T, 0, X.cellf, &C2, camo, bufside, fromcell, &ndrawn);
+          paint_cell(&T, 0, X.cellf, &C2, camo, bufside, idcell, &ndrawn);
           printf("== КАРТИНКА ИЗ ЯЧЕЕК (§349) за %.2f с: поставлено ячеек %lld из %d узлов\n",
                  now_s() - tci, (long long)ndrawn, T.nnd);
         }
@@ -1199,7 +1208,45 @@ int main(int argc, char **argv) {
           pix[p] = 0.0;
           /* При сборке из ячеек `fpix` уже заполнено и перечитывать его по
            * точке нельзя — точки в этом пути нет вовсе (§349). */
-          if (!cellimg) fpix[p] = 0.0;
+          fpix[p] = 0.0;
+          /* §354: СЧЁТ БЕЗ z-БУФЕРА. Всё, что нужно пикселю, берётся из ЯЧЕЙКИ:
+           * доля открытого диска, нормаль (взвешенная площадью) и материал.
+           * Треугольного буфера в этом пути нет ни одного обращения; он остаётся
+           * эталону и досье, которым точная геометрия законна. */
+          if (cellimg) {
+            int32_t q = idcell[p];
+            if (q < 0) {
+              nsky++;
+              continue;
+            }
+            const float *cn = X.celln + 3 * (size_t)q;
+            double c0 = (double)cn[0], c1 = (double)cn[1], c2 = (double)cn[2];
+            double ln2 = sqrt(c0 * c0 + c1 * c1 + c2 * c2);
+            double cv3[3] = {c0, c1, c2};
+            double f2 = (X.cellf[q] >= 0.0f) ? (double)X.cellf[q] : 0.0;
+            double cs2 = 0.0;
+            if (ln2 > 0.0) {
+              /* Сторона — та, что обращена к глазу, как и у прежнего пути. */
+              double vn2 = 0.0;
+              double dq[3];
+              hz_pcull_ray(&C2, (int)(p % (size_t)bufside), (int)(p / (size_t)bufside), dq);
+              for (int c = 0; c < 3; c++)
+                vn2 += (cv3[c] / ln2) * dq[c];
+              double sgn2 = (vn2 > 0.0) ? -1.0 : 1.0;
+              for (int c = 0; c < 3; c++)
+                cs2 -= sgn2 * (cv3[c] / ln2) * X.dir[c];
+              if (cs2 < 0.0) cs2 = 0.0;
+            }
+            double kd2 = (X.cellmt[q] >= 0) ? m.mtl[X.cellmt[q]].kd : 1.0;
+            pix[p] = kd2 * f2 * cs2;
+            fpix[p] = (cs2 > 0.0) ? f2 : 0.0;
+            sum += pix[p];
+            if (f2 > 0.5)
+              nlit2++;
+            else
+              nsh2++;
+            continue;
+          }
           if (ib[p] < 0) {
             nsky++;
             continue;
@@ -1358,7 +1405,7 @@ int main(int argc, char **argv) {
            * из поточечного обхода — иначе меряется прежний путь, что и вышло
            * трижды подряд. Сторона грани остаётся частью определения величины и
            * применяется к обоим путям одинаково. */
-          double fv = cellimg ? fromcell[p] : f;
+          double fv = f;
           pix[p] = kd * fv * cs;
           /* Эталон спрашивает «видно ли отсюда солнце», и ответ у отвёрнутой
            * стороны — НЕТ, независимо от `f`. Сверять надо ту же величину. */
@@ -1879,7 +1926,7 @@ int main(int argc, char **argv) {
     free(zb);
     free(ib);
     free(pix);
-    free(fromcell);
+    free(idcell);
     free(fpix);
   }
 
@@ -2128,6 +2175,8 @@ int main(int argc, char **argv) {
    * гейте видна, и починить дешевле, чем оговаривать. */
   free(dep);
   free(mk);
+  free(X.celln);
+  free(X.cellmt);
   free(X.cellf);
   free(vis);
   free(X.cellslot);

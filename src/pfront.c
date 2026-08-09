@@ -713,6 +713,41 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         }
       X->cellf[nid] = (float)((wi > 0.0) ? fi / wi : 0.0);
     }
+    /* ЗАПИСЬ ЯЧЕЙКИ: НОРМАЛЬ И МАТЕРИАЛ (§354). Считается из того же списка
+     * кандидатов, по которому уже посчитано перекрытие, — нового обхода нет.
+     * Нормаль взвешена ПЛОЩАДЬЮ, материал берётся у наибольшего куска: и то и
+     * другое есть ответ ячейки, а не точки, и потому не требует ни z-буфера,
+     * ни попадания луча. */
+    if (!isvirt && X->celln != NULL && X->cellmt != NULL) {
+      double sn[3] = {0.0, 0.0, 0.0}, amax = 0.0;
+      int32_t mt = -1;
+      for (int32_t i = 0; i < n; i++) {
+        int32_t t = list[i];
+        const double *A = X->m->v + 3 * (size_t)X->m->f[3 * (size_t)t + 0];
+        const double *B = X->m->v + 3 * (size_t)X->m->f[3 * (size_t)t + 1];
+        const double *C = X->m->v + 3 * (size_t)X->m->f[3 * (size_t)t + 2];
+        double e1[3], e2[3], cr[3];
+        for (int c = 0; c < 3; c++) {
+          e1[c] = B[c] - A[c];
+          e2[c] = C[c] - A[c];
+        }
+        cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
+        cr[1] = e1[2] * e2[0] - e1[0] * e2[2];
+        cr[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        double a2 = sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+        if (!(a2 > 0.0)) continue;
+        for (int c = 0; c < 3; c++)
+          sn[c] += cr[c];
+        if (a2 > amax) {
+          amax = a2;
+          mt = X->m->fm[t];
+        }
+      }
+      double ln = sqrt(sn[0] * sn[0] + sn[1] * sn[1] + sn[2] * sn[2]);
+      for (int c = 0; c < 3; c++)
+        X->celln[3 * (size_t)nid + (size_t)c] = (ln > 0.0) ? (float)(sn[c] / ln) : 0.0f;
+      X->cellmt[nid] = mt;
+    }
     /* Освещённость ячейки — тоже по ПОТОКУ, а не среднее по трём граням. */
     double fl = 0.0, w = 0.0;
     for (int a = 0; a < 3; a++) {

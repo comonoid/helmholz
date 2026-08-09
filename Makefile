@@ -167,6 +167,7 @@ build/psimp: tools/psimp.c $(PGEOM) | build
 # огрубление. Стенды Ш5…Ш8 и §10 собираются из него.
 PFULL = src/scene_obj.c src/poly_seg.c src/polygon.c src/pedge.c src/prast.c src/psweep.c \
         src/pray.c src/phcube.c src/ptree.c src/pvert.c src/pdirect.c src/pcut.c src/pmerge.c src/pvfit.c src/plod.c src/lodio.c src/plink.c src/pff.c src/image.c \
+        src/pclip.c \
         src/cut/surf.c src/cut/poly3.c src/cut/qef.c \
         src/transport/dirs3.c src/transport/quad.c src/transport/cam3.c src/transport/ray3.c \
         src/octree.c

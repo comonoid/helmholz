@@ -23,6 +23,7 @@
  * 12 октав доводят ячейку до 19 мм, то есть ниже входного треугольника. */
 #define HZ_NH 12
 
+#include "pclip.h"
 #include "pedge.h"
 #include "lodio.h"
 #include "plod.h"
@@ -44,6 +45,11 @@ static double now_s(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
+}
+
+static int cmp_i64(const void *x, const void *y) {
+  int64_t a = *(const int64_t *)x, b = *(const int64_t *)y;
+  return (a < b) ? -1 : ((a > b) ? 1 : 0);
 }
 
 static int cmp_dbl(const void *x, const void *y) {
@@ -550,6 +556,7 @@ int main(int argc, char **argv) {
   double epsmul = 1.0, radmul = 1.0, eyemul = 1.0, ang0 = 0.0, vfitlim = 0.0;
   double cgate = 0.0, ladbase = 0.0;
   const char *save = NULL, *load = NULL;
+  int cellsj = 0; /* §330: показатель мелкой ячейки для замера занятости */
   /* НЕИЗВЕСТНЫЙ АРГУМЕНТ — ОШИБКА, А НЕ ПРОПУСК (§60, дефект оснастки). Флаг,
    * который не совпал, молчал, и конфигурация вышла тождественной другой; поймать
    * это удалось лишь по совпадению всех семи чисел. Обрыв дешевле. */
@@ -610,6 +617,10 @@ int main(int argc, char **argv) {
      * уровне, то есть сравниваются сцены, совпадающие на 87 %. Сравнивать надо
      * при РАВНОЙ ЦЕНЕ, а цена задаётся ε. */
     if (strcmp(argv[i], "curve") == 0) ok = curve = 1;
+    if (strncmp(argv[i], "cells=", 6) == 0) {
+      cellsj = (int)strtol(argv[i] + 6, NULL, 10);
+      ok = 1;
+    }
     if (strncmp(argv[i], "lev=", 4) == 0) {
       maxlev = (int)strtol(argv[i] + 4, NULL, 10);
       ok = 1;
@@ -671,6 +682,96 @@ int main(int argc, char **argv) {
       0) {
     fprintf(stderr, "нет сцены\n");
     return 1;
+  }
+  /* ЗАНЯТЫЕ ЯЧЕЙКИ ПО УРОВНЯМ (§330) — ПОСЫЛКА ЗАКОНА ЧЕТВЁРКИ.
+   *
+   * Пирамида стоит `1 + 1/4 + 1/16 + … = 4/3` ровно тогда, когда содержимого на
+   * уровень становится вчетверо меньше. Для ПОВЕРХНОСТИ в трёхмерном дереве это
+   * должно быть так по размерности (занятых ячеек `∝ h⁻²`), а не по восьмёрке
+   * (`h⁻³` — закон ОБЪЁМА). Посылка проверяется здесь прямо и ЧЕСТНЫМ
+   * пересечением: ячейка занята, если отсечение треугольника коробкой дало
+   * НЕНУЛЕВУЮ ПЛОЩАДЬ (то же определение, что у `hz_pocc_build`). Габаритный
+   * суррогат брать нельзя — он даёт закон объёма даже там, где его нет (замерено
+   * в §328: у наклонного лоскута коробка трёхмерна). Считается ДО сегментации,
+   * потому что от неё не зависит вовсе. */
+  if (cellsj > 0) {
+    double lo3[3] = {1e300, 1e300, 1e300}, hi3[3] = {-1e300, -1e300, -1e300};
+    for (int32_t k = 0; k < m.nv; k++)
+      for (int c = 0; c < 3; c++) {
+        double x = m.v[3 * (size_t)k + (size_t)c];
+        if (x < lo3[c]) lo3[c] = x;
+        if (x > hi3[c]) hi3[c] = x;
+      }
+    double diag =
+        sqrt((hi3[0] - lo3[0]) * (hi3[0] - lo3[0]) + (hi3[1] - lo3[1]) * (hi3[1] - lo3[1]) +
+             (hi3[2] - lo3[2]) * (hi3[2] - lo3[2]));
+    double h = diag / pow(2.0, (double)cellsj);
+    int64_t cap = 1 << 20, nk = 0;
+    int64_t *key = malloc((size_t)cap * sizeof *key);
+    if (key == NULL) return 1;
+    double t0c = now_s();
+    int64_t nemit = 0;
+    for (int32_t t = 0; t < m.nt; t++) {
+      const double *A = m.v + (size_t)m.f[3 * (size_t)t + 0] * 3;
+      const double *B = m.v + (size_t)m.f[3 * (size_t)t + 1] * 3;
+      const double *C = m.v + (size_t)m.f[3 * (size_t)t + 2] * 3;
+      int64_t i0[3], i1[3];
+      for (int c = 0; c < 3; c++) {
+        double a = A[c] < B[c] ? A[c] : B[c];
+        if (C[c] < a) a = C[c];
+        double b = A[c] > B[c] ? A[c] : B[c];
+        if (C[c] > b) b = C[c];
+        i0[c] = (int64_t)floor((a - lo3[c]) / h);
+        i1[c] = (int64_t)floor((b - lo3[c]) / h);
+      }
+      for (int64_t z = i0[2]; z <= i1[2]; z++)
+        for (int64_t y = i0[1]; y <= i1[1]; y++)
+          for (int64_t x = i0[0]; x <= i1[0]; x++) {
+            double cl[3] = {lo3[0] + (double)x * h, lo3[1] + (double)y * h, lo3[2] + (double)z * h};
+            double ch[3] = {cl[0] + h, cl[1] + h, cl[2] + h};
+            hz_pclip_poly P;
+            nemit++;
+            if (hz_pclip_tri(A, B, C, cl, ch, &P) < 3) continue;
+            if (!(hz_pclip_area(&P) > 0.0)) continue;
+            if (nk == cap) {
+              int64_t nc = cap * 2;
+              int64_t *kk = realloc(key, (size_t)nc * sizeof *kk);
+              if (kk == NULL) {
+                free(key);
+                return 1;
+              }
+              key = kk;
+              cap = nc;
+            }
+            key[nk++] = (x << 42) | (y << 21) | z;
+          }
+    }
+    printf("== ЗАНЯТЫЕ ЯЧЕЙКИ (честное отсечение), %s: габарит %.3f м, мелкая ячейка %.4f м, "
+           "проб %lld, попаданий %lld, за %.1f с\n",
+           scene, diag, h, (long long)nemit, (long long)nk, now_s() - t0c);
+    /* Огрубление свёрткой индексов: множество занятых ячеек уровня выше есть
+     * образ нижнего, поэтому честное отсечение нужно ровно ОДИН раз. */
+    for (int j = cellsj; j >= 0; j--) {
+      qsort(key, (size_t)nk, sizeof *key, cmp_i64);
+      int64_t u = 0;
+      for (int64_t q = 0; q < nk; q++)
+        if (q == 0 || key[q] != key[q - 1]) key[u++] = key[q];
+      static int64_t prev = 0;
+      printf("   ячейка %10.5f м (2^-%2d диагонали): ЗАНЯТО %10lld", diag / pow(2.0, (double)j), j,
+             (long long)u);
+      if (prev > 0)
+        printf("   к предыдущему %6.2f×  (закон поверхности — 4)", (double)prev / (double)u);
+      printf("\n");
+      prev = u;
+      nk = u;
+      for (int64_t q = 0; q < nk; q++) {
+        int64_t x = (key[q] >> 42) & 0x1fffff, y = (key[q] >> 21) & 0x1fffff, z = key[q] & 0x1fffff;
+        key[q] = ((x >> 1) << 42) | ((y >> 1) << 21) | (z >> 1);
+      }
+    }
+    free(key);
+    hz_obj_free(&m);
+    return 0;
   }
   hz_pseglist sg;
   if (hz_seg_planar(&sg, &m, dseg) != 0) return 1;

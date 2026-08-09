@@ -92,12 +92,46 @@ static int src_cross(void *ctx, const int32_t a[3], int axis, double *t, double 
 
 typedef struct {
   int32_t child0; /* -1 = лист */
+  int32_t parent; /* -1 у корня; нужен ЗАЛИВКЕ для подъёма к общему предку (§373) */
   int32_t t0;     /* начало списка треугольников листа размера 1 */
   int32_t tn;     /* длина списка — по НЕрасширенной коробке, правило плотного пути */
   uint8_t hit;    /* коробка, РАСШИРЕННАЯ на ячейку, задета треугольником */
   uint8_t occ;    /* НЕрасширенная задета: ячейка ПЕРЕКРЫВАЕТ заливку */
   uint8_t out;    /* заливка дошла */
 } snode;
+
+/* ПАЛЕЦ (§373). Запомненный ПУТЬ последнего спуска. Спуск идёт в глубину,
+ * поэтому следующий запрос почти всегда лежит под одним из запомненных узлов, и
+ * начинать от КОРНЯ незачем: подъём по короткому пути дешевле девяти чтений
+ * вразнобой. Результат от пальца НЕ ЗАВИСИТ — принадлежность проверяется всегда;
+ * ускоряется только поиск.
+ * ВНИМАНИЕ (А632): это изменяемое состояние в источнике, то есть источник
+ * НЕ ПОТОКОБЕЗОПАСЕН. Когда спуск пойдёт в потоки (§366 п. 4), палец обязан
+ * стать потоко-локальным, иначе гонка на записи пути. */
+typedef struct {
+  int32_t ni[HZ_DC_MAX_LOG2SIZE + 2];
+  int32_t lo[HZ_DC_MAX_LOG2SIZE + 2][3];
+  int32_t size[HZ_DC_MAX_LOG2SIZE + 2];
+  int len;
+} spath;
+
+/* Глубочайший запомненный узел, НАКРЫВАЮЩИЙ запрос целиком. */
+static int sp_find(const spath *p, const int32_t qlo[3], int32_t qsize) {
+  for (int d = p->len - 1; d >= 0; d--) {
+    int in = 1;
+    for (int a = 0; a < 3; a++)
+      if (qlo[a] < p->lo[d][a] || qlo[a] + qsize > p->lo[d][a] + p->size[d]) in = 0;
+    if (in) return d;
+  }
+  return -1;
+}
+
+static void sp_put(spath *p, int d, int32_t ni, const int32_t lo[3], int32_t size) {
+  p->ni[d] = ni;
+  p->size[d] = size;
+  for (int a = 0; a < 3; a++)
+    p->lo[d][a] = lo[a];
+}
 
 typedef struct {
   snode *nd;
@@ -106,12 +140,13 @@ typedef struct {
   int32_t ntri, captri;
   frame fr;
   const hz_objmesh *m;
-  double *tlo, *thi;           /* габариты треугольников — дешёвый отсев */
-  int noflood, invert, skip0;  /* ключи контролей */
-  int64_t nsign, nbox, ncross; /* цена спуска СЧИТАЕТСЯ, а не оценивается */
+  double *tlo, *thi;                     /* габариты треугольников — дешёвый отсев */
+  int noflood, invert, skip0, badfinger; /* ключи контролей */
+  int64_t nsign, nbox, ncross;           /* цена спуска СЧИТАЕТСЯ, а не оценивается */
+  spath fcell, fbox;                     /* пальцы: поиск ячейки и поиск коробки */
 } sfield;
 
-static int32_t s_alloc8(sfield *S) {
+static int32_t s_alloc8(sfield *S, int32_t ni) {
   if (S->n + 8 > S->cap) {
     int32_t nc = S->cap * 2;
     if (nc < S->n + 8) nc = S->n + 8;
@@ -122,8 +157,10 @@ static int32_t s_alloc8(sfield *S) {
   }
   int32_t base = S->n;
   memset(&S->nd[base], 0, 8 * sizeof *S->nd);
-  for (int i = 0; i < 8; i++)
+  for (int i = 0; i < 8; i++) {
     S->nd[base + i].child0 = -1;
+    S->nd[base + i].parent = ni;
+  }
   S->n += 8;
   return base;
 }
@@ -208,7 +245,7 @@ static int s_build(sfield *S, int32_t ni, const int32_t lo[3], int32_t size, con
     return 0;
   }
 
-  int32_t c0 = s_alloc8(S);
+  int32_t c0 = s_alloc8(S, ni);
   if (c0 < 0) return -1;
   S->nd[ni].child0 = c0;
   int32_t half = size / 2;
@@ -350,7 +387,23 @@ static int s_flood(sfield *S) {
         qlo[a] = d ? L.lo[a] + L.size : L.lo[a] - 1;
         qhi[a] = qlo[a] + 1;
         if (qlo[a] < 0 || qlo[a] >= S->fr.n) continue;
-        s_spread(S, &st, 0, zero, S->fr.n, qlo, qhi);
+        /* ПОДЪЁМ ДО ОБЩЕГО ПРЕДКА, А НЕ СПУСК ОТ КОРНЯ (§373). Коробка предка
+         * восстанавливается арифметикой, а не хранением: коробка выровнена по
+         * своему размеру, поэтому у родителя это `lo & ~(2·size − 1)` при
+         * размере `2·size`. В худшем случае (сосед по другую сторону середины
+         * сцены) поднимемся до корня и не выиграем ничего — А636. */
+        int32_t ani = L.ni, alo[3] = {L.lo[0], L.lo[1], L.lo[2]}, asize = L.size;
+        for (;;) {
+          int cov = 1;
+          for (int b = 0; b < 3; b++)
+            if (qlo[b] < alo[b] || qhi[b] > alo[b] + asize) cov = 0;
+          if (cov || S->nd[ani].parent < 0) break;
+          ani = S->nd[ani].parent;
+          asize *= 2;
+          for (int b = 0; b < 3; b++)
+            alo[b] &= ~(asize - 1);
+        }
+        s_spread(S, &st, ani, alo, asize, qlo, qhi);
       }
   }
   int bad = st.oom;
@@ -360,8 +413,26 @@ static int s_flood(sfield *S) {
 
 /* --- обратные вызовы разрежённого источника -------------------------------- */
 
-static const snode *s_leaf_at(const sfield *S, const int32_t cell[3]) {
-  int32_t ni = 0, size = S->fr.n, lo[3] = {0, 0, 0};
+static const snode *s_leaf_at(sfield *S, const int32_t cell[3]) {
+  spath *p = &S->fcell;
+  /* НЕГАТИВНЫЙ КОНТРОЛЬ `badfinger` (§373): палец отдаёт прошлый лист, НЕ
+   * проверив, что ячейка в нём лежит. Ровно та ошибка, которую палец и может
+   * внести; приёмка обязана её увидеть, иначе принята вслепую. */
+  if (S->badfinger && p->len > 0) return &S->nd[p->ni[p->len - 1]];
+  int d = sp_find(p, cell, 1);
+  int32_t ni, size, lo[3];
+  if (d < 0) {
+    d = 0;
+    ni = 0;
+    size = S->fr.n;
+    lo[0] = lo[1] = lo[2] = 0;
+    sp_put(p, 0, ni, lo, size);
+  } else {
+    ni = p->ni[d];
+    size = p->size[d];
+    for (int a = 0; a < 3; a++)
+      lo[a] = p->lo[d][a];
+  }
   while (S->nd[ni].child0 >= 0) {
     int32_t half = size / 2;
     int bit = 0;
@@ -372,7 +443,9 @@ static const snode *s_leaf_at(const sfield *S, const int32_t cell[3]) {
       }
     ni = S->nd[ni].child0 + bit;
     size = half;
+    sp_put(p, ++d, ni, lo, size);
   }
+  p->len = d + 1;
   return &S->nd[ni];
 }
 
@@ -481,10 +554,30 @@ static int s_boxq(void *ctx, const int32_t lo[3], int32_t size) {
   /* НЕГАТИВНЫЙ КОНТРОЛЬ `skip0` (§370): предикат ЛЖЁТ «пусто» на одном октанте
    * корня. Отказ обязан быть fail-open — геометрия исчезает молча. */
   if (S->skip0 && size == S->fr.n / 2 && lo[0] == 0 && lo[1] == 0 && lo[2] == 0) return 0;
-  int32_t ni = 0, sz = S->fr.n, l[3] = {0, 0, 0};
+  spath *p = &S->fbox;
+  int d = sp_find(p, lo, size);
+  int32_t ni, sz, l[3];
+  if (d < 0) {
+    d = 0;
+    ni = 0;
+    sz = S->fr.n;
+    l[0] = l[1] = l[2] = 0;
+    sp_put(p, 0, ni, l, sz);
+  } else {
+    ni = p->ni[d];
+    sz = p->size[d];
+    for (int a = 0; a < 3; a++)
+      l[a] = p->lo[d][a];
+  }
   while (sz > size) {
-    if (!S->nd[ni].hit) return 0;
-    if (S->nd[ni].child0 < 0) return 1; /* лист крупнее запроса: отвечаем «может быть» */
+    if (!S->nd[ni].hit) {
+      p->len = d + 1;
+      return 0;
+    }
+    if (S->nd[ni].child0 < 0) { /* лист крупнее запроса: отвечаем «может быть» */
+      p->len = d + 1;
+      return 1;
+    }
     int32_t half = sz / 2;
     int bit = 0;
     for (int a = 0; a < 3; a++)
@@ -494,7 +587,9 @@ static int s_boxq(void *ctx, const int32_t lo[3], int32_t size) {
       }
     ni = S->nd[ni].child0 + bit;
     sz = half;
+    sp_put(p, ++d, ni, l, sz);
   }
+  p->len = d + 1;
   return S->nd[ni].hit ? 1 : 0;
 }
 
@@ -517,7 +612,7 @@ static int32_t dense_tris(void *ctx, const int32_t cell[3], const int32_t **out)
 }
 
 static int32_t sparse_tris(void *ctx, const int32_t cell[3], const int32_t **out) {
-  const sfield *S = (const sfield *)ctx;
+  sfield *S = (sfield *)ctx;
   const snode *L = s_leaf_at(S, cell);
   *out = S->tri + L->t0;
   return L->tn;
@@ -636,10 +731,11 @@ static void surf_err(const hz_dctree *T, const frame *fr, const hz_objmesh *m, t
 
 int main(int argc, char **argv) {
   if (argc < 3) {
-    fprintf(stderr, "pfield ФАЙЛ.obj МАСШТАБ [lev=N] [both] [noflood] [invert] [skip0]\n");
+    fprintf(stderr,
+            "pfield ФАЙЛ.obj МАСШТАБ [lev=N] [both] [noflood] [invert] [skip0] [badfinger]\n");
     return 2;
   }
-  int lev = 6, noflood = 0, invert = 0, skip0 = 0, both = 0;
+  int lev = 6, noflood = 0, invert = 0, skip0 = 0, both = 0, badfinger = 0;
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "lev=", 4) == 0) lev = (int)strtol(argv[i] + 4, NULL, 10);
     /* ПЛОТНЫЙ ЭТАЛОН РЯДОМ (Г42): оба пути в одном прогоне, сверка побитовая. */
@@ -650,6 +746,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "invert") == 0) invert = 1;
     /* НЕГАТИВНЫЙ КОНТРОЛЬ (§370): предикат лжёт «пусто» на октанте корня. */
     if (strcmp(argv[i], "skip0") == 0) skip0 = 1;
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ (§373): палец без проверки принадлежности. */
+    if (strcmp(argv[i], "badfinger") == 0) badfinger = 1;
   }
   if (lev < 1 || lev > HZ_DC_MAX_LOG2SIZE) {
     fprintf(stderr, "lev вне разрядного предела (1..%d)\n", HZ_DC_MAX_LOG2SIZE);
@@ -683,9 +781,9 @@ int main(int argc, char **argv) {
   fr.h = side / (double)(fr.n - 2);
   for (int c = 0; c < 3; c++)
     fr.org[c] = 0.5 * (lo[c] + hi[c]) - 0.5 * (double)fr.n * fr.h;
-  printf("== ПОЛЕ: %s, треугольников %d, сетка %d^3, ячейка %.4f м%s%s%s\n", argv[1], m.nt, fr.n,
+  printf("== ПОЛЕ: %s, треугольников %d, сетка %d^3, ячейка %.4f м%s%s%s%s\n", argv[1], m.nt, fr.n,
          fr.h, noflood ? "  [НЕТ ЗАЛИВКИ]" : "", invert ? "  [ЗНАК ОБРАЩЁН]" : "",
-         skip0 ? "  [ПРЕДИКАТ ЛЖЁТ НА ОКТАНТЕ 0]" : "");
+         skip0 ? "  [ПРЕДИКАТ ЛЖЁТ НА ОКТАНТЕ 0]" : "", badfinger ? "  [ПАЛЕЦ БЕЗ ПРОВЕРКИ]" : "");
 
   int64_t dense_nv = 0;
   vrec *dense_v = NULL;
@@ -1011,6 +1109,7 @@ int main(int argc, char **argv) {
   S.noflood = noflood;
   S.invert = invert;
   S.skip0 = skip0;
+  S.badfinger = badfinger;
   S.cap = 64;
   S.nd = calloc((size_t)S.cap, sizeof *S.nd);
   S.captri = 1024;
@@ -1087,25 +1186,34 @@ int main(int argc, char **argv) {
       printf("   ЯЧЕЙКА КАМЕРЫ §2: вне сетки\n");
   }
 
+  hz_dctree T;
+  if (hz_dc_init(&T, lev) != 0) exit(1);
+  t0 = now_s();
+  int rc = hz_dc_shape_lazy(&T, lev, s_sign, s_boxq, &S);
+  double t_shape = now_s() - t0;
+  if (rc != HZ_DC_OK) {
+    fprintf(stderr, "спуск за структурой: код %d\n", rc);
+    return 1;
+  }
+  printf("   спуск за структурой за %.2f с: узлов %d\n", t_shape, T.n);
+
   hz_htab ht;
   if (hz_htab_init(&ht) != 0) exit(1);
   t0 = now_s();
   int32_t ndup = 0;
-  int rc = hz_dc_edges_lazy(&ht, lev, s_sign, s_cross, s_boxq, &S, &ndup);
+  rc = hz_dc_edges_lazy(&ht, &T, s_cross, &S, &ndup);
   double t_edges = now_s() - t0;
   if (rc != HZ_DC_OK) {
-    fprintf(stderr, "ленивый спуск за рёбрами: код %d\n", rc);
+    fprintf(stderr, "проход за рёбрами: код %d\n", rc);
     return 1;
   }
-  printf("   спуск за рёбрами за %.2f с: рёбер %d, повторов схлопнуто %d\n", t_edges, ht.n, ndup);
+  printf("   проход за рёбрами за %.2f с: рёбер %d, повторов схлопнуто %d\n", t_edges, ht.n, ndup);
 
-  hz_dctree T;
-  if (hz_dc_init(&T, lev) != 0) exit(1);
   t0 = now_s();
-  rc = hz_dc_tree_lazy(&T, &ht, lev, s_sign, s_boxq, &S);
+  rc = hz_dc_forms_lazy(&T, &ht);
   double t_dc = now_s() - t0;
-  printf("   спуск за деревом за %.2f с: код %d, узлов %d; ЗАГНАНО %d, НЕМАНИФОЛДНЫХ %d\n", t_dc,
-         rc, T.n, T.nclamped, T.nmulti);
+  printf("   формы и вершины за %.2f с: код %d, узлов %d; ЗАГНАНО %d, НЕМАНИФОЛДНЫХ %d\n", t_dc, rc,
+         T.n, T.nclamped, T.nmulti);
   int64_t nv = 0;
   collect_verts(&T, 0, zero, fr.n, NULL, &nv);
   printf("   вершин выдано %lld\n", (long long)nv);

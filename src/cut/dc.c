@@ -415,14 +415,56 @@ static uint8_t corner_mask_src(const lazyctx *L, const int32_t lo[3], int32_t si
   return m;
 }
 
-/* Спуск ПЕРВЫЙ: только эрмитовы рёбра. Ребро приходит из каждой делящей его
- * ячейки, поэтому повторы неизбежны и снимаются потом hz_htab_uniq — с
- * побитовой сверкой копий, а не выбором первой попавшейся. */
-static void lazy_edges(lazyctx *L, const int32_t lo[3], int32_t size) {
+/* ПРОХОД ПЕРВЫЙ И ЕДИНСТВЕННЫЙ, ГДЕ СПРАШИВАЮТ ИСТОЧНИК (§373): структура и
+ * маски углов. Ни форм, ни рёбер, ни вершин — их считают проходы 2 и 3 УЖЕ ПО
+ * ДЕРЕВУ, и потому источник опрашивается ровно один раз на узел, а не дважды.
+ *
+ * МАСКА ВНУТРЕННЕГО УЗЛА СОБИРАЕТСЯ ИЗ ДЕТЕЙ, а не спрашивается: угол `c`
+ * родителя И ЕСТЬ угол `c` ребёнка `c` (`lo + c·half + c·half = lo + c·size`) —
+ * тождество, а не приближение. Отсюда ПОРЯДКОВЫЙ инвариант (А633): у
+ * внутреннего узла `corner` действителен только ПОСЛЕ рекурсии, и до неё его
+ * читать нельзя. Единственный потребитель — solve_node через hz_dc_manifold —
+ * работает в проходе 3, то есть заведомо после.
+ *
+ * У ОСТАНОВЛЕННОГО УЗЛА маска по-прежнему берётся всеми восемью вопросами.
+ * «Все восемь равны» есть следствие КОНТРАКТА bx, а негативный контроль его
+ * нарушает нарочно (А635): сэкономить тут значит сделать поведение под
+ * контролем неопределённым, то есть купить скорость негодностью проверки. */
+static int lazy_shape(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size, lazyctx *L) {
+  t->nd[ni].child0 = -1;
+  hz_qef_zero(&t->nd[ni].q);
+  if (!L->bx(L->ctx, lo, size) || size == 1) {
+    t->nd[ni].corner = corner_mask_src(L, lo, size);
+    return HZ_DC_OK;
+  }
+  int32_t c0 = dc_alloc8(t);
+  if (c0 < 0) return HZ_DC_ENOMEM;
+  t->nd[ni].child0 = c0;
+  int32_t half = size / 2;
+  for (int i = 0; i < 8; i++) {
+    int32_t clo[3];
+    for (int a = 0; a < 3; a++)
+      clo[a] = lo[a] + (((i >> a) & 1) ? half : 0);
+    int rc = lazy_shape(t, c0 + i, clo, half, L);
+    if (rc != HZ_DC_OK) return rc;
+  }
+  uint8_t m = 0;
+  for (int c = 0; c < 8; c++)
+    if ((t->nd[c0 + c].corner >> c) & 1) m = (uint8_t)(m | (1u << c));
+  t->nd[ni].corner = m;
+  return HZ_DC_OK;
+}
+
+/* Проход ВТОРОЙ: эрмитовы рёбра ПО ГОТОВОМУ ДЕРЕВУ. Маска берётся из узла,
+ * источник спрашивается только про пересечение. Ребро приходит из каждой
+ * делящей его ячейки, поэтому повторы неизбежны и снимаются потом
+ * hz_htab_uniq — с побитовой сверкой копий, а не выбором первой попавшейся. */
+static void lazy_edges(lazyctx *L, const hz_dctree *t, int32_t ni, const int32_t lo[3],
+                       int32_t size) {
   if (L->rc != HZ_DC_OK) return;
-  if (!L->bx(L->ctx, lo, size)) return;
-  if (size == 1) {
-    uint8_t m = corner_mask_src(L, lo, 1);
+  if (t->nd[ni].child0 < 0) {
+    if (size != 1) return;
+    uint8_t m = t->nd[ni].corner;
     for (int i = 0; i < 12; i++) {
       int axis, off[3];
       unit_edge(i, &axis, off);
@@ -443,69 +485,64 @@ static void lazy_edges(lazyctx *L, const int32_t lo[3], int32_t size) {
     int32_t clo[3];
     for (int a = 0; a < 3; a++)
       clo[a] = lo[a] + (((i >> a) & 1) ? half : 0);
-    lazy_edges(L, clo, half);
+    lazy_edges(L, t, t->nd[ni].child0 + i, clo, half);
     if (L->rc != HZ_DC_OK) return;
   }
 }
 
-/* Спуск ВТОРОЙ: дерево. Дословно build_rec, но остановка — от источника
- * (bx), а маска — от него же. Всё остальное (leaf_qef, sum_children,
- * solve_node, порядок детей) ОБЩЕЕ с плотным путём, и это не экономия строк:
- * разойдись они, побитовое совпадение вершин перестало бы что-либо значить. */
-static int lazy_build(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size, lazyctx *L,
-                      const hz_htab *ht) {
-  t->nd[ni].corner = corner_mask_src(L, lo, size);
-  t->nd[ni].child0 = -1;
-  hz_qef_zero(&t->nd[ni].q);
-  if (!L->bx(L->ctx, lo, size)) return HZ_DC_OK;
-
-  if (size == 1) {
+/* Проход ТРЕТИЙ: формы и вершины, снизу вверх, БЕЗ ЕДИНОГО обращения к
+ * источнику. Порядок действий и порядок детей те же, что у плотного пути
+ * (build_rec), и это не экономия строк: разойдись они, побитовое совпадение
+ * вершин перестало бы что-либо значить. Остановленный узел формы не получает —
+ * ровно как в плотном пути, где box_uniform возвращал управление до solve_node. */
+static void lazy_forms(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size,
+                       const hz_htab *ht) {
+  if (t->nd[ni].child0 < 0) {
+    if (size != 1) return;
     leaf_qef(t, ni, lo, ht);
     solve_node(t, ni, lo, size);
-    return HZ_DC_OK;
+    return;
   }
-
-  int32_t c0 = dc_alloc8(t);
-  if (c0 < 0) return HZ_DC_ENOMEM;
-  t->nd[ni].child0 = c0;
   int32_t half = size / 2;
   for (int i = 0; i < 8; i++) {
     int32_t clo[3];
     for (int a = 0; a < 3; a++)
       clo[a] = lo[a] + (((i >> a) & 1) ? half : 0);
-    int rc = lazy_build(t, c0 + i, clo, half, L, ht);
-    if (rc != HZ_DC_OK) return rc;
+    lazy_forms(t, t->nd[ni].child0 + i, clo, half, ht);
   }
   sum_children(t, ni, size);
   solve_node(t, ni, lo, size);
-  return HZ_DC_OK;
 }
 
-int hz_dc_edges_lazy(hz_htab *ht, int log2size, hz_dc_sign sg, hz_dc_cross cr, hz_dc_box bx,
-                     void *ctx, int32_t *ndup) {
+int hz_dc_shape_lazy(hz_dctree *t, int log2size, hz_dc_sign sg, hz_dc_box bx, void *ctx) {
   if (log2size < 0 || log2size > HZ_DC_MAX_LOG2SIZE) return HZ_DC_ERANGE;
-  lazyctx L = {sg, cr, bx, ctx, ht, HZ_DC_OK};
-  int32_t zero[3] = {0, 0, 0}, size = (int32_t)1 << log2size;
-  lazy_edges(&L, zero, size);
+  if (t->log2size != log2size) return HZ_DC_ERANGE;
+  lazyctx L = {sg, NULL, bx, ctx, NULL, HZ_DC_OK};
+  int32_t zero[3] = {0, 0, 0};
+  return lazy_shape(t, 0, zero, (int32_t)1 << log2size, &L);
+}
+
+int hz_dc_edges_lazy(hz_htab *ht, const hz_dctree *t, hz_dc_cross cr, void *ctx, int32_t *ndup) {
+  lazyctx L = {NULL, cr, NULL, ctx, ht, HZ_DC_OK};
+  int32_t zero[3] = {0, 0, 0};
+  lazy_edges(&L, t, 0, zero, (int32_t)1 << t->log2size);
   if (L.rc != HZ_DC_OK) return L.rc;
   return hz_htab_uniq(ht, ndup);
 }
 
-int hz_dc_tree_lazy(hz_dctree *t, const hz_htab *ht, int log2size, hz_dc_sign sg, hz_dc_box bx,
-                    void *ctx) {
-  if (t->log2size != log2size) return HZ_DC_ERANGE;
-  lazyctx L = {sg, NULL, bx, ctx, NULL, HZ_DC_OK};
-  int32_t zero[3] = {0, 0, 0}, size = (int32_t)1 << log2size;
-  int rc = lazy_build(t, 0, zero, size, &L, ht);
-  if (rc != HZ_DC_OK) return rc;
+int hz_dc_forms_lazy(hz_dctree *t, const hz_htab *ht) {
+  int32_t zero[3] = {0, 0, 0};
+  lazy_forms(t, 0, zero, (int32_t)1 << t->log2size, ht);
   return t->nmulti > 0 ? HZ_DC_EMULTI : HZ_DC_OK;
 }
 
 int hz_dc_build_lazy(hz_dctree *t, hz_htab *ht, int log2size, hz_dc_sign sg, hz_dc_cross cr,
                      hz_dc_box bx, void *ctx, int32_t *ndup) {
-  int rc = hz_dc_edges_lazy(ht, log2size, sg, cr, bx, ctx, ndup);
+  int rc = hz_dc_shape_lazy(t, log2size, sg, bx, ctx);
   if (rc != HZ_DC_OK) return rc;
-  return hz_dc_tree_lazy(t, ht, log2size, sg, bx, ctx);
+  rc = hz_dc_edges_lazy(ht, t, cr, ctx, ndup);
+  if (rc != HZ_DC_OK) return rc;
+  return hz_dc_forms_lazy(t, ht);
 }
 
 int hz_dc_repair(hz_dctree *t, const hz_htab *ht, const int32_t cell[3]) {

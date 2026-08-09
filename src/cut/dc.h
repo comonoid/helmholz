@@ -156,12 +156,18 @@ int hz_dc_build(hz_dctree *t, const hz_signgrid *g, const hz_htab *ht);
 int hz_dc_build_lazy(hz_dctree *t, hz_htab *ht, int log2size, hz_dc_sign sg, hz_dc_cross cr,
                      hz_dc_box bx, void *ctx, int32_t *ndup);
 
-/* Те же два спуска ПОРОЗНЬ — чтобы их цена докладывалась раздельно (А616): одно
- * число «время построения поля» прячет, где именно оно потрачено. */
-int hz_dc_edges_lazy(hz_htab *ht, int log2size, hz_dc_sign sg, hz_dc_cross cr, hz_dc_box bx,
-                     void *ctx, int32_t *ndup);
-int hz_dc_tree_lazy(hz_dctree *t, const hz_htab *ht, int log2size, hz_dc_sign sg, hz_dc_box bx,
-                    void *ctx);
+/* ТРИ ПРОХОДА ПОРОЗНЬ, и это не только ради раздельного доклада цены (А616).
+ * Источник опрашивается ТОЛЬКО В ПЕРВОМ, остальные идут по готовому дереву —
+ * отсюда и цена узла (§373): маска углов считается один раз, а не дважды, и у
+ * внутренних узлов не считается вовсе.
+ *   1. hz_dc_shape_lazy — структура и маски углов (sign + box);
+ *   2. hz_dc_edges_lazy — эрмитовы рёбра по дереву (только cross);
+ *   3. hz_dc_forms_lazy — формы и вершины снизу вверх (источник не нужен).
+ * Порядок обязателен: 2 читает маски, поставленные 1; 3 читает таблицу,
+ * заполненную 2. */
+int hz_dc_shape_lazy(hz_dctree *t, int log2size, hz_dc_sign sg, hz_dc_box bx, void *ctx);
+int hz_dc_edges_lazy(hz_htab *ht, const hz_dctree *t, hz_dc_cross cr, void *ctx, int32_t *ndup);
+int hz_dc_forms_lazy(hz_dctree *t, const hz_htab *ht);
 
 /* Починка после правки эрмитовых данных (Г13): пересчитать лист, накрывающий
  * ячейку cell, и ПЕРЕСЛОЖИТЬ предков, O(глубины). Топологию не трогает: если

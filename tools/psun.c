@@ -1295,7 +1295,12 @@ int main(int argc, char **argv) {
             int64_t ngapr = 0, ngaps = 0, ncop = 0, nopp = 0, nmid = 0;
             int64_t nch_ns = 0, nch_rn = 0;
             double sumd_ns = 0.0, sumd_rn = 0.0;
-#pragma omp parallel for schedule(dynamic, 8) reduction(+ : nch, nlitbad, nshbad, sumd)            \
+/* §348: НОВЫЕ СЧЁТЧИКИ ОБЯЗАНЫ ВОЙТИ В РЕДУКЦИЮ. Первая редакция §344/§346
+ * писала их из шестнадцати потоков без синхронизации — гонка, и она выдала
+ * себя расхождением счётчиков между прогонами (26 554 против 26 615). Гейт
+ * гонок не ловит: это дело санитайзера, а не -fanalyzer. */
+#pragma omp parallel for schedule(dynamic, 8)                                                      \
+    reduction(+ : nch, nlitbad, nshbad, sumd, nch_ns, sumd_ns, nch_rn, sumd_rn, ncop, nopp, nmid)  \
     reduction(max : maxd)
             for (int32_t jj = 0; jj < ew; jj++)
               for (int32_t ii = 0; ii < ew; ii++) {
@@ -1441,6 +1446,8 @@ int main(int argc, char **argv) {
                   if (k2 >= 0) {
                     double gap = t2 - t1;
                     if (ftrue > 0.5 && four < 0.5) {
+/* Массивы — под критической секцией: популяция мала (сотня), цена никакая. */
+#pragma omp critical
                       gapr[ngapr++] = gap;
                       /* Явные нули: `cppcheck` не прослеживает заполнение через
                        * условный указатель и ГАТИТ по нему — тот же класс, что
@@ -1473,8 +1480,10 @@ int main(int argc, char **argv) {
                         nopp++;
                       else
                         nmid++;
-                    } else if (dd < 1e-6)
+                    } else if (dd < 1e-6) {
+#pragma omp critical
                       gaps[ngaps++] = gap;
+                    }
                   }
                 }
                 if (ftrue < 0.5 && four > 0.5) nlitbad++;

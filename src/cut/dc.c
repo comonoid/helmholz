@@ -62,6 +62,40 @@ int hz_htab_sort(hz_htab *h) {
   return HZ_DC_OK;
 }
 
+/* Побитовое равенство двух чисел. Именно битов, а не значений: сверяется
+ * ОДИНАКОВОСТЬ ВЫЧИСЛЕНИЯ у четырёх ячеек, и «почти равно» тут не годится
+ * (заодно -Wfloat-equal запрещает писать ==). */
+static int same_bits(double a, double b) {
+  uint64_t x, y;
+  memcpy(&x, &a, sizeof x);
+  memcpy(&y, &b, sizeof y);
+  return x == y;
+}
+
+static int hedge_same(const hz_hedge *a, const hz_hedge *b) {
+  if (a->axis != b->axis || a->in_lo != b->in_lo) return 0;
+  for (int k = 0; k < 3; k++)
+    if (a->p[k] != b->p[k] || !same_bits(a->nrm[k], b->nrm[k])) return 0;
+  return same_bits(a->t, b->t);
+}
+
+int hz_htab_uniq(hz_htab *h, int32_t *ndup) {
+  int32_t dup = 0;
+  if (h->n > 1) qsort(h->e, (size_t)h->n, sizeof(hz_hedge), hedge_cmp);
+  int32_t w = 0;
+  for (int32_t i = 0; i < h->n; i++) {
+    if (w > 0 && h->e[w - 1].key == h->e[i].key) {
+      if (!hedge_same(&h->e[w - 1], &h->e[i])) return HZ_DC_EDUP;
+      dup++;
+      continue;
+    }
+    h->e[w++] = h->e[i];
+  }
+  h->n = w;
+  if (ndup != NULL) *ndup = dup;
+  return HZ_DC_OK;
+}
+
 const hz_hedge *hz_htab_find(const hz_htab *h, int axis, const int32_t p[3]) {
   uint64_t k = hz_hedge_key(axis, p);
   int32_t lo = 0, hi = h->n - 1;
@@ -94,6 +128,24 @@ int hz_signgrid_at(const hz_signgrid *g, const int32_t c[3]) {
   return g->s[((size_t)c[0] * (size_t)g->n1 + (size_t)c[1]) * (size_t)g->n1 + (size_t)c[2]];
 }
 
+/* ОДИН опрос ребра со сменой знака. Вынесен из hz_dc_sample НЕ ради краткости:
+ * ленивый спуск обязан заносить в таблицу ПОБИТОВО ту же запись, иначе сверка
+ * двух путей меряет разницу двух копий формулы, а не разницу спусков. */
+static int probe_edge(hz_htab *ht, hz_dc_cross cr, void *ctx, const int32_t p[3], int axis,
+                      int s0) {
+  double t = 0.0, nrm[3] = {0, 0, 0};
+  if (cr(ctx, p, axis, &t, nrm) != 0) return HZ_DC_ETOPO;
+  if (!(t >= 0.0) || !(t <= 1.0)) return HZ_DC_ETOPO;
+  double m = sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
+  if (!(m > 0.0)) return HZ_DC_ETOPO;
+  /* Нормировка ЗДЕСЬ и один раз: вес образца в QEF есть |n|², поэтому
+   * неединичная нормаль молча перевесила бы соседей. Источник вправе вернуть
+   * градиент. */
+  for (int k = 0; k < 3; k++)
+    nrm[k] /= m;
+  return hz_htab_add(ht, axis, p, t, nrm, s0);
+}
+
 int hz_dc_sample(hz_signgrid *g, hz_htab *ht, int log2size, hz_dc_sign sg, hz_dc_cross cr,
                  void *ctx) {
   if (log2size < 0 || log2size > HZ_DC_SAMPLE_MAX_LOG2SIZE) return HZ_DC_ERANGE;
@@ -124,17 +176,7 @@ int hz_dc_sample(hz_signgrid *g, hz_htab *ht, int log2size, hz_dc_sign sg, hz_dc
           q[axis]++;
           int s0 = hz_signgrid_at(g, p), s1 = hz_signgrid_at(g, q);
           if (s0 == s1) continue;
-          double t = 0.0, nrm[3] = {0, 0, 0};
-          if (cr(ctx, p, axis, &t, nrm) != 0) return HZ_DC_ETOPO;
-          if (!(t >= 0.0) || !(t <= 1.0)) return HZ_DC_ETOPO;
-          double m = sqrt(nrm[0] * nrm[0] + nrm[1] * nrm[1] + nrm[2] * nrm[2]);
-          if (!(m > 0.0)) return HZ_DC_ETOPO;
-          /* Нормировка ЗДЕСЬ и один раз: вес образца в QEF есть |n|², поэтому
-           * неединичная нормаль молча перевесила бы соседей. Источник вправе
-           * вернуть градиент. */
-          for (int k = 0; k < 3; k++)
-            nrm[k] /= m;
-          int rc = hz_htab_add(ht, axis, p, t, nrm, s0);
+          int rc = probe_edge(ht, cr, ctx, p, axis, s0);
           if (rc != HZ_DC_OK) return rc;
         }
   }
@@ -347,6 +389,123 @@ int hz_dc_build(hz_dctree *t, const hz_signgrid *g, const hz_htab *ht) {
   int rc = build_rec(t, 0, zero, (int32_t)1 << t->log2size, g, ht);
   if (rc != HZ_DC_OK) return rc;
   return t->nmulti > 0 ? HZ_DC_EMULTI : HZ_DC_OK;
+}
+
+/* --- 3b. ДЕШЁВЫЙ СПУСК (§370) ---------------------------------------------- */
+
+typedef struct {
+  hz_dc_sign sg;
+  hz_dc_cross cr;
+  hz_dc_box bx;
+  void *ctx;
+  hz_htab *ht;
+  int rc;
+} lazyctx;
+
+/* Маска углов ВОСЕМЬЮ вопросами источнику, а не чтением массива. Порядок битов
+ * тот же, что у corner_mask, — на нём стоит совпадение с плотным путём. */
+static uint8_t corner_mask_src(const lazyctx *L, const int32_t lo[3], int32_t size) {
+  uint8_t m = 0;
+  for (int c = 0; c < 8; c++) {
+    int32_t p[3];
+    for (int a = 0; a < 3; a++)
+      p[a] = lo[a] + (((c >> a) & 1) ? size : 0);
+    if (L->sg(L->ctx, p)) m = (uint8_t)(m | (1u << c));
+  }
+  return m;
+}
+
+/* Спуск ПЕРВЫЙ: только эрмитовы рёбра. Ребро приходит из каждой делящей его
+ * ячейки, поэтому повторы неизбежны и снимаются потом hz_htab_uniq — с
+ * побитовой сверкой копий, а не выбором первой попавшейся. */
+static void lazy_edges(lazyctx *L, const int32_t lo[3], int32_t size) {
+  if (L->rc != HZ_DC_OK) return;
+  if (!L->bx(L->ctx, lo, size)) return;
+  if (size == 1) {
+    uint8_t m = corner_mask_src(L, lo, 1);
+    for (int i = 0; i < 12; i++) {
+      int axis, off[3];
+      unit_edge(i, &axis, off);
+      int c0 = off[0] | (off[1] << 1) | (off[2] << 2), c1 = c0 | (1 << axis);
+      int s0 = (m >> c0) & 1;
+      if (s0 == ((m >> c1) & 1)) continue;
+      int32_t p[3] = {lo[0] + off[0], lo[1] + off[1], lo[2] + off[2]};
+      int rc = probe_edge(L->ht, L->cr, L->ctx, p, axis, s0);
+      if (rc != HZ_DC_OK) {
+        L->rc = rc;
+        return;
+      }
+    }
+    return;
+  }
+  int32_t half = size / 2;
+  for (int i = 0; i < 8; i++) {
+    int32_t clo[3];
+    for (int a = 0; a < 3; a++)
+      clo[a] = lo[a] + (((i >> a) & 1) ? half : 0);
+    lazy_edges(L, clo, half);
+    if (L->rc != HZ_DC_OK) return;
+  }
+}
+
+/* Спуск ВТОРОЙ: дерево. Дословно build_rec, но остановка — от источника
+ * (bx), а маска — от него же. Всё остальное (leaf_qef, sum_children,
+ * solve_node, порядок детей) ОБЩЕЕ с плотным путём, и это не экономия строк:
+ * разойдись они, побитовое совпадение вершин перестало бы что-либо значить. */
+static int lazy_build(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size, lazyctx *L,
+                      const hz_htab *ht) {
+  t->nd[ni].corner = corner_mask_src(L, lo, size);
+  t->nd[ni].child0 = -1;
+  hz_qef_zero(&t->nd[ni].q);
+  if (!L->bx(L->ctx, lo, size)) return HZ_DC_OK;
+
+  if (size == 1) {
+    leaf_qef(t, ni, lo, ht);
+    solve_node(t, ni, lo, size);
+    return HZ_DC_OK;
+  }
+
+  int32_t c0 = dc_alloc8(t);
+  if (c0 < 0) return HZ_DC_ENOMEM;
+  t->nd[ni].child0 = c0;
+  int32_t half = size / 2;
+  for (int i = 0; i < 8; i++) {
+    int32_t clo[3];
+    for (int a = 0; a < 3; a++)
+      clo[a] = lo[a] + (((i >> a) & 1) ? half : 0);
+    int rc = lazy_build(t, c0 + i, clo, half, L, ht);
+    if (rc != HZ_DC_OK) return rc;
+  }
+  sum_children(t, ni, size);
+  solve_node(t, ni, lo, size);
+  return HZ_DC_OK;
+}
+
+int hz_dc_edges_lazy(hz_htab *ht, int log2size, hz_dc_sign sg, hz_dc_cross cr, hz_dc_box bx,
+                     void *ctx, int32_t *ndup) {
+  if (log2size < 0 || log2size > HZ_DC_MAX_LOG2SIZE) return HZ_DC_ERANGE;
+  lazyctx L = {sg, cr, bx, ctx, ht, HZ_DC_OK};
+  int32_t zero[3] = {0, 0, 0}, size = (int32_t)1 << log2size;
+  lazy_edges(&L, zero, size);
+  if (L.rc != HZ_DC_OK) return L.rc;
+  return hz_htab_uniq(ht, ndup);
+}
+
+int hz_dc_tree_lazy(hz_dctree *t, const hz_htab *ht, int log2size, hz_dc_sign sg, hz_dc_box bx,
+                    void *ctx) {
+  if (t->log2size != log2size) return HZ_DC_ERANGE;
+  lazyctx L = {sg, NULL, bx, ctx, NULL, HZ_DC_OK};
+  int32_t zero[3] = {0, 0, 0}, size = (int32_t)1 << log2size;
+  int rc = lazy_build(t, 0, zero, size, &L, ht);
+  if (rc != HZ_DC_OK) return rc;
+  return t->nmulti > 0 ? HZ_DC_EMULTI : HZ_DC_OK;
+}
+
+int hz_dc_build_lazy(hz_dctree *t, hz_htab *ht, int log2size, hz_dc_sign sg, hz_dc_cross cr,
+                     hz_dc_box bx, void *ctx, int32_t *ndup) {
+  int rc = hz_dc_edges_lazy(ht, log2size, sg, cr, bx, ctx, ndup);
+  if (rc != HZ_DC_OK) return rc;
+  return hz_dc_tree_lazy(t, ht, log2size, sg, bx, ctx);
 }
 
 int hz_dc_repair(hz_dctree *t, const hz_htab *ht, const int32_t cell[3]) {

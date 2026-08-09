@@ -1072,6 +1072,7 @@ int main(int argc, char **argv) {
      * солнце», а не «насколько ярко», и мешать в одну величину косинус с
      * альбедо значило бы сверять три вещи разом. */
     double *fpix = malloc(np * sizeof *fpix);
+    double *fcell = NULL; /* §351: доля, собранная ИЗ ЯЧЕЕК */
     if (zb != NULL && ib != NULL && pix != NULL && fpix != NULL) {
       double diag = 0.0;
       for (int c = 0; c < 3; c++) {
@@ -1096,12 +1097,24 @@ int main(int argc, char **argv) {
          *
          * ЦЕНА ЭТОГО ХОДА НАЗВАНА ЗАРАНЕЕ: картинка выходит с разрешением ПОЛЯ,
          * а не пикселя, потому что мельче ячейки в ней ничего нет. */
+        /* §351: ЭТАЛОНУ ГЕОМЕТРИЯ ЗАКОННА — он и есть истина, и отнимать у него
+         * точную видимость было ошибкой §349 (эталон и проверяемое выродились
+         * одновременно). Треугольный z-буфер остаётся ЕМУ; путь из ячеек
+         * заполняет только `fpix`, со своей глубиной. Тогда сравниваются две
+         * ОПРЕДЕЛЁННЫЕ величины: поле, собранное из ячеек, против точной доли
+         * диска в видимой точке, и разность есть цена квантования ячейкой. */
         if (cellimg) {
           double tci = now_s();
+          float *zc = malloc(np * sizeof *zc);
+          if (zc == NULL) return 2;
+          fcell = malloc(np * sizeof *fcell);
+          if (fcell == NULL) {
+            free(zc);
+            return 2;
+          }
           for (size_t p = 0; p < np; p++) {
-            zb[p] = 1e30f;
-            ib[p] = -1;
-            fpix[p] = 0.0;
+            zc[p] = 1e30f;
+            fcell[p] = 0.0;
           }
           int64_t ndrawn = 0;
           for (int32_t q = 0; q < T.nnd; q++) {
@@ -1144,15 +1157,16 @@ int main(int argc, char **argv) {
             for (int jj2 = j0; jj2 <= j1; jj2++)
               for (int ii2 = i0; ii2 <= i1; ii2++) {
                 size_t pp = (size_t)jj2 * (size_t)bufside + (size_t)ii2;
-                if ((float)tmin >= zb[pp]) continue;
-                zb[pp] = (float)tmin;
-                ib[pp] = q;
-                fpix[pp] = (X.cellf[q] >= 0.0f) ? (double)X.cellf[q] : 0.0;
+                if ((float)tmin >= zc[pp]) continue;
+                zc[pp] = (float)tmin;
+                fcell[pp] = (X.cellf[q] >= 0.0f) ? (double)X.cellf[q] : 0.0;
               }
           }
+          free(zc);
           printf("== КАРТИНКА ИЗ ЯЧЕЕК (§349) за %.2f с: поставлено ячеек %lld из %d узлов\n",
                  now_s() - tci, (long long)ndrawn, T.nnd);
-        } else {
+        }
+        {
           double tsh = now_s();
           memcpy(C2.fr, X.fr, sizeof C2.fr);
           C2.usefr = 1;
@@ -1327,12 +1341,17 @@ int main(int argc, char **argv) {
             cs -= sgn * (nn[c] / ln2) * X.dir[c]; /* `dir` — направление ЛУЧЕЙ источника */
           if (cs < 0.0) cs = 0.0;                 /* отвёрнута от солнца — темно */
           double kd = m.mtl[m.fm[t]].kd;
-          pix[p] = kd * f * cs;
+          /* §351: при сборке из ячеек сравниваемая доля берётся ИЗ ЯЧЕЙКИ, а не
+           * из поточечного обхода — иначе меряется прежний путь, что и вышло
+           * трижды подряд. Сторона грани остаётся частью определения величины и
+           * применяется к обоим путям одинаково. */
+          double fv = cellimg ? fcell[p] : f;
+          pix[p] = kd * fv * cs;
           /* Эталон спрашивает «видно ли отсюда солнце», и ответ у отвёрнутой
            * стороны — НЕТ, независимо от `f`. Сверять надо ту же величину. */
-          fpix[p] = (cs > 0.0) ? f : 0.0;
+          fpix[p] = (cs > 0.0) ? fv : 0.0;
           sum += pix[p];
-          if (f > 0.5)
+          if (fv > 0.5)
             nlit2++;
           else
             nsh2++;
@@ -1847,6 +1866,7 @@ int main(int argc, char **argv) {
     free(zb);
     free(ib);
     free(pix);
+    free(fcell);
     free(fpix);
   }
 

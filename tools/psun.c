@@ -1442,7 +1442,11 @@ int main(int argc, char **argv) {
                     double gap = t2 - t1;
                     if (ftrue > 0.5 && four < 0.5) {
                       gapr[ngapr++] = gap;
-                      double nn1[3], nn2[3];
+                      /* Явные нули: `cppcheck` не прослеживает заполнение через
+                       * условный указатель и ГАТИТ по нему — тот же класс, что
+                       * у `gcc -fanalyzer` с обёртками (CLAUDE.md). Правится
+                       * формой записи, а не подавлением. */
+                      double nrm2[2][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
                       for (int qq = 0; qq < 2; qq++) {
                         int32_t tq = qq ? k2 : k1;
                         const double *A = m.v + 3 * (size_t)m.f[3 * (size_t)tq + 0];
@@ -1459,9 +1463,10 @@ int main(int argc, char **argv) {
                         double l2 = sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
                         if (!(l2 > 0.0)) l2 = 1.0;
                         for (int c = 0; c < 3; c++)
-                          (qq ? nn2 : nn1)[c] = cr[c] / l2;
+                          nrm2[qq][c] = cr[c] / l2;
                       }
-                      double cs = nn1[0] * nn2[0] + nn1[1] * nn2[1] + nn1[2] * nn2[2];
+                      double cs = nrm2[0][0] * nrm2[1][0] + nrm2[0][1] * nrm2[1][1] +
+                                  nrm2[0][2] * nrm2[1][2];
                       if (cs > 0.9)
                         ncop++;
                       else if (cs < -0.9)

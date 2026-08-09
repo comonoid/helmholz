@@ -63,7 +63,8 @@ int main(int argc, char **argv) {
   int indep = 1, intol = 128, silh = 1;
   double ooff = 1e-5, nofrec = 0.0;
   int coverset = 0, shiftset = 0, zbuf = 1;
-  int g_virt = 0; /* §338 */
+  int g_virt = 0;      /* §338 */
+  int g_camfloor = -1; /* §340: −1 — «как virt» */
   /* УГЛОВОЙ РАДИУС ИСТОЧНИКА — ПАРАМЕТР, А НЕ КОНСТАНТА (замечание пользователя
    * 08-07). Он был зашит числом солнца в ДВУХ местах — у фронта и у эталона, — и
    * потому «протяжённый источник» из §275 означал лишь `K` выборок ТОГО ЖЕ
@@ -107,6 +108,10 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "nk=", 3) == 0) nk = (int)strtol(argv[i] + 3, NULL, 10);
     if (strncmp(argv[i], "asun=", 5) == 0) asun = strtod(argv[i] + 5, NULL);
     /* §338: ленивый спуск ниже листа; умолчание — прежнее поведение. */
+    if (strncmp(argv[i], "camfloor=", 9) == 0) {
+      g_camfloor = (int)strtol(argv[i] + 9, NULL, 10);
+      continue;
+    }
     if (strncmp(argv[i], "virt=", 5) == 0) {
       g_virt = (int)strtol(argv[i] + 5, NULL, 10);
       continue;
@@ -356,7 +361,14 @@ int main(int argc, char **argv) {
         X.sdir[s][c] /= nn;
     }
   }
+  /* Умолчание камерного пола: он включается вместе с ленивым спуском, потому
+   * что без спуска его просто нечему ограничивать (§340). */
+  if (g_camfloor < 0) g_camfloor = g_virt;
   X.pxeps2 = (px * HZ_CFG_EPS) * (px * HZ_CFG_EPS);
+  /* §340: камерный пол. Глаз тот же, что у картинки и у пирамиды. */
+  for (int c = 0; c < 3; c++)
+    X.eye[c] = camo[c];
+  X.camfloor = g_camfloor;
   X.t_entry = 1e300;
   for (int k = 0; k < 8; k++) {
     double t = 0.0;

@@ -157,6 +157,14 @@ typedef struct {
   const hz_objmesh *m;
   const double *tlo, *thi;
   double dir[3], pxeps2, t_entry;
+  /* ВТОРОЙ ПРЕДЕЛ ОСТАНОВКИ — КАМЕРНЫЙ (§340, А577). Прежний пол считает глубину
+   * от плоскости входа СВЕТА и у самой плоскости вырождается, отчего был
+   * обесточен сторожем `d2 > r2` и не ограничивал спуск вовсе. Здесь стоит закон
+   * LOD проекта: `L = ε·R` от ГЛАЗА. Расстояние до глаза снизу ограничено, и
+   * потому предел не вырождается нигде. Камера входит В ОБХОД, а не в дерево:
+   * А133/А470 запрещают второе, не первое. */
+  double eye[3];
+  int camfloor;
   int fail;
   int64_t ncell, ncell_geo, ncell_void, ncap, npclip;
   int64_t stop_leaf, stop_floor, stop_flat, stop_void, nlit, nshadow;

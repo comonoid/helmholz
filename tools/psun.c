@@ -69,6 +69,7 @@ int main(int argc, char **argv) {
   double ooff = 1e-5, nofrec = 0.0;
   int coverset = 0, shiftset = 0, zbuf = 1;
   int g_virt = 0;      /* §338 */
+  int cellimg = 0;     /* §349: картинка из ячеек фронта, без второй видимости */
   int g_camfloor = -1; /* §340: −1 — «как virt» */
   /* УГЛОВОЙ РАДИУС ИСТОЧНИКА — ПАРАМЕТР, А НЕ КОНСТАНТА (замечание пользователя
    * 08-07). Он был зашит числом солнца в ДВУХ местах — у фронта и у эталона, — и
@@ -113,6 +114,10 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "nk=", 3) == 0) nk = (int)strtol(argv[i] + 3, NULL, 10);
     if (strncmp(argv[i], "asun=", 5) == 0) asun = strtod(argv[i] + 5, NULL);
     /* §338: ленивый спуск ниже листа; умолчание — прежнее поведение. */
+    if (strncmp(argv[i], "cellimg=", 8) == 0) {
+      cellimg = (int)strtol(argv[i] + 8, NULL, 10);
+      continue;
+    }
     if (strncmp(argv[i], "camfloor=", 9) == 0) {
       g_camfloor = (int)strtol(argv[i] + 9, NULL, 10);
       continue;
@@ -1082,23 +1087,92 @@ int main(int argc, char **argv) {
          * треугольников — он же негативный контроль: картинки обязаны совпасть
          * ПОБИТОВО, иначе порядок обхода неверен. */
         int64_t sh_tri = 0, sh_cell = 0;
-        double tsh = now_s();
-        memcpy(C2.fr, X.fr, sizeof C2.fr);
-        C2.usefr = 1;
-        if (zbuf)
-          hz_pcull_shot(&C2, &m, zb, ib);
-        else
-          hz_pcull_shot_tree(&C2, &m, &T, tlo, thi, zb, ib, &sh_tri, &sh_cell);
-        printf("== РИСОВАНИЕ %s за %.2f с: треугольников поставлено %lld, ячеек обойдено %lld "
-               "(всего в сцене %d)\n",
-               zbuf ? "z-БУФЕРОМ (перебор всех)" : "СПЕРЕДИ НАЗАД по дереву", now_s() - tsh,
-               (long long)sh_tri, (long long)sh_cell, m.nt);
+        /* КАРТИНКА ИЗ ЯЧЕЕК ФРОНТА (§349, вопрос пользователя «зачем нам
+         * z-буфер»). Видимость считается ОДИН раз и в той же структуре, в
+         * которой живёт поле: проецируется коробка ОСТАНОВИВШЕЙСЯ ячейки, в
+         * пиксель пишется её состояние, глубина сравнивается ПО ЯЧЕЙКАМ.
+         * Треугольники здесь не участвуют вовсе — а значит исчезает и стык двух
+         * видимостей, породивший все 117 расхождений (§347).
+         *
+         * ЦЕНА ЭТОГО ХОДА НАЗВАНА ЗАРАНЕЕ: картинка выходит с разрешением ПОЛЯ,
+         * а не пикселя, потому что мельче ячейки в ней ничего нет. */
+        if (cellimg) {
+          double tci = now_s();
+          for (size_t p = 0; p < np; p++) {
+            zb[p] = 1e30f;
+            ib[p] = -1;
+            fpix[p] = 0.0;
+          }
+          int64_t ndrawn = 0;
+          for (int32_t q = 0; q < T.nnd; q++) {
+            if (X.cellf[q] < -1.5f) continue; /* запись фронта отсутствует */
+            const double *clo = T.nd[q].lo, *chi = T.nd[q].hi;
+            /* Экранный габарит коробки — по восьми углам. */
+            double u0 = 1e300, u1 = -1e300, v0 = 1e300, v1 = -1e300, tmin = 1e300;
+            int ok = 1;
+            for (int k = 0; k < 8 && ok; k++) {
+              double W[3];
+              for (int c = 0; c < 3; c++)
+                W[c] = (k & (1 << c)) ? chi[c] : clo[c];
+              /* Проекция мира в экран — обратная к `hz_pcull_ray`, той же рамой:
+               * `t = (W−глаз)·fw`, экранные `(u, v)` из отношений к `t`. */
+              double W2[3] = {W[0] - camo[0], W[1] - camo[1], W[2] - camo[2]};
+              double st = W2[0] * C2.fw[0] + W2[1] * C2.fw[1] + W2[2] * C2.fw[2];
+              if (!(st > 1e-9)) {
+                ok = 0;
+                break;
+              }
+              double ar = (W2[0] * C2.rt[0] + W2[1] * C2.rt[1] + W2[2] * C2.rt[2]) / st;
+              double br = (W2[0] * C2.up[0] + W2[1] * C2.up[1] + W2[2] * C2.up[2]) / st;
+              double hh2 = 0.5 * (double)bufside;
+              double su = (ar / C2.tanh_ + 1.0) * hh2 - 0.5;
+              double sv = (br / C2.tanh_ + 1.0) * hh2 - 0.5;
+              if (su < u0) u0 = su;
+              if (su > u1) u1 = su;
+              if (sv < v0) v0 = sv;
+              if (sv > v1) v1 = sv;
+              if (st < tmin) tmin = st;
+            }
+            if (!ok || !(tmin > 0.0)) continue;
+            int i0 = (int)floor(u0), i1 = (int)ceil(u1);
+            int j0 = (int)floor(v0), j1 = (int)ceil(v1);
+            if (i0 < 0) i0 = 0;
+            if (j0 < 0) j0 = 0;
+            if (i1 >= bufside) i1 = bufside - 1;
+            if (j1 >= bufside) j1 = bufside - 1;
+            ndrawn++;
+            for (int jj2 = j0; jj2 <= j1; jj2++)
+              for (int ii2 = i0; ii2 <= i1; ii2++) {
+                size_t pp = (size_t)jj2 * (size_t)bufside + (size_t)ii2;
+                if ((float)tmin >= zb[pp]) continue;
+                zb[pp] = (float)tmin;
+                ib[pp] = q;
+                fpix[pp] = (X.cellf[q] >= 0.0f) ? (double)X.cellf[q] : 0.0;
+              }
+          }
+          printf("== КАРТИНКА ИЗ ЯЧЕЕК (§349) за %.2f с: поставлено ячеек %lld из %d узлов\n",
+                 now_s() - tci, (long long)ndrawn, T.nnd);
+        } else {
+          double tsh = now_s();
+          memcpy(C2.fr, X.fr, sizeof C2.fr);
+          C2.usefr = 1;
+          if (zbuf)
+            hz_pcull_shot(&C2, &m, zb, ib);
+          else
+            hz_pcull_shot_tree(&C2, &m, &T, tlo, thi, zb, ib, &sh_tri, &sh_cell);
+          printf("== РИСОВАНИЕ %s за %.2f с: треугольников поставлено %lld, ячеек обойдено %lld "
+                 "(всего в сцене %d)\n",
+                 zbuf ? "z-БУФЕРОМ (перебор всех)" : "СПЕРЕДИ НАЗАД по дереву", now_s() - tsh,
+                 (long long)sh_tri, (long long)sh_cell, m.nt);
+        }
         int64_t nsky = 0, nlit2 = 0, nsh2 = 0, nback = 0, nmiss = 0;
         int pathshown = 0;
         double sum = 0.0;
         for (size_t p = 0; p < np; p++) {
           pix[p] = 0.0;
-          fpix[p] = 0.0;
+          /* При сборке из ячеек `fpix` уже заполнено и перечитывать его по
+           * точке нельзя — точки в этом пути нет вовсе (§349). */
+          if (!cellimg) fpix[p] = 0.0;
           if (ib[p] < 0) {
             nsky++;
             continue;

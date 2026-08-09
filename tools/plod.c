@@ -1002,6 +1002,14 @@ int main(int argc, char **argv) {
         ord[q] = (ck[q] << 0);
       /* пары (ключ, треугольник) упаковываются в один массив структур ради
        * одной сортировки; отдельный компаратор не заводится */
+      /* `ni == 0` возможен на пустом уровне; malloc(0) — находка санитайзера, а не
+       * дефект, но обрывать проще, чем объяснять. */
+      if (ni == 0) {
+        free(ck);
+        free(ct);
+        free(ord);
+        continue;
+      }
       hz_pair *pr = malloc((size_t)ni * sizeof *pr);
       if (pr == NULL) {
         free(ck);
@@ -1062,13 +1070,13 @@ int main(int argc, char **argv) {
           nn[c] /= ln;
         for (int64_t s = q; s < r; s++)
           for (int v = 0; v < 3; v++) {
-            const double *V = m.v + (size_t)m.f[3 * (size_t)pr[s].t + v] * 3;
+            const double *V = m.v + (size_t)m.f[3 * (size_t)pr[s].t + (size_t)v] * 3;
             off += (nn[0] * V[0] + nn[1] * V[1] + nn[2] * V[2]) / (double)(3 * nt);
           }
         double e1max = 0.0;
         for (int64_t s = q; s < r; s++)
           for (int v = 0; v < 3; v++) {
-            const double *V = m.v + (size_t)m.f[3 * (size_t)pr[s].t + v] * 3;
+            const double *V = m.v + (size_t)m.f[3 * (size_t)pr[s].t + (size_t)v] * 3;
             double d = fabs(nn[0] * V[0] + nn[1] * V[1] + nn[2] * V[2] - off);
             if (d > e1max) e1max = d;
           }

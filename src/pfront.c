@@ -21,6 +21,22 @@
  * детские грани, и они складываются СЛОЖЕНИЕМ МОМЕНТОВ (Р2, точная L²-проекция).
  */
 
+/* Площадь (удвоенная) и ненормированная нормаль треугольника. */
+static double tri_area_normal(const hz_objmesh *m, int32_t t, double cr[3]) {
+  const double *A = m->v + 3 * (size_t)m->f[3 * (size_t)t + 0];
+  const double *B = m->v + 3 * (size_t)m->f[3 * (size_t)t + 1];
+  const double *C = m->v + 3 * (size_t)m->f[3 * (size_t)t + 2];
+  double e1[3], e2[3];
+  for (int c = 0; c < 3; c++) {
+    e1[c] = B[c] - A[c];
+    e2[c] = C[c] - A[c];
+  }
+  cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
+  cr[1] = e1[2] * e2[0] - e1[0] * e2[2];
+  cr[2] = e1[0] * e2[1] - e1[1] * e2[0];
+  return sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+}
+
 /* Индексы осей грани: для оси `a` местные оси грани — две другие, по возрастанию. */
 static void face_axes(int a, int *p, int *q) {
   *p = (a + 1) % 3;
@@ -719,8 +735,25 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
      * другое есть ответ ячейки, а не точки, и потому не требует ни z-буфера,
      * ни попадания луча. */
     if (!isvirt && X->celln != NULL && X->cellmt != NULL) {
-      double sn[3] = {0.0, 0.0, 0.0}, amax = 0.0;
+      /* СНАЧАЛА СЕМЯ — НОРМАЛЬ НАИБОЛЬШЕГО КУСКА, и только потом сумма с ним
+       * согласованных. Складывать нормали СО ЗНАКОМ нельзя: у замкнутой
+       * поверхности лицо и изнанка гасят друг друга, и у воксельной сцены это
+       * в КАЖДОЙ ячейке — кадр выходит чёрным. Это та самая проверка
+       * `n_i·n > 0`, которую план запрещает убирать (А17, А22). */
+      double seed[3] = {0.0, 0.0, 0.0}, amax = 0.0;
       int32_t mt = -1;
+      for (int32_t i = 0; i < n; i++) {
+        double cr[3];
+        double a2 = tri_area_normal(X->m, list[i], cr);
+        if (!(a2 > 0.0)) continue;
+        if (a2 > amax) {
+          amax = a2;
+          mt = X->m->fm[list[i]];
+          for (int c = 0; c < 3; c++)
+            seed[c] = cr[c] / a2;
+        }
+      }
+      double sn[3] = {0.0, 0.0, 0.0};
       for (int32_t i = 0; i < n; i++) {
         int32_t t = list[i];
         const double *A = X->m->v + 3 * (size_t)X->m->f[3 * (size_t)t + 0];
@@ -736,12 +769,12 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
         cr[2] = e1[0] * e2[1] - e1[1] * e2[0];
         double a2 = sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
         if (!(a2 > 0.0)) continue;
+        /* Складывается ТОЛЬКО согласованное с семенем — та самая проверка,
+         * которую план запрещает убирать (А17, А22). */
+        double dp = (cr[0] * seed[0] + cr[1] * seed[1] + cr[2] * seed[2]) / a2;
+        if (!(dp > 0.0)) continue;
         for (int c = 0; c < 3; c++)
           sn[c] += cr[c];
-        if (a2 > amax) {
-          amax = a2;
-          mt = X->m->fm[t];
-        }
       }
       double ln = sqrt(sn[0] * sn[0] + sn[1] * sn[1] + sn[2] * sn[2]);
       for (int c = 0; c < 3; c++)

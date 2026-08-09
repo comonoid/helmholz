@@ -50,10 +50,22 @@ static int cmp_dbl_psun(const void *x, const void *y) {
  * другой. Здесь порядок верен по построению, буфер глубины не заводится вовсе
  * (на 1024² это 4 МБ чтения и записи за кадр — чистая полоса памяти), и
  * сравнения на пиксель тоже нет. */
-static void paint_cell(const hz_ptree *T, int32_t nid, const float *cellf, const hz_pcull *C,
-                       const double *eye, int side, int32_t *out, int64_t *ndrawn) {
+static void paint_cell(const hz_ptree *T, int32_t nid, const float *cellf, const float *celln,
+                       const hz_pcull *C, const double *eye, int side, int32_t *out,
+                       int64_t *ndrawn) {
   const hz_ptnode *N = &T->nd[nid];
-  if (cellf[nid] > -1.5f) {
+  /* ПУСТУЮ ЯЧЕЙКУ РИСОВАТЬ НЕЛЬЗЯ (§359). Это воздух: ни нормали, ни материала у
+   * него нет, а лежит он БЛИЖЕ поверхности и закрывал бы её. Именно это давало и
+   * чёрные кадры, и «гигантские блоки» — рисовался передний пустой узел, а не то,
+   * что за ним. Признак пустоты — нулевая нормаль записи (§354). */
+  double nl2 = 0.0;
+  if (celln != NULL)
+    for (int c = 0; c < 3; c++) {
+      double v = (double)celln[3 * (size_t)nid + (size_t)c];
+      nl2 += v * v;
+    }
+  int hasgeo = (nl2 > 0.0);
+  if (cellf[nid] > -1.5f && hasgeo) {
     /* Экранный след коробки — по восьми углам, той же рамой, что `hz_pcull_ray`. */
     double u0 = 1e300, u1 = -1e300, v0 = 1e300, v1 = -1e300;
     for (int k = 0; k < 8; k++) {
@@ -102,7 +114,7 @@ static void paint_cell(const hz_ptree *T, int32_t nid, const float *cellf, const
       for (int c = 0; c < 3; c++)
         if (((k >> c) & 1) == e[c]) nf++;
       if (nf != far) continue;
-      paint_cell(T, N->child + k, cellf, C, eye, side, out, ndrawn);
+      paint_cell(T, N->child + k, cellf, celln, C, eye, side, out, ndrawn);
     }
 }
 
@@ -1184,7 +1196,7 @@ int main(int argc, char **argv) {
           for (size_t p = 0; p < np; p++)
             idcell[p] = -1;
           int64_t ndrawn = 0;
-          paint_cell(&T, 0, X.cellf, &C2, camo, bufside, idcell, &ndrawn);
+          paint_cell(&T, 0, X.cellf, X.celln, &C2, camo, bufside, idcell, &ndrawn);
           printf("== КАРТИНКА ИЗ ЯЧЕЕК (§349) за %.2f с: поставлено ячеек %lld из %d узлов\n",
                  now_s() - tci, (long long)ndrawn, T.nnd);
         }

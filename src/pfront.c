@@ -780,6 +780,24 @@ void hz_pfront_walk(hz_pfront_ctx *X, int32_t nid, const double *lo, const doubl
       for (int c = 0; c < 3; c++)
         X->celln[3 * (size_t)nid + (size_t)c] = (ln > 0.0) ? (float)(sn[c] / ln) : 0.0f;
       X->cellmt[nid] = mt;
+      /* Смещение — взвешенное площадью среднее `n·v` по вершинам согласованных
+       * кусков: та же плоскость, что у записи §334 при `k = 1`. */
+      if (X->celloff != NULL && ln > 0.0) {
+        double nn3[3] = {sn[0] / ln, sn[1] / ln, sn[2] / ln};
+        double so = 0.0, sw = 0.0;
+        for (int32_t i = 0; i < n; i++) {
+          double cr[3];
+          double a2 = tri_area_normal(X->m, list[i], cr);
+          if (!(a2 > 0.0)) continue;
+          if (!((cr[0] * seed[0] + cr[1] * seed[1] + cr[2] * seed[2]) / a2 > 0.0)) continue;
+          for (int v = 0; v < 3; v++) {
+            const double *V = X->m->v + 3 * (size_t)X->m->f[3 * (size_t)list[i] + (size_t)v];
+            so += a2 * (nn3[0] * V[0] + nn3[1] * V[1] + nn3[2] * V[2]);
+            sw += a2;
+          }
+        }
+        X->celloff[nid] = (sw > 0.0) ? (float)(so / sw) : 0.0f;
+      }
     }
     /* Освещённость ячейки — тоже по ПОТОКУ, а не среднее по трём граням. */
     double fl = 0.0, w = 0.0;

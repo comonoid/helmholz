@@ -51,8 +51,8 @@ static int cmp_dbl_psun(const void *x, const void *y) {
  * (на 1024² это 4 МБ чтения и записи за кадр — чистая полоса памяти), и
  * сравнения на пиксель тоже нет. */
 static void paint_cell(const hz_ptree *T, int32_t nid, const float *cellf, const float *celln,
-                       const hz_pcull *C, const double *eye, int side, int32_t *out,
-                       int64_t *ndrawn) {
+                       const float *celloff, const hz_pcull *C, const double *eye, int side,
+                       int32_t *out, int64_t *ndrawn) {
   const hz_ptnode *N = &T->nd[nid];
   /* ПУСТУЮ ЯЧЕЙКУ РИСОВАТЬ НЕЛЬЗЯ (§359). Это воздух: ни нормали, ни материала у
    * него нет, а лежит он БЛИЖЕ поверхности и закрывал бы её. Именно это давало и
@@ -66,12 +66,50 @@ static void paint_cell(const hz_ptree *T, int32_t nid, const float *cellf, const
     }
   int hasgeo = (nl2 > 0.0);
   if (cellf[nid] > -1.5f && hasgeo) {
+    /* СЕЧЕНИЕ ПЛОСКОСТЬ ∩ КОРОБКА (§360). Рисовать коробку нельзя: выходят
+     * прямоугольники, а не поверхность. Плоскость ячейки задана записью
+     * (нормаль и смещение); её пересечение с коробкой есть выпуклый
+     * многоугольник не более чем из шести вершин, и он получается обходом
+     * ДВЕНАДЦАТИ РЁБЕР коробки: где знак `n·v − off` меняется, там вершина. */
+    double nrm[3] = {(double)celln[3 * (size_t)nid], (double)celln[3 * (size_t)nid + 1],
+                     (double)celln[3 * (size_t)nid + 2]};
+    double off = (celloff != NULL) ? (double)celloff[nid] : 0.0;
+    static const int ea[12] = {0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2};
+    static const int eb[12] = {0, 2, 4, 6, 0, 1, 4, 5, 0, 1, 2, 3};
+    double poly[6][3];
+    int npv = 0;
+    for (int e = 0; e < 12 && npv < 6; e++) {
+      int ax = ea[e], base = eb[e];
+      double P0[3], P1[3];
+      for (int c = 0; c < 3; c++) {
+        int bit;
+        if (c == ax)
+          bit = 0;
+        else {
+          int o = (c == (ax + 1) % 3) ? 0 : 1;
+          bit = (base >> o) & 1;
+        }
+        P0[c] = bit ? N->hi[c] : N->lo[c];
+        P1[c] = P0[c];
+      }
+      P1[ax] = N->hi[ax];
+      P0[ax] = N->lo[ax];
+      double d0 = nrm[0] * P0[0] + nrm[1] * P0[1] + nrm[2] * P0[2] - off;
+      double d1 = nrm[0] * P1[0] + nrm[1] * P1[1] + nrm[2] * P1[2] - off;
+      if ((d0 > 0.0) == (d1 > 0.0)) continue;
+      double tt = d0 / (d0 - d1);
+      for (int c = 0; c < 3; c++)
+        poly[npv][c] = P0[c] + tt * (P1[c] - P0[c]);
+      npv++;
+    }
+    if (npv < 3) return; /* плоскость коробку не режет — рисовать нечего */
     /* Экранный след коробки — по восьми углам, той же рамой, что `hz_pcull_ray`. */
     double u0 = 1e300, u1 = -1e300, v0 = 1e300, v1 = -1e300;
-    for (int k = 0; k < 8; k++) {
+    double su6[6], sv6[6];
+    for (int k = 0; k < npv; k++) {
       double W[3];
       for (int c = 0; c < 3; c++)
-        W[c] = ((k & (1 << c)) ? N->hi[c] : N->lo[c]) - eye[c];
+        W[c] = poly[k][c] - eye[c];
       double st = W[0] * C->fw[0] + W[1] * C->fw[1] + W[2] * C->fw[2];
       if (!(st > 1e-9)) return; /* ячейка задевает плоскость глаза — не рисуем */
       double ar = (W[0] * C->rt[0] + W[1] * C->rt[1] + W[2] * C->rt[2]) / st;
@@ -79,6 +117,8 @@ static void paint_cell(const hz_ptree *T, int32_t nid, const float *cellf, const
       double hh = 0.5 * (double)side;
       double su = (ar / C->tanh_ + 1.0) * hh - 0.5;
       double sv = (br / C->tanh_ + 1.0) * hh - 0.5;
+      su6[k] = su;
+      sv6[k] = sv;
       if (su < u0) u0 = su;
       if (su > u1) u1 = su;
       if (sv < v0) v0 = sv;
@@ -94,9 +134,39 @@ static void paint_cell(const hz_ptree *T, int32_t nid, const float *cellf, const
     (*ndrawn)++;
     /* Пишется НОМЕР ЯЧЕЙКИ, а не значение: из ячейки счёту нужны три вещи —
      * доля, нормаль и материал (§354), и держать их врозь незачем. */
+    /* Заливка ВЫПУКЛОГО многоугольника: пиксель внутри, если он с одной стороны
+     * от всех рёбер. Вершины идут в порядке обхода рёбер коробки, поэтому
+     * сортируются по углу вокруг центра — иначе многоугольник самопересекается. */
+    double cu = 0.0, cv = 0.0;
+    for (int k = 0; k < npv; k++) {
+      cu += su6[k];
+      cv += sv6[k];
+    }
+    cu /= (double)npv;
+    cv /= (double)npv;
+    for (int a = 1; a < npv; a++) {
+      double ka = atan2(sv6[a] - cv, su6[a] - cu);
+      int b = a;
+      while (b > 0 && atan2(sv6[b - 1] - cv, su6[b - 1] - cu) > ka) {
+        double t1 = su6[b], t2 = sv6[b];
+        su6[b] = su6[b - 1];
+        sv6[b] = sv6[b - 1];
+        su6[b - 1] = t1;
+        sv6[b - 1] = t2;
+        b--;
+      }
+    }
     for (int jj = j0; jj <= j1; jj++)
-      for (int ii = i0; ii <= i1; ii++)
-        out[(size_t)jj * (size_t)side + (size_t)ii] = nid;
+      for (int ii = i0; ii <= i1; ii++) {
+        double pu = (double)ii, pv = (double)jj;
+        int inside = 1;
+        for (int k = 0; k < npv && inside; k++) {
+          int k2 = (k + 1 < npv) ? k + 1 : 0;
+          double ex = su6[k2] - su6[k], ey = sv6[k2] - sv6[k];
+          if (ex * (pv - sv6[k]) - ey * (pu - su6[k]) < 0.0) inside = 0;
+        }
+        if (inside) out[(size_t)jj * (size_t)side + (size_t)ii] = nid;
+      }
     return;
   }
   if (N->child < 0) return;
@@ -114,7 +184,7 @@ static void paint_cell(const hz_ptree *T, int32_t nid, const float *cellf, const
       for (int c = 0; c < 3; c++)
         if (((k >> c) & 1) == e[c]) nf++;
       if (nf != far) continue;
-      paint_cell(T, N->child + k, cellf, celln, C, eye, side, out, ndrawn);
+      paint_cell(T, N->child + k, cellf, celln, celloff, C, eye, side, out, ndrawn);
     }
 }
 
@@ -950,6 +1020,7 @@ int main(int argc, char **argv) {
   if (img) {
     /* §354: запись ячейки — нормаль и материал, рядом с долей. */
     X.celln = calloc((size_t)T.nnd * 3, sizeof *X.celln);
+    X.celloff = calloc((size_t)T.nnd, sizeof *X.celloff);
     X.cellmt = malloc((size_t)T.nnd * sizeof *X.cellmt);
     if (X.cellmt != NULL)
       for (int32_t i = 0; i < T.nnd; i++)
@@ -1196,7 +1267,7 @@ int main(int argc, char **argv) {
           for (size_t p = 0; p < np; p++)
             idcell[p] = -1;
           int64_t ndrawn = 0;
-          paint_cell(&T, 0, X.cellf, X.celln, &C2, camo, bufside, idcell, &ndrawn);
+          paint_cell(&T, 0, X.cellf, X.celln, X.celloff, &C2, camo, bufside, idcell, &ndrawn);
           printf("== КАРТИНКА ИЗ ЯЧЕЕК (§349) за %.2f с: поставлено ячеек %lld из %d узлов\n",
                  now_s() - tci, (long long)ndrawn, T.nnd);
         }
@@ -2188,6 +2259,7 @@ int main(int argc, char **argv) {
   free(dep);
   free(mk);
   free(X.celln);
+  free(X.celloff);
   free(X.cellmt);
   free(X.cellf);
   free(vis);

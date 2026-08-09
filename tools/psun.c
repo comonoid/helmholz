@@ -40,6 +40,71 @@ static int cmp_dbl_psun(const void *x, const void *y) {
   return (a < b) ? -1 : ((a > b) ? 1 : 0);
 }
 
+/* РИСОВАНИЕ ПО АЛГОРИТМУ ХУДОЖНИКА, БЕЗ БУФЕРА ГЛУБИНЫ (§353, довод пользователя
+ * 08-09). Ячейки фронта ДИЗЪЮНКТНЫ — они разбиение пространства, — поэтому
+ * порядок октантов по знакам направления на камеру есть ТОЧНЫЙ порядок
+ * видимости, и достаточно рисовать сзади наперёд с простой перезаписью.
+ *
+ * ЧЕМ ЭТО ЛУЧШЕ ПРЕЖНЕГО. §351 сравнивал ячейки по ближнему углу коробки, а это
+ * НЕ порядок видимости: коробка с более близким углом может целиком лежать за
+ * другой. Здесь порядок верен по построению, буфер глубины не заводится вовсе
+ * (на 1024² это 4 МБ чтения и записи за кадр — чистая полоса памяти), и
+ * сравнения на пиксель тоже нет. */
+static void paint_cell(const hz_ptree *T, int32_t nid, const float *cellf, const hz_pcull *C,
+                       const double *eye, int side, double *out, int64_t *ndrawn) {
+  const hz_ptnode *N = &T->nd[nid];
+  if (cellf[nid] > -1.5f) {
+    /* Экранный след коробки — по восьми углам, той же рамой, что `hz_pcull_ray`. */
+    double u0 = 1e300, u1 = -1e300, v0 = 1e300, v1 = -1e300;
+    for (int k = 0; k < 8; k++) {
+      double W[3];
+      for (int c = 0; c < 3; c++)
+        W[c] = ((k & (1 << c)) ? N->hi[c] : N->lo[c]) - eye[c];
+      double st = W[0] * C->fw[0] + W[1] * C->fw[1] + W[2] * C->fw[2];
+      if (!(st > 1e-9)) return; /* ячейка задевает плоскость глаза — не рисуем */
+      double ar = (W[0] * C->rt[0] + W[1] * C->rt[1] + W[2] * C->rt[2]) / st;
+      double br = (W[0] * C->up[0] + W[1] * C->up[1] + W[2] * C->up[2]) / st;
+      double hh = 0.5 * (double)side;
+      double su = (ar / C->tanh_ + 1.0) * hh - 0.5;
+      double sv = (br / C->tanh_ + 1.0) * hh - 0.5;
+      if (su < u0) u0 = su;
+      if (su > u1) u1 = su;
+      if (sv < v0) v0 = sv;
+      if (sv > v1) v1 = sv;
+    }
+    int i0 = (int)floor(u0), i1 = (int)ceil(u1);
+    int j0 = (int)floor(v0), j1 = (int)ceil(v1);
+    if (i0 < 0) i0 = 0;
+    if (j0 < 0) j0 = 0;
+    if (i1 >= side) i1 = side - 1;
+    if (j1 >= side) j1 = side - 1;
+    if (i1 < i0 || j1 < j0) return;
+    (*ndrawn)++;
+    double f = (cellf[nid] >= 0.0f) ? (double)cellf[nid] : 0.0;
+    for (int jj = j0; jj <= j1; jj++)
+      for (int ii = i0; ii <= i1; ii++)
+        out[(size_t)jj * (size_t)side + (size_t)ii] = f;
+    return;
+  }
+  if (N->child < 0) return;
+  /* Порядок СЗАДИ НАПЕРЁД: дальний октант первым. Дальняя сторона по оси `c` —
+   * та, что напротив глаза относительно середины. */
+  double mid[3];
+  int e[3];
+  for (int c = 0; c < 3; c++) {
+    mid[c] = 0.5 * (N->lo[c] + N->hi[c]);
+    e[c] = (eye[c] < mid[c]) ? 1 : 0;
+  }
+  for (int far = 3; far >= 0; far--)
+    for (int k = 0; k < 8; k++) {
+      int nf = 0;
+      for (int c = 0; c < 3; c++)
+        if (((k >> c) & 1) == e[c]) nf++;
+      if (nf != far) continue;
+      paint_cell(T, N->child + k, cellf, C, eye, side, out, ndrawn);
+    }
+}
+
 static double now_s(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -1105,64 +1170,12 @@ int main(int argc, char **argv) {
          * диска в видимой точке, и разность есть цена квантования ячейкой. */
         if (cellimg) {
           double tci = now_s();
-          float *zc = malloc(np * sizeof *zc);
-          if (zc == NULL) return 2;
           fromcell = malloc(np * sizeof *fromcell);
-          if (fromcell == NULL) {
-            free(zc);
-            return 2;
-          }
-          for (size_t p = 0; p < np; p++) {
-            zc[p] = 1e30f;
+          if (fromcell == NULL) return 2;
+          for (size_t p = 0; p < np; p++)
             fromcell[p] = 0.0;
-          }
           int64_t ndrawn = 0;
-          for (int32_t q = 0; q < T.nnd; q++) {
-            if (X.cellf[q] < -1.5f) continue; /* запись фронта отсутствует */
-            const double *clo = T.nd[q].lo, *chi = T.nd[q].hi;
-            /* Экранный габарит коробки — по восьми углам. */
-            double u0 = 1e300, u1 = -1e300, v0 = 1e300, v1 = -1e300, tmin = 1e300;
-            int ok = 1;
-            for (int k = 0; k < 8 && ok; k++) {
-              double W[3];
-              for (int c = 0; c < 3; c++)
-                W[c] = (k & (1 << c)) ? chi[c] : clo[c];
-              /* Проекция мира в экран — обратная к `hz_pcull_ray`, той же рамой:
-               * `t = (W−глаз)·fw`, экранные `(u, v)` из отношений к `t`. */
-              double W2[3] = {W[0] - camo[0], W[1] - camo[1], W[2] - camo[2]};
-              double st = W2[0] * C2.fw[0] + W2[1] * C2.fw[1] + W2[2] * C2.fw[2];
-              if (!(st > 1e-9)) {
-                ok = 0;
-                break;
-              }
-              double ar = (W2[0] * C2.rt[0] + W2[1] * C2.rt[1] + W2[2] * C2.rt[2]) / st;
-              double br = (W2[0] * C2.up[0] + W2[1] * C2.up[1] + W2[2] * C2.up[2]) / st;
-              double hh2 = 0.5 * (double)bufside;
-              double su = (ar / C2.tanh_ + 1.0) * hh2 - 0.5;
-              double sv = (br / C2.tanh_ + 1.0) * hh2 - 0.5;
-              if (su < u0) u0 = su;
-              if (su > u1) u1 = su;
-              if (sv < v0) v0 = sv;
-              if (sv > v1) v1 = sv;
-              if (st < tmin) tmin = st;
-            }
-            if (!ok || !(tmin > 0.0)) continue;
-            int i0 = (int)floor(u0), i1 = (int)ceil(u1);
-            int j0 = (int)floor(v0), j1 = (int)ceil(v1);
-            if (i0 < 0) i0 = 0;
-            if (j0 < 0) j0 = 0;
-            if (i1 >= bufside) i1 = bufside - 1;
-            if (j1 >= bufside) j1 = bufside - 1;
-            ndrawn++;
-            for (int jj2 = j0; jj2 <= j1; jj2++)
-              for (int ii2 = i0; ii2 <= i1; ii2++) {
-                size_t pp = (size_t)jj2 * (size_t)bufside + (size_t)ii2;
-                if ((float)tmin >= zc[pp]) continue;
-                zc[pp] = (float)tmin;
-                fromcell[pp] = (X.cellf[q] >= 0.0f) ? (double)X.cellf[q] : 0.0;
-              }
-          }
-          free(zc);
+          paint_cell(&T, 0, X.cellf, &C2, camo, bufside, fromcell, &ndrawn);
           printf("== КАРТИНКА ИЗ ЯЧЕЕК (§349) за %.2f с: поставлено ячеек %lld из %d узлов\n",
                  now_s() - tci, (long long)ndrawn, T.nnd);
         }

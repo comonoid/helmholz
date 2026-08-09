@@ -18,6 +18,11 @@
  * подтверждение при перекрытии.
  */
 
+/* §327: сколько размеров ячейки в лестнице касаний — двоичная, 12 октав от
+ * габарита сцены. Двенадцать, а не «сколько-нибудь»: у города габарит 79 м, и
+ * 12 октав доводят ячейку до 19 мм, то есть ниже входного треугольника. */
+#define HZ_NH 12
+
 #include "pedge.h"
 #include "lodio.h"
 #include "plod.h"
@@ -891,6 +896,23 @@ int main(int argc, char **argv) {
      * разметка уровня → полигоны → `nbv`. Цена — пересборка полигонов на каждом
      * уровне (на Сан-Мигеле около двух минут при прогоне в 38), и она заплачена
      * сознательно: без этого числа вердикт §319 держался бы на прокси. */
+    /* ЛЕСТНИЦА РАЗМЕРОВ ЯЧЕЙКИ — ДВОИЧНАЯ, ОТ ГАБАРИТА СЦЕНЫ ВНИЗ (§327). Якоря
+     * «своя ячейка уровня» нет СОЗНАТЕЛЬНО: он был бы порогом, подобранным под
+     * ответ. Печатается вся матрица, диагональ читает потребитель. */
+    double slo[3] = {1e300, 1e300, 1e300}, shi[3] = {-1e300, -1e300, -1e300};
+    for (int32_t k = 0; k < m.nv; k++)
+      for (int c = 0; c < 3; c++) {
+        double x = m.v[3 * (size_t)k + (size_t)c];
+        if (x < slo[c]) slo[c] = x;
+        if (x > shi[c]) shi[c] = x;
+      }
+    double sdiag =
+        sqrt((shi[0] - slo[0]) * (shi[0] - slo[0]) + (shi[1] - slo[1]) * (shi[1] - slo[1]) +
+             (shi[2] - slo[2]) * (shi[2] - slo[2]));
+    double hcell[HZ_NH];
+    for (int j = 0; j < HZ_NH; j++)
+      hcell[j] = sdiag / pow(2.0, (double)j);
+    double *touch = calloc((size_t)L.nlev * HZ_NH, sizeof *touch);
     int32_t *lcut = malloc((size_t)L.np * sizeof *lcut);
     int64_t *nbv = malloc((size_t)L.nlev * sizeof *nbv);
     int64_t *nbvs = malloc((size_t)L.nlev * sizeof *nbvs);
@@ -898,7 +920,7 @@ int main(int argc, char **argv) {
     int64_t *nouter = malloc((size_t)L.nlev * sizeof *nouter);
     int64_t *nhole = malloc((size_t)L.nlev * sizeof *nhole);
     if (lcut != NULL && nbv != NULL && nbvs != NULL && nloop != NULL && nouter != NULL &&
-        nhole != NULL) {
+        nhole != NULL && touch != NULL) {
       for (int lev = 0; lev < L.nlev; lev++) {
         nbv[lev] = 0;
         nbvs[lev] = 0;
@@ -948,6 +970,35 @@ int main(int argc, char **argv) {
                 nhole[lev]++;
             }
           }
+          /* КАСАНИЯ (ЯЧЕЙКА, КАНДИДАТ) ПО РАВНОМЕРНОЙ СЕТКЕ (§327, А546).
+           * Элемент с габаритом `[lo,hi]` при ячейке `h` встречает ровно
+           * `∏(⌈hi/h⌉ − ⌊lo/h⌋)` ячеек — считается точно, без дерева и без
+           * фронта: правило дробления, пол прохода и камера к вопросу не
+           * относятся, а отношение `T(L,h)/T(0,h)` при одной `h` от общего
+           * множителя сетки не зависит. Габарит элемента берётся по его
+           * ТРЕУГОЛЬНИКАМ — то же множество, по которому считан `dmax`. */
+          for (int32_t q = 0; q < pc.np; q++) {
+            const hz_poly *P = &pc.p[q];
+            double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+            for (int32_t t = 0; t < P->ntri; t++) {
+              int32_t ti = pc.tri[P->t0 + t];
+              for (int cc = 0; cc < 3; cc++) {
+                const double *vv = m.v + (size_t)m.f[3 * (size_t)ti + (size_t)cc] * 3;
+                for (int c = 0; c < 3; c++) {
+                  if (vv[c] < lo[c]) lo[c] = vv[c];
+                  if (vv[c] > hi[c]) hi[c] = vv[c];
+                }
+              }
+            }
+            if (!(lo[0] <= hi[0])) continue;
+            for (int j = 0; j < HZ_NH; j++) {
+              double h = hcell[j];
+              double cells = 1.0;
+              for (int c = 0; c < 3; c++)
+                cells *= ceil(hi[c] / h) - floor(lo[c] / h);
+              touch[(size_t)lev * HZ_NH + (size_t)j] += cells;
+            }
+          }
           hz_edgestat es;
           if (hz_edge_simplify(&pc, L.delta0 * pow(ladb, lev), HZ_EDGE_SHARED, &es) == 0)
             nbvs[lev] = es.nbv_out;
@@ -975,6 +1026,23 @@ int main(int argc, char **argv) {
           printf(" %.0f", (double)nbvs[lev] / (double)(ncnt[lev] ? ncnt[lev] : 1));
         printf("\n");
       }
+      if (touch[0] > 0.0) {
+        printf("      КАСАНИЙ (ячейка, кандидат) ПО РАВНОМЕРНОЙ СЕТКЕ, §327:\n");
+        printf("         ячейка, м:   ");
+        for (int j = 0; j < HZ_NH; j++)
+          printf(" %9.3g", hcell[j]);
+        printf("\n         УРОВЕНЬ 0, штук:");
+        for (int j = 0; j < HZ_NH; j++)
+          printf(" %9.3g", touch[j]);
+        printf("\n");
+        for (int lev = 1; lev < L.nlev; lev++) {
+          printf("         ур.%d, T_L/T_0: ", lev);
+          for (int j = 0; j < HZ_NH; j++)
+            printf(" %9.3f",
+                   (touch[j] > 0.0) ? touch[(size_t)lev * HZ_NH + (size_t)j] / touch[j] : 0.0);
+          printf("\n");
+        }
+      }
       if (nloop[0] > 0) {
         printf("      ПЕТЕЛЬ края (граничных циклов) всего:");
         for (int lev = 0; lev < L.nlev; lev++)
@@ -995,6 +1063,7 @@ int main(int argc, char **argv) {
       }
     }
     free(nloop);
+    free(touch);
     free(nouter);
     free(nhole);
     for (int step = 1; step <= 3; step++) {

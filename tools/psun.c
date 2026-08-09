@@ -1283,6 +1283,9 @@ int main(int argc, char **argv) {
           if (emap != NULL) {
             int64_t nch = 0, nlitbad = 0, nshbad = 0;
             double sumd = 0.0, maxd = 0.0;
+            /* §344: разложение ошибки — без знаковых пикселей и контроль наугад. */
+            int64_t nch_ns = 0, nch_rn = 0;
+            double sumd_ns = 0.0, sumd_rn = 0.0;
 #pragma omp parallel for schedule(dynamic, 8) reduction(+ : nch, nlitbad, nshbad, sumd)            \
     reduction(max : maxd)
             for (int32_t jj = 0; jj < ew; jj++)
@@ -1379,7 +1382,28 @@ int main(int argc, char **argv) {
                 if (dd > maxd) maxd = dd;
                 if (ftrue < 0.5 && four > 0.5) nlitbad++;
                 if (ftrue > 0.5 && four < 0.5) nshbad++;
+                /* §344: та же ошибка БЕЗ пикселей, разошедшихся знаком, и
+                 * контроль — БЕЗ такого же числа пикселей, взятых наугад
+                 * (детерминированно, хешем от номера: замер обязан
+                 * повторяться). Оба накопителя идут тем же проходом. */
+                int issign = (ftrue < 0.5 && four > 0.5) || (ftrue > 0.5 && four < 0.5);
+                if (!issign) {
+                  sumd_ns += dd;
+                  nch_ns++;
+                }
+                uint32_t hh = (uint32_t)(jj * 73856093 ^ ii * 19349663);
+                hh ^= hh >> 13;
+                hh *= 2654435761u;
+                if ((hh % 1000u) >=
+                    4u) { /* выкинуть примерно 0.4 % — столько же, сколько знаковых */
+                  sumd_rn += dd;
+                  nch_rn++;
+                }
               }
+            printf("     БЕЗ ЗНАКОВЫХ ПИКСЕЛЕЙ (§344): |Δ| среднее %.6f по %lld пикселям; "
+                   "КОНТРОЛЬ (столько же наугад): %.6f по %lld\n",
+                   nch_ns > 0 ? sumd_ns / (double)nch_ns : 0.0, (long long)nch_ns,
+                   nch_rn > 0 ? sumd_rn / (double)nch_rn : 0.0, (long long)nch_rn);
             printf("   ЭТАЛОН ПО СЕТКЕ %dx%d (теневой луч перебором, %lld пикселей за %.1f с):\n"
                    "     |Δдоли| среднее %.4f, наибольшее %.4f; РАЗОШЛИСЬ ЗНАКОМ: у нас светло "
                    "а в тени %lld (%.2f %%), у нас тень а на свету %lld (%.2f %%)\n",

@@ -424,14 +424,43 @@ int main(int argc, char **argv) {
   hz_signgrid g;
   hz_htab ht;
   memset(&g, 0, sizeof g);
-  if (hz_htab_init(&ht) != 0) return 1;
+  if (hz_htab_init(&ht) != 0) {
+    free(S.sgn);
+    free(S.et);
+    free(S.enrm);
+    free(out);
+    free(occ);
+    free(cnt);
+    free(lst);
+    return 1;
+  }
   int rc = hz_dc_sample(&g, &ht, lev, src_sign, src_cross, &S);
   if (rc != HZ_DC_OK) {
     fprintf(stderr, "опрос источника: код %d\n", rc);
+    hz_htab_free(&ht);
+    hz_signgrid_free(&g);
+    free(S.sgn);
+    free(S.et);
+    free(S.enrm);
+    free(out);
+    free(occ);
+    free(cnt);
+    free(lst);
     return 1;
   }
   hz_dctree T;
-  if (hz_dc_init(&T, lev) != 0) return 1;
+  if (hz_dc_init(&T, lev) != 0) {
+    hz_htab_free(&ht);
+    hz_signgrid_free(&g);
+    free(S.sgn);
+    free(S.et);
+    free(S.enrm);
+    free(out);
+    free(occ);
+    free(cnt);
+    free(lst);
+    return 1;
+  }
   rc = hz_dc_build(&T, &g, &ht);
   printf("   дерево DC за %.2f с: код %d, узлов %d, рёбер в таблице %d; ЗАГНАНО %d, "
          "НЕМАНИФОЛДНЫХ %d\n",

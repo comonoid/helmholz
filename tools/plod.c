@@ -180,6 +180,76 @@ static int32_t greedy_cover(const hz_objmesh *m, const hz_pair *p, int64_t n, do
   return np;
 }
 
+/* ПОРАЗРЯДНАЯ СОРТИРОВКА КЛЮЧЕЙ ЯЧЕЙКИ (§335, замечание пользователя 08-09).
+ *
+ * Ключ есть БЕЗЗНАКОВОЕ машинное слово, собранное из трёх индексов по 21 биту, и
+ * сравнивать его через указатель на функцию незачем: `qsort` платит косвенный
+ * вызов на каждое сравнение и не векторизуется. LSD по 11 бит: 2048 корзин, и
+ * проходов ровно столько, сколько занимает НАИБОЛЬШИЙ ключ, — на мелких уровнях
+ * их два-три вместо шести.
+ *
+ * ПРАВИЛЬНОСТЬ ПРОВЕРЯЕТСЯ НЕ ГЛАЗАМИ: рядом стоит сверка с `qsort` под ключом
+ * `radix=0`, и она обязана дать ПОБИТОВО тот же порядок (у ключей нет повторов
+ * с разным содержимым — пара несёт ещё номер треугольника, поэтому сверяется
+ * весь массив, а не только ключи).
+ */
+#define HZ_RDX_BITS 11
+#define HZ_RDX_SIZE (1 << HZ_RDX_BITS)
+#define HZ_RDX_MASK (HZ_RDX_SIZE - 1)
+
+static void radix_u64(int64_t *a, int64_t *tmp, int64_t n) {
+  if (n < 2) return;
+  uint64_t mx = 0;
+  for (int64_t i = 0; i < n; i++)
+    if ((uint64_t)a[i] > mx) mx = (uint64_t)a[i];
+  int64_t *src = a, *dst = tmp;
+  for (int sh = 0; (mx >> sh) != 0; sh += HZ_RDX_BITS) {
+    int64_t cnt[HZ_RDX_SIZE + 1];
+    for (int i = 0; i <= HZ_RDX_SIZE; i++)
+      cnt[i] = 0;
+    for (int64_t i = 0; i < n; i++)
+      cnt[(((uint64_t)src[i] >> sh) & HZ_RDX_MASK) + 1]++;
+    for (int i = 0; i < HZ_RDX_SIZE; i++)
+      cnt[i + 1] += cnt[i];
+    for (int64_t i = 0; i < n; i++)
+      dst[cnt[((uint64_t)src[i] >> sh) & HZ_RDX_MASK]++] = src[i];
+    int64_t *t = src;
+    src = dst;
+    dst = t;
+  }
+  if (src != a)
+    for (int64_t i = 0; i < n; i++)
+      a[i] = src[i];
+}
+
+static void radix_pair(hz_pair *a, hz_pair *tmp, int64_t n) {
+  if (n < 2) return;
+  uint64_t mx = 0;
+  for (int64_t i = 0; i < n; i++)
+    if ((uint64_t)a[i].k > mx) mx = (uint64_t)a[i].k;
+  hz_pair *src = a, *dst = tmp;
+  for (int sh = 0; (mx >> sh) != 0; sh += HZ_RDX_BITS) {
+    int64_t cnt[HZ_RDX_SIZE + 1];
+    for (int i = 0; i <= HZ_RDX_SIZE; i++)
+      cnt[i] = 0;
+    for (int64_t i = 0; i < n; i++)
+      cnt[(((uint64_t)src[i].k >> sh) & HZ_RDX_MASK) + 1]++;
+    for (int i = 0; i < HZ_RDX_SIZE; i++)
+      cnt[i + 1] += cnt[i];
+    for (int64_t i = 0; i < n; i++)
+      dst[cnt[((uint64_t)src[i].k >> sh) & HZ_RDX_MASK]++] = src[i];
+    hz_pair *t = src;
+    src = dst;
+    dst = t;
+  }
+  if (src != a)
+    for (int64_t i = 0; i < n; i++)
+      a[i] = src[i];
+}
+
+static int g_radix = 1; /* §335: поразрядная сортировка; `radix=0` — прежний qsort как сверка */
+static double g_tsort = 0.0; /* §335: сколько времени уходит на сортировку ключей */
+
 static int cmp_i64(const void *x, const void *y) {
   int64_t a = *(const int64_t *)x, b = *(const int64_t *)y;
   return (a < b) ? -1 : ((a > b) ? 1 : 0);
@@ -751,6 +821,10 @@ int main(int argc, char **argv) {
      * уровне, то есть сравниваются сцены, совпадающие на 87 %. Сравнивать надо
      * при РАВНОЙ ЦЕНЕ, а цена задаётся ε. */
     if (strcmp(argv[i], "curve") == 0) ok = curve = 1;
+    if (strncmp(argv[i], "radix=", 6) == 0) {
+      g_radix = (int)strtol(argv[i] + 6, NULL, 10);
+      ok = 1;
+    }
     if (strncmp(argv[i], "fit=", 4) == 0) {
       fitj = (int)strtol(argv[i] + 4, NULL, 10);
       ok = 1;
@@ -847,6 +921,7 @@ int main(int argc, char **argv) {
     int64_t cap = 1 << 20, nk = 0;
     int64_t *key = malloc((size_t)cap * sizeof *key);
     if (key == NULL) return 1;
+    int64_t *keytmp = NULL;
     double t0c = now_s();
     int64_t nemit = 0;
     for (int32_t t = 0; t < m.nt; t++) {
@@ -887,10 +962,20 @@ int main(int argc, char **argv) {
     printf("== ЗАНЯТЫЕ ЯЧЕЙКИ (честное отсечение), %s: габарит %.3f м, мелкая ячейка %.4f м, "
            "проб %lld, попаданий %lld, за %.1f с\n",
            scene, diag, h, (long long)nemit, (long long)nk, now_s() - t0c);
+    keytmp = malloc((size_t)(nk > 0 ? nk : 1) * sizeof *keytmp);
+    if (keytmp == NULL) {
+      free(key);
+      return 1;
+    }
     /* Огрубление свёрткой индексов: множество занятых ячеек уровня выше есть
      * образ нижнего, поэтому честное отсечение нужно ровно ОДИН раз. */
     for (int j = cellsj; j >= 0; j--) {
-      qsort(key, (size_t)nk, sizeof *key, cmp_i64);
+      double tqs = now_s();
+      if (g_radix) {
+        radix_u64(key, keytmp, nk);
+      } else
+        qsort(key, (size_t)nk, sizeof *key, cmp_i64);
+      g_tsort += now_s() - tqs;
       int64_t u = 0;
       for (int64_t q = 0; q < nk; q++)
         if (q == 0 || key[q] != key[q - 1]) key[u++] = key[q];
@@ -908,6 +993,7 @@ int main(int argc, char **argv) {
       }
     }
     free(key);
+    free(keytmp);
     hz_obj_free(&m);
     return 0;
   }
@@ -1021,7 +1107,20 @@ int main(int argc, char **argv) {
         pr[q].k = ck[q];
         pr[q].t = ct[q];
       }
-      qsort(pr, (size_t)ni, sizeof *pr, cmp_pair);
+      double tqs = now_s();
+      if (g_radix) {
+        hz_pair *ptmp = malloc((size_t)ni * sizeof *ptmp);
+        if (ptmp == NULL) {
+          free(ck);
+          free(ct);
+          free(pr);
+          return 1;
+        }
+        radix_pair(pr, ptmp, ni);
+        free(ptmp);
+      } else
+        qsort(pr, (size_t)ni, sizeof *pr, cmp_pair);
+      g_tsort += now_s() - tqs;
       free(ord);
       /* по ячейкам */
       double *d1 = malloc((size_t)ni * sizeof *d1), *d2 = malloc((size_t)ni * sizeof *d2);
@@ -1133,6 +1232,7 @@ int main(int argc, char **argv) {
       free(d2);
       free(kk);
     }
+    printf("   СОРТИРОВКА КЛЮЧЕЙ: %.3f с\n", g_tsort);
     hz_obj_free(&m);
     return 0;
   }

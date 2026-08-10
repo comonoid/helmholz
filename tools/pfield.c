@@ -1172,6 +1172,7 @@ typedef struct {
   unsigned char *vis; /* на ячейку грубой сетки: свет доходит */
   int32_t n;          /* сторона грубой сетки */
   int drop;           /* lev − log2(n) */
+  int axis;           /* НЕГАТИВНЫЙ КОНТРОЛЬ: прежнее осевое наследование */
 } sweepgrid;
 
 static void sweep_free(sweepgrid *G) {
@@ -1193,6 +1194,10 @@ static void sweep_light(sweepgrid *G, const opyr *P, const frame *fr, const doub
     s[k] = (int32_t)f;
   }
   G->vis[hz_occ_index(n, s[0], s[1], s[2])] = 1u;
+  /* Источник в координатах ГРУБОЙ сетки — к нему и строится направление. */
+  double sc[3];
+  for (int k = 0; k < 3; k++)
+    sc[k] = (q[k] - fr->org[k]) / (fr->h * (double)((int32_t)1 << G->drop));
   /* ВОСЕМЬ ОКТАНТОВ. Внутри октанта каждая ось идёт ОТ источника, поэтому сосед
    * со стороны источника уже посчитан — это и есть условие свипа. */
   for (int oct = 0; oct < 8; oct++) {
@@ -1203,22 +1208,55 @@ static void sweep_light(sweepgrid *G, const opyr *P, const frame *fr, const doub
         for (int32_t x = x0; x >= 0 && x < n; x += dx) {
           size_t ci = hz_occ_index(n, x, y, z);
           if (G->vis[ci]) continue;
-          /* Сосед со стороны источника по каждой оси; видимость наследуется,
-           * если он сам виден И НЕ ЗАНЯТ. Занятая ячейка свет не пропускает —
-           * это и есть тень. */
           int v = 0;
-          int32_t px = x - dx, py = y - dy, pz = z - dz;
-          if (px >= 0 && px < n) {
-            size_t pi = hz_occ_index(n, px, y, z);
-            if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
-          }
-          if (!v && py >= 0 && py < n) {
-            size_t pi = hz_occ_index(n, x, py, z);
-            if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
-          }
-          if (!v && pz >= 0 && pz < n) {
-            size_t pi = hz_occ_index(n, x, y, pz);
-            if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
+          if (G->axis) {
+            /* НЕГАТИВНЫЙ КОНТРОЛЬ (§419): прежнее правило — максимум по трём
+             * ОСЕВЫМ соседям. Путь ступенчатый, свет заворачивает за угол, и
+             * расхождение с эталоном обязано вернуться к `18 %`. */
+            int32_t px = x - dx, py = y - dy, pz = z - dz;
+            if (px >= 0 && px < n) {
+              size_t pi = hz_occ_index(n, px, y, z);
+              if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
+            }
+            if (!v && py >= 0 && py < n) {
+              size_t pi = hz_occ_index(n, x, py, z);
+              if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
+            }
+            if (!v && pz >= 0 && pz < n) {
+              size_t pi = hz_occ_index(n, x, y, pz);
+              if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
+            }
+          } else {
+            /* Ш5а1: ПРЕДШЕСТВЕННИК ВДОЛЬ НАСТОЯЩЕГО НАПРАВЛЕНИЯ НА ИСТОЧНИК.
+             * Берётся ячейка, содержащая точку `центр − шаг·d`, где `d` —
+             * единичное направление на источник. Предшественник ОДИН, а не
+             * максимум по трём, — и потому свет не может «свернуть за угол»:
+             * путь идёт по прямой, а не ступенькой.
+             * Шаг — сторона ячейки: меньший шаг дал бы ту же ячейку, больший
+             * перепрыгнул бы заслон. */
+            double c0[3] = {(double)x + 0.5, (double)y + 0.5, (double)z + 0.5};
+            double d[3], dl = 0.0;
+            for (int k = 0; k < 3; k++) {
+              d[k] = sc[k] - c0[k];
+              dl += d[k] * d[k];
+            }
+            dl = sqrt(dl);
+            if (!(dl > 0.0)) {
+              G->vis[ci] = 1u;
+              continue;
+            }
+            int32_t qc[3];
+            int ok = 1;
+            for (int k = 0; k < 3; k++) {
+              double w = c0[k] + d[k] / dl;
+              int32_t iw = (int32_t)floor(w);
+              if (iw < 0 || iw >= n) ok = 0;
+              qc[k] = ok ? iw : 0;
+            }
+            if (ok) {
+              size_t pi = hz_occ_index(n, qc[0], qc[1], qc[2]);
+              if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
+            }
           }
           if (v) G->vis[ci] = 1u;
         }
@@ -1239,11 +1277,12 @@ static int sweep_vis(const sweepgrid *G, const frame *fr, const double p[3]) {
  * берётся затенение; геометрия (косинус, `1/r²`, образцы площадки) та же — иначе
  * сверка мерила бы разницу формул, а не разницу механизмов. */
 static void front_sweep(const hz_dcslice *S, const frame *fr, const opyr *P, const arealight *L,
-                        float *irr, double *t_sweep, double *t_gather) {
+                        float *irr, double *t_sweep, double *t_gather, int axismode) {
   static const double su[HZ_LIGHT_SAMPLES] = {-0.5, 0.5, -0.5, 0.5};
   static const double sv[HZ_LIGHT_SAMPLES] = {-0.5, -0.5, 0.5, 0.5};
   sweepgrid G;
   G.drop = HZ_SWEEP_DROP;
+  G.axis = axismode;
   G.n = (int32_t)1 << (fr->lev - G.drop);
   G.vis = malloc((size_t)G.n * (size_t)G.n * (size_t)G.n);
   if (G.vis == NULL) exit(1);
@@ -1410,7 +1449,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "pfield ФАЙЛ.obj МАСШТАБ [lev=N] [nonrm] [occdump=ПУТЬ] [polydump=ПУТЬ]\n");
     return 2;
   }
-  int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512;
+  int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
   double lodthr = 1.0;
   const char *occdump = NULL, *polydump = NULL;
   for (int i = 3; i < argc; i++) {
@@ -1428,6 +1467,11 @@ int main(int argc, char **argv) {
     }
     /* Ш5: кадр со светом. `res=` — разрешение, `thr=` — порог среза в пикселях. */
     if (strcmp(argv[i], "lit") == 0) lit = 1;
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ §419: вернуть осевое наследование видимости. */
+    if (strcmp(argv[i], "sweepaxis") == 0) {
+      lit = 1;
+      sweepaxis = 1;
+    }
     if (strncmp(argv[i], "res=", 4) == 0) res = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "thr=", 4) == 0) lodthr = strtod(argv[i] + 4, NULL);
     /* Выгрузка занятости для сверки с эталоном Ш0 (`tools/poccref.c`). */
@@ -2138,7 +2182,7 @@ int main(int argc, char **argv) {
     float *irr2 = malloc(3 * (size_t)S.n * sizeof *irr2);
     if (irr2 == NULL) exit(1);
     double t_sw = 0.0, t_ga = 0.0;
-    front_sweep(&S, &fr, &P, &AL, irr2, &t_sw, &t_ga);
+    front_sweep(&S, &fr, &P, &AL, irr2, &t_sw, &t_ga, sweepaxis);
     {
       int64_t ndiff = 0, nlit_r = 0, nlit_s = 0;
       double emax = 0.0;

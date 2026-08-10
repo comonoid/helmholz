@@ -721,6 +721,90 @@ static int lod_stop(void *ctx, const hz_dctree *t, const hz_dcref *r) {
   return px <= L->thr;
 }
 
+/* ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ (§446). Мера площадки `h²` на ЯЧЕЙКУ не может
+ * быть верной для листа нулевой толщины: ячеек по обе стороны листа вдвое
+ * больше, чем листов (§445). Площадь по ВЫДАННЫМ МНОГОУГОЛЬНИКАМ двойного счёта
+ * не должна иметь — обход выдаёт многоугольник на ПЕРЕСЕЧЁННОЕ РЕБРО, а ребро у
+ * листа одно, с какой бы стороны ни стояли ячейки. Здесь это проверяется числом.
+ *
+ * ДВА ВЕЕРА, А НЕ ОДИН (А796): площадь неплоского четырёхугольника от веера
+ * ЗАВИСИТ — складка идёт по разной диагонали. Считаются оба, и печатается
+ * разность: она и есть цена неоднозначности, а не погрешность. */
+typedef struct {
+  double fan0, fan1; /* веер от v0 и от v1, в ЯЧЕЙКАХ² */
+  double ax[3];      /* площадь по главной оси нормали (без знака), веер от v0 */
+  int64_t px[3];     /* многоугольников по той же оси — различитель А798 */
+  int64_t npoly, ntri, ndeg;
+  double flatmax; /* максимум неплоскостности в долях ячейки */
+} areacnt;
+
+static double tri_area2(const double a[3], const double b[3], const double c[3], double n[3]) {
+  double u[3], v[3];
+  for (int k = 0; k < 3; k++) {
+    u[k] = b[k] - a[k];
+    v[k] = c[k] - a[k];
+  }
+  n[0] = u[1] * v[2] - u[2] * v[1];
+  n[1] = u[2] * v[0] - u[0] * v[2];
+  n[2] = u[0] * v[1] - u[1] * v[0];
+  return 0.5 * sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+}
+
+/* Веер от вершины `b`: треугольники (b, b+i, b+i+1) по кругу. Для тройки оба
+ * веера совпадают тождественно, для четвёрки — нет. */
+static double fan_area(const double (*v)[3], int nv, int b, double nsum[3]) {
+  double s = 0.0;
+  if (nsum != NULL) nsum[0] = nsum[1] = nsum[2] = 0.0;
+  for (int i = 1; i + 1 < nv; i++) {
+    double n[3];
+    double a = tri_area2(v[b], v[(b + i) % nv], v[(b + i + 1) % nv], n);
+    s += a;
+    if (nsum != NULL)
+      for (int k = 0; k < 3; k++)
+        nsum[k] += n[k];
+  }
+  return s;
+}
+
+static int area_emit(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv) {
+  areacnt *A = (areacnt *)ctx;
+  (void)ref;
+  double nsum[3];
+  double s0 = fan_area(v, nv, 0, nsum);
+  A->fan0 += s0;
+  A->fan1 += fan_area(v, nv, 1, NULL);
+  A->npoly++;
+  A->ntri += nv - 2;
+  /* ВЫРОЖДЕННЫЕ СЧИТАЮТСЯ ОТДЕЛЬНО (А797): у них направление нормали есть шум
+   * округления, и в разбивку по осям их пускать нельзя. Порог — ТОЧНЫЙ ноль,
+   * а не подобранная малость. */
+  double ln = sqrt(nsum[0] * nsum[0] + nsum[1] * nsum[1] + nsum[2] * nsum[2]);
+  if (!(ln > 0.0)) {
+    A->ndeg++;
+    return 0;
+  }
+  int ax = 0;
+  for (int k = 1; k < 3; k++)
+    if (fabs(nsum[k]) > fabs(nsum[ax])) ax = k;
+  A->ax[ax] += s0;
+  A->px[ax]++;
+  /* Неплоскостность четвёрки: расстояние `v3` до плоскости первых трёх, в
+   * долях ячейки (координаты обхода — в ячейках рамы). */
+  if (nv == 4) {
+    double n[3];
+    double a012 = tri_area2(v[0], v[1], v[2], n);
+    double l = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (a012 > 0.0 && l > 0.0) {
+      double d = 0.0;
+      for (int k = 0; k < 3; k++)
+        d += n[k] * (v[3][k] - v[0][k]);
+      d = fabs(d) / l;
+      if (d > A->flatmax) A->flatmax = d;
+    }
+  }
+  return 0;
+}
+
 /* ВЫДАННАЯ СЕТКА, СОБРАННАЯ ОБХОДОМ (А735). Треугольники складываются в один
  * массив и привязываются к КАЖДОЙ из четырёх своих ячеек односвязным списком:
  * поиск ближайшего к точке идёт тогда по кандидатам ЭТОЙ ячейки, а не по всей
@@ -2622,6 +2706,49 @@ int main(int argc, char **argv) {
      * погрешность геометрии.
      * ЗДЕСЬ ПРОВЕРЯЕТСЯ МОЙ ГАТЕР, А НЕ АРИФМЕТИКА: угловые коэффициенты
      * считаются тем же кодом, что и отскок на сцене. */
+    /* ---- ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ (§446): ПЕРВОЕ ДЕЙСТВИЕ, НАЗНАЧЕННОЕ
+     * ЗАРАНЕЕ В §445 ---- */
+    if (oven > 0.0) {
+      /* ИСТИНА БЕРЁТСЯ ИЗ САМОГО МЕША, А НЕ КОНСТАНТОЙ `6.0`. Тогда замер
+       * остаётся верным при любом масштабе — и негативный контроль НК-1
+       * (масштаб `2.0`) проверяет себя сам, а не сверяется с вписанным числом. */
+      double atrue = 0.0;
+      for (int32_t t3 = 0; t3 < m.nt; t3++) {
+        const double *p0 = m.v + 3 * (size_t)m.f[3 * (size_t)t3];
+        const double *p1 = m.v + 3 * (size_t)m.f[3 * (size_t)t3 + 1];
+        const double *p2 = m.v + 3 * (size_t)m.f[3 * (size_t)t3 + 2];
+        double nn[3];
+        atrue += tri_area2(p0, p1, p2, nn);
+      }
+      areacnt A;
+      memset(&A, 0, sizeof A);
+      int32_t nskip = 0;
+      /* ОГРАНИЧИТЕЛЬ ТОТ ЖЕ, ЧТО У СБОРКИ СРЕЗА, иначе площадь одной
+       * поверхности сравнивалась бы с ячейками другой. Для печи — полная
+       * глубина (§437). */
+      int wrca = hz_dc_walk_stats(&T, NULL, NULL, area_emit, &A, &nskip);
+      areacnt R;
+      memset(&R, 0, sizeof R);
+      int wrcr = hz_dc_walk_ref(&T, &ht, NULL, NULL, area_emit, &R);
+      double h2 = fr.h * fr.h;
+      printf("   ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ (§446): веер от v0 %.5f м², от v1 %.5f м² "
+             "(разность %.3e); ИСТИННАЯ по мешу %.5f м², отношение %.4f\n",
+             A.fan0 * h2, A.fan1 * h2, fabs(A.fan0 - A.fan1) * h2, atrue,
+             A.fan0 * h2 / (atrue > 0.0 ? atrue : 1.0));
+      printf("   ПО ОСЯМ (главная ось нормали, БЕЗ знака): площадь %.5f / %.5f / %.5f м²; "
+             "многоугольников %lld / %lld / %lld против 841 на грань\n",
+             A.ax[0] * h2, A.ax[1] * h2, A.ax[2] * h2, (long long)A.px[0], (long long)A.px[1],
+             (long long)A.px[2]);
+      printf("   ОБХОД: многоугольников %lld, треугольников %lld, вырожденных %lld, "
+             "неплоскостность макс %.3e ячейки, ПРОПУЩЕНО полигонов %lld (код %d)\n",
+             (long long)A.npoly, (long long)A.ntri, (long long)A.ndeg, A.flatmax, (long long)nskip,
+             wrca);
+      printf("   ЭТАЛОННЫЙ ОБХОД (Г42, независимая реализация, код %d): %.5f м², "
+             "многоугольников %lld; РАСХОЖДЕНИЕ с рабочим %.3e отн.\n",
+             wrcr, R.fan0 * h2, (long long)R.npoly,
+             fabs(R.fan0 - A.fan0) / (A.fan0 > 0.0 ? A.fan0 : 1.0));
+    }
+
     if (oven > 0.0) {
       double rho = oven, Le = 1.0;
       float *B = malloc(3 * (size_t)S.n * sizeof *B);

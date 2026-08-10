@@ -1015,12 +1015,18 @@ static void cell_proc(walkctx *w, const hz_dcref *r) {
   }
 }
 
-int hz_dc_walk(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_dc_poly emit, void *pctx) {
+int hz_dc_walk_stats(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_dc_poly emit, void *pctx,
+                     int32_t *nskip) {
   walkctx w = {t, stop, sctx, emit, pctx, HZ_DC_OK, 0};
   hz_dcref root = {0, {0, 0, 0}, (int32_t)1 << t->log2size};
   cell_proc(&w, &root);
+  if (nskip != NULL) *nskip = w.nskip;
   if (w.rc == HZ_DC_OK && w.nskip > 0) return HZ_DC_EMULTI;
   return w.rc;
+}
+
+int hz_dc_walk(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_dc_poly emit, void *pctx) {
+  return hz_dc_walk_stats(t, stop, sctx, emit, pctx, NULL);
 }
 
 /* Спуск к ячейке cell среза (leafish). */

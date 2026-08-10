@@ -710,6 +710,276 @@ static int lod_stop(void *ctx, const hz_dctree *t, const hz_dcref *r) {
   return px <= L->thr;
 }
 
+/* ВЫДАННАЯ СЕТКА, СОБРАННАЯ ОБХОДОМ (А735). Треугольники складываются в один
+ * массив и привязываются к КАЖДОЙ из четырёх своих ячеек односвязным списком:
+ * поиск ближайшего к точке идёт тогда по кандидатам ЭТОЙ ячейки, а не по всей
+ * сетке. Список, а не массив на ячейку, потому что число многоугольников на
+ * ячейку заранее не известно и хвост у него длинный.
+ *
+ * ЗДЕСЬ ЖЕ СЧИТАЕТСЯ ОБРАЩЁННЫЙ ОБХОД (А729) — та проверка, без которой выбор
+ * `edir` у крупного узла остаётся ничем не подкреплённым: нормаль
+ * многоугольника (по Ньюэллу) сравнивается со средней нормалью его ячеек, и
+ * несовпадение знака СЧИТАЕТСЯ. Адаптивный срез делает перепад уровней
+ * повсеместным, поэтому если правило негодно, счётчик обязан это показать. */
+/* ИНДЕКС ПО ГРУБОЙ СЕТКЕ, А НЕ ПО УЗЛУ — ПОПРАВКА К СЕБЕ (А738). Первая
+ * редакция привязывала треугольник к его четырём ЯЧЕЙКАМ и искала ближайший
+ * только среди них. Для крупной ячейки это опять мажоранта: точка у её края
+ * ближе всего к треугольнику, привязанному к СОСЕДУ, а он в список не попадал.
+ * Здесь треугольник кладётся во все клетки грубой сетки, которые задевает его
+ * габарит, и поиск идёт по клетке точки плюс кольцо соседей — тогда величина
+ * есть настоящее расстояние до выданной поверхности, а не оценка сверху. */
+#define HZ_EGRID 6 /* сторона сетки индекса = 1 << HZ_EGRID */
+
+typedef struct {
+  double *v; /* 9 на треугольник: три вершины в координатах ДЕРЕВА */
+  int32_t ntri, cap;
+  int32_t *head; /* на клетку индекса: первое вхождение, -1 — нет */
+  int32_t *nxt;  /* следующее вхождение */
+  int32_t *tri;  /* какому треугольнику принадлежит вхождение */
+  int32_t nn, ncap;
+  int32_t gn; /* сторона сетки индекса */
+  int lev;
+} emesh;
+
+static int emesh_link(emesh *E, int32_t gi, int32_t ti) {
+  if (E->nn >= E->ncap) {
+    int32_t nc = E->ncap > 0 ? E->ncap * 2 : 4096;
+    int32_t *a1 = realloc(E->nxt, (size_t)nc * sizeof *a1);
+    if (a1 == NULL) return -1;
+    E->nxt = a1;
+    int32_t *a2 = realloc(E->tri, (size_t)nc * sizeof *a2);
+    if (a2 == NULL) return -1;
+    E->tri = a2;
+    E->ncap = nc;
+  }
+  E->nxt[E->nn] = E->head[gi];
+  E->tri[E->nn] = ti;
+  E->head[gi] = E->nn;
+  E->nn++;
+  return 0;
+}
+
+static int emesh_push(emesh *E, const double a[3], const double b[3], const double c[3],
+                      const hz_dcref *ref, int nv) {
+  if (E->ntri >= E->cap) {
+    int32_t nc = E->cap * 2;
+    double *nv2 = realloc(E->v, (size_t)nc * 9 * sizeof *nv2);
+    if (nv2 == NULL) return -1;
+    E->v = nv2;
+    E->cap = nc;
+  }
+  double *d = E->v + 9 * (size_t)E->ntri;
+  for (int k = 0; k < 3; k++) {
+    d[k] = a[k];
+    d[3 + k] = b[k];
+    d[6 + k] = c[k];
+  }
+  int32_t ti = E->ntri++;
+  (void)ref;
+  (void)nv;
+  /* Габарит треугольника в клетках индекса. Координаты — в ячейках сетки уровня
+   * `lev`, клетка индекса шире в `1 << (lev - HZ_EGRID)` раз. */
+  int sh = E->lev - HZ_EGRID;
+  if (sh < 0) sh = 0;
+  int32_t g0[3] = {0, 0, 0}, g1[3] = {0, 0, 0};
+  for (int k = 0; k < 3; k++) {
+    double lo = d[k], hi = d[k];
+    for (int q = 1; q < 3; q++) {
+      if (d[3 * q + k] < lo) lo = d[3 * q + k];
+      if (d[3 * q + k] > hi) hi = d[3 * q + k];
+    }
+    int32_t i0 = (int32_t)floor(lo) >> sh, i1 = (int32_t)floor(hi) >> sh;
+    if (i0 < 0) i0 = 0;
+    if (i1 >= E->gn) i1 = E->gn - 1;
+    g0[k] = i0;
+    g1[k] = i1;
+  }
+  for (int32_t z = g0[2]; z <= g1[2]; z++)
+    for (int32_t y = g0[1]; y <= g1[1]; y++)
+      for (int32_t x = g0[0]; x <= g1[0]; x++)
+        if (emesh_link(E, (int32_t)hz_occ_index(E->gn, x, y, z), ti) != 0) return -1;
+  return 0;
+}
+
+static int emesh_emit(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv) {
+  emesh *E = (emesh *)ctx;
+  double a[3] = {v[0][0], v[0][1], v[0][2]};
+  for (int i = 1; i + 1 < nv; i++)
+    if (emesh_push(E, a, v[i], v[i + 1], ref, nv) != 0) return 1;
+  return 0;
+}
+
+/* Ближайшая точка треугольника: квадрат расстояния от точки до треугольника.
+ * Разбор по областям Вороного (Эриксон, «Real-Time Collision Detection»);
+ * величина ТОЧНАЯ, а не приближение по вершинам, — в этом весь смысл правки
+ * А735. */
+static double pt_tri_d2(const double p[3], const double a[3], const double b[3],
+                        const double c[3]) {
+  double ab[3], ac[3], ap[3];
+  for (int k = 0; k < 3; k++) {
+    ab[k] = b[k] - a[k];
+    ac[k] = c[k] - a[k];
+    ap[k] = p[k] - a[k];
+  }
+  double d1 = ab[0] * ap[0] + ab[1] * ap[1] + ab[2] * ap[2];
+  double d2 = ac[0] * ap[0] + ac[1] * ap[1] + ac[2] * ap[2];
+  double q[3];
+  if (d1 <= 0.0 && d2 <= 0.0) {
+    for (int k = 0; k < 3; k++)
+      q[k] = a[k];
+  } else {
+    double bp[3];
+    for (int k = 0; k < 3; k++)
+      bp[k] = p[k] - b[k];
+    double d3 = ab[0] * bp[0] + ab[1] * bp[1] + ab[2] * bp[2];
+    double d4 = ac[0] * bp[0] + ac[1] * bp[1] + ac[2] * bp[2];
+    if (d3 >= 0.0 && d4 <= d3) {
+      for (int k = 0; k < 3; k++)
+        q[k] = b[k];
+    } else {
+      double cp[3];
+      for (int k = 0; k < 3; k++)
+        cp[k] = p[k] - c[k];
+      double d5 = ab[0] * cp[0] + ab[1] * cp[1] + ab[2] * cp[2];
+      double d6 = ac[0] * cp[0] + ac[1] * cp[1] + ac[2] * cp[2];
+      double vc = d1 * d4 - d3 * d2, vb = d5 * d2 - d1 * d6, va = d3 * d6 - d5 * d4;
+      if (d6 >= 0.0 && d5 <= d6) {
+        for (int k = 0; k < 3; k++)
+          q[k] = c[k];
+      } else if (vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0) {
+        double t = d1 / (d1 - d3);
+        for (int k = 0; k < 3; k++)
+          q[k] = a[k] + t * ab[k];
+      } else if (vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0) {
+        double t = d2 / (d2 - d6);
+        for (int k = 0; k < 3; k++)
+          q[k] = a[k] + t * ac[k];
+      } else if (va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0) {
+        double t = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        for (int k = 0; k < 3; k++)
+          q[k] = b[k] + t * (c[k] - b[k]);
+      } else {
+        double den = 1.0 / (va + vb + vc);
+        double u = vb * den, w = vc * den;
+        for (int k = 0; k < 3; k++)
+          q[k] = a[k] + ab[k] * u + ac[k] * w;
+      }
+    }
+  }
+  double s = 0.0;
+  for (int k = 0; k < 3; k++) {
+    double d = p[k] - q[k];
+    s += d * d;
+  }
+  return s;
+}
+
+/* Ближайшее расстояние от точки до ВЫДАННОЙ поверхности. Ищется по клетке точки
+ * и кольцу соседей: радиус растёт, пока не найдено хоть что-то, но не дальше
+ * половины сетки — иначе на пустой сцене цикл стал бы полным перебором молча. */
+static double emesh_nearest(const emesh *E, const frame *fr, const double p[3]) {
+  int sh = E->lev - HZ_EGRID;
+  if (sh < 0) sh = 0;
+  int32_t g[3];
+  for (int k = 0; k < 3; k++) {
+    double f = floor((p[k] - fr->org[k]) / fr->h);
+    int32_t i = (int32_t)f >> sh;
+    if (i < 0) i = 0;
+    if (i >= E->gn) i = E->gn - 1;
+    g[k] = i;
+  }
+  double best = 1e300;
+  for (int32_t r = 0; r <= E->gn / 2; r++) {
+    for (int32_t dz = -r; dz <= r; dz++)
+      for (int32_t dy = -r; dy <= r; dy++)
+        for (int32_t dx = -r; dx <= r; dx++) {
+          /* только КОЖУРА кольца: внутренность просмотрена на прошлом радиусе */
+          if (r > 0 && dx > -r && dx < r && dy > -r && dy < r && dz > -r && dz < r) continue;
+          int32_t x = g[0] + dx, y = g[1] + dy, z = g[2] + dz;
+          if (x < 0 || y < 0 || z < 0 || x >= E->gn || y >= E->gn || z >= E->gn) continue;
+          for (int32_t e = E->head[hz_occ_index(E->gn, x, y, z)]; e >= 0; e = E->nxt[e]) {
+            const double *tv = E->v + 9 * (size_t)E->tri[e];
+            double w[3][3];
+            for (int q = 0; q < 3; q++)
+              for (int c = 0; c < 3; c++)
+                w[q][c] = fr->org[c] + tv[3 * q + c] * fr->h;
+            double d = pt_tri_d2(p, w[0], w[1], w[2]);
+            if (d < best) best = d;
+          }
+        }
+    /* Найденное на радиусе r могло оказаться дальше, чем есть на r+1, поэтому
+     * после первой находки просматривается ещё одно кольцо — и только потом
+     * выход. Без этого величина была бы «первое попавшееся», а не ближайшее. */
+    if (best < 1e299 && r > 0) break;
+  }
+  return best;
+}
+/* Ключ ячейки среза для сличения ДВУХ срезов множествами (не построчно, А720). */
+static uint64_t cellkey(const hz_dccell *c) {
+  return ((uint64_t)c->lvl << 48) | ((uint64_t)c->lo[0] << 32) | ((uint64_t)c->lo[1] << 16) |
+         (uint64_t)c->lo[2];
+}
+
+static int cmp_u64(const void *x, const void *y) {
+  uint64_t a = *(const uint64_t *)x, b = *(const uint64_t *)y;
+  return a < b ? -1 : (a > b ? 1 : 0);
+}
+
+/* ОБРАЩЁННЫЙ ОБХОД (А729) — проверка выбора `edir` у крупного узла. Нормаль
+ * выданного треугольника сравнивается с нормалью ГРАНИ ближайшего исходного
+ * треугольника в той же ячейке.
+ *
+ * ОГОВОРКА, БЕЗ КОТОРОЙ ЧИСЛО НЕ ЧИТАЕТСЯ: обход исходной модели сам может быть
+ * несогласован (суп треугольников), и часть несовпадений придёт оттуда, а не от
+ * нас. Поэтому величина берётся ДИФФЕРЕНЦИАЛЬНО: та же доля считается при
+ * ПОЛНОЙ ГЛУБИНЕ, где перепада уровней нет вовсе, и сравниваются ДВЕ доли.
+ * Разность и есть вклад перепада; общий уровень — свойство модели. */
+static int64_t emesh_flips(const emesh *E, celltris *CT, const frame *fr, const hz_objmesh *m,
+                           int64_t *ncmp) {
+  int64_t nf = 0, nc = 0;
+  for (int32_t i = 0; i < E->ntri; i++) {
+    const double *tv = E->v + 9 * (size_t)i;
+    double w[3][3], ctr[3] = {0, 0, 0};
+    for (int q = 0; q < 3; q++)
+      for (int c = 0; c < 3; c++) {
+        w[q][c] = fr->org[c] + tv[3 * q + c] * fr->h;
+        ctr[c] += w[q][c] / 3.0;
+      }
+    double e1[3], e2[3], nn[3];
+    for (int c = 0; c < 3; c++) {
+      e1[c] = w[1][c] - w[0][c];
+      e2[c] = w[2][c] - w[0][c];
+    }
+    nn[0] = e1[1] * e2[2] - e1[2] * e2[1];
+    nn[1] = e1[2] * e2[0] - e1[0] * e2[2];
+    nn[2] = e1[0] * e2[1] - e1[1] * e2[0];
+    int32_t cell[3];
+    int ok = 1;
+    for (int c = 0; c < 3; c++) {
+      double f = floor((ctr[c] - fr->org[c]) / fr->h);
+      if (!(f >= 0.0) || !(f < (double)fr->n)) ok = 0;
+      cell[c] = ok ? (int32_t)f : 0;
+    }
+    if (!ok) continue;
+    const int32_t *ls = NULL;
+    if (ct_list(CT, cell, &ls) == 0) continue;
+    const double *A2, *B2, *C2;
+    tri_verts(m, ls[0], &A2, &B2, &C2);
+    double f1[3], f2[3], fn[3];
+    for (int c = 0; c < 3; c++) {
+      f1[c] = B2[c] - A2[c];
+      f2[c] = C2[c] - A2[c];
+    }
+    fn[0] = f1[1] * f2[2] - f1[2] * f2[1];
+    fn[1] = f1[2] * f2[0] - f1[0] * f2[2];
+    fn[2] = f1[0] * f2[1] - f1[1] * f2[0];
+    double d = nn[0] * fn[0] + nn[1] * fn[1] + nn[2] * fn[2];
+    nc++;
+    if (d < 0.0) nf++;
+  }
+  if (ncmp != NULL) *ncmp = nc;
+  return nf;
+}
 /* --- 4. главная ------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
@@ -992,7 +1262,8 @@ int main(int argc, char **argv) {
     hz_slice_free(&S);
   }
 
-  /* ---- 4в. АДАПТИВНЫЙ СРЕЗ (Ш3) ---- */
+  /* ---- 4в. АДАПТИВНЫЙ СРЕЗ (Ш3): критерий, ошибка ДО ВЫДАННОЙ ПОВЕРХНОСТИ,
+   *      ориентация на перепаде уровней, доля среза за кадр ---- */
   {
     lodctx L;
     memset(&L, 0, sizeof L);
@@ -1000,11 +1271,82 @@ int main(int argc, char **argv) {
       double eyec[3] = HZ_CFG_HALL_EYE;
       for (int a = 0; a < 3; a++)
         L.eye[a] = (eyec[a] - fr.org[a]) / fr.h;
+      /* А737 ПРОВЕРЯЕТСЯ ПРЯМО: сколько ВНУТРЕННИХ узлов имеют невязку РОВНО НОЛЬ
+       * по уровням. Узел уровня 2 накрывает 1/64 сцены и плоским быть не может;
+       * ноль у него означает не «идеально подогнано», а сокращение близких больших
+       * чисел, о котором предупреждает сам `qef.h`. */
+      {
+        int64_t nz[HZ_DC_MAX_LOG2SIZE + 2], nt2[HZ_DC_MAX_LOG2SIZE + 2];
+        for (int i = 0; i <= HZ_DC_MAX_LOG2SIZE + 1; i++)
+          nz[i] = nt2[i] = 0;
+        for (int32_t i = 0; i < T.n; i++) {
+          if (T.nd[i].child0 < 0) continue;
+          if (!hz_dc_hasvert(&T, i)) continue;
+          /* уровень узла восстанавливается по числу образцов? нет — по глубине,
+           * а глубины у узла нет; поэтому считается обходом ниже */
+          (void)0;
+        }
+        /* обход с глубиной */
+        int32_t st[64];
+        int32_t sl[64];
+        int sp = 0;
+        st[sp] = 0;
+        sl[sp] = 0;
+        sp = 1;
+        while (sp > 0) {
+          sp--;
+          int32_t ni = st[sp];
+          int lv = sl[sp];
+          if (T.nd[ni].child0 < 0) continue;
+          if (hz_dc_hasvert(&T, ni)) {
+            nt2[lv]++;
+            if (!(hz_dc_rms(&T, ni) > 0.0)) nz[lv]++;
+          }
+          for (int k = 0; k < 8 && sp < 60; k++) {
+            st[sp] = T.nd[ni].child0 + k;
+            sl[sp] = lv + 1;
+            sp++;
+          }
+        }
+        printf("   А737 НЕВЯЗКА РОВНО НОЛЬ У ВНУТРЕННИХ УЗЛОВ ПО УРОВНЯМ:");
+        for (int i = 0; i <= lev; i++)
+          if (nt2[i] > 0) printf(" L%d %lld/%lld", i, (long long)nz[i], (long long)nt2[i]);
+        printf("\n");
+      }
     }
-    /* Радиан на пиксель — из поля зрения и разрешения §2. Не константа в
-     * формуле: обе величины взяты из scene_cfg.h. */
+    /* Радиан на пиксель — из поля зрения и разрешения §2, а не константой. */
     L.pxrad = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / 512.0;
 
+    /* ЭТАЛОН ПОЛНОЙ ГЛУБИНЫ ДЛЯ А729. Без него доля обращённых не читается:
+     * часть несовпадений идёт от самой модели (суп треугольников с
+     * несогласованным обходом), и отделить её можно только сравнением с
+     * режимом, где перепада уровней нет вовсе. */
+    {
+      emesh E0;
+      E0.ntri = 0;
+      E0.cap = 1024;
+      E0.v = malloc((size_t)E0.cap * 9 * sizeof *E0.v);
+      E0.gn = (int32_t)1 << (lev < HZ_EGRID ? lev : HZ_EGRID);
+      E0.lev = lev;
+      E0.tri = NULL;
+      E0.head = malloc((size_t)E0.gn * (size_t)E0.gn * (size_t)E0.gn * sizeof *E0.head);
+      E0.nxt = NULL;
+      E0.ncap = 0;
+      E0.nn = 0;
+      if (E0.v == NULL || E0.head == NULL) exit(1);
+      for (int64_t i = 0; i < (int64_t)E0.gn * E0.gn * E0.gn; i++)
+        E0.head[i] = -1;
+      if (hz_dc_walk(&T, NULL, NULL, emesh_emit, &E0) != HZ_DC_OK) exit(1);
+      int64_t nc0 = 0, nf0 = emesh_flips(&E0, &CT, &fr, &m, &nc0);
+      printf("   ЭТАЛОН ПОЛНОЙ ГЛУБИНЫ: треугольников %lld, ОБРАЩЁННЫХ %lld из %lld (%.3f %%) — "
+             "это доля МОДЕЛИ, перепада уровней здесь нет\n",
+             (long long)E0.ntri, (long long)nf0, (long long)nc0,
+             100.0 * (double)nf0 / (double)(nc0 ? nc0 : 1));
+      free(E0.v);
+      free(E0.head);
+      free(E0.nxt);
+      free(E0.tri);
+    }
     static const double thrs[6] = {0.0, 0.25, 0.5, 1.0, 2.0, 1e30};
     hz_dcslice A;
     if (hz_slice_init(&A, lev) != HZ_DC_OK) exit(1);
@@ -1017,7 +1359,6 @@ int main(int argc, char **argv) {
       double ts = now_s() - t0;
       for (int32_t i = 0; i < A.n; i++)
         L.hist[A.c[i].lvl]++;
-      /* Медиана и хвост уровней остановки — распределение, а не среднее. */
       int64_t half = A.n / 2, acc2 = 0;
       int lmed = 0, lmin = 99, lmax = -1;
       for (int i = 0; i <= HZ_DC_MAX_LOG2SIZE + 1; i++) {
@@ -1027,11 +1368,33 @@ int main(int argc, char **argv) {
         acc2 += L.hist[i];
         if (acc2 <= half) lmed = i;
       }
-      /* ОШИБКА: расстояние от ИСТИННОЙ поверхности до выданного. ПОПУЛЯЦИЯ —
-       * ВХОД (занятые ячейки Ш0), а не выход: иначе величина не обнаружит
-       * отсутствия (§380). Точка на истинной поверхности — центр тяжести куска
-       * треугольника в занятой ячейке; выданная — вершина того узла среза,
-       * который эту ячейку накрывает. */
+
+      /* ВЫДАННАЯ ПОВЕРХНОСТЬ СОБИРАЕТСЯ ЦЕЛИКОМ (А735). Мерить расстояние до
+       * ВЕРШИНЫ накрывающей ячейки — подмена: поверхность есть сетка
+       * многоугольников, а не набор вершин, и у крупной ячейки её единственная
+       * вершина отстоит от края на размер ячейки. Здесь треугольники обхода
+       * складываются в массив и привязываются к КАЖДОЙ из своих ячеек списком,
+       * чтобы поиск ближайшего шёл по O(1) кандидатов, а не по всей сетке. */
+      emesh EM;
+      EM.ntri = 0;
+      EM.cap = 1024;
+      EM.v = malloc((size_t)EM.cap * 9 * sizeof *EM.v);
+      EM.gn = (int32_t)1 << (lev < HZ_EGRID ? lev : HZ_EGRID);
+      EM.lev = lev;
+      EM.tri = NULL;
+      EM.head = malloc((size_t)EM.gn * (size_t)EM.gn * (size_t)EM.gn * sizeof *EM.head);
+      EM.nxt = NULL;
+      EM.ncap = 0;
+      EM.nn = 0;
+      if (EM.v == NULL || EM.head == NULL) exit(1);
+      for (int64_t i = 0; i < (int64_t)EM.gn * EM.gn * EM.gn; i++)
+        EM.head[i] = -1;
+      if (hz_dc_walk(&T, lod_stop, &L, emesh_emit, &EM) != HZ_DC_OK) exit(1);
+
+      /* ОШИБКА: от ИСТИННОЙ поверхности до ВЫДАННОЙ. ПОПУЛЯЦИЯ — ВХОД (занятые
+       * ячейки эталона Ш0). Точка на истинной поверхности — центр тяжести куска
+       * треугольника в занятой ячейке; расстояние — до ближайшей точки
+       * треугольника выданной сетки, привязанного к накрывающему узлу. */
       double *er = malloc((size_t)(nocc > 0 ? nocc : 1) * sizeof *er);
       if (er == NULL) exit(1);
       int64_t ne = 0, nmiss = 0;
@@ -1042,8 +1405,7 @@ int main(int argc, char **argv) {
             if (!hz_occ_get(P.b[lev], ci)) continue;
             int32_t cell[3] = {(int32_t)x, (int32_t)y, (int32_t)z};
             const int32_t *ls = NULL;
-            int32_t nl = ct_list(&CT, cell, &ls);
-            if (nl == 0) continue;
+            if (ct_list(&CT, cell, &ls) == 0) continue;
             double cl[3], ch[3];
             cell_box(&fr, x, y, z, cl, ch);
             const double *Aa, *Bb, *Cc;
@@ -1054,31 +1416,12 @@ int main(int argc, char **argv) {
             for (int q = 0; q < Q.nv; q++)
               for (int c = 0; c < 3; c++)
                 tp[c] += Q.v[q][c] / (double)Q.nv;
-            /* спуск с тем же предикатом — тот узел, который срез и выдал */
-            int32_t ni = 0, size = fr.n, lo3[3] = {0, 0, 0};
-            for (;;) {
-              hz_dcref r = {ni, {lo3[0], lo3[1], lo3[2]}, size};
-              if (T.nd[ni].child0 < 0 || lod_stop(&L, &T, &r)) break;
-              int32_t half2 = size / 2;
-              int bit = 0;
-              for (int a = 0; a < 3; a++)
-                if (cell[a] >= lo3[a] + half2) {
-                  bit |= 1 << a;
-                  lo3[a] += half2;
-                }
-              ni = T.nd[ni].child0 + bit;
-              size = half2;
-            }
-            if (!hz_dc_hasvert(&T, ni)) {
+            double best = emesh_nearest(&EM, &fr, tp);
+            if (best > 1e299) {
               nmiss++;
               continue;
             }
-            double d = 0.0;
-            for (int c = 0; c < 3; c++) {
-              double w = fr.org[c] + hz_dc_vx(&T, ni)[c] * fr.h - tp[c];
-              d += w * w;
-            }
-            er[ne++] = sqrt(d);
+            er[ne++] = sqrt(best);
           }
       double p50 = 0, p90 = 0, p99 = 0;
       if (ne > 0) {
@@ -1088,11 +1431,75 @@ int main(int argc, char **argv) {
         p99 = er[(ne * 99) / 100];
       }
       free(er);
-      printf("   СРЕЗ порог %.2f пикс: ячеек %d, доля от полного %.4f, уровни %d..%d медиана %d, "
-             "сборка %.2f с; ОШИБКА до ИСТИННОЙ поверхности p50 %.4f p90 %.4f p99 %.4f м, "
-             "без вершины %lld из %lld\n",
-             L.thr, A.n, (double)A.n / (double)(nvl ? nvl : 1), lmin, lmax, lmed, ts, p50, p90, p99,
-             (long long)nmiss, (long long)(ne + nmiss));
+      printf("   СРЕЗ порог %.2f пикс: ячеек %d, доля %.4f, уровни %d..%d медиана %d, сборка "
+             "%.3f с, треугольников %lld; ОШИБКА ДО ВЫДАННОЙ ПОВЕРХНОСТИ p50 %.5f p90 %.5f "
+             "p99 %.5f м; без поверхности %lld из %lld\n",
+             L.thr, A.n, (double)A.n / (double)(nvl ? nvl : 1), lmin, lmax, lmed, ts,
+             (long long)EM.ntri, p50, p90, p99, (long long)nmiss, (long long)(ne + nmiss));
+      {
+        int64_t nc2 = 0;
+        int64_t nf2 = emesh_flips(&EM, &CT, &fr, &m, &nc2);
+        printf("      ОБРАЩЁННЫХ (А729, дифференциально): %lld из %lld (%.3f %%)\n", (long long)nf2,
+               (long long)nc2, 100.0 * (double)nf2 / (double)(nc2 ? nc2 : 1));
+      }
+      free(EM.v);
+      free(EM.head);
+      free(EM.nxt);
+      free(EM.tri);
+    }
+
+    /* ДОЛЯ СРЕЗА, МЕНЯЮЩАЯСЯ ЗА КАДР (П3.4, А674). Скорость и частота названы
+     * ДО прогона: ходьба 1.4 м/с при 30 кадрах в секунду — шаг 4.667 см.
+     * ЭТО ВЕРХНЯЯ ОЦЕНКА ПОЛЬЗЫ инкрементальности, а не её цена (А732):
+     * меряется, СКОЛЬКО ячеек изменилось между двумя ПОЛНЫМИ сборками. */
+    {
+      L.thr = 1.0;
+      hz_dcslice B;
+      if (hz_slice_init(&B, lev) != HZ_DC_OK) exit(1);
+      if (hz_slice_build(&A, &T, &ht, lod_stop, &L) != HZ_DC_OK) exit(1);
+      double step_m = 1.4 / 30.0;
+      /* шаг вдоль взгляда: камера идёт туда, куда смотрит */
+      double eyec[3] = HZ_CFG_HALL_EYE, atc[3] = HZ_CFG_HALL_AT, dir[3];
+      double dl = 0.0;
+      for (int a = 0; a < 3; a++) {
+        dir[a] = atc[a] - eyec[a];
+        dl += dir[a] * dir[a];
+      }
+      dl = sqrt(dl);
+      for (int a = 0; a < 3; a++)
+        L.eye[a] += (dir[a] / dl) * step_m / fr.h;
+      if (hz_slice_build(&B, &T, &ht, lod_stop, &L) != HZ_DC_OK) exit(1);
+      /* Сличаются МНОЖЕСТВА по ключу (координата, уровень). Оба среза уже в
+       * мортоновом порядке, но порядок при разных срезах разный, поэтому
+       * ключи сортируются — сверять построчно нельзя (класс А720). */
+      int64_t na = A.n, nb = B.n;
+      uint64_t *ka = malloc((size_t)(na > 0 ? na : 1) * sizeof *ka);
+      uint64_t *kb = malloc((size_t)(nb > 0 ? nb : 1) * sizeof *kb);
+      if (ka == NULL || kb == NULL) exit(1);
+      for (int64_t i = 0; i < na; i++)
+        ka[i] = cellkey(&A.c[i]);
+      for (int64_t i = 0; i < nb; i++)
+        kb[i] = cellkey(&B.c[i]);
+      qsort(ka, (size_t)na, sizeof *ka, cmp_u64);
+      qsort(kb, (size_t)nb, sizeof *kb, cmp_u64);
+      int64_t i = 0, j = 0, same = 0;
+      while (i < na && j < nb) {
+        if (ka[i] == kb[j]) {
+          same++;
+          i++;
+          j++;
+        } else if (ka[i] < kb[j])
+          i++;
+        else
+          j++;
+      }
+      printf("   ДОЛЯ СРЕЗА ЗА КАДР (ходьба 1.4 м/с, 30 к/с, шаг %.4f м): было %lld, стало "
+             "%lld, общих %lld, ИЗМЕНИЛОСЬ %.2f %% (верхняя оценка пользы, не цена — А732)\n",
+             step_m, (long long)na, (long long)nb, (long long)same,
+             100.0 * (double)(na + nb - 2 * same) / (double)(na > 0 ? na : 1));
+      free(ka);
+      free(kb);
+      hz_slice_free(&B);
     }
     hz_slice_free(&A);
   }

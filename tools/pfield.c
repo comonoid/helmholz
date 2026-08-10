@@ -2431,7 +2431,12 @@ int main(int argc, char **argv) {
     hz_dcslice S;
     if (hz_slice_init(&S, lev) != HZ_DC_OK) exit(1);
     double ta = now_s();
-    if (hz_slice_build(&S, &T, &ht, lod_stop, &LL) != HZ_DC_OK) exit(1);
+    /* ПЕЧЬ СТРОИТСЯ НА ПОЛНУЮ ГЛУБИНУ, А НЕ ПО СРЕЗУ. Коробка вся ПЛОСКАЯ,
+     * невязка QEF на ней ноль, и критерий LOD законно огрубляет её до предела:
+     * при камере зала срез вышел в СЕМЬ ячеек, и печь мерила перенос между
+     * семью гигантскими площадками. Это был не отказ переноса, а отказ моего
+     * замера — величина считалась не на том. */
+    if (hz_slice_build(&S, &T, &ht, oven > 0.0 ? NULL : lod_stop, &LL) != HZ_DC_OK) exit(1);
     double t_slice = now_s() - ta;
 
     /* ИСТОЧНИК: площадка под потолком зала. Габарит сцены известен, потолок —
@@ -2652,9 +2657,47 @@ int main(int argc, char **argv) {
                   (float)(rho * (double)B[3 * (size_t)j + (size_t)k] * ff);
           }
         }
+        /* ДИАГНОЗ §435, ПУНКТ (а) и (б): сколько пар прошло оба `cos > 0` и
+         * чему равна сумма угловых коэффициентов ОДНОЙ площадки. В замкнутой
+         * полости вторая обязана быть `1`; отклонение и есть мера того,
+         * насколько гатер теряет энергию. */
+        if (it == 1) {
+          int64_t npair = 0;
+          double ffsum = 0.0;
+          int32_t j0 = 0;
+          double pj0[3], nj0[3];
+          hz_slice_vertex(&S, j0, pj0);
+          for (int k = 0; k < 3; k++)
+            pj0[k] = fr.org[k] + pj0[k] * fr.h;
+          hz_slice_normal(&S, j0, nj0);
+          for (int32_t i = 0; i < S.n; i++) {
+            if (i == j0) continue;
+            double pi[3], ni[3], w[3], r2 = 0.0;
+            hz_slice_vertex(&S, i, pi);
+            for (int k = 0; k < 3; k++)
+              pi[k] = fr.org[k] + pi[k] * fr.h;
+            hz_slice_normal(&S, i, ni);
+            for (int k = 0; k < 3; k++) {
+              w[k] = pi[k] - pj0[k];
+              r2 += w[k] * w[k];
+            }
+            if (!(r2 > 0.0)) continue;
+            double r = sqrt(r2);
+            double cj = (w[0] * nj0[0] + w[1] * nj0[1] + w[2] * nj0[2]) / r;
+            double ci = -(w[0] * ni[0] + w[1] * ni[1] + w[2] * ni[2]) / r;
+            if (!(ci > 0.0) || !(cj > 0.0)) continue;
+            double cs2 = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
+            npair++;
+            ffsum += ci * cj * cs2 * cs2 / (3.14159265358979323846 * r2);
+          }
+          printf("   ДИАГНОЗ ПЕЧИ: у площадки 0 видимых партнёров %lld из %d; СУММА УГЛОВЫХ "
+                 "КОЭФФИЦИЕНТОВ %.5f (в замкнутой полости обязана быть 1)\n",
+                 (long long)npair, S.n - 1, ffsum);
+        }
         double sum = 0.0;
         for (int32_t i = 0; i < S.n; i++)
           sum += (double)Bn[3 * (size_t)i];
+
         double mean = sum / (double)(S.n ? S.n : 1);
         printf("   ПЕЧЬ ρ=%.2f, отскок %2d: средняя B = %.5f против замкнутой формы %.5f "
                "(отклонение %.2f %%)\n",

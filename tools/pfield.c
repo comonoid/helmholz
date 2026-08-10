@@ -2379,7 +2379,10 @@ int main(int argc, char **argv) {
     float *irr = malloc(3 * (size_t)S.n * sizeof *irr);
     if (irr == NULL) exit(1);
     ta = now_s();
-    front_direct(&S, &fr, &P, &AL, irr, 0.5, 0, NULL);
+    /* РАБОЧИЙ ПУТЬ — С ПОДЪЁМОМ (§426): тот же предикат, вчетверо дешевле.
+     * Плоский марш остаётся АРБИТРОМ и зовётся ниже. */
+    int64_t nstep_w = 0;
+    front_direct(&S, &fr, &P, &AL, irr, 0.5, 1, &nstep_w);
     double t_dir = now_s() - ta;
     /* А772/А775: ЭТАЛОН ПРОВЕРЯЕТСЯ САМ. Марш идёт шагом , и тонкий заслон
      * он может проскочить. Пересчёт вдвое мельче: если множество затенённых
@@ -2412,13 +2415,15 @@ int main(int argc, char **argv) {
       if (irrh == NULL) exit(1);
       int64_t nsteph = 0;
       double th = now_s();
-      front_direct(&S, &fr, &P, &AL, irrh, 0.5, 1, &nsteph);
+      /* АРБИТР — ПЛОСКИЙ марш: рабочий путь стал иерархическим, и сравнивать
+       * его с самим собою значило бы печатать ложный ноль. */
+      front_direct(&S, &fr, &P, &AL, irrh, 0.5, 0, &nsteph);
       th = now_s() - th;
       int64_t nd2 = 0;
       for (int32_t i = 0; i < S.n; i++)
         if ((irr[3 * (size_t)i] > 0.0f) != (irrh[3 * (size_t)i] > 0.0f)) nd2++;
-      printf("   ЭТАЛОН С ПОДЪЁМОМ: %.1f мс против %.1f мс плоского (в %.2f раза), шагов %lld "
-             "(%.1f на луч); РАСХОЖДЕНИЕ С ПЛОСКИМ %lld ячеек\n",
+      printf("   АРБИТР (плоский марш): %.1f мс против %.1f мс рабочего с подъёмом (в %.2f "
+             "раза), шагов %lld (%.1f на луч); РАСХОЖДЕНИЕ %lld ячеек\n",
              th * 1e3, t_dir * 1e3, t_dir / (th > 0.0 ? th : 1.0), (long long)nsteph,
              (double)nsteph / (double)((int64_t)S.n * HZ_LIGHT_SAMPLES), (long long)nd2);
       free(irrh);

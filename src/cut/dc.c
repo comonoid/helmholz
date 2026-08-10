@@ -96,6 +96,50 @@ int hz_htab_uniq(hz_htab *h, int32_t *ndup) {
   return HZ_DC_OK;
 }
 
+/* СВЕДЕНИЕ ПО БЛИЖАЙШЕМУ ПЕРЕСЕЧЕНИЮ (Р7, §393). Беззнаковый источник заносит
+ * ребро ОДИН РАЗ НА КАЖДЫЙ пересекающий его треугольник, и записи законно
+ * разные — `hz_htab_uniq` здесь не годится, он требует побитового совпадения.
+ *
+ * ПРАВИЛО ВЫБОРА ОДНО И НАЗВАНО: остаётся пересечение с НАИМЕНЬШИМ `t`, то есть
+ * ПЕРВОЕ ОТ НИЖНЕГО КОНЦА ребра. Ровно это делал и знаковый источник
+ * (`best = min t`), так что правило не новое. ЧЕГО ОНО СТОИТ: если ребро
+ * пересекают два листа поверхности, второй теряется — но одна вершина на ячейку
+ * его и не представила бы (принятое ограничение DC), так что потеря не
+ * добавляется этим правилом, а лишь не лечится им.
+ *
+ * ПОРЯДОК СТРОГИЙ И НЕ ЗАВИСИТ ОТ ПОРЯДКА ЗАНЕСЕНИЯ: при равных `t` сравниваются
+ * координаты нормали. Иначе итог зависел бы от того, в каком порядке шли
+ * треугольники, и первое же распараллеливание источника его бы изменило. */
+static int hedge_cmp_mint(const void *x, const void *y) {
+  const hz_hedge *a = (const hz_hedge *)x, *b = (const hz_hedge *)y;
+  /* Сравнения строго через `<`/`>`, а не через `!=`: -Wfloat-equal запрещает
+   * второе, и запрещает по делу — здесь нужен ПОРЯДОК, а не равенство. */
+  if (a->key != b->key) return a->key < b->key ? -1 : 1;
+  if (a->t < b->t) return -1;
+  if (a->t > b->t) return 1;
+  for (int c = 0; c < 3; c++) {
+    if (a->nrm[c] < b->nrm[c]) return -1;
+    if (a->nrm[c] > b->nrm[c]) return 1;
+  }
+  return 0;
+}
+
+int hz_htab_reduce_min(hz_htab *h, int32_t *ndrop) {
+  int32_t drop = 0;
+  if (h->n > 1) qsort(h->e, (size_t)h->n, sizeof(hz_hedge), hedge_cmp_mint);
+  int32_t w = 0;
+  for (int32_t i = 0; i < h->n; i++) {
+    if (w > 0 && h->e[w - 1].key == h->e[i].key) {
+      drop++;
+      continue;
+    }
+    h->e[w++] = h->e[i];
+  }
+  h->n = w;
+  if (ndrop != NULL) *ndrop = drop;
+  return HZ_DC_OK;
+}
+
 const hz_hedge *hz_htab_find(const hz_htab *h, int axis, const int32_t p[3]) {
   uint64_t k = hz_hedge_key(axis, p);
   int32_t lo = 0, hi = h->n - 1;
@@ -391,105 +435,6 @@ int hz_dc_build(hz_dctree *t, const hz_signgrid *g, const hz_htab *ht) {
   return t->nmulti > 0 ? HZ_DC_EMULTI : HZ_DC_OK;
 }
 
-/* --- 3b. ДЕШЁВЫЙ СПУСК (§370) ---------------------------------------------- */
-
-typedef struct {
-  hz_dc_sign sg;
-  hz_dc_cross cr;
-  hz_dc_box bx;
-  void *ctx;
-  hz_htab *ht;
-  int rc;
-} lazyctx;
-
-/* Маска углов ВОСЕМЬЮ вопросами источнику, а не чтением массива. Порядок битов
- * тот же, что у corner_mask, — на нём стоит совпадение с плотным путём. */
-static uint8_t corner_mask_src(const lazyctx *L, const int32_t lo[3], int32_t size) {
-  uint8_t m = 0;
-  for (int c = 0; c < 8; c++) {
-    int32_t p[3];
-    for (int a = 0; a < 3; a++)
-      p[a] = lo[a] + (((c >> a) & 1) ? size : 0);
-    if (L->sg(L->ctx, p)) m = (uint8_t)(m | (1u << c));
-  }
-  return m;
-}
-
-/* ПРОХОД ПЕРВЫЙ И ЕДИНСТВЕННЫЙ, ГДЕ СПРАШИВАЮТ ИСТОЧНИК (§373): структура и
- * маски углов. Ни форм, ни рёбер, ни вершин — их считают проходы 2 и 3 УЖЕ ПО
- * ДЕРЕВУ, и потому источник опрашивается ровно один раз на узел, а не дважды.
- *
- * МАСКА ВНУТРЕННЕГО УЗЛА СОБИРАЕТСЯ ИЗ ДЕТЕЙ, а не спрашивается: угол `c`
- * родителя И ЕСТЬ угол `c` ребёнка `c` (`lo + c·half + c·half = lo + c·size`) —
- * тождество, а не приближение. Отсюда ПОРЯДКОВЫЙ инвариант (А633): у
- * внутреннего узла `corner` действителен только ПОСЛЕ рекурсии, и до неё его
- * читать нельзя. Единственный потребитель — solve_node через hz_dc_manifold —
- * работает в проходе 3, то есть заведомо после.
- *
- * У ОСТАНОВЛЕННОГО УЗЛА маска по-прежнему берётся всеми восемью вопросами.
- * «Все восемь равны» есть следствие КОНТРАКТА bx, а негативный контроль его
- * нарушает нарочно (А635): сэкономить тут значит сделать поведение под
- * контролем неопределённым, то есть купить скорость негодностью проверки. */
-static int lazy_shape(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size, lazyctx *L) {
-  t->nd[ni].child0 = -1;
-  hz_qef_zero(&t->nd[ni].q);
-  if (!L->bx(L->ctx, lo, size) || size == 1) {
-    t->nd[ni].corner = corner_mask_src(L, lo, size);
-    return HZ_DC_OK;
-  }
-  int32_t c0 = dc_alloc8(t);
-  if (c0 < 0) return HZ_DC_ENOMEM;
-  t->nd[ni].child0 = c0;
-  int32_t half = size / 2;
-  for (int i = 0; i < 8; i++) {
-    int32_t clo[3];
-    for (int a = 0; a < 3; a++)
-      clo[a] = lo[a] + (((i >> a) & 1) ? half : 0);
-    int rc = lazy_shape(t, c0 + i, clo, half, L);
-    if (rc != HZ_DC_OK) return rc;
-  }
-  uint8_t m = 0;
-  for (int c = 0; c < 8; c++)
-    if ((t->nd[c0 + c].corner >> c) & 1) m = (uint8_t)(m | (1u << c));
-  t->nd[ni].corner = m;
-  return HZ_DC_OK;
-}
-
-/* Проход ВТОРОЙ: эрмитовы рёбра ПО ГОТОВОМУ ДЕРЕВУ. Маска берётся из узла,
- * источник спрашивается только про пересечение. Ребро приходит из каждой
- * делящей его ячейки, поэтому повторы неизбежны и снимаются потом
- * hz_htab_uniq — с побитовой сверкой копий, а не выбором первой попавшейся. */
-static void lazy_edges(lazyctx *L, const hz_dctree *t, int32_t ni, const int32_t lo[3],
-                       int32_t size) {
-  if (L->rc != HZ_DC_OK) return;
-  if (t->nd[ni].child0 < 0) {
-    if (size != 1) return;
-    uint8_t m = t->nd[ni].corner;
-    for (int i = 0; i < 12; i++) {
-      int axis, off[3];
-      unit_edge(i, &axis, off);
-      int c0 = off[0] | (off[1] << 1) | (off[2] << 2), c1 = c0 | (1 << axis);
-      int s0 = (m >> c0) & 1;
-      if (s0 == ((m >> c1) & 1)) continue;
-      int32_t p[3] = {lo[0] + off[0], lo[1] + off[1], lo[2] + off[2]};
-      int rc = probe_edge(L->ht, L->cr, L->ctx, p, axis, s0);
-      if (rc != HZ_DC_OK) {
-        L->rc = rc;
-        return;
-      }
-    }
-    return;
-  }
-  int32_t half = size / 2;
-  for (int i = 0; i < 8; i++) {
-    int32_t clo[3];
-    for (int a = 0; a < 3; a++)
-      clo[a] = lo[a] + (((i >> a) & 1) ? half : 0);
-    lazy_edges(L, t, t->nd[ni].child0 + i, clo, half);
-    if (L->rc != HZ_DC_OK) return;
-  }
-}
-
 /* Проход ТРЕТИЙ: формы и вершины, снизу вверх, БЕЗ ЕДИНОГО обращения к
  * источнику. Порядок действий и порядок детей те же, что у плотного пути
  * (build_rec), и это не экономия строк: разойдись они, побитовое совпадение
@@ -514,35 +459,129 @@ static void lazy_forms(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t si
   solve_node(t, ni, lo, size);
 }
 
-int hz_dc_shape_lazy(hz_dctree *t, int log2size, hz_dc_sign sg, hz_dc_box bx, void *ctx) {
-  if (log2size < 0 || log2size > HZ_DC_MAX_LOG2SIZE) return HZ_DC_ERANGE;
-  if (t->log2size != log2size) return HZ_DC_ERANGE;
-  lazyctx L = {sg, NULL, bx, ctx, NULL, HZ_DC_OK};
-  int32_t zero[3] = {0, 0, 0};
-  return lazy_shape(t, 0, zero, (int32_t)1 << log2size, &L);
+/* --- 3б. БЕЗЗНАКОВЫЙ ПУТЬ (Р7, §393) --------------------------------------- */
+
+/* ЧЕМ ЭТО ОТЛИЧАЕТСЯ ОТ СНЕСЁННОГО АДАПТЕРА, И ПОЧЕМУ РАЗЛИЧИЕ НЕ СЛОВЕСНОЕ.
+ * Прежний ленивый спуск задавал источнику ТРИ вопроса — знак угла, пересечение
+ * ребра, «есть ли смена знака в коробке», — и первые два суть вопросы ПРО ПОЛЕ,
+ * то есть про то, что источник обязан не отвечать, а СТРОИТЬ (Р1, А650).
+ * Здесь остаётся один вопрос, и он про КОРОБКУ: есть ли в ней геометрия. Рёбра
+ * источник ПЕРЕДАЁТ таблицей, знака не существует вовсе.
+ *
+ * ЗАМЕР, ИЗ КОТОРОГО ЭТО ВЫРОСЛО (§391), А НЕ ВКУС: у сцены из односторонних
+ * треугольников «внутри» не определено, и заливка давала либо потерю предметов
+ * (не протекла), либо потерю стен (протекла) — уровня без потери не было ни
+ * одного. */
+static int shape_occ_rec(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size, hz_dc_occ oc,
+                         void *ctx) {
+  t->nd[ni].child0 = -1;
+  t->nd[ni].corner = 0; /* знака нет; hz_dc_manifold(0) = 1, отказа Г47 не будет */
+  t->nd[ni].ecross = 0;
+  t->nd[ni].edir = 0;
+  hz_qef_zero(&t->nd[ni].q);
+  if (!oc(ctx, lo, size) || size == 1) return HZ_DC_OK;
+  int32_t c0 = dc_alloc8(t);
+  if (c0 < 0) return HZ_DC_ENOMEM;
+  t->nd[ni].child0 = c0;
+  int32_t half = size / 2;
+  for (int i = 0; i < 8; i++) {
+    int32_t clo[3];
+    for (int a = 0; a < 3; a++)
+      clo[a] = lo[a] + (((i >> a) & 1) ? half : 0);
+    int rc = shape_occ_rec(t, c0 + i, clo, half, oc, ctx);
+    if (rc != HZ_DC_OK) return rc;
+  }
+  return HZ_DC_OK;
 }
 
-int hz_dc_edges_lazy(hz_htab *ht, const hz_dctree *t, hz_dc_cross cr, void *ctx, int32_t *ndup) {
-  lazyctx L = {NULL, cr, NULL, ctx, ht, HZ_DC_OK};
+int hz_dc_shape_occ(hz_dctree *t, int log2size, hz_dc_occ oc, void *ctx) {
+  if (log2size < 0 || log2size > HZ_DC_MAX_LOG2SIZE) return HZ_DC_ERANGE;
+  if (t->log2size != log2size) return HZ_DC_ERANGE;
+  t->unsgn = 1;
+  t->nbigmask = 0;
   int32_t zero[3] = {0, 0, 0};
-  lazy_edges(&L, t, 0, zero, (int32_t)1 << t->log2size);
-  if (L.rc != HZ_DC_OK) return L.rc;
-  return hz_htab_uniq(ht, ndup);
+  return shape_occ_rec(t, 0, zero, (int32_t)1 << log2size, oc, ctx);
+}
+
+/* Маски рёбер. У листа размера 1 — прямым поиском в таблице; порядок рёбер тот
+ * же `unit_edge`, что у формы листа, и это не удобство: на одинаковом порядке
+ * стоит побитовость починки (Г49).
+ *
+ * У ВНУТРЕННЕГО УЗЛА ребро `i` накрыто РОВНО ДВУМЯ детьми — теми, у кого
+ * совпали биты по двум поперечным осям; их собственные рёбра с тем же номером
+ * `i` и есть его половины. Поэтому `ecross` родителя есть ИЛИ по этим двум, и
+ * это тождество, а не приближение. `edir` берётся у ПЕРВОГО из двух, у кого
+ * пересечение есть, и при двух пересечениях сразу он НЕ ОПРЕДЕЛЁН — долг Ш3
+ * (А708). При полной глубине обход читает маску только у самой мелкой из
+ * четырёх ячеек (Г43), то есть всегда у ребра сетки, и долг не наступает. */
+static void masks_occ_rec(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size,
+                          const hz_htab *ht) {
+  hz_dcnode *nd = &t->nd[ni];
+  if (nd->child0 < 0) {
+    nd->ecross = 0;
+    nd->edir = 0;
+    if (size != 1) return;
+    for (int i = 0; i < 12; i++) {
+      int axis, off[3];
+      unit_edge(i, &axis, off);
+      int32_t p[3] = {lo[0] + off[0], lo[1] + off[1], lo[2] + off[2]};
+      const hz_hedge *e = hz_htab_find(ht, axis, p);
+      if (e == NULL) continue;
+      nd->ecross = (uint16_t)(nd->ecross | (1u << i));
+      if (e->nrm[axis] > 0.0) nd->edir = (uint16_t)(nd->edir | (1u << i));
+    }
+    return;
+  }
+  int32_t c0 = nd->child0, half = size / 2;
+  for (int k = 0; k < 8; k++) {
+    int32_t clo[3];
+    for (int a = 0; a < 3; a++)
+      clo[a] = lo[a] + (((k >> a) & 1) ? half : 0);
+    masks_occ_rec(t, c0 + k, clo, half, ht);
+  }
+  uint16_t ec = 0, ed = 0;
+  for (int i = 0; i < 12; i++) {
+    int axis, off[3];
+    unit_edge(i, &axis, off);
+    int u = (axis + 1) % 3, v = (axis + 2) % 3;
+    int base = (off[u] << u) | (off[v] << v);
+    for (int h = 0; h < 2; h++) {
+      const hz_dcnode *ch = &t->nd[c0 + (base | (h << axis))];
+      if (!((ch->ecross >> i) & 1u)) continue;
+      if (!((ec >> i) & 1u)) {
+        ec = (uint16_t)(ec | (1u << i));
+        if ((ch->edir >> i) & 1u) ed = (uint16_t)(ed | (1u << i));
+      }
+    }
+  }
+  t->nd[ni].ecross = ec;
+  t->nd[ni].edir = ed;
+}
+
+/* А709: у недробившегося узла пересечённых рёбер быть не может — спуск идёт по
+ * занятости, а ребро, задетое треугольником, лежит в задетой коробке. Это не
+ * соглашение, а следствие предиката, и оно СЧИТАЕТСЯ, а не предполагается. */
+static void masks_check_rec(hz_dctree *t, int32_t ni, int32_t size) {
+  if (t->nd[ni].child0 < 0) {
+    if (size != 1 && t->nd[ni].ecross != 0) t->nbigmask++;
+    return;
+  }
+  for (int k = 0; k < 8; k++)
+    masks_check_rec(t, t->nd[ni].child0 + k, size / 2);
+}
+
+int hz_dc_masks_occ(hz_dctree *t, const hz_htab *ht) {
+  int32_t zero[3] = {0, 0, 0};
+  masks_occ_rec(t, 0, zero, (int32_t)1 << t->log2size, ht);
+  t->nbigmask = 0;
+  masks_check_rec(t, 0, (int32_t)1 << t->log2size);
+  return HZ_DC_OK;
 }
 
 int hz_dc_forms_lazy(hz_dctree *t, const hz_htab *ht) {
   int32_t zero[3] = {0, 0, 0};
   lazy_forms(t, 0, zero, (int32_t)1 << t->log2size, ht);
   return t->nmulti > 0 ? HZ_DC_EMULTI : HZ_DC_OK;
-}
-
-int hz_dc_build_lazy(hz_dctree *t, hz_htab *ht, int log2size, hz_dc_sign sg, hz_dc_cross cr,
-                     hz_dc_box bx, void *ctx, int32_t *ndup) {
-  int rc = hz_dc_shape_lazy(t, log2size, sg, bx, ctx);
-  if (rc != HZ_DC_OK) return rc;
-  rc = hz_dc_edges_lazy(ht, t, cr, ctx, ndup);
-  if (rc != HZ_DC_OK) return rc;
-  return hz_dc_forms_lazy(t, ht);
 }
 
 int hz_dc_repair(hz_dctree *t, const hz_htab *ht, const int32_t cell[3]) {
@@ -672,10 +711,23 @@ static void process_edge(walkctx *w, const hz_dcref q[4], int e, const int32_t q
   int c0 = 0;
   if (qlo[u] != q[mi].lo[u]) c0 |= 1 << u;
   if (qlo[v] != q[mi].lo[v]) c0 |= 1 << v;
-  int c1 = c0 | (1 << e);
-  int s0 = (w->t->nd[q[mi].ni].corner >> c0) & 1;
-  int s1 = (w->t->nd[q[mi].ni].corner >> c1) & 1;
-  if (s0 == s1) return;
+  int s0;
+  if (w->t->unsgn) {
+    /* БЕЗЗНАКОВЫЙ КЛЮЧ (Р7, §393): поверхность опознаётся ПЕРЕСЕЧЁННЫМ РЕБРОМ,
+     * а обход многоугольника — НОРМАЛЬЮ образца на нём. Номер ребра в нумерации
+     * `unit_edge`: ось `e`, смещения по двум поперечным берутся из тех же битов
+     * `c0`, что и знак у знакового пути, — то есть место читается одинаково, а
+     * значение по-разному. `s0 = 1` значит «наружу смотрит +e», ровно как
+     * «материал у нижнего конца» у знакового. */
+    int i = e * 4 + (((c0 >> u) & 1) | (((c0 >> v) & 1) << 1));
+    if (!((w->t->nd[q[mi].ni].ecross >> i) & 1u)) return;
+    s0 = (w->t->nd[q[mi].ni].edir >> i) & 1u;
+  } else {
+    int c1 = c0 | (1 << e);
+    s0 = (w->t->nd[q[mi].ni].corner >> c0) & 1;
+    int s1 = (w->t->nd[q[mi].ni].corner >> c1) & 1;
+    if (s0 == s1) return;
+  }
 
   double vv[4][3];
   hz_dcref rr[4];

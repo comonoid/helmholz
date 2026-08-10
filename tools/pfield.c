@@ -1652,6 +1652,7 @@ int main(int argc, char **argv) {
   }
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0;
+  double oven = 0.0;
   double lodthr = 1.0;
   const char *occdump = NULL, *polydump = NULL;
   for (int i = 3; i < argc; i++) {
@@ -1682,6 +1683,11 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "alb0") == 0) {
       lit = 1;
       alb0 = 1;
+    }
+    /* ПЕЧЬ (§430): замкнутая коробка, постоянное альбедо, ответ известен. */
+    if (strncmp(argv[i], "oven=", 5) == 0) {
+      lit = 1;
+      oven = strtod(argv[i] + 5, NULL);
     }
     if (strcmp(argv[i], "sweepr01") == 0) {
       lit = 1;
@@ -2582,6 +2588,69 @@ int main(int argc, char **argv) {
              t_sw * 1e9 / (double)(S.n ? S.n : 1) / (double)HZ_LIGHT_SAMPLES, t_ga * 1e3,
              (long long)nlit_r, (long long)nlit_s, (long long)ndiff,
              100.0 * (double)ndiff / (double)(S.n ? S.n : 1), emax);
+    }
+
+    /* ---- ПЕЧЬ (Ш5б, §430): ЗАМКНУТАЯ ФОРМА ПРОТИВ ИТЕРАЦИИ ---- */
+    /* В замкнутой полости с ПОСТОЯННЫМ альбедо и постоянной эмиссией угловые
+     * коэффициенты каждой площадки суммируются в единицу, поэтому радиозность
+     * удовлетворяет `B = E + ρ·B`, то есть `B = E/(1−ρ)` ТОЧНО. Ответ не зависит
+     * ни от формы полости, ни от разбиения — потому это и приёмка: всякое
+     * отклонение есть УТЕЧКА (или приток) энергии в моём переносе, а не
+     * погрешность геометрии.
+     * ЗДЕСЬ ПРОВЕРЯЕТСЯ МОЙ ГАТЕР, А НЕ АРИФМЕТИКА: угловые коэффициенты
+     * считаются тем же кодом, что и отскок на сцене. */
+    if (oven > 0.0) {
+      double rho = oven, Le = 1.0;
+      float *B = malloc(3 * (size_t)S.n * sizeof *B);
+      float *Bn = malloc(3 * (size_t)S.n * sizeof *Bn);
+      if (B == NULL || Bn == NULL) exit(1);
+      for (int32_t i = 0; i < 3 * S.n; i++)
+        B[i] = (float)Le;
+      double exact = Le / (1.0 - rho);
+      for (int it = 1; it <= 12; it++) {
+        for (int32_t i = 0; i < 3 * S.n; i++)
+          Bn[i] = (float)Le;
+        for (int32_t j = 0; j < S.n; j++) {
+          double pj[3], nj[3];
+          hz_slice_vertex(&S, j, pj);
+          for (int k = 0; k < 3; k++)
+            pj[k] = fr.org[k] + pj[k] * fr.h;
+          hz_slice_normal(&S, j, nj);
+          double cs = fr.h * (double)((int32_t)1 << (lev - (int)S.c[j].lvl));
+          double aj = cs * cs;
+          for (int32_t i = 0; i < S.n; i++) {
+            if (i == j) continue;
+            double pi[3], ni[3], w[3], r2 = 0.0;
+            hz_slice_vertex(&S, i, pi);
+            for (int k = 0; k < 3; k++)
+              pi[k] = fr.org[k] + pi[k] * fr.h;
+            hz_slice_normal(&S, i, ni);
+            for (int k = 0; k < 3; k++) {
+              w[k] = pj[k] - pi[k];
+              r2 += w[k] * w[k];
+            }
+            if (!(r2 > 0.0)) continue;
+            double r = sqrt(r2);
+            double ci = (w[0] * ni[0] + w[1] * ni[1] + w[2] * ni[2]) / r;
+            double cj = -(w[0] * nj[0] + w[1] * nj[1] + w[2] * nj[2]) / r;
+            if (!(ci > 0.0) || !(cj > 0.0)) continue;
+            double ff = ci * cj * aj / (3.14159265358979323846 * r2);
+            for (int k = 0; k < 3; k++)
+              Bn[3 * (size_t)i + (size_t)k] += (float)(rho * (double)B[3 * (size_t)j + (size_t)k] * ff);
+          }
+        }
+        double sum = 0.0;
+        for (int32_t i = 0; i < S.n; i++)
+          sum += (double)Bn[3 * (size_t)i];
+        double mean = sum / (double)(S.n ? S.n : 1);
+        printf("   ПЕЧЬ ρ=%.2f, отскок %2d: средняя B = %.5f против замкнутой формы %.5f "
+               "(отклонение %.2f %%)\n",
+               rho, it, mean, exact, 100.0 * (mean - exact) / exact);
+        for (int32_t i = 0; i < 3 * S.n; i++)
+          B[i] = Bn[i];
+      }
+      free(B);
+      free(Bn);
     }
 
     /* ---- ОДИН ОТСКОК (Ш5б, §430) ---- */

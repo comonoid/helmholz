@@ -730,12 +730,30 @@ static int lod_stop(void *ctx, const hz_dctree *t, const hz_dcref *r) {
  * ДВА ВЕЕРА, А НЕ ОДИН (А796): площадь неплоского четырёхугольника от веера
  * ЗАВИСИТ — складка идёт по разной диагонали. Считаются оба, и печатается
  * разность: она и есть цена неоднозначности, а не погрешность. */
+/* ГИСТОГРАММА ПО ПЛОСКОСТЯМ (§450, П2). `3 × 2 + 3 × 1 = 9` есть вывод из
+ * арифметики, а не измерение: надо увидеть САМИ листы — сколько их, где они и на
+ * каком расстоянии друг от друга. Ячейка делится на `HZ_PLBIN` долей, чтобы
+ * различить два слоя, отстоящих на одну ячейку, и заодно увидеть смещение листа
+ * ВНУТРИ ячейки. Корзины заводит вызывающий; NULL — гистограммы нет. */
+#define HZ_PLBIN 8
+
 typedef struct {
   double fan0, fan1; /* веер от v0 и от v1, в ЯЧЕЙКАХ² */
   double ax[3];      /* площадь по главной оси нормали (без знака), веер от v0 */
   int64_t px[3];     /* многоугольников по той же оси — различитель А798 */
   int64_t npoly, ntri, ndeg;
-  double flatmax; /* максимум неплоскостности в долях ячейки */
+  double flatmax;  /* максимум неплоскостности в долях ячейки */
+  double *pl_area; /* [3][nbin]: площадь по плоскостям, м² считает вызывающий */
+  int64_t *pl_cnt; /* [3][nbin]: многоугольников по плоскостям */
+  int32_t nbin;
+  /* РАЗЛИЧИТЕЛЬ, БЕЗ КОТОРОГО ГИСТОГРАММА ПО ПЛОСКОСТЯМ НЕ РАЗДЕЛЯЕТ ДВЕ
+   * ГИПОТЕЗЫ (П2). Вершина DC ставится НА ПОВЕРХНОСТЬ, поэтому два слоя ячеек по
+   * обе стороны листа дадут вершины в ОДНОЙ плоскости — геометрически дубль
+   * неотличим от «одно ребро учтено дважды». Отличает их только ЯЧЕЙКА: здесь
+   * многоугольники раскладываются по координате своей ячейки вдоль главной оси. */
+  double *cl_area; /* [3][ncell]: площадь по СЛОЯМ ЯЧЕЕК */
+  int64_t *cl_cnt;
+  int32_t ncell;
 } areacnt;
 
 static double tri_area2(const double a[3], const double b[3], const double c[3], double n[3]) {
@@ -768,7 +786,6 @@ static double fan_area(const double (*v)[3], int nv, int b, double nsum[3]) {
 
 static int area_emit(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv) {
   areacnt *A = (areacnt *)ctx;
-  (void)ref;
   double nsum[3];
   double s0 = fan_area(v, nv, 0, nsum);
   A->fan0 += s0;
@@ -788,6 +805,30 @@ static int area_emit(void *ctx, const hz_dcref *ref, const double (*v)[3], int n
     if (fabs(nsum[k]) > fabs(nsum[ax])) ax = k;
   A->ax[ax] += s0;
   A->px[ax]++;
+  if (A->pl_area != NULL) {
+    /* Плоскость листа — координата ЦЕНТРОИДА многоугольника вдоль его главной
+     * оси. Центроид, а не вершина: у наклонного многоугольника вершины разъедутся
+     * по корзинам, а центроид — нет. */
+    double c = 0.0;
+    for (int i = 0; i < nv; i++)
+      c += v[i][ax];
+    c /= (double)nv;
+    long long b = llround(c * (double)HZ_PLBIN);
+    if (b >= 0 && b < (long long)A->nbin) {
+      A->pl_area[(size_t)ax * (size_t)A->nbin + (size_t)b] += s0;
+      A->pl_cnt[(size_t)ax * (size_t)A->nbin + (size_t)b]++;
+    }
+  }
+  if (A->cl_area != NULL) {
+    /* Ячейка берётся ПЕРВАЯ из четырёх (`ref[0]`): у многоугольника вокруг
+     * ребра все четыре лежат в ОДНОМ слое вдоль оси ребра, а ось ребра совпадает
+     * с главной осью нормали листа. Слой поэтому определён однозначно. */
+    int32_t c0 = ref[0].lo[ax];
+    if (c0 >= 0 && c0 < A->ncell) {
+      A->cl_area[(size_t)ax * (size_t)A->ncell + (size_t)c0] += s0;
+      A->cl_cnt[(size_t)ax * (size_t)A->ncell + (size_t)c0]++;
+    }
+  }
   /* Неплоскостность четвёрки: расстояние `v3` до плоскости первых трёх, в
    * долях ячейки (координаты обхода — в ячейках рамы). */
   if (nv == 4) {
@@ -1741,7 +1782,7 @@ int main(int argc, char **argv) {
     return 2;
   }
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
-  int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0;
+  int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
   double oven = 0.0;
   double lodthr = 1.0;
   const char *occdump = NULL, *polydump = NULL;
@@ -1773,6 +1814,11 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "alb0") == 0) {
       lit = 1;
       alb0 = 1;
+    }
+    /* ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ (§446/§450 П3): на любой сцене, без печи. */
+    if (strcmp(argv[i], "area") == 0) {
+      lit = 1;
+      area = 1;
     }
     /* ПЕЧЬ (§430): замкнутая коробка, постоянное альбедо, ответ известен. */
     if (strncmp(argv[i], "oven=", 5) == 0) {
@@ -2707,8 +2753,10 @@ int main(int argc, char **argv) {
      * ЗДЕСЬ ПРОВЕРЯЕТСЯ МОЙ ГАТЕР, А НЕ АРИФМЕТИКА: угловые коэффициенты
      * считаются тем же кодом, что и отскок на сцене. */
     /* ---- ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ (§446): ПЕРВОЕ ДЕЙСТВИЕ, НАЗНАЧЕННОЕ
-     * ЗАРАНЕЕ В §445 ---- */
-    if (oven > 0.0) {
+     * ЗАРАНЕЕ В §445. КЛЮЧ `area` — ЧТОБЫ ЗАМЕР ШЁЛ НА ЛЮБОЙ СЦЕНЕ (§450, П3а):
+     * величина `1.5` снята только на коробке, а правило А793 требует гонять
+     * эталон НА КАЖДОЙ НОВОЙ СЦЕНЕ. ---- */
+    if (oven > 0.0 || area) {
       /* ИСТИНА БЕРЁТСЯ ИЗ САМОГО МЕША, А НЕ КОНСТАНТОЙ `6.0`. Тогда замер
        * остаётся верным при любом масштабе — и негативный контроль НК-1
        * (масштаб `2.0`) проверяет себя сам, а не сверяется с вписанным числом. */
@@ -2720,33 +2768,121 @@ int main(int argc, char **argv) {
         double nn[3];
         atrue += tri_area2(p0, p1, p2, nn);
       }
-      areacnt A;
-      memset(&A, 0, sizeof A);
-      int32_t nskip = 0;
-      /* ОГРАНИЧИТЕЛЬ ТОТ ЖЕ, ЧТО У СБОРКИ СРЕЗА, иначе площадь одной
-       * поверхности сравнивалась бы с ячейками другой. Для печи — полная
-       * глубина (§437). */
-      int wrca = hz_dc_walk_stats(&T, NULL, NULL, area_emit, &A, &nskip);
-      areacnt R;
-      memset(&R, 0, sizeof R);
-      int wrcr = hz_dc_walk_ref(&T, &ht, NULL, NULL, area_emit, &R);
-      double h2 = fr.h * fr.h;
-      printf("   ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ (§446): веер от v0 %.5f м², от v1 %.5f м² "
-             "(разность %.3e); ИСТИННАЯ по мешу %.5f м², отношение %.4f\n",
-             A.fan0 * h2, A.fan1 * h2, fabs(A.fan0 - A.fan1) * h2, atrue,
-             A.fan0 * h2 / (atrue > 0.0 ? atrue : 1.0));
-      printf("   ПО ОСЯМ (главная ось нормали, БЕЗ знака): площадь %.5f / %.5f / %.5f м²; "
-             "многоугольников %lld / %lld / %lld против 841 на грань\n",
-             A.ax[0] * h2, A.ax[1] * h2, A.ax[2] * h2, (long long)A.px[0], (long long)A.px[1],
-             (long long)A.px[2]);
-      printf("   ОБХОД: многоугольников %lld, треугольников %lld, вырожденных %lld, "
-             "неплоскостность макс %.3e ячейки, ПРОПУЩЕНО полигонов %lld (код %d)\n",
-             (long long)A.npoly, (long long)A.ntri, (long long)A.ndeg, A.flatmax, (long long)nskip,
-             wrca);
-      printf("   ЭТАЛОННЫЙ ОБХОД (Г42, независимая реализация, код %d): %.5f м², "
-             "многоугольников %lld; РАСХОЖДЕНИЕ с рабочим %.3e отн.\n",
-             wrcr, R.fan0 * h2, (long long)R.npoly,
-             fabs(R.fan0 - A.fan0) / (A.fan0 > 0.0 ? A.fan0 : 1.0));
+      /* ТАБЛИЦА РЁБЕР ДО ВСЯКОГО ОБХОДА: сколько пересечений в каждом СЛОЕ и
+       * сколько из них сидят на КОНЦАХ ребра (`t` у нуля или у единицы). Обход и
+       * вершины стоят ниже по цепочке, и судить по ним о причине — та же ошибка,
+       * что А791 (искать вниз, когда надо вверх). */
+      {
+        int64_t *el = calloc(3 * (size_t)(fr.n + 1), sizeof *el);
+        if (el == NULL) exit(1);
+        int64_t nt0 = 0, nt1 = 0;
+        for (int32_t i = 0; i < ht.n; i++) {
+          int a = ht.e[i].axis;
+          int32_t p = ht.e[i].p[a];
+          if (p >= 0 && p <= fr.n) el[(size_t)a * (size_t)(fr.n + 1) + (size_t)p]++;
+          /* Порог — не магический: это шаг ребра в долях, при котором точка
+           * неотличима от конца в двойной точности на сетке в 2^lev ячеек. */
+          if (ht.e[i].t < 1e-12) nt0++;
+          if (ht.e[i].t > 1.0 - 1e-12) nt1++;
+        }
+        printf("   ТАБЛИЦА РЁБЕР: записей %d; `t` у НУЛЯ %lld, `t` у ЕДИНИЦЫ %lld "
+               "(поверхность на границе ячеек даёт и то и другое)\n",
+               ht.n, (long long)nt0, (long long)nt1);
+        for (int a = 0; a < 3; a++) {
+          int64_t tot = 0;
+          for (int32_t p = 0; p <= fr.n; p++)
+            tot += el[(size_t)a * (size_t)(fr.n + 1) + (size_t)p];
+          if (tot == 0) continue;
+          printf("   РЁБЕРА ПО СЛОЯМ ось %d (всего %lld):", a, (long long)tot);
+          for (int32_t p = 0; p <= fr.n; p++) {
+            int64_t c = el[(size_t)a * (size_t)(fr.n + 1) + (size_t)p];
+            if (c * 100 < tot) continue;
+            printf(" | слой %d: %lld", p, (long long)c);
+          }
+          printf("\n");
+        }
+        free(el);
+      }
+
+      /* ДВА ОГРАНИЧИТЕЛЯ ПОРОЗНЬ (§450, П3.2): ПОЛНАЯ ГЛУБИНА и СРЕЗ. Площадь
+       * одной поверхности нельзя сравнивать с ячейками другой, а срез огрубляет
+       * — значит числа разные, и печатать их надо врозь, а не одно за оба. */
+      int32_t nbin = HZ_PLBIN * fr.n + 2;
+      for (int pass = 0; pass < 2; pass++) {
+        areacnt A;
+        memset(&A, 0, sizeof A);
+        A.nbin = nbin;
+        A.pl_area = calloc(3 * (size_t)nbin, sizeof *A.pl_area);
+        A.pl_cnt = calloc(3 * (size_t)nbin, sizeof *A.pl_cnt);
+        A.ncell = fr.n + 1;
+        A.cl_area = calloc(3 * (size_t)A.ncell, sizeof *A.cl_area);
+        A.cl_cnt = calloc(3 * (size_t)A.ncell, sizeof *A.cl_cnt);
+        if (A.pl_area == NULL || A.pl_cnt == NULL || A.cl_area == NULL || A.cl_cnt == NULL) exit(1);
+        int32_t nskip = 0;
+        int wrca = pass == 0 ? hz_dc_walk_stats(&T, NULL, NULL, area_emit, &A, &nskip)
+                             : hz_dc_walk_stats(&T, lod_stop, &LL, area_emit, &A, &nskip);
+        double h2 = fr.h * fr.h;
+        const char *tag = pass == 0 ? "ПОЛНАЯ ГЛУБИНА" : "СРЕЗ";
+        printf("   ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ [%s] (§446): веер от v0 %.5f м², от v1 %.5f м² "
+               "(разность %.3e); ИСТИННАЯ по мешу %.5f м², отношение %.4f\n",
+               tag, A.fan0 * h2, A.fan1 * h2, fabs(A.fan0 - A.fan1) * h2, atrue,
+               A.fan0 * h2 / (atrue > 0.0 ? atrue : 1.0));
+        printf("   ПО ОСЯМ [%s] (главная ось нормали, БЕЗ знака): площадь %.5f / %.5f / %.5f м²; "
+               "многоугольников %lld / %lld / %lld\n",
+               tag, A.ax[0] * h2, A.ax[1] * h2, A.ax[2] * h2, (long long)A.px[0],
+               (long long)A.px[1], (long long)A.px[2]);
+        printf("   ОБХОД [%s]: многоугольников %lld, треугольников %lld, вырожденных %lld, "
+               "неплоскостность макс %.3e ячейки, ПРОПУЩЕНО полигонов %lld (код %d)\n",
+               tag, (long long)A.npoly, (long long)A.ntri, (long long)A.ndeg, A.flatmax,
+               (long long)nskip, wrca);
+        /* ГИСТОГРАММА ПО ПЛОСКОСТЯМ (П2). Печатаются корзины, несущие не менее
+         * сотой доли площади своей оси: иначе список утонет в хвосте из
+         * единичных многоугольников на стыках стен. Отсечённая доля печатается,
+         * чтобы «показано не всё» не читалось как «больше ничего нет». */
+        for (int ax = 0; ax < 3; ax++) {
+          if (!(A.ax[ax] > 0.0)) continue;
+          printf("   ПЛОСКОСТИ [%s] ось %d (площадь оси %.5f м²):", tag, ax, A.ax[ax] * h2);
+          double shown = 0.0;
+          int nsh = 0;
+          for (int32_t b = 0; b < nbin; b++) {
+            double a = A.pl_area[(size_t)ax * (size_t)nbin + (size_t)b];
+            if (!(a > 0.01 * A.ax[ax])) continue;
+            printf(" | %.4f м: %.5f м² (%lld мн-ков)",
+                   fr.org[ax] + (double)b / (double)HZ_PLBIN * fr.h, a * h2,
+                   (long long)A.pl_cnt[(size_t)ax * (size_t)nbin + (size_t)b]);
+            shown += a;
+            nsh++;
+          }
+          printf(" || показано %d корзин, %.1f %% площади оси\n", nsh, 100.0 * shown / A.ax[ax]);
+          printf("   СЛОИ ЯЧЕЕК [%s] ось %d:", tag, ax);
+          int nsh2 = 0;
+          double shown2 = 0.0;
+          for (int32_t c = 0; c < A.ncell; c++) {
+            double a = A.cl_area[(size_t)ax * (size_t)A.ncell + (size_t)c];
+            if (!(a > 0.01 * A.ax[ax])) continue;
+            printf(" | слой %d: %.5f м² (%lld мн-ков)", c, a * h2,
+                   (long long)A.cl_cnt[(size_t)ax * (size_t)A.ncell + (size_t)c]);
+            shown2 += a;
+            nsh2++;
+          }
+          printf(" || показано %d слоёв, %.1f %% площади оси\n", nsh2, 100.0 * shown2 / A.ax[ax]);
+        }
+        if (pass == 0) {
+          /* ЭТАЛОННЫЙ ОБХОД ТОЛЬКО НА ПОЛНОЙ ГЛУБИНЕ: на срезе отображение
+           * «ребро -> полигон» у него отсутствует по построению (Г42). */
+          areacnt R;
+          memset(&R, 0, sizeof R);
+          int wrcr = hz_dc_walk_ref(&T, &ht, NULL, NULL, area_emit, &R);
+          printf("   ЭТАЛОННЫЙ ОБХОД (Г42, независимая реализация, код %d): %.5f м², "
+                 "многоугольников %lld; РАСХОЖДЕНИЕ с рабочим %.3e отн.\n",
+                 wrcr, R.fan0 * h2, (long long)R.npoly,
+                 fabs(R.fan0 - A.fan0) / (A.fan0 > 0.0 ? A.fan0 : 1.0));
+        }
+        free(A.pl_area);
+        free(A.pl_cnt);
+        free(A.cl_area);
+        free(A.cl_cnt);
+      }
     }
 
     if (oven > 0.0) {

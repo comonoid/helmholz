@@ -2740,6 +2740,25 @@ int main(int argc, char **argv) {
               double cs3 = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
               atot += cs3 * cs3;
             }
+            {
+              /* СКОЛЬКО ЯЧЕЕК НА ГРАНЬ. У единичной коробки при lev=5 стена
+               * занимает 30x30 = 900 клеток; если ячеек среза меньше, значит
+               * вершина выдана не в каждой клетке стены — это и есть недосчёт
+               * площади. Группировка по ГЛАВНОЙ оси нормали: шесть граней. */
+              int64_t hg[6] = {0, 0, 0, 0, 0, 0};
+              for (int32_t i = 0; i < S.n; i++) {
+                double nn2[3];
+                hz_slice_normal(&S, i, nn2);
+                int ax = 0;
+                for (int k = 1; k < 3; k++)
+                  if (fabs(nn2[k]) > fabs(nn2[ax])) ax = k;
+                hg[2 * ax + (nn2[ax] > 0.0 ? 1 : 0)]++;
+              }
+              printf("   ЯЧЕЕК НА ГРАНЬ (по главной оси нормали): %lld %lld %lld %lld %lld %lld "
+                     "против 900 клеток стены\n",
+                     (long long)hg[0], (long long)hg[1], (long long)hg[2], (long long)hg[3],
+                     (long long)hg[4], (long long)hg[5]);
+            }
             printf("   ПЛОЩАДЬ СРЕЗА: %.5f м² против истинной 6.00000 м² у единичной коробки "
                    "(отношение %.4f)\n",
                    atot, atot / 6.0);

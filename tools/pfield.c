@@ -1139,6 +1139,150 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
   }
 }
 
+/* --- 3з. СВИП ПОТОКОМ (Ш5, §383) ------------------------------------------- */
+
+/* ЧТО ЗДЕСЬ ДЕЛАЕТСЯ И ЧЕМ ЭТО ОТЛИЧАЕТСЯ ОТ ЛУЧА. Луч платит `O(шаги)` за
+ * КАЖДУЮ пару «ячейка — образец источника»: марш повторяется для каждой ячейки
+ * заново, хотя соседние ячейки идут почти одним и тем же путём. Свип платит
+ * `O(1)` на ячейку: видимость ячейки выводится из видимости её соседа СО
+ * СТОРОНЫ ИСТОЧНИКА, уже посчитанной, потому что обход идёт в порядке удаления
+ * от источника. Работа, которую луч делает заново каждый раз, здесь делится
+ * между всеми ячейками — в этом и весь выигрыш, а не в мелкой оптимизации.
+ *
+ * ПОРЯДОК ОБХОДА И ЕСТЬ ОКТАНТНЫЙ: знак `(c − s)` по каждой оси задаёт октант,
+ * и внутри октанта координата обходится ОТ источника, поэтому сосед со стороны
+ * источника заведомо посчитан. Октантов восемь, и они покрывают сетку целиком.
+ *
+ * ЧЕГО ЭТОТ СВИП НЕ ДЕЛАЕТ — СКАЗАНО ЗДЕСЬ, ЧТОБЫ НЕ ЧИТАЛОСЬ СДЕЛАННЫМ. Он
+ * несёт ВИДИМОСТЬ (затенение), а не радиантность: перенос энергии с отскоком —
+ * следующая часть. Тень получается ПОЛУТЕНЬЮ только за счёт нескольких образцов
+ * площадки, как и у луча.
+ *
+ * ПРИБЛИЖЕНИЕ, КОТОРОЕ НАДО НАЗВАТЬ: сосед берётся по ТРЁМ осям, и видимость
+ * наследуется как максимум по ним. Это распространение вдоль ступенчатого пути,
+ * а не вдоль прямой, поэтому у длинных косых теней край поедет. Насколько —
+ * МЕРИТСЯ поячеечно против луча (А763), а не оценивается на глаз. */
+
+/* Сетка свипа грубее сетки поля: тень не обязана иметь разрешение поверхности, а
+ * цена свипа кубична по стороне. Уровень назван числом и проверяется замером
+ * расхождения с эталоном-лучом. */
+#define HZ_SWEEP_DROP 2
+
+typedef struct {
+  unsigned char *vis; /* на ячейку грубой сетки: свет доходит */
+  int32_t n;          /* сторона грубой сетки */
+  int drop;           /* lev − log2(n) */
+} sweepgrid;
+
+static void sweep_free(sweepgrid *G) {
+  free(G->vis);
+  G->vis = NULL;
+}
+
+/* Один образец источника: заполнить видимость на всей грубой сетке. */
+static void sweep_light(sweepgrid *G, const opyr *P, const frame *fr, const double q[3]) {
+  int32_t n = G->n;
+  size_t nc = (size_t)n * (size_t)n * (size_t)n;
+  memset(G->vis, 0, nc);
+  /* Ячейка источника видима по определению — с неё начинается всякий путь. */
+  int32_t s[3];
+  for (int k = 0; k < 3; k++) {
+    double f = floor((q[k] - fr->org[k]) / (fr->h * (double)((int32_t)1 << G->drop)));
+    if (f < 0.0) f = 0.0;
+    if (f > (double)(n - 1)) f = (double)(n - 1);
+    s[k] = (int32_t)f;
+  }
+  G->vis[hz_occ_index(n, s[0], s[1], s[2])] = 1u;
+  /* ВОСЕМЬ ОКТАНТОВ. Внутри октанта каждая ось идёт ОТ источника, поэтому сосед
+   * со стороны источника уже посчитан — это и есть условие свипа. */
+  for (int oct = 0; oct < 8; oct++) {
+    int dx = (oct & 1) ? 1 : -1, dy = (oct & 2) ? 1 : -1, dz = (oct & 4) ? 1 : -1;
+    int32_t x0 = dx > 0 ? s[0] : s[0], y0 = dy > 0 ? s[1] : s[1], z0 = dz > 0 ? s[2] : s[2];
+    for (int32_t z = z0; z >= 0 && z < n; z += dz)
+      for (int32_t y = y0; y >= 0 && y < n; y += dy)
+        for (int32_t x = x0; x >= 0 && x < n; x += dx) {
+          size_t ci = hz_occ_index(n, x, y, z);
+          if (G->vis[ci]) continue;
+          /* Сосед со стороны источника по каждой оси; видимость наследуется,
+           * если он сам виден И НЕ ЗАНЯТ. Занятая ячейка свет не пропускает —
+           * это и есть тень. */
+          int v = 0;
+          int32_t px = x - dx, py = y - dy, pz = z - dz;
+          if (px >= 0 && px < n) {
+            size_t pi = hz_occ_index(n, px, y, z);
+            if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
+          }
+          if (!v && py >= 0 && py < n) {
+            size_t pi = hz_occ_index(n, x, py, z);
+            if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
+          }
+          if (!v && pz >= 0 && pz < n) {
+            size_t pi = hz_occ_index(n, x, y, pz);
+            if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
+          }
+          if (v) G->vis[ci] = 1u;
+        }
+  }
+}
+
+static int sweep_vis(const sweepgrid *G, const frame *fr, const double p[3]) {
+  int32_t c[3];
+  for (int k = 0; k < 3; k++) {
+    double f = floor((p[k] - fr->org[k]) / (fr->h * (double)((int32_t)1 << G->drop)));
+    if (!(f >= 0.0) || !(f < (double)G->n)) return 0;
+    c[k] = (int32_t)f;
+  }
+  return G->vis[hz_occ_index(G->n, c[0], c[1], c[2])];
+}
+
+/* Прямая облучённость СВИПОМ. Отличие от `front_direct` только в том, откуда
+ * берётся затенение; геометрия (косинус, `1/r²`, образцы площадки) та же — иначе
+ * сверка мерила бы разницу формул, а не разницу механизмов. */
+static void front_sweep(const hz_dcslice *S, const frame *fr, const opyr *P, const arealight *L,
+                        float *irr, double *t_sweep, double *t_gather) {
+  static const double su[HZ_LIGHT_SAMPLES] = {-0.5, 0.5, -0.5, 0.5};
+  static const double sv[HZ_LIGHT_SAMPLES] = {-0.5, -0.5, 0.5, 0.5};
+  sweepgrid G;
+  G.drop = HZ_SWEEP_DROP;
+  G.n = (int32_t)1 << (fr->lev - G.drop);
+  G.vis = malloc((size_t)G.n * (size_t)G.n * (size_t)G.n);
+  if (G.vis == NULL) exit(1);
+  for (int32_t i = 0; i < 3 * S->n; i++)
+    irr[i] = 0.0f;
+  *t_sweep = 0.0;
+  *t_gather = 0.0;
+  for (int sm = 0; sm < HZ_LIGHT_SAMPLES; sm++) {
+    double q[3];
+    for (int k = 0; k < 3; k++)
+      q[k] = L->c[k] + L->u[k] * su[sm] + L->v[k] * sv[sm];
+    double ta = now_s();
+    sweep_light(&G, P, fr, q);
+    *t_sweep += now_s() - ta;
+    ta = now_s();
+    for (int32_t i = 0; i < S->n; i++) {
+      double p[3], n[3];
+      hz_slice_vertex(S, i, p);
+      for (int k = 0; k < 3; k++)
+        p[k] = fr->org[k] + p[k] * fr->h;
+      hz_slice_normal(S, i, n);
+      double w[3], r2 = 0.0;
+      for (int k = 0; k < 3; k++) {
+        w[k] = q[k] - p[k];
+        r2 += w[k] * w[k];
+      }
+      if (!(r2 > 0.0)) continue;
+      double r = sqrt(r2);
+      double cosr = (w[0] * n[0] + w[1] * n[1] + w[2] * n[2]) / r;
+      if (!(cosr > 0.0)) continue;
+      if (!sweep_vis(&G, fr, p)) continue;
+      double g = cosr / r2 / (double)HZ_LIGHT_SAMPLES;
+      for (int k = 0; k < 3; k++)
+        irr[3 * (size_t)i + (size_t)k] += (float)(L->rgb[k] * g);
+    }
+    *t_gather += now_s() - ta;
+  }
+  sweep_free(&G);
+}
 /* --- 3ж. РАСТЕРИЗАЦИЯ СО СВЕТОМ (Ш5) --------------------------------------- */
 
 /* ЦВЕТ ИНТЕРПОЛИРУЕТСЯ ПО МНОГОУГОЛЬНИКУ, а не берётся плоским на треугольник —
@@ -1975,6 +2119,29 @@ int main(int argc, char **argv) {
     ta = now_s();
     front_direct(&S, &fr, &P, &AL, irr);
     double t_dir = now_s() - ta;
+    /* СВИП — то, что Ш5 обязан измерить; луч выше остаётся ЭТАЛОНОМ (А763), и
+     * сверка идёт ПОЯЧЕЕЧНО, а не по картинке. */
+    float *irr2 = malloc(3 * (size_t)S.n * sizeof *irr2);
+    if (irr2 == NULL) exit(1);
+    double t_sw = 0.0, t_ga = 0.0;
+    front_sweep(&S, &fr, &P, &AL, irr2, &t_sw, &t_ga);
+    {
+      int64_t ndiff = 0, nlit_r = 0, nlit_s = 0;
+      double emax = 0.0;
+      for (int32_t i = 0; i < S.n; i++) {
+        double a = irr[3 * (size_t)i], b = irr2[3 * (size_t)i];
+        if (a > 0.0) nlit_r++;
+        if (b > 0.0) nlit_s++;
+        if ((a > 0.0) != (b > 0.0)) ndiff++;
+        double d = fabs(a - b);
+        if (d > emax) emax = d;
+      }
+      printf("   СВИП: %.1f мс (%.0f нс на ячейку на образец), сбор %.1f мс; освещённых ячеек "
+             "луч %lld, свип %lld, РАЗОШЛИСЬ %lld (%.2f %%), макс расхождение %.3e\n",
+             t_sw * 1e3, t_sw * 1e9 / (double)(S.n ? S.n : 1) / (double)HZ_LIGHT_SAMPLES,
+             t_ga * 1e3, (long long)nlit_r, (long long)nlit_s, (long long)ndiff,
+             100.0 * (double)ndiff / (double)(S.n ? S.n : 1), emax);
+    }
 
     /* ЦВЕТ ЯЧЕЙКИ КЛАДЁТСЯ В ИНДЕКС ПО КЛЮЧУ, чтобы растеризатор мог его взять
      * по ячейке многоугольника. Индекс ПЛОСКИЙ (отсортированные ключи +
@@ -2048,6 +2215,7 @@ int main(int argc, char **argv) {
     }
     free(key);
     free(ord);
+    free(irr2);
     free(irr);
     hz_slice_free(&S);
   }

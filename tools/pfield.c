@@ -1072,7 +1072,8 @@ typedef struct {
 /* Затенён ли путь от точки к точке. Марш по ЗАНЯТОСТИ мелкого уровня с шагом в
  * пол-ячейки: занятая ячейка на пути — заслон. Концы исключаются, иначе сама
  * поверхность закрывала бы себя. */
-static int shadowed(const opyr *P, const frame *fr, const double a[3], const double b[3]) {
+static int shadowed(const opyr *P, const frame *fr, const double a[3], const double b[3],
+                    double stepfrac) {
   double d[3], len = 0.0;
   for (int k = 0; k < 3; k++) {
     d[k] = b[k] - a[k];
@@ -1080,11 +1081,20 @@ static int shadowed(const opyr *P, const frame *fr, const double a[3], const dou
   }
   len = sqrt(len);
   if (!(len > 0.0)) return 0;
-  double step = fr->h * 0.5;
+  double step = fr->h * stepfrac;
   int ns = (int)(len / step);
-  if (ns > 4096) ns = 4096;
-  for (int i = 2; i < ns - 1; i++) {
+  if (ns > 16384) ns = 16384;
+  /* ИСКЛЮЧЕНИЕ НАЧАЛА — ПО РАССТОЯНИЮ, А НЕ ПО ЧИСЛУ ОБРАЗЦОВ (найдено А776).
+   * Прежде пропускались первые ДВА образца: при шаге в полячейки это отступ в
+   * ЦЕЛУЮ ячейку, а при шаге в четверть — уже в половину. Тогда мельчение шага
+   * начинало ловить СОБСТВЕННУЮ ячейку поверхности как заслон, и треть
+   * освещённых ячеек пропадала — проверка сходимости мерила самозатенение, а не
+   * заслоны. Отступ `1.5` ячейки назван числом: он выводит луч за пределы своей
+   * ячейки и её соседа по грани, и от шага марша больше не зависит. */
+  double skip = 1.5 * fr->h;
+  for (int i = 0; i < ns - 1; i++) {
     double t = (double)i / (double)ns;
+    if (t * len < skip) continue;
     int32_t c[3];
     int ok = 1;
     for (int k = 0; k < 3; k++) {
@@ -1105,7 +1115,7 @@ static int shadowed(const opyr *P, const frame *fr, const double a[3], const dou
 #define HZ_LIGHT_SAMPLES 4
 
 static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, const arealight *L,
-                         float *irr) {
+                         float *irr, double stepfrac) {
   static const double su[HZ_LIGHT_SAMPLES] = {-0.5, 0.5, -0.5, 0.5};
   static const double sv[HZ_LIGHT_SAMPLES] = {-0.5, -0.5, 0.5, 0.5};
   for (int32_t i = 0; i < S->n; i++) {
@@ -1129,7 +1139,7 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
        * та сторона, к которой нормаль обращена, а модуль брать нельзя — иначе
        * стена светилась бы с обратной стороны. */
       if (!(cosr > 0.0)) continue;
-      if (shadowed(P, fr, p, q)) continue;
+      if (shadowed(P, fr, p, q, stepfrac)) continue;
       double g = cosr / r2 / (double)HZ_LIGHT_SAMPLES;
       for (int k = 0; k < 3; k++)
         acc[k] += L->rgb[k] * g;
@@ -2183,8 +2193,32 @@ int main(int argc, char **argv) {
     float *irr = malloc(3 * (size_t)S.n * sizeof *irr);
     if (irr == NULL) exit(1);
     ta = now_s();
-    front_direct(&S, &fr, &P, &AL, irr);
+    front_direct(&S, &fr, &P, &AL, irr, 0.5);
     double t_dir = now_s() - ta;
+    /* А772/А775: ЭТАЛОН ПРОВЕРЯЕТСЯ САМ. Марш идёт шагом , и тонкий заслон
+     * он может проскочить. Пересчёт вдвое мельче: если множество затенённых
+     * почти не изменилось, эталон устойчив, и доли расхождения со свипом
+     * говорят про свип. Если изменилось — все эти доли наполовину про эталон. */
+    {
+      float *irrf = malloc(3 * (size_t)S.n * sizeof *irrf);
+      if (irrf == NULL) exit(1);
+      double tf = now_s();
+      front_direct(&S, &fr, &P, &AL, irrf, 0.25);
+      tf = now_s() - tf;
+      int64_t nd = 0, na = 0, nb = 0;
+      for (int32_t i = 0; i < S.n; i++) {
+        int a1 = irr[3 * (size_t)i] > 0.0f, b1 = irrf[3 * (size_t)i] > 0.0f;
+        na += a1;
+        nb += b1;
+        nd += (a1 != b1);
+      }
+      printf("   ЭТАЛОН ПРИ ПОЛОВИННОМ ШАГЕ (%.1f мс): освещённых h/2 %lld, h/4 %lld, "
+             "РАЗОШЛИСЬ %lld (%.3f %% от среза)\n",
+             tf * 1e3, (long long)na, (long long)nb, (long long)nd,
+             100.0 * (double)nd / (double)(S.n ? S.n : 1));
+      free(irrf);
+    }
+
     /* СВИП — то, что Ш5 обязан измерить; луч выше остаётся ЭТАЛОНОМ (А763), и
      * сверка идёт ПОЯЧЕЕЧНО, а не по картинке. */
     float *irr2 = malloc(3 * (size_t)S.n * sizeof *irr2);

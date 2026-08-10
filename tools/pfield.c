@@ -677,6 +677,39 @@ static int poly_dump(void *ctx, const hz_dcref *ref, const double (*v)[3], int n
   return 0;
 }
 
+/* --- 3г. КРИТЕРИЙ АДАПТИВНОГО СРЕЗА (Ш3, §401) ----------------------------- */
+
+/* «НЕВЯЗКА × ПРОЕКЦИЯ», ПОРОГ В ПИКСЕЛЯХ. Порог в метрах был бы магическим:
+ * он зависел бы от масштаба сцены. В пикселях — нет, и потому число в нём
+ * названо тем, что оно есть, — допуском наблюдателя.
+ * ЗАВИСИМОСТЬ ОТ КАМЕРЫ ЗДЕСЬ ЗАКОННА И ЕДИНСТВЕННА ВО ВСЁМ УСТРОЙСТВЕ (А730):
+ * LOD привязан к наблюдателю по построению, иначе цена становится input-bounded.
+ * Сама  при этом чисто геометрическая и от камеры не зависит. */
+typedef struct {
+  double eye[3]; /* камера в координатах ДЕРЕВА, то есть в ячейках */
+  double pxrad;  /* радиан на пиксель */
+  double thr;    /* порог, пикселей */
+  int64_t hist[HZ_DC_MAX_LOG2SIZE + 2];
+} lodctx;
+
+static int lod_stop(void *ctx, const hz_dctree *t, const hz_dcref *r) {
+  lodctx *L = (lodctx *)ctx;
+  if (t->nd[r->ni].child0 < 0) return 1;
+  /* Расстояние до БЛИЖАЙШЕЙ точки коробки (А733): у крупного узла оно разное в
+   * разных его точках, а консервативно то, что даёт более мелкое дробление.
+   * Камера внутри узла даёт ноль, и тогда спуск безусловен — деления на ноль не
+   * возникает по построению, а не по проверке. */
+  double d2 = 0.0;
+  for (int a = 0; a < 3; a++) {
+    double lo = (double)r->lo[a], hi = lo + (double)r->size, e = L->eye[a];
+    double dd = e < lo ? lo - e : (e > hi ? e - hi : 0.0);
+    d2 += dd * dd;
+  }
+  if (!(d2 > 0.0)) return 0;
+  double px = (hz_dc_rms(t, r->ni) / sqrt(d2)) / L->pxrad;
+  return px <= L->thr;
+}
+
 /* --- 4. главная ------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
@@ -957,6 +990,111 @@ int main(int argc, char **argv) {
              S.n, (long long)nvt, dmax, quant, dmax / quant, a90, amax);
     }
     hz_slice_free(&S);
+  }
+
+  /* ---- 4в. АДАПТИВНЫЙ СРЕЗ (Ш3) ---- */
+  {
+    lodctx L;
+    memset(&L, 0, sizeof L);
+    {
+      double eyec[3] = HZ_CFG_HALL_EYE;
+      for (int a = 0; a < 3; a++)
+        L.eye[a] = (eyec[a] - fr.org[a]) / fr.h;
+    }
+    /* Радиан на пиксель — из поля зрения и разрешения §2. Не константа в
+     * формуле: обе величины взяты из scene_cfg.h. */
+    L.pxrad = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / 512.0;
+
+    static const double thrs[6] = {0.0, 0.25, 0.5, 1.0, 2.0, 1e30};
+    hz_dcslice A;
+    if (hz_slice_init(&A, lev) != HZ_DC_OK) exit(1);
+    for (int k = 0; k < 6; k++) {
+      L.thr = thrs[k];
+      for (int i = 0; i <= HZ_DC_MAX_LOG2SIZE + 1; i++)
+        L.hist[i] = 0;
+      t0 = now_s();
+      if (hz_slice_build(&A, &T, &ht, lod_stop, &L) != HZ_DC_OK) exit(1);
+      double ts = now_s() - t0;
+      for (int32_t i = 0; i < A.n; i++)
+        L.hist[A.c[i].lvl]++;
+      /* Медиана и хвост уровней остановки — распределение, а не среднее. */
+      int64_t half = A.n / 2, acc2 = 0;
+      int lmed = 0, lmin = 99, lmax = -1;
+      for (int i = 0; i <= HZ_DC_MAX_LOG2SIZE + 1; i++) {
+        if (L.hist[i] == 0) continue;
+        if (i < lmin) lmin = i;
+        if (i > lmax) lmax = i;
+        acc2 += L.hist[i];
+        if (acc2 <= half) lmed = i;
+      }
+      /* ОШИБКА: расстояние от ИСТИННОЙ поверхности до выданного. ПОПУЛЯЦИЯ —
+       * ВХОД (занятые ячейки Ш0), а не выход: иначе величина не обнаружит
+       * отсутствия (§380). Точка на истинной поверхности — центр тяжести куска
+       * треугольника в занятой ячейке; выданная — вершина того узла среза,
+       * который эту ячейку накрывает. */
+      double *er = malloc((size_t)(nocc > 0 ? nocc : 1) * sizeof *er);
+      if (er == NULL) exit(1);
+      int64_t ne = 0, nmiss = 0;
+      for (int64_t z = 0; z < fr.n; z++)
+        for (int64_t y = 0; y < fr.n; y++)
+          for (int64_t x = 0; x < fr.n; x++) {
+            size_t ci = hz_occ_index(fr.n, x, y, z);
+            if (!hz_occ_get(P.b[lev], ci)) continue;
+            int32_t cell[3] = {(int32_t)x, (int32_t)y, (int32_t)z};
+            const int32_t *ls = NULL;
+            int32_t nl = ct_list(&CT, cell, &ls);
+            if (nl == 0) continue;
+            double cl[3], ch[3];
+            cell_box(&fr, x, y, z, cl, ch);
+            const double *Aa, *Bb, *Cc;
+            tri_verts(&m, ls[0], &Aa, &Bb, &Cc);
+            hz_pclip_poly Q;
+            if (hz_pclip_tri(Aa, Bb, Cc, cl, ch, &Q) < 3) continue;
+            double tp[3] = {0, 0, 0};
+            for (int q = 0; q < Q.nv; q++)
+              for (int c = 0; c < 3; c++)
+                tp[c] += Q.v[q][c] / (double)Q.nv;
+            /* спуск с тем же предикатом — тот узел, который срез и выдал */
+            int32_t ni = 0, size = fr.n, lo3[3] = {0, 0, 0};
+            for (;;) {
+              hz_dcref r = {ni, {lo3[0], lo3[1], lo3[2]}, size};
+              if (T.nd[ni].child0 < 0 || lod_stop(&L, &T, &r)) break;
+              int32_t half2 = size / 2;
+              int bit = 0;
+              for (int a = 0; a < 3; a++)
+                if (cell[a] >= lo3[a] + half2) {
+                  bit |= 1 << a;
+                  lo3[a] += half2;
+                }
+              ni = T.nd[ni].child0 + bit;
+              size = half2;
+            }
+            if (!hz_dc_hasvert(&T, ni)) {
+              nmiss++;
+              continue;
+            }
+            double d = 0.0;
+            for (int c = 0; c < 3; c++) {
+              double w = fr.org[c] + hz_dc_vx(&T, ni)[c] * fr.h - tp[c];
+              d += w * w;
+            }
+            er[ne++] = sqrt(d);
+          }
+      double p50 = 0, p90 = 0, p99 = 0;
+      if (ne > 0) {
+        qsort(er, (size_t)ne, sizeof *er, cmp_d);
+        p50 = er[ne / 2];
+        p90 = er[(ne * 9) / 10];
+        p99 = er[(ne * 99) / 100];
+      }
+      free(er);
+      printf("   СРЕЗ порог %.2f пикс: ячеек %d, доля от полного %.4f, уровни %d..%d медиана %d, "
+             "сборка %.2f с; ОШИБКА до ИСТИННОЙ поверхности p50 %.4f p90 %.4f p99 %.4f м, "
+             "без вершины %lld из %lld\n",
+             L.thr, A.n, (double)A.n / (double)(nvl ? nvl : 1), lmin, lmax, lmed, ts, p50, p90, p99,
+             (long long)nmiss, (long long)(ne + nmiss));
+    }
+    hz_slice_free(&A);
   }
   ct_free(&CT);
   hz_dc_free(&T);

@@ -21,6 +21,7 @@
 #include "cut/poly3.h"
 #include "cut/qef.h"
 #include "cut/surf.h"
+#include <math.h>
 #include <stdint.h>
 
 /* Ключ ребра — ось (2 бита) плюс три координаты нижнего конца по 20 бит. Верхний
@@ -165,6 +166,18 @@ void hz_dc_free(hz_dctree *t);
  * читают их отсюда, а не полем напрямую. */
 static inline const double *hz_dc_vx(const hz_dctree *t, int32_t ni) { return t->nd[ni].vx; }
 static inline double hz_dc_err(const hz_dctree *t, int32_t ni) { return t->nd[ni].err; }
+
+/* СРЕДНЕКВАДРАТИЧНОЕ СМЕЩЕНИЕ, А НЕ САМА НЕВЯЗКА, И РАЗНИЦА НЕ КОСМЕТИЧЕСКАЯ.
+ * `err` есть `hz_qef_eval` в найденной вершине, то есть СУММА КВАДРАТОВ
+ * расстояний по образцам, в ячейках²; подставить её в критерий LOD как
+ * «смещение» значит перепутать длину с её квадратом, помноженным на число
+ * образцов, — и порог в пикселях перестанет что-либо значить. Мера длины —
+ * `sqrt(err / n)`, ровно то «среднеквадратичное НА ОБРАЗЦАХ», о котором говорит
+ * Г40/Г44 (и оно же не есть МАКСИМУМ смещения — эта оговорка остаётся в силе). */
+static inline double hz_dc_rms(const hz_dctree *t, int32_t ni) {
+  double n = (double)t->nd[ni].q.n;
+  return n > 0.0 ? sqrt(t->nd[ni].err / n) : 0.0;
+}
 static inline int hz_dc_hasvert(const hz_dctree *t, int32_t ni) {
   return (t->nd[ni].flags & HZ_DC_HASVERT) != 0;
 }

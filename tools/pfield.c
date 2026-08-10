@@ -1793,7 +1793,7 @@ int main(int argc, char **argv) {
   }
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
-  double oven = 0.0;
+  double oven = 0.0, plates = 0.0;
   double lodthr = 1.0;
   const char *occdump = NULL, *polydump = NULL;
   for (int i = 3; i < argc; i++) {
@@ -1837,6 +1837,13 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "oven=", 5) == 0) {
       lit = 1;
       oven = strtod(argv[i] + 5, NULL);
+    }
+    /* ДВЕ ПЛАСТИНЫ (§450, П6): `E_ind = ρ·E_dir·F`, где `F` — угловой
+     * коэффициент двух соосных квадратов, известный в замкнутой форме. Печь
+     * ловит СОХРАНЕНИЕ энергии, этот стенд — её РАСПРЕДЕЛЕНИЕ. */
+    if (strncmp(argv[i], "plates=", 7) == 0) {
+      lit = 1;
+      plates = strtod(argv[i] + 7, NULL);
     }
     if (strcmp(argv[i], "sweepr01") == 0) {
       lit = 1;
@@ -2598,7 +2605,9 @@ int main(int argc, char **argv) {
      * при камере зала срез вышел в СЕМЬ ячеек, и печь мерила перенос между
      * семью гигантскими площадками. Это был не отказ переноса, а отказ моего
      * замера — величина считалась не на том. */
-    if (hz_slice_build(&S, &T, &ht, oven > 0.0 ? NULL : lod_stop, &LL) != HZ_DC_OK) exit(1);
+    if (hz_slice_build(&S, &T, &ht, (oven > 0.0 || plates > 0.0) ? NULL : lod_stop, &LL) !=
+        HZ_DC_OK)
+      exit(1);
     double t_slice = now_s() - ta;
 
     /* ИСТОЧНИК: площадка под потолком зала. Габарит сцены известен, потолок —
@@ -2919,7 +2928,12 @@ int main(int argc, char **argv) {
       for (int32_t i = 0; i < 3 * S.n; i++)
         B[i] = (float)Le;
       double exact = Le / (1.0 - rho);
-      for (int it = 1; it <= 12; it++) {
+      /* ДВЕНАДЦАТИ ОТСКОКОВ МАЛО ПРИ ВЫСОКОМ АЛЬБЕДО, И ЭТО АРИФМЕТИКА, А НЕ
+       * догадка: невязка итерации есть `ρ^n`, то есть при `ρ = 0.7` и `n = 12`
+       * она `1.4 %` — сравнима с тем систематическим смещением, которое печь и
+       * должна измерять. Двадцать четыре дают `0.02 %` и разделяют их. */
+      const int OVEN_ITERS = 24;
+      for (int it = 1; it <= OVEN_ITERS; it++) {
         for (int32_t i = 0; i < 3 * S.n; i++)
           Bn[i] = (float)Le;
         for (int32_t j = 0; j < S.n; j++) {
@@ -3075,6 +3089,71 @@ int main(int argc, char **argv) {
       }
       free(B);
       free(Bn);
+    }
+
+    /* ---- ДВЕ ПЛАСТИНЫ: `E_ind = ρ·E_dir·F` (Ш5б, §430 П5б.2; §450 П6) ---- */
+    /* ПЕЧЬ ЛОВИТ СОХРАНЕНИЕ ЭНЕРГИИ, ЭТОТ СТЕНД — ЕЁ РАСПРЕДЕЛЕНИЕ. В замкнутой
+     * полости сумма угловых коэффициентов равна единице при ЛЮБОМ разумном ядре,
+     * лишь бы оно было симметрично и нормировано; отдельные коэффициенты она не
+     * проверяет. Два соосных квадрата проверяют именно их: `F` известен в
+     * замкнутой форме (каталог Хауэлла C-11), и косинусы с `1/r²` входят в него
+     * порознь.
+     * ЧЕГО ЭТОТ СТЕНД НЕ ПРОВЕРЯЕТ, И ЭТО СКАЗАНО ЗДЕСЬ, А НЕ В ДОКЛАДЕ: ЗАСЛОНЫ.
+     * Гатер незаслонённый (приближение (1) §432), значит требование А756 —
+     * «печь не ловит тени» — этим стендом ТОЖЕ не закрывается. Обе половины
+     * приёмки §430 меряют неэкранированный перенос, и тени остаются
+     * неизмеренными вовсе. */
+    if (plates > 0.0) {
+      double rho = plates;
+      /* Габарит пластин и зазор берутся ИЗ СЦЕНЫ, а не вписываются: стенд обязан
+       * оставаться верным, если пластины подвинут. */
+      double side_a = hi[0] - lo[0], gap = hi[1] - lo[1], mid = 0.5 * (lo[1] + hi[1]);
+      double X = side_a / gap;
+      double X2 = X * X, s = sqrt(1.0 + X2);
+      double F = (2.0 / (3.14159265358979323846 * X2)) *
+                 (0.5 * log((1.0 + X2) * (1.0 + X2) / (1.0 + 2.0 * X2)) +
+                  2.0 * X * s * atan(X / s) - 2.0 * X * atan(X));
+      double acc = 0.0;
+      int64_t nup = 0, nlo = 0;
+      for (int32_t i = 0; i < S.n; i++) {
+        double pi[3], ni[3];
+        hz_slice_vertex(&S, i, pi);
+        for (int k = 0; k < 3; k++)
+          pi[k] = fr.org[k] + pi[k] * fr.h;
+        if (pi[1] < mid) {
+          nlo++;
+          continue;
+        }
+        nup++;
+        hz_slice_normal(&S, i, ni);
+        double sum = 0.0;
+        for (int32_t j = 0; j < S.n; j++) {
+          double pj[3], nj[3], w[3], r2 = 0.0;
+          hz_slice_vertex(&S, j, pj);
+          for (int k = 0; k < 3; k++)
+            pj[k] = fr.org[k] + pj[k] * fr.h;
+          if (pj[1] >= mid) continue; /* излучает только НИЖНЯЯ пластина */
+          hz_slice_normal(&S, j, nj);
+          for (int k = 0; k < 3; k++) {
+            w[k] = pj[k] - pi[k];
+            r2 += w[k] * w[k];
+          }
+          if (!(r2 > 0.0)) continue;
+          double r = sqrt(r2);
+          double ci = (w[0] * ni[0] + w[1] * ni[1] + w[2] * ni[2]) / r;
+          double cj = -(w[0] * nj[0] + w[1] * nj[1] + w[2] * nj[2]) / r;
+          if (!(ci > 0.0) || !(cj > 0.0)) continue;
+          double cs = fr.h * (double)((int32_t)1 << (lev - (int)S.c[j].lvl));
+          sum += ci * cj * cs * cs / (3.14159265358979323846 * r2);
+        }
+        acc += sum;
+      }
+      double mean = acc / (double)(nup ? nup : 1);
+      printf("   ПЛАСТИНЫ: сторона %.4f м, зазор %.4f м, X = %.3f; ЯЧЕЕК верх %lld, низ %lld\n",
+             side_a, gap, X, (long long)nup, (long long)nlo);
+      printf("   `E_ind = ρ·E_dir·F` при ρ=%.2f: замерено %.5f, замкнутая форма %.5f "
+             "(F = %.5f), ОТКЛОНЕНИЕ %.2f %%\n",
+             rho, rho * mean, rho * F, F, 100.0 * (mean - F) / F);
     }
 
     /* ---- ОДИН ОТСКОК (Ш5б, §430) ---- */

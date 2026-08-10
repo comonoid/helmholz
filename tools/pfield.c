@@ -1497,6 +1497,8 @@ typedef struct {
   int w, h;
   unsigned char *rgb;
   double white;
+  int nocull;           /* НЕГАТИВНЫЙ КОНТРОЛЬ: отсечение выключено */
+  int64_t nseen, ncull; /* сколько многоугольников пришло и сколько отброшено */
 } litctx;
 
 static int lit_find(const litctx *L, const hz_dcref *r) {
@@ -1571,12 +1573,47 @@ static void lit_tri(litctx *L, const double p[3][3], const double col[3][3]) {
     }
 }
 
+/* ОТСЕЧЕНИЕ ДО ПРОЕКЦИИ (Ш5в). Срез строится на ПОЛНЫЙ ШАР — так и задумано
+ * (§383: свет приходит и из-за спины), но КАМЕРНЫЙ проход обязан брать только
+ * видимое. Прежде каждый многоугольник проецировался целиком, и лишь потом
+ * выяснялось, что он за камерой или за краем экрана.
+ *
+ * Проба — по четырём плоскостям пирамиды видимости плюс ближняя: если ВСЕ углы
+ * снаружи одной и той же плоскости, многоугольник отбрасывается. Это ТОЧНОЕ
+ * отсечение в одну сторону: отбрасывается только заведомо невидимое, поэтому
+ * картинка обязана совпасть ПОБИТОВО — она и есть приёмка. */
+static int lit_cull(const litctx *L, const double w[4][3], int nv) {
+  const tr3_camera *cm = L->cam;
+  int out_near = 0, out_l = 0, out_r = 0, out_b = 0, out_t = 0;
+  for (int i = 0; i < nv; i++) {
+    double d[3];
+    for (int c = 0; c < 3; c++)
+      d[c] = w[i][c] - cm->eye[c];
+    double zz = d[0] * cm->fwd[0] + d[1] * cm->fwd[1] + d[2] * cm->fwd[2];
+    double rr = d[0] * cm->right[0] + d[1] * cm->right[1] + d[2] * cm->right[2];
+    double uu = d[0] * cm->up[0] + d[1] * cm->up[1] + d[2] * cm->up[2];
+    if (!(zz > 1e-6)) out_near++;
+    if (rr < -zz * cm->tanx) out_l++;
+    if (rr > zz * cm->tanx) out_r++;
+    if (uu < -zz * cm->tany) out_b++;
+    if (uu > zz * cm->tany) out_t++;
+  }
+  return out_near == nv || out_l == nv || out_r == nv || out_b == nv || out_t == nv;
+}
+
 static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv) {
   litctx *L = (litctx *)ctx;
   double w[4][3], col[4][3];
-  for (int i = 0; i < nv; i++) {
+
+  for (int i = 0; i < nv; i++)
     for (int c = 0; c < 3; c++)
       w[i][c] = L->fr->org[c] + v[i][c] * L->fr->h;
+  L->nseen++;
+  if (!L->nocull && lit_cull(L, w, nv)) {
+    L->ncull++;
+    return 0;
+  }
+  for (int i = 0; i < nv; i++) {
     int idx = lit_find(L, &ref[i]);
     for (int c = 0; c < 3; c++)
       col[i][c] = idx >= 0 ? (double)L->irr[3 * (size_t)idx + (size_t)c] : 0.0;
@@ -1603,7 +1640,7 @@ int main(int argc, char **argv) {
     return 2;
   }
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
-  int sweepfrac = 1, sweepr01 = 0;
+  int sweepfrac = 1, sweepr01 = 0, nocull = 0;
   double lodthr = 1.0;
   const char *occdump = NULL, *polydump = NULL;
   for (int i = 3; i < argc; i++) {
@@ -1624,6 +1661,11 @@ int main(int argc, char **argv) {
     /* НЕГАТИВНЫЙ КОНТРОЛЬ §419: вернуть осевое наследование видимости. */
     /* Ш5а2 включён по умолчанию; ключи возвращают прежние правила. */
     if (strcmp(argv[i], "sweepbool") == 0) sweepfrac = 0;
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ Ш5в: отсечение выключено, цена обязана вернуться. */
+    if (strcmp(argv[i], "nocull") == 0) {
+      lit = 1;
+      nocull = 1;
+    }
     if (strcmp(argv[i], "sweepr01") == 0) {
       lit = 1;
       sweepr01 = 1;
@@ -2544,7 +2586,7 @@ int main(int argc, char **argv) {
       if (w995 > 0.0) white = w995;
       free(tmpw);
     }
-    litctx LC = {&S, key, ord, irr, &fr, NULL, NULL, 0, 0, NULL, white};
+    litctx LC = {&S, key, ord, irr, &fr, NULL, NULL, 0, 0, NULL, white, nocull, 0, 0};
     tr3_camera cam;
     if (tr3_camera_look(&cam, eyec, atc, upc, HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0, res,
                         res) == 0) {
@@ -2565,6 +2607,9 @@ int main(int argc, char **argv) {
       char path[256];
       snprintf(path, sizeof path, "img/pfield_lit_L%d_%d.ppm", lev, res);
       int prc = hz_ppm_write_rgb(path, rgb, res, res);
+      printf("   ОТСЕЧЕНИЕ: пришло %lld многоугольников, отброшено %lld (%.1f %%)\n",
+             (long long)LC.nseen, (long long)LC.ncull,
+             100.0 * (double)LC.ncull / (double)(LC.nseen ? LC.nseen : 1));
       printf("   КАДР СО СВЕТОМ %d²: срез %.1f мс (ячеек %d), ПРЯМОЙ СВЕТ %.1f мс (%.0f нс на "
              "ячейку), растеризация %.1f мс (код %d), ВСЕГО %.1f мс -> %s (код %d)\n",
              res, t_slice * 1e3, S.n, t_dir * 1e3, t_dir * 1e9 / (double)(S.n ? S.n : 1),

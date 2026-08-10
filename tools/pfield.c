@@ -46,6 +46,11 @@ static double now_s(void) {
   return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
+static int cmp_f(const void *x, const void *y) {
+  float a = *(const float *)x, b = *(const float *)y;
+  return (a < b) ? -1 : ((a > b) ? 1 : 0);
+}
+
 static int cmp_d(const void *x, const void *y) {
   double a = *(const double *)x, b = *(const double *)y;
   return (a < b) ? -1 : ((a > b) ? 1 : 0);
@@ -1041,6 +1046,219 @@ static int hit_sphere(hz_htab *ht, const frame *fr, const double c[3], double ra
   }
   return 0;
 }
+
+/* --- 3е. ПРЯМОЙ СВЕТ ПО СРЕЗУ (Ш5, часть первая) --------------------------- */
+
+/* ЧЕСТНОЕ ОТСТУПЛЕНИЕ ОТ ПЛАНА, ЗАПИСАННОЕ, А НЕ СДЕЛАННОЕ МОЛЧА. §383 требует
+ * СВИПА ПОТОКОМ в октантном порядке. Здесь сделан не свип, а ЗАТЕНЕНИЕ ЛУЧОМ по
+ * пирамиде занятости: от ячейки к образцам площадки. Причина — не удобство:
+ * свип переносит РАДИАНТНОСТЬ по направлениям и требует соседа в срезе, то есть
+ * индекса, которого ещё нет; луч же пользуется УЖЕ ПОСТРОЕННОЙ пирамидой (Р7) и
+ * даёт прямой свет с тенями немедленно. Цена названа: это `O(ячейки × образцы ×
+ * шаги)`, то есть по построению дороже свипа, и в приёмку П5.1 (нс на ячейку НА
+ * СВИП) оно НЕ ЗАСЧИТЫВАЕТСЯ. Отскока здесь нет вовсе — средство 5 по-прежнему
+ * не начато, и одна эта часть его не закрывает.
+ *
+ * ИСТОЧНИК ПРОТЯЖЁННЫЙ И ПОСТАВЛЕН ОСМЫСЛЕННО: площадка под потолком зала.
+ * Налобный источник для теней негоден по построению — он их не отбрасывает.
+ * ЦВЕТ ТРЁХКАНАЛЬНЫЙ И НЕ ФИКТИВНЫЙ (А757): источник ОКРАШЕН, иначе три
+ * одинаковых числа выдавались бы за RGB. */
+typedef struct {
+  double c[3];       /* центр площадки */
+  double u[3], v[3]; /* полуоси */
+  double rgb[3];     /* сила по каналам */
+} arealight;
+
+/* Затенён ли путь от точки к точке. Марш по ЗАНЯТОСТИ мелкого уровня с шагом в
+ * пол-ячейки: занятая ячейка на пути — заслон. Концы исключаются, иначе сама
+ * поверхность закрывала бы себя. */
+static int shadowed(const opyr *P, const frame *fr, const double a[3], const double b[3]) {
+  double d[3], len = 0.0;
+  for (int k = 0; k < 3; k++) {
+    d[k] = b[k] - a[k];
+    len += d[k] * d[k];
+  }
+  len = sqrt(len);
+  if (!(len > 0.0)) return 0;
+  double step = fr->h * 0.5;
+  int ns = (int)(len / step);
+  if (ns > 4096) ns = 4096;
+  for (int i = 2; i < ns - 1; i++) {
+    double t = (double)i / (double)ns;
+    int32_t c[3];
+    int ok = 1;
+    for (int k = 0; k < 3; k++) {
+      double w = a[k] + d[k] * t;
+      double f = floor((w - fr->org[k]) / fr->h);
+      if (!(f >= 0.0) || !(f < (double)fr->n)) ok = 0;
+      c[k] = ok ? (int32_t)f : 0;
+    }
+    if (!ok) continue;
+    if (hz_occ_get(P->b[fr->lev], hz_occ_index(fr->n, c[0], c[1], c[2]))) return 1;
+  }
+  return 0;
+}
+
+/* Прямая облучённость ячейки среза по трём каналам. Площадка берётся четырьмя
+ * образцами — число НАЗВАНО, а не подобрано: это углы, то есть худший случай для
+ * полутени, и увеличение его только сгладит край. */
+#define HZ_LIGHT_SAMPLES 4
+
+static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, const arealight *L,
+                         float *irr) {
+  static const double su[HZ_LIGHT_SAMPLES] = {-0.5, 0.5, -0.5, 0.5};
+  static const double sv[HZ_LIGHT_SAMPLES] = {-0.5, -0.5, 0.5, 0.5};
+  for (int32_t i = 0; i < S->n; i++) {
+    double p[3], n[3];
+    hz_slice_vertex(S, i, p);
+    for (int k = 0; k < 3; k++)
+      p[k] = fr->org[k] + p[k] * fr->h;
+    hz_slice_normal(S, i, n);
+    double acc[3] = {0, 0, 0};
+    for (int s = 0; s < HZ_LIGHT_SAMPLES; s++) {
+      double q[3], w[3], r2 = 0.0;
+      for (int k = 0; k < 3; k++) {
+        q[k] = L->c[k] + L->u[k] * su[s] + L->v[k] * sv[s];
+        w[k] = q[k] - p[k];
+        r2 += w[k] * w[k];
+      }
+      if (!(r2 > 0.0)) continue;
+      double r = sqrt(r2);
+      double cosr = (w[0] * n[0] + w[1] * n[1] + w[2] * n[2]) / r;
+      /* Поверхность односторонняя, и знака у неё нет (Р7): освещённой считается
+       * та сторона, к которой нормаль обращена, а модуль брать нельзя — иначе
+       * стена светилась бы с обратной стороны. */
+      if (!(cosr > 0.0)) continue;
+      if (shadowed(P, fr, p, q)) continue;
+      double g = cosr / r2 / (double)HZ_LIGHT_SAMPLES;
+      for (int k = 0; k < 3; k++)
+        acc[k] += L->rgb[k] * g;
+    }
+    for (int k = 0; k < 3; k++)
+      irr[3 * (size_t)i + (size_t)k] = (float)acc[k];
+  }
+}
+
+/* --- 3ж. РАСТЕРИЗАЦИЯ СО СВЕТОМ (Ш5) --------------------------------------- */
+
+/* ЦВЕТ ИНТЕРПОЛИРУЕТСЯ ПО МНОГОУГОЛЬНИКУ, а не берётся плоским на треугольник —
+ * ровно как записано в А663: угол многоугольника ЕСТЬ дуальная вершина ячейки,
+ * значит облучённость в этом углу — облучённость ТОЙ ЯЧЕЙКИ, и никаких
+ * вершинных величин заводить не надо.
+ *
+ * БЕЛАЯ ТОЧКА — не подобранная константа, а перцентиль по ЯЧЕЙКАМ СРЕЗА (то же
+ * правило, что в `hz_ppm_write`: одиночный яркий блик не должен утопить кадр).
+ * Гамма `1/2.2`. Ложноцветной палитры здесь нет: она годится полю интенсивности,
+ * а на геометрии делает картинку нечитаемой. */
+typedef struct {
+  const hz_dcslice *S;
+  const uint64_t *key;
+  const int32_t *ord;
+  const float *irr;
+  const frame *fr;
+  const tr3_camera *cam;
+  double *z;
+  int w, h;
+  unsigned char *rgb;
+  double white;
+} litctx;
+
+static int lit_find(const litctx *L, const hz_dcref *r) {
+  hz_dccell c;
+  int sh = 0;
+  for (int32_t s = r->size; s > 1; s >>= 1)
+    sh++;
+  c.lvl = (uint8_t)(L->S->lev - sh);
+  for (int a = 0; a < 3; a++)
+    c.lo[a] = (uint16_t)r->lo[a];
+  uint64_t k = cellkey(&c);
+  int32_t lo = 0, hi = L->S->n - 1;
+  while (lo <= hi) {
+    int32_t mid = lo + (hi - lo) / 2;
+    if (L->key[mid] == k) return L->ord[mid];
+    if (L->key[mid] < k)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return -1;
+}
+
+static void lit_tri(litctx *L, const double p[3][3], const double col[3][3]) {
+  const tr3_camera *cm = L->cam;
+  double sx[3], sy[3], sz[3];
+  for (int k = 0; k < 3; k++) {
+    double d[3];
+    for (int q = 0; q < 3; q++)
+      d[q] = p[k][q] - cm->eye[q];
+    double zz = d[0] * cm->fwd[0] + d[1] * cm->fwd[1] + d[2] * cm->fwd[2];
+    if (!(zz > 1e-6)) return;
+    double rr = d[0] * cm->right[0] + d[1] * cm->right[1] + d[2] * cm->right[2];
+    double uu = d[0] * cm->up[0] + d[1] * cm->up[1] + d[2] * cm->up[2];
+    sz[k] = zz;
+    sx[k] = ((rr / (zz * cm->tanx)) + 1.0) * 0.5 * (double)cm->w;
+    sy[k] = (1.0 - uu / (zz * cm->tany)) * 0.5 * (double)cm->h;
+  }
+  double x0 = sx[0], x1 = sx[0], y0 = sy[0], y1 = sy[0];
+  for (int k = 1; k < 3; k++) {
+    if (sx[k] < x0) x0 = sx[k];
+    if (sx[k] > x1) x1 = sx[k];
+    if (sy[k] < y0) y0 = sy[k];
+    if (sy[k] > y1) y1 = sy[k];
+  }
+  int ix0 = (int)floor(x0), ix1 = (int)ceil(x1), iy0 = (int)floor(y0), iy1 = (int)ceil(y1);
+  if (ix0 < 0) ix0 = 0;
+  if (iy0 < 0) iy0 = 0;
+  if (ix1 >= L->w) ix1 = L->w - 1;
+  if (iy1 >= L->h) iy1 = L->h - 1;
+  double d21x = sx[1] - sx[0], d21y = sy[1] - sy[0];
+  double d31x = sx[2] - sx[0], d31y = sy[2] - sy[0];
+  double det = d21x * d31y - d21y * d31x;
+  if (!(fabs(det) > 0.0)) return;
+  for (int py = iy0; py <= iy1; py++)
+    for (int px = ix0; px <= ix1; px++) {
+      double qx = (double)px + 0.5 - sx[0], qy = (double)py + 0.5 - sy[0];
+      double u = (qx * d31y - qy * d31x) / det, v = (qy * d21x - qx * d21y) / det;
+      if (u < 0.0 || v < 0.0 || u + v > 1.0) continue;
+      double zz = sz[0] + u * (sz[1] - sz[0]) + v * (sz[2] - sz[0]);
+      size_t k = (size_t)py * (size_t)L->w + (size_t)px;
+      if (zz >= L->z[k]) continue;
+      L->z[k] = zz;
+      for (int c = 0; c < 3; c++) {
+        double e = col[0][c] + u * (col[1][c] - col[0][c]) + v * (col[2][c] - col[0][c]);
+        double t = e / L->white;
+        if (t < 0.0) t = 0.0;
+        if (t > 1.0) t = 1.0;
+        double g = pow(t, 1.0 / 2.2);
+        L->rgb[3 * k + (size_t)c] = (unsigned char)(g * 255.0 + 0.5);
+      }
+    }
+}
+
+static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv) {
+  litctx *L = (litctx *)ctx;
+  double w[4][3], col[4][3];
+  for (int i = 0; i < nv; i++) {
+    for (int c = 0; c < 3; c++)
+      w[i][c] = L->fr->org[c] + v[i][c] * L->fr->h;
+    int idx = lit_find(L, &ref[i]);
+    for (int c = 0; c < 3; c++)
+      col[i][c] = idx >= 0 ? (double)L->irr[3 * (size_t)idx + (size_t)c] : 0.0;
+  }
+  for (int i = 1; i + 1 < nv; i++) {
+    double p3[3][3], c3[3][3];
+    for (int c = 0; c < 3; c++) {
+      p3[0][c] = w[0][c];
+      p3[1][c] = w[i][c];
+      p3[2][c] = w[i + 1][c];
+      c3[0][c] = col[0][c];
+      c3[1][c] = col[i][c];
+      c3[2][c] = col[i + 1][c];
+    }
+    lit_tri(L, p3, c3);
+  }
+  return 0;
+}
 /* --- 4. главная ------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
@@ -1048,7 +1266,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "pfield ФАЙЛ.obj МАСШТАБ [lev=N] [nonrm] [occdump=ПУТЬ] [polydump=ПУТЬ]\n");
     return 2;
   }
-  int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0;
+  int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512;
+  double lodthr = 1.0;
   const char *occdump = NULL, *polydump = NULL;
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "lev=", 4) == 0) lev = (int)strtol(argv[i] + 4, NULL, 10);
@@ -1063,6 +1282,10 @@ int main(int argc, char **argv) {
       hit = 1;
       nofix = 1;
     }
+    /* Ш5: кадр со светом. `res=` — разрешение, `thr=` — порог среза в пикселях. */
+    if (strcmp(argv[i], "lit") == 0) lit = 1;
+    if (strncmp(argv[i], "res=", 4) == 0) res = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "thr=", 4) == 0) lodthr = strtod(argv[i] + 4, NULL);
     /* Выгрузка занятости для сверки с эталоном Ш0 (`tools/poccref.c`). */
     if (strncmp(argv[i], "occdump=", 8) == 0) occdump = argv[i] + 8;
     /* ЭТАЛОН РЕГРЕССА ДЛЯ Ш2 (А666): выданные многоугольники снимаются здесь. */
@@ -1711,6 +1934,122 @@ int main(int argc, char **argv) {
       hz_dc_forms_lazy(&T, &ht);
     }
     hz_slice_free(&S0);
+  }
+
+  /* ---- 4д. КАДР СО СВЕТОМ (Ш5, часть первая) ---- */
+  if (lit) {
+    lodctx LL;
+    memset(&LL, 0, sizeof LL);
+    double eyec[3] = HZ_CFG_HALL_EYE, atc[3] = HZ_CFG_HALL_AT, upc[3] = HZ_CFG_UP;
+    for (int a = 0; a < 3; a++)
+      LL.eye[a] = (eyec[a] - fr.org[a]) / fr.h;
+    LL.pxrad = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / (double)res;
+    LL.thr = lodthr;
+    hz_dcslice S;
+    if (hz_slice_init(&S, lev) != HZ_DC_OK) exit(1);
+    double ta = now_s();
+    if (hz_slice_build(&S, &T, &ht, lod_stop, &LL) != HZ_DC_OK) exit(1);
+    double t_slice = now_s() - ta;
+
+    /* ИСТОЧНИК: площадка под потолком зала. Габарит сцены известен, потолок —
+     * его верх по оси Y; площадка ставится на 10 см ниже и в центре плана.
+     * Числа не магические: они выведены из ГАБАРИТА, а не подобраны на глаз. */
+    arealight AL;
+    for (int k = 0; k < 3; k++)
+      AL.c[k] = 0.5 * (lo[k] + hi[k]);
+    AL.c[1] = hi[1] - 0.10;
+    double half = 0.25 * (hi[0] - lo[0]);
+    AL.u[0] = half;
+    AL.u[1] = 0.0;
+    AL.u[2] = 0.0;
+    AL.v[0] = 0.0;
+    AL.v[1] = 0.0;
+    AL.v[2] = 0.25 * (hi[2] - lo[2]);
+    /* ОКРАШЕН СОЗНАТЕЛЬНО (А757): три одинаковых числа выдавать за RGB нельзя. */
+    AL.rgb[0] = 1.00;
+    AL.rgb[1] = 0.92;
+    AL.rgb[2] = 0.78;
+
+    float *irr = malloc(3 * (size_t)S.n * sizeof *irr);
+    if (irr == NULL) exit(1);
+    ta = now_s();
+    front_direct(&S, &fr, &P, &AL, irr);
+    double t_dir = now_s() - ta;
+
+    /* ЦВЕТ ЯЧЕЙКИ КЛАДЁТСЯ В ИНДЕКС ПО КЛЮЧУ, чтобы растеризатор мог его взять
+     * по ячейке многоугольника. Индекс ПЛОСКИЙ (отсортированные ключи +
+     * двоичный поиск), а не дерево: у него нет ни спуска, ни владения. */
+    uint64_t *key = malloc((size_t)S.n * sizeof *key);
+    int32_t *ord = malloc((size_t)S.n * sizeof *ord);
+    if (key == NULL || ord == NULL) exit(1);
+    for (int32_t i = 0; i < S.n; i++) {
+      key[i] = cellkey(&S.c[i]);
+      ord[i] = i;
+    }
+    /* Срез уже в мортоновом порядке; ключ (lvl, lo) монотонен по нему не всегда,
+     * поэтому сортируется явно. */
+    for (int32_t i = 1; i < S.n; i++) {
+      uint64_t k = key[i];
+      int32_t o = ord[i];
+      int32_t j = i - 1;
+      while (j >= 0 && key[j] > k) {
+        key[j + 1] = key[j];
+        ord[j + 1] = ord[j];
+        j--;
+      }
+      key[j + 1] = k;
+      ord[j + 1] = o;
+    }
+
+    /* БЕЛАЯ ТОЧКА: перцентиль 99.5 по ЯЧЕЙКАМ СРЕЗА — то же правило, что в
+     * hz_ppm_write, но применённое к населению, у которого оно осмысленно. */
+    double white = 1.0;
+    {
+      float *tmpw = malloc((size_t)S.n * sizeof *tmpw);
+      if (tmpw == NULL) exit(1);
+      for (int32_t i = 0; i < S.n; i++) {
+        float mx = irr[3 * (size_t)i];
+        if (irr[3 * (size_t)i + 1] > mx) mx = irr[3 * (size_t)i + 1];
+        if (irr[3 * (size_t)i + 2] > mx) mx = irr[3 * (size_t)i + 2];
+        tmpw[i] = mx;
+      }
+      qsort(tmpw, (size_t)S.n, sizeof *tmpw, cmp_f);
+      double w995 = (double)tmpw[(size_t)((double)S.n * 0.995)];
+      if (w995 > 0.0) white = w995;
+      free(tmpw);
+    }
+    litctx LC = {&S, key, ord, irr, &fr, NULL, NULL, 0, 0, NULL, white};
+    tr3_camera cam;
+    if (tr3_camera_look(&cam, eyec, atc, upc, HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0, res,
+                        res) == 0) {
+      size_t np = (size_t)res * (size_t)res;
+      double *zb = malloc(np * sizeof *zb);
+      unsigned char *rgb = calloc(np * 3, 1);
+      if (zb == NULL || rgb == NULL) exit(1);
+      for (size_t i = 0; i < np; i++)
+        zb[i] = 1e300;
+      LC.cam = &cam;
+      LC.z = zb;
+      LC.rgb = rgb;
+      LC.w = res;
+      LC.h = res;
+      ta = now_s();
+      int wrc = hz_dc_walk(&T, lod_stop, &LL, lit_poly, &LC);
+      double t_rast = now_s() - ta;
+      char path[256];
+      snprintf(path, sizeof path, "img/pfield_lit_L%d_%d.ppm", lev, res);
+      int prc = hz_ppm_write_rgb(path, rgb, res, res);
+      printf("   КАДР СО СВЕТОМ %d²: срез %.1f мс (ячеек %d), ПРЯМОЙ СВЕТ %.1f мс (%.0f нс на "
+             "ячейку), растеризация %.1f мс (код %d), ВСЕГО %.1f мс -> %s (код %d)\n",
+             res, t_slice * 1e3, S.n, t_dir * 1e3, t_dir * 1e9 / (double)(S.n ? S.n : 1),
+             t_rast * 1e3, wrc, (t_slice + t_dir + t_rast) * 1e3, path, prc);
+      free(zb);
+      free(rgb);
+    }
+    free(key);
+    free(ord);
+    free(irr);
+    hz_slice_free(&S);
   }
   ct_free(&CT);
   hz_dc_free(&T);

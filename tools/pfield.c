@@ -2578,6 +2578,81 @@ int main(int argc, char **argv) {
              100.0 * (double)ndiff / (double)(S.n ? S.n : 1), emax);
     }
 
+    /* ---- ОДИН ОТСКОК (Ш5б, §430) ---- */
+    /* ПРИБЛИЖЕНИЯ НАЗЫВАЮТСЯ ЗДЕСЬ, А НЕ В ДОКЛАДЕ ЗАДНИМ ЧИСЛОМ.
+     *   (1) ВИДИМОСТИ МЕЖДУ ЯЧЕЙКАМИ НЕТ: перенос идёт по незаслонённому
+     *       угловому коэффициенту. Значит свет проходит сквозь стены, и на
+     *       сцене с комнатами это ВИДНО. Взято сознательно: с видимостью цена
+     *       умножается на марш (~4.8 шага), а замер физики от заслонов не
+     *       зависит — `E_ind = ρ·E_dir` проверяется на ПЛОСКОЙ стене, где
+     *       заслонов нет вовсе.
+     *   (2) ИЗЛУЧАТЕЛИ ПРОРЕЖЕНЫ шагом `stride`: берётся каждый `stride`-й, а
+     *       вклад умножается на `stride`. Это несмещённая оценка суммы, но с
+     *       разбросом; разброс НЕ ИЗМЕРЕН и в приёмку не входит.
+     *   (3) ПЛОЩАДЬ ЯЧЕЙКИ взята как площадь её грани `(h·2^(lev-lvl))²` —
+     *       поверхность внутри ячейки наклонена и её площадь больше; это
+     *       систематическая недооценка, названная и не исправленная.
+     * ЦЕНА ОЖИДАЕТСЯ ПЛОХОЙ И ПРЕДСКАЗАНА ДО ПРОГОНА (§430, П5б.3): это замер,
+     * обосновывающий свип, а не попытка уложиться в бюджет. */
+    float *ind = calloc(3 * (size_t)S.n, sizeof *ind);
+    if (ind == NULL) exit(1);
+    {
+      int32_t stride = 1;
+      while ((int64_t)(S.n / (stride > 0 ? stride : 1)) * (int64_t)S.n > 200000000LL)
+        stride *= 2;
+      double tb = now_s();
+      int64_t nemit = 0;
+      for (int32_t j = 0; j < S.n; j += stride) {
+        double ej[3] = {(double)irr[3 * (size_t)j], (double)irr[3 * (size_t)j + 1],
+                        (double)irr[3 * (size_t)j + 2]};
+        if (!(ej[0] + ej[1] + ej[2] > 0.0)) continue;
+        nemit++;
+        double pj[3], nj[3];
+        hz_slice_vertex(&S, j, pj);
+        for (int k = 0; k < 3; k++)
+          pj[k] = fr.org[k] + pj[k] * fr.h;
+        hz_slice_normal(&S, j, nj);
+        double cside = fr.h * (double)((int32_t)1 << (lev - (int)S.c[j].lvl));
+        double aj = cside * cside * (double)stride;
+        for (int32_t i = 0; i < S.n; i++) {
+          if (i == j) continue;
+          double pi[3], ni[3], w[3], r2 = 0.0;
+          hz_slice_vertex(&S, i, pi);
+          for (int k = 0; k < 3; k++)
+            pi[k] = fr.org[k] + pi[k] * fr.h;
+          hz_slice_normal(&S, i, ni);
+          for (int k = 0; k < 3; k++) {
+            w[k] = pj[k] - pi[k];
+            r2 += w[k] * w[k];
+          }
+          if (!(r2 > 0.0)) continue;
+          double r = sqrt(r2);
+          double ci = (w[0] * ni[0] + w[1] * ni[1] + w[2] * ni[2]) / r;
+          double cj = -(w[0] * nj[0] + w[1] * nj[1] + w[2] * nj[2]) / r;
+          if (!(ci > 0.0) || !(cj > 0.0)) continue;
+          double ff = ci * cj * aj / (3.14159265358979323846 * r2);
+          for (int k = 0; k < 3; k++)
+            ind[3 * (size_t)i + (size_t)k] +=
+                (float)(ej[k] * alb(&m, S.c[j].mat, k) * ff * alb(&m, S.c[i].mat, k));
+        }
+      }
+      tb = now_s() - tb;
+      /* ПРИЁМКА: отношение косвенного к прямому обязано быть порядка альбедо. */
+      double sd = 0.0, si = 0.0;
+      for (int32_t i = 0; i < S.n; i++)
+        for (int k = 0; k < 3; k++) {
+          sd += (double)irr[3 * (size_t)i + (size_t)k];
+          si += (double)ind[3 * (size_t)i + (size_t)k];
+        }
+      printf("   ОТСКОК: %.1f с (в %.0f раз дороже прямого света), излучателей %lld из %d "
+             "(прореживание %d); СУММА косвенного / прямого = %.4f\n",
+             tb, tb / (t_dir > 0.0 ? t_dir : 1.0), (long long)nemit, S.n, stride,
+             si / (sd > 0.0 ? sd : 1.0));
+      for (int32_t i = 0; i < 3 * S.n; i++)
+        irr[i] += ind[i];
+    }
+    free(ind);
+
     /* ЦВЕТ ЯЧЕЙКИ КЛАДЁТСЯ В ИНДЕКС ПО КЛЮЧУ, чтобы растеризатор мог его взять
      * по ячейке многоугольника. Индекс ПЛОСКИЙ (отсортированные ключи +
      * двоичный поиск), а не дерево: у него нет ни спуска, ни владения. */

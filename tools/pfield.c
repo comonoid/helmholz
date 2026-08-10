@@ -1063,8 +1063,18 @@ static int hit_sphere(hz_htab *ht, const frame *fr, const double c[3], double ra
  * Налобный источник для теней негоден по построению — он их не отбрасывает.
  * ЦВЕТ ТРЁХКАНАЛЬНЫЙ И НЕ ФИКТИВНЫЙ (А757): источник ОКРАШЕН, иначе три
  * одинаковых числа выдавались бы за RGB. */
+/* АЛЬБЕДО ПО КАНАЛАМ ИЗ ТАБЛИЦЫ МАТЕРИАЛОВ. `kd3` читается загрузчиком из
+ * `.mtl` и до сих пор в поле не доходил вовсе (А761: «цвет формально
+ * трёхканальный, фактически однотонный»). Здесь он доходит. */
+static double alb(const hz_objmesh *m, uint8_t mi, int k) {
+  if (m->mtl == NULL || mi >= m->nmtl) return 0.5;
+  double a = m->mtl[mi].kd3[k];
+  return a >= 0.0 && a <= 1.0 ? a : 0.5;
+}
+
 typedef struct {
-  double c[3];       /* центр площадки */
+  double c[3]; /* центр площадки */
+
   double u[3], v[3]; /* полуоси */
   double rgb[3];     /* сила по каналам */
 } arealight;
@@ -1183,7 +1193,8 @@ static int shadowed_h(const opyr *P, const frame *fr, const double a[3], const d
 #define HZ_LIGHT_SAMPLES 4
 
 static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, const arealight *L,
-                         float *irr, double stepfrac, int hier, int64_t *nstep) {
+                         float *irr, double stepfrac, int hier, int64_t *nstep,
+                         const hz_objmesh *A) {
   static const double su[HZ_LIGHT_SAMPLES] = {-0.5, 0.5, -0.5, 0.5};
   static const double sv[HZ_LIGHT_SAMPLES] = {-0.5, -0.5, 0.5, 0.5};
   for (int32_t i = 0; i < S->n; i++) {
@@ -1215,7 +1226,7 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
       }
       double g = cosr / r2 / (double)HZ_LIGHT_SAMPLES;
       for (int k = 0; k < 3; k++)
-        acc[k] += L->rgb[k] * g;
+        acc[k] += L->rgb[k] * g * alb(A, S->c[i].mat, k);
     }
     for (int k = 0; k < 3; k++)
       irr[3 * (size_t)i + (size_t)k] = (float)acc[k];
@@ -1423,8 +1434,8 @@ static double sweep_vis(const sweepgrid *G, const frame *fr, const double p[3]) 
  * берётся затенение; геометрия (косинус, `1/r²`, образцы площадки) та же — иначе
  * сверка мерила бы разницу формул, а не разницу механизмов. */
 static void front_sweep(const hz_dcslice *S, const frame *fr, const opyr *P, const arealight *L,
-                        float *irr, double *t_sweep, double *t_gather, int axismode, int fracmode,
-                        int round01) {
+                        float *irr, const hz_objmesh *A, double *t_sweep, double *t_gather,
+                        int axismode, int fracmode, int round01) {
   static const double su[HZ_LIGHT_SAMPLES] = {-0.5, 0.5, -0.5, 0.5};
   static const double sv[HZ_LIGHT_SAMPLES] = {-0.5, -0.5, 0.5, 0.5};
   sweepgrid G;
@@ -1469,7 +1480,7 @@ static void front_sweep(const hz_dcslice *S, const frame *fr, const opyr *P, con
       if (!(vis > 0.0)) continue;
       double g = vis * cosr / r2 / (double)HZ_LIGHT_SAMPLES;
       for (int k = 0; k < 3; k++)
-        irr[3 * (size_t)i + (size_t)k] += (float)(L->rgb[k] * g);
+        irr[3 * (size_t)i + (size_t)k] += (float)(L->rgb[k] * g * alb(A, S->c[i].mat, k));
     }
     *t_gather += now_s() - ta;
   }
@@ -2418,13 +2429,36 @@ int main(int argc, char **argv) {
     AL.rgb[1] = 0.92;
     AL.rgb[2] = 0.78;
 
+    /* МАТЕРИАЛ ЯЧЕЙКИ СРЕЗА (Ш5б, §430). Байт `mat` перестаёт быть резервом:
+     * берётся материал первого треугольника в ячейке (`celltris` уже построен).
+     * Индекс, а не альбедо: в срезе лежит ИНДЕКС, полезная нагрузка — в таблице
+     * (Р4). Материалов на сцене десятки, таблица горяча в кэше.
+     * ЧЕГО ЭТО НЕ ДЕЛАЕТ: на границе двух материалов ячейка получает ОДИН из
+     * них, а не оба — граница пройдёт по ячейкам среза, то есть с точностью
+     * LOD. Для отскока это законно (энергия), для резкой границы текстуры —
+     * нет; текстур пока и нет. */
+    {
+      int64_t nmat = 0;
+      for (int32_t i = 0; i < S.n; i++) {
+        int32_t cell[3] = {(int32_t)S.c[i].lo[0], (int32_t)S.c[i].lo[1], (int32_t)S.c[i].lo[2]};
+        const int32_t *ls = NULL;
+        if (ct_list(&CT, cell, &ls) == 0) continue;
+        int32_t mi = m.fm != NULL ? m.fm[ls[0]] : 0;
+        if (mi < 0 || mi >= m.nmtl) mi = 0;
+        S.c[i].mat = (uint8_t)(mi < 255 ? mi : 255);
+        nmat++;
+      }
+      printf("   МАТЕРИАЛ В СРЕЗЕ: назначен %lld ячейкам из %d, материалов в сцене %d\n",
+             (long long)nmat, S.n, m.nmtl);
+    }
+
     float *irr = malloc(3 * (size_t)S.n * sizeof *irr);
     if (irr == NULL) exit(1);
     ta = now_s();
     /* РАБОЧИЙ ПУТЬ — С ПОДЪЁМОМ (§426): тот же предикат, вчетверо дешевле.
      * Плоский марш остаётся АРБИТРОМ и зовётся ниже. */
     int64_t nstep_w = 0;
-    front_direct(&S, &fr, &P, &AL, irr, 0.5, 1, &nstep_w);
+    front_direct(&S, &fr, &P, &AL, irr, 0.5, 1, &nstep_w, &m);
     double t_dir = now_s() - ta;
     /* А772/А775: ЭТАЛОН ПРОВЕРЯЕТСЯ САМ. Марш идёт шагом , и тонкий заслон
      * он может проскочить. Пересчёт вдвое мельче: если множество затенённых
@@ -2434,7 +2468,7 @@ int main(int argc, char **argv) {
       float *irrf = malloc(3 * (size_t)S.n * sizeof *irrf);
       if (irrf == NULL) exit(1);
       double tf = now_s();
-      front_direct(&S, &fr, &P, &AL, irrf, 0.25, 0, NULL);
+      front_direct(&S, &fr, &P, &AL, irrf, 0.25, 0, NULL, &m);
       tf = now_s() - tf;
       int64_t nd = 0, na = 0, nb = 0;
       for (int32_t i = 0; i < S.n; i++) {
@@ -2459,7 +2493,7 @@ int main(int argc, char **argv) {
       double th = now_s();
       /* АРБИТР — ПЛОСКИЙ марш: рабочий путь стал иерархическим, и сравнивать
        * его с самим собою значило бы печатать ложный ноль. */
-      front_direct(&S, &fr, &P, &AL, irrh, 0.5, 0, &nsteph);
+      front_direct(&S, &fr, &P, &AL, irrh, 0.5, 0, &nsteph, &m);
       th = now_s() - th;
       int64_t nd2 = 0;
       for (int32_t i = 0; i < S.n; i++)
@@ -2477,13 +2511,13 @@ int main(int argc, char **argv) {
     float *irr2 = malloc(3 * (size_t)S.n * sizeof *irr2);
     if (irr2 == NULL) exit(1);
     double t_sw = 0.0, t_ga = 0.0;
-    front_sweep(&S, &fr, &P, &AL, irr2, &t_sw, &t_ga, sweepaxis, sweepfrac, sweepr01);
+    front_sweep(&S, &fr, &P, &AL, irr2, &m, &t_sw, &t_ga, sweepaxis, sweepfrac, sweepr01);
     /* ДОЛЯ ОТКРЫТОСТИ, А НЕ ОБЛУЧЁННОСТЬ (§423, А781). Приёмка задана на долю,
      * поэтому нужен знаменатель — облучённость БЕЗ всякого затенения. Считается
      * третьим проходом, дешёвым (теста заслона в нём нет вовсе). */
     float *irro = malloc(3 * (size_t)S.n * sizeof *irro);
     if (irro == NULL) exit(1);
-    front_direct(&S, &fr, &P, &AL, irro, -1.0, 0, NULL);
+    front_direct(&S, &fr, &P, &AL, irro, -1.0, 0, NULL, &m);
     {
       double *dv = malloc((size_t)S.n * sizeof *dv);
       if (dv == NULL) exit(1);

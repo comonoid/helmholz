@@ -1139,7 +1139,9 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
        * та сторона, к которой нормаль обращена, а модуль брать нельзя — иначе
        * стена светилась бы с обратной стороны. */
       if (!(cosr > 0.0)) continue;
-      if (shadowed(P, fr, p, q, stepfrac)) continue;
+      /* `stepfrac < 0` — БЕЗ ЗАТЕНЕНИЯ ВОВСЕ: это знаменатель доли
+       * открытости, а не режим рендера. */
+      if (stepfrac > 0.0 && shadowed(P, fr, p, q, stepfrac)) continue;
       double g = cosr / r2 / (double)HZ_LIGHT_SAMPLES;
       for (int k = 0; k < 3; k++)
         acc[k] += L->rgb[k] * g;
@@ -1179,15 +1181,20 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
 #define HZ_SWEEP_DROP 2
 
 typedef struct {
-  unsigned char *vis; /* на ячейку грубой сетки: свет доходит */
+  unsigned char *vis; /* на ячейку: булева видимость (осевое и направленное правила) */
+  float *open;        /* Ш5а2: ДОЛЯ ОТКРЫТОСТИ, переносимая с весами граней */
   int32_t n;          /* сторона грубой сетки */
   int drop;           /* lev − log2(n) */
   int axis;           /* НЕГАТИВНЫЙ КОНТРОЛЬ: прежнее осевое наследование */
+  int frac;           /* Ш5а2: дробная открытость вместо булевой */
+  int round01;        /* НЕГАТИВНЫЙ КОНТРОЛЬ Ш5а2: округлять F до 0/1 */
 } sweepgrid;
 
 static void sweep_free(sweepgrid *G) {
   free(G->vis);
+  free(G->open);
   G->vis = NULL;
+  G->open = NULL;
 }
 
 /* Один образец источника: заполнить видимость на всей грубой сетке. */
@@ -1195,8 +1202,10 @@ static void sweep_light(sweepgrid *G, const opyr *P, const frame *fr, const doub
   int32_t n = G->n;
   size_t nc = (size_t)n * (size_t)n * (size_t)n;
   memset(G->vis, 0, nc);
+  for (size_t i = 0; i < nc; i++)
+    G->open[i] = 0.0f;
   /* Ячейка источника видима по определению — с неё начинается всякий путь. */
-  int32_t s[3];
+  int32_t s[3] = {0, 0, 0};
   for (int k = 0; k < 3; k++) {
     double f = floor((q[k] - fr->org[k]) / (fr->h * (double)((int32_t)1 << G->drop)));
     if (f < 0.0) f = 0.0;
@@ -1204,6 +1213,8 @@ static void sweep_light(sweepgrid *G, const opyr *P, const frame *fr, const doub
     s[k] = (int32_t)f;
   }
   G->vis[hz_occ_index(n, s[0], s[1], s[2])] = 1u;
+  size_t sidx = hz_occ_index(n, s[0], s[1], s[2]);
+  G->open[sidx] = 1.0f;
   /* Источник в координатах ГРУБОЙ сетки — к нему и строится направление. */
   double sc[3];
   for (int k = 0; k < 3; k++)
@@ -1217,9 +1228,62 @@ static void sweep_light(sweepgrid *G, const opyr *P, const frame *fr, const doub
       for (int32_t y = y0; y >= 0 && y < n; y += dy)
         for (int32_t x = x0; x >= 0 && x < n; x += dx) {
           size_t ci = hz_occ_index(n, x, y, z);
+          if (G->frac) {
+            /* ЯЧЕЙКА ИСТОЧНИКА НЕ ПЕРЕСЧИТЫВАЕТСЯ. Без этой оговорки свип
+             * обнулял сам источник первым же шагом: у булевых правил его
+             * защищал , а дробный путь идёт мимо него. */
+            if (ci == sidx) continue;
+            /* Ш5а2: ПЕРЕНОС ЧЕРЕЗ ГРАНИ С ВЕСАМИ (§423, А780). Открытость есть
+             * взвешенное среднее открытостей входных соседей; веса — доли потока
+             * через соответствующие грани. Ни максимума (оптимизм А778), ни
+             * одного пути (пессимизм А778) — первый порядок переноса. */
+            /* ЗАСЛОНОМ СЛУЖИТ ПРЕДШЕСТВЕННИК, А НЕ САМА ЯЧЕЙКА. Первая редакция
+             * обнуляла открытость у занятой ячейки — и тем гасила ровно те
+             * ячейки, ради которых всё считается: поверхность И ЕСТЬ занятые
+             * ячейки. Булево правило этой ошибки не имело, потому что проверяло
+             * занятость СОСЕДА. */
+            double c0[3] = {(double)x + 0.5, (double)y + 0.5, (double)z + 0.5};
+            double dd[3], sabs = 0.0;
+            for (int k = 0; k < 3; k++) {
+              dd[k] = sc[k] - c0[k];
+              sabs += fabs(dd[k]);
+            }
+            if (!(sabs > 0.0)) {
+              G->open[ci] = 1.0f;
+              continue;
+            }
+            double acc = 0.0, wsum = 0.0;
+            int32_t pp[3] = {x, y, z};
+            for (int k = 0; k < 3; k++) {
+              double w = fabs(dd[k]) / sabs;
+              if (!(w > 0.0)) continue;
+              int32_t save = pp[k];
+              pp[k] = save + (dd[k] > 0.0 ? 1 : -1);
+              if (pp[k] >= 0 && pp[k] < n) {
+                size_t pi = hz_occ_index(n, pp[0], pp[1], pp[2]);
+                /* ЗАКРЫТОЕ НАПРАВЛЕНИЕ ИСКЛЮЧАЕТСЯ ИЗ СРЕДНЕГО, А НЕ ВХОДИТ В
+                 * НЕГО НУЛЁМ. Иначе у стены одно направление из трёх всегда
+                 * закрыто, среднее падает на каждом шаге, и открытость ТАЕТ
+                 * вдоль стены — это ложное затухание, а не тень. Замерено на
+                 * первой редакции: средняя открытость 0.0605 против 0.3995 у
+                 * эталона. */
+                if (hz_occ_get(P->b[P->lev - G->drop], pi)) continue;
+                acc += w * (double)G->open[pi];
+                wsum += w;
+              }
+              pp[k] = save;
+            }
+            double f = wsum > 0.0 ? acc / wsum : 0.0;
+            /* НЕГАТИВНЫЙ КОНТРОЛЬ (§423): округление до 0/1 обязано вернуть
+             * смещения булевых правил. */
+            if (G->round01) f = f >= 0.5 ? 1.0 : 0.0;
+            G->open[ci] = (float)f;
+            continue;
+          }
           if (G->vis[ci]) continue;
           int v = 0;
           if (G->axis) {
+
             /* НЕГАТИВНЫЙ КОНТРОЛЬ (§419): прежнее правило — максимум по трём
              * ОСЕВЫМ соседям. Путь ступенчатый, свет заворачивает за угол, и
              * расхождение с эталоном обязано вернуться к `18 %`. */
@@ -1273,29 +1337,36 @@ static void sweep_light(sweepgrid *G, const opyr *P, const frame *fr, const doub
   }
 }
 
-static int sweep_vis(const sweepgrid *G, const frame *fr, const double p[3]) {
+static double sweep_vis(const sweepgrid *G, const frame *fr, const double p[3]) {
   int32_t c[3];
   for (int k = 0; k < 3; k++) {
     double f = floor((p[k] - fr->org[k]) / (fr->h * (double)((int32_t)1 << G->drop)));
-    if (!(f >= 0.0) || !(f < (double)G->n)) return 0;
+    if (!(f >= 0.0) || !(f < (double)G->n)) return 0.0;
     c[k] = (int32_t)f;
   }
-  return G->vis[hz_occ_index(G->n, c[0], c[1], c[2])];
+  size_t ci = hz_occ_index(G->n, c[0], c[1], c[2]);
+  return G->frac ? (double)G->open[ci] : (G->vis[ci] ? 1.0 : 0.0);
 }
 
 /* Прямая облучённость СВИПОМ. Отличие от `front_direct` только в том, откуда
  * берётся затенение; геометрия (косинус, `1/r²`, образцы площадки) та же — иначе
  * сверка мерила бы разницу формул, а не разницу механизмов. */
 static void front_sweep(const hz_dcslice *S, const frame *fr, const opyr *P, const arealight *L,
-                        float *irr, double *t_sweep, double *t_gather, int axismode) {
+                        float *irr, double *t_sweep, double *t_gather, int axismode, int fracmode,
+                        int round01) {
   static const double su[HZ_LIGHT_SAMPLES] = {-0.5, 0.5, -0.5, 0.5};
   static const double sv[HZ_LIGHT_SAMPLES] = {-0.5, -0.5, 0.5, 0.5};
   sweepgrid G;
+  memset(&G, 0, sizeof G);
   G.drop = HZ_SWEEP_DROP;
   G.axis = axismode;
+  G.frac = fracmode;
+  G.round01 = round01;
   G.n = (int32_t)1 << (fr->lev - G.drop);
-  G.vis = malloc((size_t)G.n * (size_t)G.n * (size_t)G.n);
-  if (G.vis == NULL) exit(1);
+  size_t gcells = (size_t)G.n * (size_t)G.n * (size_t)G.n;
+  G.vis = malloc(gcells);
+  G.open = malloc(gcells * sizeof *G.open);
+  if (G.vis == NULL || G.open == NULL) exit(1);
   for (int32_t i = 0; i < 3 * S->n; i++)
     irr[i] = 0.0f;
   *t_sweep = 0.0;
@@ -1323,8 +1394,9 @@ static void front_sweep(const hz_dcslice *S, const frame *fr, const opyr *P, con
       double r = sqrt(r2);
       double cosr = (w[0] * n[0] + w[1] * n[1] + w[2] * n[2]) / r;
       if (!(cosr > 0.0)) continue;
-      if (!sweep_vis(&G, fr, p)) continue;
-      double g = cosr / r2 / (double)HZ_LIGHT_SAMPLES;
+      double vis = sweep_vis(&G, fr, p);
+      if (!(vis > 0.0)) continue;
+      double g = vis * cosr / r2 / (double)HZ_LIGHT_SAMPLES;
       for (int k = 0; k < 3; k++)
         irr[3 * (size_t)i + (size_t)k] += (float)(L->rgb[k] * g);
     }
@@ -1460,6 +1532,7 @@ int main(int argc, char **argv) {
     return 2;
   }
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
+  int sweepfrac = 1, sweepr01 = 0;
   double lodthr = 1.0;
   const char *occdump = NULL, *polydump = NULL;
   for (int i = 3; i < argc; i++) {
@@ -1478,7 +1551,14 @@ int main(int argc, char **argv) {
     /* Ш5: кадр со светом. `res=` — разрешение, `thr=` — порог среза в пикселях. */
     if (strcmp(argv[i], "lit") == 0) lit = 1;
     /* НЕГАТИВНЫЙ КОНТРОЛЬ §419: вернуть осевое наследование видимости. */
+    /* Ш5а2 включён по умолчанию; ключи возвращают прежние правила. */
+    if (strcmp(argv[i], "sweepbool") == 0) sweepfrac = 0;
+    if (strcmp(argv[i], "sweepr01") == 0) {
+      lit = 1;
+      sweepr01 = 1;
+    }
     if (strcmp(argv[i], "sweepaxis") == 0) {
+      sweepfrac = 0;
       lit = 1;
       sweepaxis = 1;
     }
@@ -2224,7 +2304,49 @@ int main(int argc, char **argv) {
     float *irr2 = malloc(3 * (size_t)S.n * sizeof *irr2);
     if (irr2 == NULL) exit(1);
     double t_sw = 0.0, t_ga = 0.0;
-    front_sweep(&S, &fr, &P, &AL, irr2, &t_sw, &t_ga, sweepaxis);
+    front_sweep(&S, &fr, &P, &AL, irr2, &t_sw, &t_ga, sweepaxis, sweepfrac, sweepr01);
+    /* ДОЛЯ ОТКРЫТОСТИ, А НЕ ОБЛУЧЁННОСТЬ (§423, А781). Приёмка задана на долю,
+     * поэтому нужен знаменатель — облучённость БЕЗ всякого затенения. Считается
+     * третьим проходом, дешёвым (теста заслона в нём нет вовсе). */
+    float *irro = malloc(3 * (size_t)S.n * sizeof *irro);
+    if (irro == NULL) exit(1);
+    front_direct(&S, &fr, &P, &AL, irro, -1.0);
+    {
+      double *dv = malloc((size_t)S.n * sizeof *dv);
+      if (dv == NULL) exit(1);
+      int64_t nv2 = 0;
+      for (int32_t i = 0; i < S.n; i++) {
+        double den = (double)irro[3 * (size_t)i];
+        if (!(den > 0.0)) continue;
+        double a = (double)irr[3 * (size_t)i] / den, b = (double)irr2[3 * (size_t)i] / den;
+        dv[nv2++] = fabs(a - b);
+      }
+      double q90 = 0.0, q99 = 0.0, qmax = 0.0;
+      if (nv2 > 0) {
+        qsort(dv, (size_t)nv2, sizeof *dv, cmp_d);
+        q90 = dv[(nv2 * 9) / 10];
+        q99 = dv[(nv2 * 99) / 100];
+        qmax = dv[nv2 - 1];
+      }
+      {
+        double ma = 0.0, mb = 0.0;
+        int64_t nm = 0;
+        for (int32_t i = 0; i < S.n; i++) {
+          double den = (double)irro[3 * (size_t)i];
+          if (!(den > 0.0)) continue;
+          ma += (double)irr[3 * (size_t)i] / den;
+          mb += (double)irr2[3 * (size_t)i] / den;
+          nm++;
+        }
+        printf("   СРЕДНЯЯ ОТКРЫТОСТЬ: эталон %.4f, свип %.4f (по %lld ячейкам)\n",
+               ma / (double)(nm ? nm : 1), mb / (double)(nm ? nm : 1), (long long)nm);
+      }
+      printf("   ПРИЁМКА Ш5а2 (доля открытости против эталона, популяция — ячейки среза с "
+             "ненулевым знаменателем %lld): p90 %.4f, p99 %.4f, макс %.4f\n",
+             (long long)nv2, q90, q99, qmax);
+      free(dv);
+    }
+    free(irro);
     {
       int64_t ndiff = 0, nlit_r = 0, nlit_s = 0;
       double emax = 0.0;

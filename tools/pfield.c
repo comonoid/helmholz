@@ -1651,7 +1651,7 @@ int main(int argc, char **argv) {
     return 2;
   }
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
-  int sweepfrac = 1, sweepr01 = 0, nocull = 0;
+  int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0;
   double lodthr = 1.0;
   const char *occdump = NULL, *polydump = NULL;
   for (int i = 3; i < argc; i++) {
@@ -1676,6 +1676,12 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "nocull") == 0) {
       lit = 1;
       nocull = 1;
+    }
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ §430: нулевое альбедо ОТСКОКА — косвенное обязано
+     * стать РОВНО нулём, а прямой свет не измениться. */
+    if (strcmp(argv[i], "alb0") == 0) {
+      lit = 1;
+      alb0 = 1;
     }
     if (strcmp(argv[i], "sweepr01") == 0) {
       lit = 1;
@@ -2633,7 +2639,8 @@ int main(int argc, char **argv) {
           double ff = ci * cj * aj / (3.14159265358979323846 * r2);
           for (int k = 0; k < 3; k++)
             ind[3 * (size_t)i + (size_t)k] +=
-                (float)(ej[k] * alb(&m, S.c[j].mat, k) * ff * alb(&m, S.c[i].mat, k));
+                (float)(ej[k] * (alb0 ? 0.0 : alb(&m, S.c[j].mat, k)) * ff *
+                        alb(&m, S.c[i].mat, k));
         }
       }
       tb = now_s() - tb;

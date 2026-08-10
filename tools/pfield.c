@@ -2690,6 +2690,16 @@ int main(int argc, char **argv) {
             npair++;
             ffsum += ci * cj * cs2 * cs2 / (3.14159265358979323846 * r2);
           }
+          {
+            double atot = 0.0;
+            for (int32_t i = 0; i < S.n; i++) {
+              double cs3 = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
+              atot += cs3 * cs3;
+            }
+            printf("   ПЛОЩАДЬ СРЕЗА: %.5f м² против истинной 6.00000 м² у единичной коробки "
+                   "(отношение %.4f)\n",
+                   atot, atot / 6.0);
+          }
           printf("   ДИАГНОЗ ПЕЧИ: у площадки 0 видимых партнёров %lld из %d; СУММА УГЛОВЫХ "
                  "КОЭФФИЦИЕНТОВ %.5f (в замкнутой полости обязана быть 1)\n",
                  (long long)npair, S.n - 1, ffsum);

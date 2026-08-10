@@ -1474,6 +1474,20 @@ int main(int argc, char **argv) {
       "   занятость за %.2f с: занятых ячеек %lld (%.3f %%), пирамида %.1f МБ\n", t_occ,
       (long long)nocc, 100.0 * (double)nocc / (double)((size_t)fr.n * (size_t)fr.n * (size_t)fr.n),
       (double)hz_occ_bytes((size_t)fr.n * (size_t)fr.n * (size_t)fr.n) * (8.0 / 7.0) / 1048576.0);
+  {
+    /* СКОЛЬКО СЕТКИ МОЖНО ПРОПУСТИТЬ: доля ЗАНЯТЫХ ячеек по уровням пирамиды.
+     * Если на грубых уровнях занято единицы процентов, то свип, умеющий
+     * перепрыгивать пустой узел, платит по ПОВЕРХНОСТИ, а не по объёму. */
+    printf("   ПИРАМИДА ЗАНЯТОСТИ по уровням (занято/всего):");
+    for (int l = 1; l <= lev; l++) {
+      int32_t nl = (int32_t)1 << l;
+      int64_t tot = (int64_t)nl * nl * nl, occn = 0;
+      for (int64_t i = 0; i < tot; i++)
+        if (hz_occ_get(P.b[l], (size_t)i)) occn++;
+      printf(" L%d %.2f%%", l, 100.0 * (double)occn / (double)tot);
+    }
+    printf("\n");
+  }
   if (occdump != NULL) {
     int wrc = hz_occ_write(occdump, lev, fr.n, P.b[lev]);
     printf("   ДАМП ЗАНЯТОСТИ -> %s (код %d)\n", occdump, wrc);

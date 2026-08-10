@@ -150,7 +150,12 @@ typedef struct {
   double *tlo, *thi;                     /* габариты треугольников — дешёвый отсев */
   int noflood, invert, skip0, badfinger; /* ключи контролей */
   int64_t nsign, nbox, ncross;           /* цена спуска СЧИТАЕТСЯ, а не оценивается */
-  spath fcell, fbox;                     /* пальцы: поиск ячейки и поиск коробки */
+  /* ДИАГНОЗ Ш1а (§389), ОДНОРАЗОВОЕ по А673: сколько раз `s_cross` вернул
+   * настоящее пересечение и сколько раз ЗАПЛАТУ с осевой нормалью. Знаменатель
+   * доли зафиксирован ДО прогона (А697) — сумма этих двух; отказы (ребро вне
+   * сетки) в него не входят. */
+  int64_t nxreal, nxpatch;
+  spath fcell, fbox; /* пальцы: поиск ячейки и поиск коробки */
 } sfield;
 
 static int32_t s_alloc8(sfield *S, int32_t ni) {
@@ -565,11 +570,13 @@ static int s_cross(void *ctx, const int32_t a[3], int axis, double *t, double nr
       }
     }
   if (best <= 1.0) {
+    S->nxreal++;
     *t = best;
     for (int c = 0; c < 3; c++)
       nrm[c] = bn[c];
     return 0;
   }
+  S->nxpatch++;
   /* ЗАПЛАТА — то же правило, что в сведении плотного пути (§369, А611): знак
    * сменился, а треугольника на ребре нет. Молчать нельзя, потому что
    * построитель требует «пересечение ⟺ смена знака». */
@@ -792,30 +799,53 @@ static int dc_vert_at(const hz_dctree *t, const int32_t cell[3]) {
   }
 }
 
-static void occ_cover(const sfield *S, const hz_dctree *T, int32_t ni, const int32_t lo[3],
-                      int32_t size, int64_t *nocc, int64_t *nlost) {
+/* РАЗБОР ПО КЛАССАМ (§389, Ш1а; ОДНОРАЗОВОЕ по А673). Классы читаются из
+ * МЕХАНИЗМА отказа, а не из предметной разметки сцены, и почему — сказано в
+ * §389 и А695: предметные («стена / предмет / пол») требуют авторской разметки
+ * руками, а на вопрос «адаптер или знак» отвечают именно эти три. Они
+ * исчерпывают потерю по построению: у восьми углов либо все знаки нули, либо все
+ * единицы, либо есть и то и другое. */
+typedef struct {
+  int64_t nocc, nlost;
+  int64_t out_all[2], out_lost[2]; /* [0] — все занятые, [1] — потерянные */
+} covstat;
+
+static void occ_cover(sfield *S, const hz_dctree *T, int32_t ni, const int32_t lo[3], int32_t size,
+                      covstat *st, int64_t cls[2][3]) {
   if (S->nd[ni].child0 >= 0) {
     int32_t half = size / 2;
     for (int i = 0; i < 8; i++) {
       int32_t clo[3];
       for (int a = 0; a < 3; a++)
         clo[a] = lo[a] + (((i >> a) & 1) ? half : 0);
-      occ_cover(S, T, S->nd[ni].child0 + i, clo, half, nocc, nlost);
+      occ_cover(S, T, S->nd[ni].child0 + i, clo, half, st, cls);
     }
     return;
   }
   if (!S->nd[ni].occ) return;
-  (*nocc)++;
-  for (int dz = -1; dz <= 1; dz++)
-    for (int dy = -1; dy <= 1; dy++)
-      for (int dx = -1; dx <= 1; dx++) {
+  st->nocc++;
+  int nin = 0;
+  for (int k = 0; k < 8; k++) {
+    int32_t c[3];
+    for (int a = 0; a < 3; a++)
+      c[a] = lo[a] + ((k >> a) & 1);
+    nin += s_sign(S, c) ? 1 : 0;
+  }
+  int klass = (nin == 0) ? 0 : ((nin == 8) ? 1 : 2); /* 0 снаружи, 1 внутри, 2 смена */
+  cls[0][klass]++;
+  int lost = 1;
+  for (int dz = -1; dz <= 1 && lost; dz++)
+    for (int dy = -1; dy <= 1 && lost; dy++)
+      for (int dx = -1; dx <= 1 && lost; dx++) {
         int32_t c[3] = {lo[0] + dx, lo[1] + dy, lo[2] + dz};
         if (c[0] < 0 || c[1] < 0 || c[2] < 0 || c[0] >= S->fr.n || c[1] >= S->fr.n ||
             c[2] >= S->fr.n)
           continue;
-        if (dc_vert_at(T, c)) return;
+        if (dc_vert_at(T, c)) lost = 0;
       }
-  (*nlost)++;
+  if (!lost) return;
+  st->nlost++;
+  cls[1][klass]++;
 }
 
 /* --- 3b. КАРТИНКА ПОЛЯ (первая; §377) -------------------------------------- */
@@ -1430,11 +1460,37 @@ int main(int argc, char **argv) {
   surf_err(&T, &fr, &m, sparse_tris, &S, "");
   {
     /* ПОКРЫТИЕ — величина, чья популяция ВХОД, а не выход (§380). */
-    int64_t nocc2 = 0, nlost = 0;
-    occ_cover(&S, &T, 0, zero, fr.n, &nocc2, &nlost);
+    covstat st;
+    memset(&st, 0, sizeof st);
+    int64_t cls[2][3] = {{0, 0, 0}, {0, 0, 0}};
+    /* А698: разбор зовёт `s_sign`, а тот ведёт счётчик цены спуска. Счётчики
+     * сохраняются и восстанавливаются, иначе строка «ВЫЗОВОВ ИСТОЧНИКА» станет
+     * неверной молча. */
+    int64_t sv_sign = S.nsign, sv_box = S.nbox, sv_cross = S.ncross;
+    occ_cover(&S, &T, 0, zero, fr.n, &st, cls);
+    S.nsign = sv_sign;
+    S.nbox = sv_box;
+    S.ncross = sv_cross;
     printf("   ПОТЕРЯНО ПОЛЕМ: занятых ячеек %lld, без вершины в себе и 26 соседях %lld "
            "(%.1f %%)\n",
-           (long long)nocc2, (long long)nlost, 100.0 * (double)nlost / (double)(nocc2 ? nocc2 : 1));
+           (long long)st.nocc, (long long)st.nlost,
+           100.0 * (double)st.nlost / (double)(st.nocc ? st.nocc : 1));
+    {
+      double dl = (double)(st.nlost ? st.nlost : 1), da = (double)(st.nocc ? st.nocc : 1);
+      printf("   КЛАССЫ (§389): ПОТЕРЯННЫЕ  все 8 углов СНАРУЖИ %lld (%.1f %%), все 8 ВНУТРИ %lld "
+             "(%.1f %%), СМЕНА ЗНАКА %lld (%.1f %%)\n",
+             (long long)cls[1][0], 100.0 * (double)cls[1][0] / dl, (long long)cls[1][1],
+             100.0 * (double)cls[1][1] / dl, (long long)cls[1][2], 100.0 * (double)cls[1][2] / dl);
+      printf("   КЛАССЫ (§389): ВСЕ ЗАНЯТЫЕ  все 8 углов СНАРУЖИ %lld (%.1f %%), все 8 ВНУТРИ %lld "
+             "(%.1f %%), СМЕНА ЗНАКА %lld (%.1f %%)\n",
+             (long long)cls[0][0], 100.0 * (double)cls[0][0] / da, (long long)cls[0][1],
+             100.0 * (double)cls[0][1] / da, (long long)cls[0][2], 100.0 * (double)cls[0][2] / da);
+      printf("   ЗАПЛАТА (§389, знаменатель по А697): настоящих пересечений %lld, ЗАПЛАТ %lld "
+             "(%.2f %%)\n",
+             (long long)S.nxreal, (long long)S.nxpatch,
+             100.0 * (double)S.nxpatch /
+                 (double)((S.nxreal + S.nxpatch) ? (S.nxreal + S.nxpatch) : 1));
+    }
   }
 
   /* ---- КАРТИНКА ПОЛЯ: обход -> полигоны -> z-буфер -> img/ ---- */

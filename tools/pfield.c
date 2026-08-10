@@ -2097,7 +2097,16 @@ int main(int argc, char **argv) {
       if (E0.v == NULL || E0.head == NULL) exit(1);
       for (int64_t i = 0; i < (int64_t)E0.gn * E0.gn * E0.gn; i++)
         E0.head[i] = -1;
-      if (hz_dc_walk(&T, NULL, NULL, emesh_emit, &E0) != HZ_DC_OK) exit(1);
+      /* HZ_DC_EMULTI (код 4) НЕ ФАТАЛЕН: обход так помечает ячейки, где вершины
+       * нет, и продолжает — «дыра честнее пустого экрана» (dc.c, §377). Считать
+       * его отказом значило бы падать на любой сцене, где такие ячейки есть; на
+       * зале их 0, на замкнутой коробке — нет, и стенд падал молча. Код
+       * печатается, а не глотается. */
+      {
+        int wrc0 = hz_dc_walk(&T, NULL, NULL, emesh_emit, &E0);
+        if (wrc0 != HZ_DC_OK && wrc0 != HZ_DC_EMULTI) exit(1);
+        if (wrc0 == HZ_DC_EMULTI) printf("   (обход эталона: код 4, часть ячеек без вершины)\n");
+      }
       int64_t nc0 = 0, nf0 = emesh_flips(&E0, &CT, &fr, &m, &nc0);
       printf("   ЭТАЛОН ПОЛНОЙ ГЛУБИНЫ: треугольников %lld, ОБРАЩЁННЫХ %lld из %lld (%.3f %%) — "
              "это доля МОДЕЛИ, перепада уровней здесь нет\n",
@@ -2150,7 +2159,10 @@ int main(int argc, char **argv) {
       if (EM.v == NULL || EM.head == NULL) exit(1);
       for (int64_t i = 0; i < (int64_t)EM.gn * EM.gn * EM.gn; i++)
         EM.head[i] = -1;
-      if (hz_dc_walk(&T, lod_stop, &L, emesh_emit, &EM) != HZ_DC_OK) exit(1);
+      {
+        int wrcm = hz_dc_walk(&T, lod_stop, &L, emesh_emit, &EM);
+        if (wrcm != HZ_DC_OK && wrcm != HZ_DC_EMULTI) exit(1);
+      }
 
       /* ОШИБКА: от ИСТИННОЙ поверхности до ВЫДАННОЙ. ПОПУЛЯЦИЯ — ВХОД (занятые
        * ячейки эталона Ш0). Точка на истинной поверхности — центр тяжести куска
@@ -2636,7 +2648,8 @@ int main(int argc, char **argv) {
             if (!(ci > 0.0) || !(cj > 0.0)) continue;
             double ff = ci * cj * aj / (3.14159265358979323846 * r2);
             for (int k = 0; k < 3; k++)
-              Bn[3 * (size_t)i + (size_t)k] += (float)(rho * (double)B[3 * (size_t)j + (size_t)k] * ff);
+              Bn[3 * (size_t)i + (size_t)k] +=
+                  (float)(rho * (double)B[3 * (size_t)j + (size_t)k] * ff);
           }
         }
         double sum = 0.0;

@@ -26,6 +26,7 @@
  * ГЕОМЕТРИЮ поля и только её.
  */
 #include "cut/dc.h"
+#include "cut/dcslice.h"
 #include "image.h"
 #include "occmap.h"
 #include "pclip.h"
@@ -369,8 +370,13 @@ typedef struct {
 } vrec;
 
 static void collect_verts(const hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size,
-                          vrec *out, int64_t cap, int64_t *n) {
-  if (t->nd[ni].flags & HZ_DC_HASVERT) {
+                          vrec *out, int64_t cap, int64_t *n, int leaves) {
+  /* `leaves` РАЗДЕЛЯЕТ ДВЕ РАЗНЫЕ ВЕЛИЧИНЫ, которые до сих пор считались одной и
+   * той же (найдено замером среза, §399): вершина есть У КАЖДОГО узла дерева,
+   * включая внутренние, а поверхность при полной глубине строится по ЛИСТЬЯМ.
+   * «Вершин выдано» без этого различения завышает счёт на все внутренние узлы —
+   * при `L = 6` это `13 554` против `10 624`, то есть `27 %`. */
+  if ((t->nd[ni].flags & HZ_DC_HASVERT) && (!leaves || t->nd[ni].child0 < 0)) {
     /* ЁМКОСТЬ ПЕРЕДАЁТСЯ ЯВНО, а не подразумевается из первого прохода. Проход
      * первый считает, второй пишет, и связь между ними держалась ТОЛЬКО тем, что
      * дерево между вызовами не менялось. Здесь она стала проверяемой: анализатор
@@ -392,14 +398,14 @@ static void collect_verts(const hz_dctree *t, int32_t ni, const int32_t lo[3], i
     int32_t clo[3];
     for (int a = 0; a < 3; a++)
       clo[a] = lo[a] + (((i >> a) & 1) ? half : 0);
-    collect_verts(t, t->nd[ni].child0 + i, clo, half, out, cap, n);
+    collect_verts(t, t->nd[ni].child0 + i, clo, half, out, cap, n, leaves);
   }
 }
 
 static void surf_err(const hz_dctree *T, const frame *fr, const hz_objmesh *m, trilist_fn tl,
                      void *tctx, const char *tag) {
   int64_t nv = 0;
-  collect_verts(T, 0, (int32_t[3]){0, 0, 0}, fr->n, NULL, 0, &nv);
+  collect_verts(T, 0, (int32_t[3]){0, 0, 0}, fr->n, NULL, 0, &nv, 0);
   if (nv == 0) return;
   double *er = malloc((size_t)nv * sizeof *er);
   vrec *vr = malloc((size_t)nv * sizeof *vr);
@@ -409,7 +415,7 @@ static void surf_err(const hz_dctree *T, const frame *fr, const hz_objmesh *m, t
     return;
   }
   int64_t k = 0;
-  collect_verts(T, 0, (int32_t[3]){0, 0, 0}, fr->n, vr, nv, &k);
+  collect_verts(T, 0, (int32_t[3]){0, 0, 0}, fr->n, vr, nv, &k, 0);
   if (k != nv)
     printf("   %s ДВА ПРОХОДА РАЗОШЛИСЬ: %lld против %lld\n", tag, (long long)k, (long long)nv);
   int64_t ne = 0;
@@ -457,7 +463,7 @@ static void surf_err(const hz_dctree *T, const frame *fr, const hz_objmesh *m, t
   }
   if (ne > 0) {
     qsort(er, (size_t)ne, sizeof *er, cmp_d);
-    printf("   %s ОШИБКА ПОВЕРХНОСТИ (ОДНОСТОРОННЯЯ, А598): p50 %.4f p90 %.4f max %.4f м, по "
+    printf("   %s ОШИБКА ПОВЕРХНОСТИ (ОДНОСТОРОННЯЯ, А598): p50 %.6f p90 %.6f max %.6f м, по "
            "%lld вершинам\n",
            tag, er[ne / 2], er[(ne * 9) / 10], er[ne - 1], (long long)ne);
   }
@@ -678,13 +684,15 @@ int main(int argc, char **argv) {
     fprintf(stderr, "pfield ФАЙЛ.obj МАСШТАБ [lev=N] [nonrm] [occdump=ПУТЬ] [polydump=ПУТЬ]\n");
     return 2;
   }
-  int lev = 6, nonrm = 0;
+  int lev = 6, nonrm = 0, vq1 = 0;
   const char *occdump = NULL, *polydump = NULL;
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "lev=", 4) == 0) lev = (int)strtol(argv[i] + 4, NULL, 10);
     /* НЕГАТИВНЫЙ КОНТРОЛЬ (§393): все нормали рёбер осевые. Вершины обязаны
      * остаться (ребро пересечено — вершина есть), а качество обязано упасть. */
     if (strcmp(argv[i], "nonrm") == 0) nonrm = 1;
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ §397: вершина среза в один бит на ось. */
+    if (strcmp(argv[i], "vq1") == 0) vq1 = 1;
     /* Выгрузка занятости для сверки с эталоном Ш0 (`tools/poccref.c`). */
     if (strncmp(argv[i], "occdump=", 8) == 0) occdump = argv[i] + 8;
     /* ЭТАЛОН РЕГРЕССА ДЛЯ Ш2 (А666): выданные многоугольники снимаются здесь. */
@@ -766,9 +774,13 @@ int main(int argc, char **argv) {
          t_shape, T.n, t_masks, T.nbigmask, t_dc, rc, T.nclamped);
   int64_t nv = 0;
   int32_t zero[3] = {0, 0, 0};
-  collect_verts(&T, 0, zero, fr.n, NULL, 0, &nv);
-  printf("   ВЕРШИН ВЫДАНО %lld; рёбер/вершину %.3f\n", (long long)nv,
-         (double)ht.n / (double)(nv ? nv : 1));
+  int64_t nvl = 0;
+  collect_verts(&T, 0, zero, fr.n, NULL, 0, &nv, 0);
+  collect_verts(&T, 0, zero, fr.n, NULL, 0, &nvl, 1);
+  printf("   ВЕРШИН: У ВСЕХ УЗЛОВ %lld (рёбер/вершину %.3f), У ЛИСТЬЕВ %lld "
+         "(рёбер/вершину %.3f)\n",
+         (long long)nv, (double)ht.n / (double)(nv ? nv : 1), (long long)nvl,
+         (double)ht.n / (double)(nvl ? nvl : 1));
   printf("   ПАМЯТЬ: дерево DC %.1f МБ (%zu Б/узел), рёбра %.1f МБ, пирамида %.1f МБ\n",
          (double)T.n * (double)sizeof(hz_dcnode) / 1048576.0, sizeof(hz_dcnode),
          (double)ht.n * (double)sizeof(hz_hedge) / 1048576.0,
@@ -834,6 +846,118 @@ int main(int argc, char **argv) {
     }
   }
 
+  /* ---- 4б. СРЕЗ (Ш2): построение, замер обхода, сверка вершин ---- */
+  {
+    hz_dcslice S;
+    if (hz_slice_init(&S, lev) != HZ_DC_OK) exit(1);
+    if (vq1) S.vbits = 1; /* НЕГАТИВНЫЙ КОНТРОЛЬ §397: вершина в один бит на ось */
+    t0 = now_s();
+    int src = hz_slice_build(&S, &T, &ht, NULL, NULL);
+    double t_slice = now_s() - t0;
+    printf("   СРЕЗ за %.2f с: код %d, ячеек %d, %zu Б/ячейка, %.1f МБ%s\n", t_slice, src, S.n,
+           sizeof(hz_dccell), (double)S.n * (double)sizeof(hz_dccell) / 1048576.0,
+           vq1 ? "  [ВЕРШИНА В 1 БИТ]" : "");
+
+    /* ЗАМЕР ГОРЯЧЕГО ПУТИ. Обход читает ровно то, что будет читать фронт:
+     * вершину и нормаль каждой ячейки. Результат СУММИРУЕТСЯ и печатается —
+     * иначе компилятор вправе выбросить цикл целиком, и замер померяет пустоту.
+     * Проходов несколько: первый греет кэш, и мешать холодный с установившимся
+     * нельзя (правило раздельного доклада). */
+    /* ЦЕНА РАЗЛАГАЕТСЯ НА ТРИ, иначе «нс на ячейку» не скажет, ЧТО именно
+     * дорого. Вариант 0 — чистый ПОТОК (сложение самих байт, ничего не
+     * декодируется): это пол, задаваемый памятью. Вариант 1 добавляет
+     * распаковку ВЕРШИНЫ, а с ней разбор мортонова кода (цикл по уровням).
+     * Вариант 2 добавляет распаковку НОРМАЛИ (октаэдр, корень). Разность
+     * соседних вариантов и есть цена каждой части. */
+    double acc[3] = {0.0, 0.0, 0.0}, t_first[3] = {0, 0, 0}, t_best[3] = {1e300, 1e300, 1e300};
+    for (int mode = 0; mode < 3; mode++)
+      for (int pass = 0; pass < 5; pass++) {
+        double ta = now_s();
+        double a = 0.0;
+        for (int32_t i = 0; i < S.n; i++) {
+          if (mode == 0) {
+            a += (double)S.c[i].vx[0] + (double)S.c[i].vx[1] + (double)S.c[i].vx[2] +
+                 (double)S.c[i].noct + (double)S.c[i].lo[0] + (double)S.c[i].lo[1] +
+                 (double)S.c[i].lo[2] + (double)S.c[i].lvl;
+            continue;
+          }
+          double v[3];
+          hz_slice_vertex(&S, i, v);
+          if (mode == 1) {
+            a += v[0] + v[1] + v[2] + (double)S.c[i].noct;
+            continue;
+          }
+          double nn[3];
+          hz_slice_normal(&S, i, nn);
+          a += v[0] * nn[0] + v[1] * nn[1] + v[2] * nn[2];
+        }
+        double dt = now_s() - ta;
+        if (pass == 0) t_first[mode] = dt;
+        if (dt < t_best[mode]) t_best[mode] = dt;
+        acc[mode] = a;
+      }
+    double per = 1e9 / (double)(S.n ? S.n : 1);
+    printf("   ОБХОД СРЕЗА (установившийся, нс/ячейка): ПОТОК %.2f; +ВЕРШИНА %.2f; "
+           "+НОРМАЛЬ %.2f. ХОЛОДНЫЙ полный %.2f мс (%.2f нс/ячейка)\n",
+           t_best[0] * per, t_best[1] * per, t_best[2] * per, t_first[2] * 1e3, t_first[2] * per);
+    printf("   контрольные суммы %.6e %.6e %.6e\n", acc[0], acc[1], acc[2]);
+
+    /* СВЕРКА С ДЕРЕВОМ: срез обязан нести ТЕ ЖЕ вершины с точностью кванта.
+     * Популяция — ячейки СРЕЗА (их столько же, сколько вершин у дерева), и это
+     * сказано прямо: сверка ловит потерю точности, а не потерю ячеек. */
+    {
+      int64_t nvt = 0;
+      collect_verts(&T, 0, zero, fr.n, NULL, 0, &nvt, 1);
+      double dmax = 0.0;
+      vrec *vt = malloc((size_t)(nvt > 0 ? nvt : 1) * sizeof *vt);
+      if (vt == NULL) exit(1);
+      int64_t kk = 0;
+      collect_verts(&T, 0, zero, fr.n, vt, nvt, &kk, 1);
+      /* Обход дерева в collect_verts идёт тем же порядком детей 0..7, что и
+       * сборка среза, поэтому сопоставление ПОРЯДКОВОЕ и второго индекса не
+       * заводит. Если порядки разойдутся, расхождение будет огромным, а не
+       * тонким, — то есть проверка не слепа к собственной ошибке. */
+      int64_t nn = (int64_t)S.n < kk ? (int64_t)S.n : kk;
+      for (int64_t i = 0; i < nn; i++) {
+        double v[3];
+        hz_slice_vertex(&S, (int32_t)i, v);
+        for (int a = 0; a < 3; a++) {
+          double d = fabs(v[a] - vt[i].vx[a]) * fr.h;
+          if (d > dmax) dmax = d;
+        }
+      }
+      free(vt);
+      double quant = fr.h / (double)((1u << S.vbits) - 1u);
+      /* ОШИБКА НОРМАЛИ меряется НА КОДЕКЕ, а не на ячейке: берутся нормали
+       * таблицы рёбер, кодируются и раскодируются, считается угол. Так и
+       * говорится в докладе — это ошибка ОКТАЭДРИЧЕСКОГО КОДА, и она НЕ
+       * покрывает ошибки суммирования нормалей по ячейке. */
+      double a90 = 0.0, amax = 0.0;
+      {
+        double *ang = malloc((size_t)(ht.n > 0 ? ht.n : 1) * sizeof *ang);
+        if (ang == NULL) exit(1);
+        for (int32_t i = 0; i < ht.n; i++) {
+          double d[3];
+          hz_oct_decode(hz_oct_encode(ht.e[i].nrm), d);
+          double c = d[0] * ht.e[i].nrm[0] + d[1] * ht.e[i].nrm[1] + d[2] * ht.e[i].nrm[2];
+          if (c > 1.0) c = 1.0;
+          if (c < -1.0) c = -1.0;
+          ang[i] = acos(c) * 180.0 / 3.14159265358979323846;
+        }
+        qsort(ang, (size_t)ht.n, sizeof *ang, cmp_d);
+        if (ht.n > 0) {
+          a90 = ang[(ht.n * 9) / 10];
+          amax = ang[ht.n - 1];
+        }
+        free(ang);
+      }
+      printf("   СВЕРКА СРЕЗА С ДЕРЕВОМ: ячеек среза %d, вершин дерева %lld; МАКС СМЕЩЕНИЕ "
+             "%.3e м при кванте %.3e м (отношение %.3f); УГОЛ КОДА НОРМАЛИ p90 %.3f, макс "
+             "%.3f град\n",
+             S.n, (long long)nvt, dmax, quant, dmax / quant, a90, amax);
+    }
+    hz_slice_free(&S);
+  }
   ct_free(&CT);
   hz_dc_free(&T);
   hz_htab_free(&ht);

@@ -158,6 +158,17 @@ typedef struct {
 int hz_dc_init(hz_dctree *t, int log2size);
 void hz_dc_free(hz_dctree *t);
 
+/* ПРОИЗВОДНЫЕ ВЕЛИЧИНЫ УЗЛА — ТОЛЬКО ЧЕРЕЗ ФУНКЦИИ (А722). Вершина, невязка и
+ * форма суть ПРОИЗВОДНОЕ (А661): они пересчитываются из долговечного и по замыслу
+ * не должны храниться в узле вовсе. Сегодня это ещё поля; когда они уедут в
+ * побочные массивы или на стек сборки, потребители не заметят — при условии, что
+ * читают их отсюда, а не полем напрямую. */
+static inline const double *hz_dc_vx(const hz_dctree *t, int32_t ni) { return t->nd[ni].vx; }
+static inline double hz_dc_err(const hz_dctree *t, int32_t ni) { return t->nd[ni].err; }
+static inline int hz_dc_hasvert(const hz_dctree *t, int32_t ni) {
+  return (t->nd[ni].flags & HZ_DC_HASVERT) != 0;
+}
+
 /* Построение: спуск, пока в коробке есть смена знака; в листе размера 1 — маска
  * углов и QEF из его 12 рёбер; на подъёме форма родителя = сумма СДВИНУТЫХ форм
  * детей, и вершина решается для КАЖДОГО узла. Это и есть предвычисленная

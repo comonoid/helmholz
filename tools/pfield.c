@@ -2662,6 +2662,50 @@ int main(int argc, char **argv) {
          * полости вторая обязана быть `1`; отклонение и есть мера того,
          * насколько гатер теряет энергию. */
         if (it == 1) {
+          /* СУММА ПО ВСЕМ ПЛОЩАДКАМ, А НЕ ПО ОДНОЙ (А790). Площадка `0` —
+           * угловая, и она видит меньше типичной; одно число с неё мерой
+           * потери гатера не является. Здесь считается РАСПРЕДЕЛЕНИЕ. */
+          {
+            double *fs = malloc((size_t)S.n * sizeof *fs);
+            if (fs == NULL) exit(1);
+            for (int32_t jj = 0; jj < S.n; jj++) {
+              double pa[3], na[3];
+              hz_slice_vertex(&S, jj, pa);
+              for (int k = 0; k < 3; k++)
+                pa[k] = fr.org[k] + pa[k] * fr.h;
+              hz_slice_normal(&S, jj, na);
+              double acc2 = 0.0;
+              for (int32_t ii = 0; ii < S.n; ii++) {
+                if (ii == jj) continue;
+                double pb[3], nb[3], ww[3], rr2 = 0.0;
+                hz_slice_vertex(&S, ii, pb);
+                for (int k = 0; k < 3; k++)
+                  pb[k] = fr.org[k] + pb[k] * fr.h;
+                hz_slice_normal(&S, ii, nb);
+                for (int k = 0; k < 3; k++) {
+                  ww[k] = pb[k] - pa[k];
+                  rr2 += ww[k] * ww[k];
+                }
+                if (!(rr2 > 0.0)) continue;
+                double rr = sqrt(rr2);
+                double caa = (ww[0] * na[0] + ww[1] * na[1] + ww[2] * na[2]) / rr;
+                double cbb = -(ww[0] * nb[0] + ww[1] * nb[1] + ww[2] * nb[2]) / rr;
+                if (!(caa > 0.0) || !(cbb > 0.0)) continue;
+                double csb = fr.h * (double)((int32_t)1 << (lev - (int)S.c[ii].lvl));
+                acc2 += caa * cbb * csb * csb / (3.14159265358979323846 * rr2);
+              }
+              fs[jj] = acc2;
+            }
+            qsort(fs, (size_t)S.n, sizeof *fs, cmp_d);
+            double mean = 0.0;
+            for (int32_t jj = 0; jj < S.n; jj++)
+              mean += fs[jj];
+            mean /= (double)(S.n ? S.n : 1);
+            printf("   СУММА УГЛОВЫХ КОЭФФИЦИЕНТОВ ПО ВСЕМ %d ПЛОЩАДКАМ: среднее %.4f, p10 %.4f, "
+                   "p50 %.4f, p90 %.4f (обязана быть 1)\n",
+                   S.n, mean, fs[S.n / 10], fs[S.n / 2], fs[(S.n * 9) / 10]);
+            free(fs);
+          }
           int64_t npair = 0;
           double ffsum = 0.0;
           int32_t j0 = 0;

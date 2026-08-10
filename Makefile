@@ -326,6 +326,7 @@ check:
 	  src/pcull.c tests/cbmc_pcull.c \
 	  tests/test_polygon.c tests/test_oven.c tests/test_bounce.c tests/cbmc_sceneobj.c \
 	  tools/lod3.c tools/pfmdiff.c tools/render3.c tools/segstat.c
+	CCHECK_EXTRA=-I$(CURDIR)/tools scripts/ccheck.sh tools/poccref.c tests/cbmc_occmap.c
 
 # Г31: СТРАЖ КОНФИГУРАЦИИ СБОРКИ, А НЕ ЧИСЕЛ. Побитовое совпадение выходов ядра
 # контракцию НЕ ловит — измерено: с 18 fma-инструкциями внутри test_poly3
@@ -388,4 +389,10 @@ build/pflow: tools/pflow.c $(PFULL) | build
 
 # pfield — источник эрмитова поля из меша (§365). Общий слой `cut/` плюс отсечение.
 build/pfield: tools/pfield.c src/scene_obj.c src/pclip.c src/cut/dc.c src/cut/qef.c src/cut/poly3.c src/cut/surf.c src/image.c src/transport/cam3.c src/transport/ray3.c src/octree.c | build
-	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pfield.c src/scene_obj.c src/pclip.c src/cut/dc.c src/cut/qef.c src/cut/poly3.c src/cut/surf.c src/image.c src/transport/cam3.c src/transport/ray3.c src/octree.c -lm'
+	$(RUN) 'gcc $(CFLAGS) -I tools -o $@ tools/pfield.c src/scene_obj.c src/pclip.c src/cut/dc.c src/cut/qef.c src/cut/poly3.c src/cut/surf.c src/image.c src/transport/cam3.c src/transport/ray3.c src/octree.c -lm'
+
+# poccref — ЭТАЛОН ЗАНЯТОСТИ (§385, шаг Ш0). Ни деревьев, ни ускорителей:
+# только меш и отсечение. Он обязан пережить удаление адаптера в Ш1б, поэтому и
+# стоит отдельным инструментом, а не ключом `pfield`.
+build/poccref: tools/poccref.c tools/occmap.h src/scene_obj.c src/pclip.c | build
+	$(RUN) 'gcc $(CFLAGS) -I tools -o $@ tools/poccref.c src/scene_obj.c src/pclip.c -lm'

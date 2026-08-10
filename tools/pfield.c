@@ -30,6 +30,11 @@
  */
 #include "cut/dc.h"
 #include "image.h"
+/* occmap.h — ОДНОРАЗОВОЕ (А673, §385). Ключ `occdump` выгружает множество
+ * занятых ячеек ЭТОГО дерева, чтобы эталон `tools/poccref.c` мог с ним
+ * сверился ДО того, как Ш1б снесёт и адаптер, и дерево занятости. Уходит
+ * вместе с ними; сохранять «на всякий случай» не надо. */
+#include "occmap.h"
 #include "pclip.h"
 #include "scene_cfg.h"
 #include "scene_obj.h"
@@ -366,6 +371,31 @@ static void s_volume(const sfield *S, int32_t ni, int32_t size, int64_t v[3]) {
     v[0] += c;
   else
     v[1] += c;
+}
+
+/* ВЫГРУЗКА ЗАНЯТОСТИ ЭТОГО ДЕРЕВА (§385, Ш0; ОДНОРАЗОВОЕ по А673). Занятым может
+ * быть только лист размера 1 — `occ` ставится в `s_build` ровно там и больше
+ * нигде. Проверять это надо, а не полагаться: лист крупнее ячейки с `occ = 1`
+ * означал бы, что дамп молча теряет целый блок, и сверка показала бы расхождение
+ * ПУТЕЙ там, где расхождение в ВЫГРУЗКЕ. Поэтому такие листья считаются. */
+static void s_dump_occ(const sfield *S, int32_t ni, const int32_t lo[3], int32_t size,
+                       unsigned char *bit, int64_t *nbig) {
+  if (S->nd[ni].child0 >= 0) {
+    int32_t half = size / 2;
+    for (int i = 0; i < 8; i++) {
+      int32_t clo[3];
+      for (int a = 0; a < 3; a++)
+        clo[a] = lo[a] + (((i >> a) & 1) ? half : 0);
+      s_dump_occ(S, S->nd[ni].child0 + i, clo, half, bit, nbig);
+    }
+    return;
+  }
+  if (!S->nd[ni].occ) return;
+  if (size != 1) {
+    (*nbig)++;
+    return;
+  }
+  hz_occ_set(bit, hz_occ_index(S->fr.n, lo[0], lo[1], lo[2]));
 }
 
 static int s_flood(sfield *S) {
@@ -888,13 +918,16 @@ static int rast_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int n
 
 int main(int argc, char **argv) {
   if (argc < 3) {
-    fprintf(stderr,
-            "pfield ФАЙЛ.obj МАСШТАБ [lev=N] [both] [noflood] [invert] [skip0] [badfinger]\n");
+    fprintf(stderr, "pfield ФАЙЛ.obj МАСШТАБ [lev=N] [both] [noflood] [invert] [skip0] [badfinger] "
+                    "[occdump=ПУТЬ]\n");
     return 2;
   }
   int lev = 6, noflood = 0, invert = 0, skip0 = 0, both = 0, badfinger = 0;
+  const char *occdump = NULL;
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "lev=", 4) == 0) lev = (int)strtol(argv[i] + 4, NULL, 10);
+    /* ОДНОРАЗОВОЕ (А673): выгрузка занятости для сверки с эталоном Ш0. */
+    if (strncmp(argv[i], "occdump=", 8) == 0) occdump = argv[i] + 8;
     /* ПЛОТНЫЙ ЭТАЛОН РЯДОМ (Г42): оба пути в одном прогоне, сверка побитовая. */
     if (strcmp(argv[i], "both") == 0) both = 1;
     /* НЕГАТИВНЫЙ КОНТРОЛЬ (§365): знак не строится вовсе — вершин обязано выйти 0. */
@@ -1308,6 +1341,19 @@ int main(int argc, char **argv) {
   printf("   дерево занятости за %.2f с: узлов %d, листьев %lld, ЗАНЯТЫХ мелких %lld, "
          "вхождений %d\n",
          t_tree, S.n, (long long)nleaf, (long long)nocc, S.ntri);
+
+  if (occdump != NULL) {
+    size_t ncell = (size_t)fr.n * (size_t)fr.n * (size_t)fr.n;
+    unsigned char *bit = calloc(hz_occ_bytes(ncell), 1);
+    if (bit == NULL) exit(1);
+    int64_t nbig = 0;
+    s_dump_occ(&S, 0, zero, fr.n, bit, &nbig);
+    int wrc = hz_occ_write(occdump, lev, fr.n, bit);
+    printf(
+        "   ДАМП ЗАНЯТОСТИ -> %s (код %d); занятых листьев КРУПНЕЕ ячейки %lld (обязан быть 0)\n",
+        occdump, wrc, (long long)nbig);
+    free(bit);
+  }
 
   t0 = now_s();
   if (s_flood(&S) != 0) {

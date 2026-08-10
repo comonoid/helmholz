@@ -980,6 +980,67 @@ static int64_t emesh_flips(const emesh *E, celltris *CT, const frame *fr, const 
   if (ncmp != NULL) *ncmp = nc;
   return nf;
 }
+
+/* --- 3д. РАЗРУШЕНИЕ (Ш4, Р8) ----------------------------------------------- */
+
+/* УДАЛЕНИЕ ПОВЕРХНОСТИ СФЕРОЙ. По Р8 это одна из двух определённых операций:
+ * стираются эрмитовы образцы рёбер, ЦЕЛИКОМ лежащих внутри сферы. «Внутри»
+ * принадлежит ПРИМИТИВУ — у него знак свой и аналитический, поле в этом не
+ * участвует, и потому отсутствие знака у поля здесь ничему не мешает.
+ *
+ * КРАЙ ДЫРЫ ВЫЙДЕТ СТУПЕНЧАТЫМ, и это сознательно (А743): ребро либо целиком
+ * внутри, либо нет. Доля рёбер, накрытых ЧАСТИЧНО, считается и печатается —
+ * если она велика, гладкий край становится обязательным.
+ *
+ * Стирание — пометкой в поле in_lo, а не удалением из массива: таблица
+ * отсортирована по ключу, и вырезание записи сдвинуло бы всё за ней, то есть
+ * стоило бы O(таблицы) вместо O(затронутых). Поиск `hz_htab_find` при этом
+ * обязан отдавать помеченные как «нет ребра» — это делает вызывающий. */
+typedef struct {
+  int64_t nedge, npart, ncell;
+  int32_t lo[3], hi[3]; /* коробка затронутых ЯЧЕЕК */
+} hitstat;
+
+static int hit_sphere(hz_htab *ht, const frame *fr, const double c[3], double rad, hitstat *S) {
+  memset(S, 0, sizeof *S);
+  for (int a = 0; a < 3; a++) {
+    S->lo[a] = fr->n;
+    S->hi[a] = -1;
+  }
+  for (int32_t i = 0; i < ht->n; i++) {
+    hz_hedge *e = &ht->e[i];
+    if (e->in_lo == HZ_HEDGE_ERASED) continue; /* уже стёрто */
+    /* Оба конца ребра в мировых координатах. */
+    double p0[3], p1[3];
+    for (int k = 0; k < 3; k++) {
+      p0[k] = fr->org[k] + (double)e->p[k] * fr->h;
+      p1[k] = p0[k];
+    }
+    p1[e->axis] += fr->h;
+    double d0 = 0.0, d1 = 0.0;
+    for (int k = 0; k < 3; k++) {
+      double a0 = p0[k] - c[k], a1 = p1[k] - c[k];
+      d0 += a0 * a0;
+      d1 += a1 * a1;
+    }
+    int in0 = d0 <= rad * rad, in1 = d1 <= rad * rad;
+    if (!in0 && !in1) continue;
+    if (in0 != in1) {
+      S->npart++;
+      continue; /* частично накрытое ребро НЕ трогаем — А743 */
+    }
+    e->in_lo = HZ_HEDGE_ERASED;
+    S->nedge++;
+    for (int a = 0; a < 3; a++) {
+      int32_t l = e->p[a] - 1, h = e->p[a];
+      if (l < 0) l = 0;
+      if (h >= fr->n) h = fr->n - 1;
+      if (l < S->lo[a]) S->lo[a] = l;
+      if (h > S->hi[a]) S->hi[a] = h;
+    }
+  }
+  return 0;
+}
 /* --- 4. главная ------------------------------------------------------------ */
 
 int main(int argc, char **argv) {
@@ -987,7 +1048,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "pfield ФАЙЛ.obj МАСШТАБ [lev=N] [nonrm] [occdump=ПУТЬ] [polydump=ПУТЬ]\n");
     return 2;
   }
-  int lev = 6, nonrm = 0, vq1 = 0;
+  int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0;
   const char *occdump = NULL, *polydump = NULL;
   for (int i = 3; i < argc; i++) {
     if (strncmp(argv[i], "lev=", 4) == 0) lev = (int)strtol(argv[i] + 4, NULL, 10);
@@ -996,6 +1057,12 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "nonrm") == 0) nonrm = 1;
     /* НЕГАТИВНЫЙ КОНТРОЛЬ §397: вершина среза в один бит на ось. */
     if (strcmp(argv[i], "vq1") == 0) vq1 = 1;
+    /* Ш4: удар сферой, два случая врозь (А669). */
+    if (strcmp(argv[i], "hit") == 0) hit = 1;
+    if (strcmp(argv[i], "nofix") == 0) {
+      hit = 1;
+      nofix = 1;
+    }
     /* Выгрузка занятости для сверки с эталоном Ш0 (`tools/poccref.c`). */
     if (strncmp(argv[i], "occdump=", 8) == 0) occdump = argv[i] + 8;
     /* ЭТАЛОН РЕГРЕССА ДЛЯ Ш2 (А666): выданные многоугольники снимаются здесь. */
@@ -1502,6 +1569,148 @@ int main(int argc, char **argv) {
       hz_slice_free(&B);
     }
     hz_slice_free(&A);
+  }
+
+  /* ---- 4г. РАЗРУШЕНИЕ (Ш4, Р8) ---- */
+  if (hit) {
+    /* Порог среза ЗАФИКСИРОВАН до прогона (А745): 1 пиксель, тот же, на котором
+     * сняты числа §405. Менять его в этом шаге нельзя. */
+    lodctx LH;
+    memset(&LH, 0, sizeof LH);
+    double eyec[3] = HZ_CFG_HALL_EYE, atc[3] = HZ_CFG_HALL_AT;
+    for (int a = 0; a < 3; a++)
+      LH.eye[a] = (eyec[a] - fr.org[a]) / fr.h;
+    LH.pxrad = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / 512.0;
+    LH.thr = 1.0;
+
+    hz_dcslice S0;
+    if (hz_slice_init(&S0, lev) != HZ_DC_OK) exit(1);
+    if (hz_slice_build(&S0, &T, &ht, lod_stop, &LH) != HZ_DC_OK) exit(1);
+
+    /* ДВА СЛУЧАЯ ВРОЗЬ (А669), и оба называются: удар В УПОР — в метре перед
+     * камерой по взгляду; удар ЗА СПИНОЙ — в метре позади. Одно число здесь
+     * было бы подменой величины: доля зависит не от структуры, а от того, где
+     * камера относительно удара. */
+    double dir[3], dl = 0.0;
+    for (int a = 0; a < 3; a++) {
+      dir[a] = atc[a] - eyec[a];
+      dl += dir[a] * dir[a];
+    }
+    dl = sqrt(dl);
+    for (int a = 0; a < 3; a++)
+      dir[a] /= dl;
+    static const char *nm[2] = {"В УПОР", "ЗА СПИНОЙ"};
+    for (int cse = 0; cse < 2; cse++) {
+      /* ЦЕЛИТЬСЯ НАДО В ПОВЕРХНОСТЬ, А НЕ В ВОЗДУХ. Первая редакция ставила
+       * сферу в метре по взгляду, попадала в пустоту, стирала НОЛЬ рёбер — и
+       * все числа выходили нулями, неотличимыми от «правка не работает».
+       * Здесь центр берётся в первой ЗАНЯТОЙ ячейке вдоль луча (шаг h/2 по
+       * занятости Ш0): удар В УПОР — вперёд по взгляду, ЗА СПИНОЙ — назад. */
+      double c[3], sgn = (cse == 0 ? 1.0 : -1.0);
+      int found = 0;
+      for (double s = 0.0; s < 20.0 && !found; s += fr.h * 0.5) {
+        int32_t cc[3];
+        int ok2 = 1;
+        for (int a = 0; a < 3; a++) {
+          double w = eyec[a] + dir[a] * sgn * s;
+          double f = floor((w - fr.org[a]) / fr.h);
+          if (!(f >= 0.0) || !(f < (double)fr.n)) ok2 = 0;
+          cc[a] = ok2 ? (int32_t)f : 0;
+          c[a] = w;
+        }
+        if (ok2 && hz_occ_get(P.b[lev], hz_occ_index(fr.n, cc[0], cc[1], cc[2]))) found = 1;
+      }
+      if (!found) {
+        printf("   УДАР %s: луч не встретил геометрии — случай не измерен\n", nm[cse]);
+        continue;
+      }
+      /* Копия таблицы: каждый случай бьёт по НЕТРОНУТОМУ полю. */
+      hz_htab h2;
+      if (hz_htab_init(&h2) != 0) exit(1);
+      for (int32_t i = 0; i < ht.n; i++)
+        if (hz_htab_add(&h2, ht.e[i].axis, ht.e[i].p, ht.e[i].t, ht.e[i].nrm, ht.e[i].in_lo) != 0)
+          exit(1);
+      hitstat HS;
+      double ta = now_s();
+      hit_sphere(&h2, &fr, c, 0.2, &HS);
+      double t_edit = now_s() - ta;
+      /* ПОЧИНКА: только затронутые ячейки, подъём к корню за O(глубины). */
+      ta = now_s();
+      int64_t ncell = 0;
+      /* НЕГАТИВНЫЙ КОНТРОЛЬ nofix (§407): правка таблицы БЕЗ починки дерева.
+       * Срез обязан остаться СТАРЫМ, то есть разойтись с полной пересборкой. */
+      for (int32_t z = nofix ? 1 : HS.lo[2]; z <= (nofix ? 0 : HS.hi[2]); z++)
+        for (int32_t y = HS.lo[1]; y <= HS.hi[1]; y++)
+          for (int32_t x = HS.lo[0]; x <= HS.hi[0]; x++) {
+            int32_t cl2[3] = {x, y, z};
+            hz_dc_fix_cell(&T, &h2, cl2);
+            ncell++;
+          }
+      double t_fix = now_s() - ta;
+      ta = now_s();
+      hz_dcslice S1;
+      if (hz_slice_init(&S1, lev) != HZ_DC_OK) exit(1);
+      if (hz_slice_build(&S1, &T, &h2, lod_stop, &LH) != HZ_DC_OK) exit(1);
+      double t_slice2 = now_s() - ta;
+
+      /* Г49 В ВЕРНОЙ ФОРМЕ (А744): сверка не с перестройкой ТОГО ЖЕ поддерева
+       * (это тождество), а с ПОЛНОЙ пересборкой всего поля из правленой
+       * таблицы — только она ловит недооценку затронутой области. */
+      hz_dctree T2;
+      if (hz_dc_init(&T2, lev) != HZ_DC_OK) exit(1);
+      if (hz_dc_shape_occ(&T2, lev, u_occ, &P) != HZ_DC_OK) exit(1);
+      hz_dc_masks_occ(&T2, &h2);
+      hz_dc_forms_lazy(&T2, &h2);
+      hz_dcslice S2;
+      if (hz_slice_init(&S2, lev) != HZ_DC_OK) exit(1);
+      if (hz_slice_build(&S2, &T2, &h2, lod_stop, &LH) != HZ_DC_OK) exit(1);
+      int64_t nbit = 0;
+      if (S1.n == S2.n)
+        for (int32_t i = 0; i < S1.n; i++)
+          if (memcmp(&S1.c[i], &S2.c[i], sizeof(hz_dccell)) != 0) nbit++;
+
+      /* ДОЛЯ СРЕЗА, изменившаяся от удара: множествами по ключу. */
+      int64_t na = S0.n, nb = S1.n, same = 0;
+      uint64_t *ka = malloc((size_t)(na > 0 ? na : 1) * sizeof *ka);
+      uint64_t *kb = malloc((size_t)(nb > 0 ? nb : 1) * sizeof *kb);
+      if (ka == NULL || kb == NULL) exit(1);
+      for (int64_t i = 0; i < na; i++)
+        ka[i] = cellkey(&S0.c[i]);
+      for (int64_t i = 0; i < nb; i++)
+        kb[i] = cellkey(&S1.c[i]);
+      qsort(ka, (size_t)na, sizeof *ka, cmp_u64);
+      qsort(kb, (size_t)nb, sizeof *kb, cmp_u64);
+      for (int64_t i = 0, j = 0; i < na && j < nb;) {
+        if (ka[i] == kb[j]) {
+          same++;
+          i++;
+          j++;
+        } else if (ka[i] < kb[j])
+          i++;
+        else
+          j++;
+      }
+      printf("   УДАР %s (сфера r=0.20 м): рёбер стёрто %lld, ЧАСТИЧНО накрытых %lld (%.1f %%), "
+             "ячеек чинено %lld; ПРАВКА %.3f мс, ПОЧИНКА %.3f мс, СРЕЗ %.3f мс, всего %.3f мс; "
+             "срез %lld -> %lld, ИЗМЕНИЛОСЬ %.3f %%; Г49 против ПОЛНОЙ пересборки: ячеек %d "
+             "против %d, различий %lld\n",
+             nm[cse], (long long)HS.nedge, (long long)HS.npart,
+             100.0 * (double)HS.npart / (double)((HS.nedge + HS.npart) ? (HS.nedge + HS.npart) : 1),
+             (long long)ncell, t_edit * 1e3, t_fix * 1e3, t_slice2 * 1e3,
+             (t_edit + t_fix + t_slice2) * 1e3, (long long)na, (long long)nb,
+             100.0 * (double)(na + nb - 2 * same) / (double)(na > 0 ? na : 1), S1.n, S2.n,
+             (long long)nbit);
+      free(ka);
+      free(kb);
+      hz_slice_free(&S1);
+      hz_slice_free(&S2);
+      hz_dc_free(&T2);
+      hz_htab_free(&h2);
+      /* Дерево испорчено починкой по правленой таблице — вернуть в исходное. */
+      hz_dc_masks_occ(&T, &ht);
+      hz_dc_forms_lazy(&T, &ht);
+    }
+    hz_slice_free(&S0);
   }
   ct_free(&CT);
   hz_dc_free(&T);

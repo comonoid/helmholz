@@ -117,7 +117,7 @@ static int sb_push(sbctx *B, int32_t ni, const int32_t lo[3], int32_t size, int 
       p[u] += k & 1;
       p[v] += (k >> 1) & 1;
       const hz_hedge *e = hz_htab_find(B->ht, a, p);
-      if (e == NULL) continue;
+      if (e == NULL || e->in_lo == HZ_HEDGE_ERASED) continue;
       for (int c = 0; c < 3; c++)
         nsum[c] += e->nrm[c];
     }

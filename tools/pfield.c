@@ -2136,10 +2136,16 @@ int main(int argc, char **argv) {
         double d = fabs(a - b);
         if (d > emax) emax = d;
       }
-      printf("   СВИП: %.1f мс (%.0f нс на ячейку на образец), сбор %.1f мс; освещённых ячеек "
+      printf("   СВИП: %.1f мс на %d образцов; сетка %d^3 = %lld ячеек, %.2f нс НА ЯЧЕЙКУ СЕТКИ; "
+             "%.0f нс на ячейку СРЕЗА (это цена для БЮДЖЕТА, а не цена обработки); сбор %.1f мс; "
+             "освещённых ячеек "
              "луч %lld, свип %lld, РАЗОШЛИСЬ %lld (%.2f %%), макс расхождение %.3e\n",
-             t_sw * 1e3, t_sw * 1e9 / (double)(S.n ? S.n : 1) / (double)HZ_LIGHT_SAMPLES,
-             t_ga * 1e3, (long long)nlit_r, (long long)nlit_s, (long long)ndiff,
+             t_sw * 1e3, HZ_LIGHT_SAMPLES, (int)1 << (lev - HZ_SWEEP_DROP),
+             (long long)((int64_t)1 << (3 * (lev - HZ_SWEEP_DROP))),
+             t_sw * 1e9 / (double)((int64_t)1 << (3 * (lev - HZ_SWEEP_DROP))) /
+                 (double)HZ_LIGHT_SAMPLES,
+             t_sw * 1e9 / (double)(S.n ? S.n : 1) / (double)HZ_LIGHT_SAMPLES, t_ga * 1e3,
+             (long long)nlit_r, (long long)nlit_s, (long long)ndiff,
              100.0 * (double)ndiff / (double)(S.n ? S.n : 1), emax);
     }
 

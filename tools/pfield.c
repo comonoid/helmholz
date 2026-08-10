@@ -1109,13 +1109,81 @@ static int shadowed(const opyr *P, const frame *fr, const double a[3], const dou
   return 0;
 }
 
+/* ЗАТЕНЕНИЕ С ПОДЪЁМОМ В ГРУБЫЕ ВЕТКИ (А784). Плоский марш идёт шагом в
+ * полячейки и платит по РАССТОЯНИЮ; здесь на каждом шаге ищется САМЫЙ КРУПНЫЙ
+ * пустой узел, накрывающий текущую точку, и он пересекается ЦЕЛИКОМ. Большой
+ * пустой куб стоит один шаг, а не свою сторону в ячейках.
+ *
+ * ПРЕДИКАТ ТОТ ЖЕ, что у плоского марша: заслон — занятая ячейка мелкого уровня.
+ * Значит множество затенённых обязано СОВПАСТЬ, и это приёмка, а не пожелание:
+ * пропуск пустоты ТОЧЕН по построению (пустой узел не содержит геометрии вовсе),
+ * и любое расхождение означает ошибку в подъёме, а не приближение. */
+static int shadowed_h(const opyr *P, const frame *fr, const double a[3], const double b[3],
+                      int64_t *nstep) {
+  double d[3], len = 0.0;
+  for (int k = 0; k < 3; k++) {
+    d[k] = b[k] - a[k];
+    len += d[k] * d[k];
+  }
+  len = sqrt(len);
+  if (!(len > 0.0)) return 0;
+  for (int k = 0; k < 3; k++)
+    d[k] /= len;
+  double skip = 1.5 * fr->h; /* тот же отступ начала, что и у плоского (А776) */
+  double t = skip;
+  while (t < len) {
+    int32_t c[3];
+    int ok = 1;
+    for (int k = 0; k < 3; k++) {
+      double w = a[k] + d[k] * t;
+      double f = floor((w - fr->org[k]) / fr->h);
+      if (!(f >= 0.0) || !(f < (double)fr->n)) ok = 0;
+      c[k] = ok ? (int32_t)f : 0;
+    }
+    if (!ok) return 0;
+    if (nstep != NULL) (*nstep)++;
+    if (hz_occ_get(P->b[fr->lev], hz_occ_index(fr->n, c[0], c[1], c[2]))) return 1;
+    /* ПОДЪЁМ: самый крупный ПУСТОЙ узел, накрывающий точку. Пока предок пуст —
+     * поднимаемся; шаг равен стороне найденного узла. */
+    int l = fr->lev;
+    while (l > 0) {
+      int32_t nl = (int32_t)1 << (l - 1);
+      if (hz_occ_get(P->b[l - 1],
+                     hz_occ_index(nl, c[0] >> (fr->lev - l + 1), c[1] >> (fr->lev - l + 1),
+                                  c[2] >> (fr->lev - l + 1))))
+        break;
+      l--;
+    }
+    /* ШАГ — ДО ВЫХОДА ИЗ УЗЛА, А НЕ НА ЕГО СТОРОНУ. Первая редакция прибавляла
+     * сторону узла от ТЕКУЩЕЙ точки и потому перескакивала за его дальнюю грань:
+     * `958` ячеек разошлись с плоским маршем — заслон сразу за узлом
+     * проглатывался. Здесь считается расстояние до ближайшей из трёх дальних
+     * граней (обычная плитовая проба), и оно всегда меньше стороны. */
+    int sh2 = fr->lev - l;
+    double side = fr->h * (double)((int32_t)1 << sh2);
+    double texit = 1e300;
+    for (int k = 0; k < 3; k++) {
+      if (!(fabs(d[k]) > 1e-300)) continue;
+      int32_t nodelo = (c[k] >> sh2) << sh2;
+      double lo0 = fr->org[k] + (double)nodelo * fr->h;
+      double bnd = d[k] > 0.0 ? lo0 + side : lo0;
+      double tk = (bnd - a[k]) / d[k];
+      if (tk > t && tk < texit) texit = tk;
+    }
+    /* Отступ в четверть ячейки выводит точку ЗА грань: без него следующая проба
+     * попадала бы ровно на границу и топталась на месте. */
+    t = (texit < 1e299 ? texit : t + side) + fr->h * 0.25;
+  }
+  return 0;
+}
+
 /* Прямая облучённость ячейки среза по трём каналам. Площадка берётся четырьмя
  * образцами — число НАЗВАНО, а не подобрано: это углы, то есть худший случай для
  * полутени, и увеличение его только сгладит край. */
 #define HZ_LIGHT_SAMPLES 4
 
 static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, const arealight *L,
-                         float *irr, double stepfrac) {
+                         float *irr, double stepfrac, int hier, int64_t *nstep) {
   static const double su[HZ_LIGHT_SAMPLES] = {-0.5, 0.5, -0.5, 0.5};
   static const double sv[HZ_LIGHT_SAMPLES] = {-0.5, -0.5, 0.5, 0.5};
   for (int32_t i = 0; i < S->n; i++) {
@@ -1141,7 +1209,10 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
       if (!(cosr > 0.0)) continue;
       /* `stepfrac < 0` — БЕЗ ЗАТЕНЕНИЯ ВОВСЕ: это знаменатель доли
        * открытости, а не режим рендера. */
-      if (stepfrac > 0.0 && shadowed(P, fr, p, q, stepfrac)) continue;
+      if (stepfrac > 0.0) {
+        int sh = hier ? shadowed_h(P, fr, p, q, nstep) : shadowed(P, fr, p, q, stepfrac);
+        if (sh) continue;
+      }
       double g = cosr / r2 / (double)HZ_LIGHT_SAMPLES;
       for (int k = 0; k < 3; k++)
         acc[k] += L->rgb[k] * g;
@@ -2308,7 +2379,7 @@ int main(int argc, char **argv) {
     float *irr = malloc(3 * (size_t)S.n * sizeof *irr);
     if (irr == NULL) exit(1);
     ta = now_s();
-    front_direct(&S, &fr, &P, &AL, irr, 0.5);
+    front_direct(&S, &fr, &P, &AL, irr, 0.5, 0, NULL);
     double t_dir = now_s() - ta;
     /* А772/А775: ЭТАЛОН ПРОВЕРЯЕТСЯ САМ. Марш идёт шагом , и тонкий заслон
      * он может проскочить. Пересчёт вдвое мельче: если множество затенённых
@@ -2318,7 +2389,7 @@ int main(int argc, char **argv) {
       float *irrf = malloc(3 * (size_t)S.n * sizeof *irrf);
       if (irrf == NULL) exit(1);
       double tf = now_s();
-      front_direct(&S, &fr, &P, &AL, irrf, 0.25);
+      front_direct(&S, &fr, &P, &AL, irrf, 0.25, 0, NULL);
       tf = now_s() - tf;
       int64_t nd = 0, na = 0, nb = 0;
       for (int32_t i = 0; i < S.n; i++) {
@@ -2334,7 +2405,27 @@ int main(int argc, char **argv) {
       free(irrf);
     }
 
-    /* СВИП — то, что Ш5 обязан измерить; луч выше остаётся ЭТАЛОНОМ (А763), и
+    /* ЭТАЛОН С ПОДЪЁМОМ (А784). Предикат тот же, значит множество затенённых
+     * обязано СОВПАСТЬ побитово; падают только шаги и время. */
+    {
+      float *irrh = malloc(3 * (size_t)S.n * sizeof *irrh);
+      if (irrh == NULL) exit(1);
+      int64_t nsteph = 0;
+      double th = now_s();
+      front_direct(&S, &fr, &P, &AL, irrh, 0.5, 1, &nsteph);
+      th = now_s() - th;
+      int64_t nd2 = 0;
+      for (int32_t i = 0; i < S.n; i++)
+        if ((irr[3 * (size_t)i] > 0.0f) != (irrh[3 * (size_t)i] > 0.0f)) nd2++;
+      printf("   ЭТАЛОН С ПОДЪЁМОМ: %.1f мс против %.1f мс плоского (в %.2f раза), шагов %lld "
+             "(%.1f на луч); РАСХОЖДЕНИЕ С ПЛОСКИМ %lld ячеек\n",
+             th * 1e3, t_dir * 1e3, t_dir / (th > 0.0 ? th : 1.0), (long long)nsteph,
+             (double)nsteph / (double)((int64_t)S.n * HZ_LIGHT_SAMPLES), (long long)nd2);
+      free(irrh);
+    }
+
+    /* СВИП — то, что Ш5 обязан измерить
+; луч выше остаётся ЭТАЛОНОМ (А763), и
      * сверка идёт ПОЯЧЕЕЧНО, а не по картинке. */
     float *irr2 = malloc(3 * (size_t)S.n * sizeof *irr2);
     if (irr2 == NULL) exit(1);
@@ -2345,7 +2436,7 @@ int main(int argc, char **argv) {
      * третьим проходом, дешёвым (теста заслона в нём нет вовсе). */
     float *irro = malloc(3 * (size_t)S.n * sizeof *irro);
     if (irro == NULL) exit(1);
-    front_direct(&S, &fr, &P, &AL, irro, -1.0);
+    front_direct(&S, &fr, &P, &AL, irro, -1.0, 0, NULL);
     {
       double *dv = malloc((size_t)S.n * sizeof *dv);
       if (dv == NULL) exit(1);

@@ -1732,15 +1732,26 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
  * УЗЕЛ НЕСЁТ ПОТОК, А НЕ ЯРКОСТЬ: `flux = Σ радианс·площадь` по детям. Тогда
  * сложение точное, а яркость восстанавливается делением на площадь там, где
  * нужна. Складывать яркости было бы неверно — они не аддитивны. */
+/* КОРЗИНЫ ПО НАПРАВЛЕНИЮ (§519). Узел агрегируется не как одно целое, а по
+ * СЕМЕЙСТВАМ поверхностей: шесть корзин по знаковой главной оси нормали.
+ * Тогда столешница (+y) и ножка (±x) — разные семейства, у каждого разброс
+ * ничтожен, и оба агрегируются точно. Стена с толщиной: внутренняя сторона в
+ * одной корзине, наружная в противоположной, и они не смешиваются.
+ * ШЕСТЬ, А НЕ БОЛЬШЕ: внутри корзины нормали лежат в конусе 90°, то есть
+ * разброс ограничен `1 − cos 45° = 0.29` сверху ПО ПОСТРОЕНИЮ, а у плоскости он
+ * ноль. Больше корзин — точнее конус, но дороже узел; число проверяется
+ * замером, а не назначается навсегда. */
 typedef struct {
-  double c[3];    /* центр тяжести, мир */
-  double n[3];    /* средняя нормаль, единичная */
-  double flux[3]; /* Σ радианс·площадь·альбедо по каналам */
-  double area;    /* суммарная площадь */
-  double rad;     /* радиус: полудиагональ коробки, мир */
-  int32_t ch[8];  /* дети; -1 там, где пусто. НЕ подряд: каждый строит своё
-                   * поддерево, поэтому «первый плюс k» здесь неверно — эта
-                   * ошибка уже стоила ложного нуля в свипе по дереву (§512). */
+  double c[3], n[3], flux[3];
+  double area, nsum, rad;
+} ebin;
+
+typedef struct {
+  ebin b[6];     /* семейства по знаковой главной оси нормали (§519) */
+  int rough;     /* внутри есть шероховатый материал (hz_flat = 0) */
+  int32_t ch[8]; /* дети; -1 там, где пусто. НЕ подряд: каждый строит своё
+                  * поддерево, поэтому «первый плюс k» здесь неверно — эта
+                  * ошибка уже стоила ложного нуля в свипе по дереву (§512). */
   int nch;
 } enode;
 
@@ -1777,47 +1788,63 @@ static int32_t etree_alloc(etree *T, int32_t k) {
 static int32_t etree_build(etree *T, const hz_dcslice *S, const frame *fr, const float *irr,
                            const hz_objmesh *m, int32_t a, int32_t b, int lvl, int lev) {
   int32_t me = etree_alloc(T, 1);
-  enode *e = &T->e[me];
-  memset(e, 0, sizeof *e);
-  e->nch = 0;
-  for (int k = 0; k < 8; k++)
-    e->ch[k] = -1;
-  double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
-  for (int32_t i = a; i < b; i++) {
-    double p[3], n[3];
-    hz_slice_vertex(S, i, p);
-    for (int k = 0; k < 3; k++)
-      p[k] = fr->org[k] + p[k] * fr->h;
-    hz_slice_normal(S, i, n);
-    double side = fr->h * (double)((int32_t)1 << (lev - (int)S->c[i].lvl));
-    double ar = side * side;
-    e->area += ar;
-    for (int k = 0; k < 3; k++) {
-      e->c[k] += p[k] * ar;
-      e->n[k] += n[k] * ar;
-      if (p[k] < lo[k]) lo[k] = p[k];
-      if (p[k] > hi[k]) hi[k] = p[k];
-      e->flux[k] += (double)irr[3 * (size_t)i + (size_t)k] * ar * alb(m, S->c[i].mat, k);
+  {
+    enode *e = &T->e[me];
+    memset(e, 0, sizeof *e);
+    e->nch = 0;
+    for (int k = 0; k < 8; k++)
+      e->ch[k] = -1;
+    double lo[6][3], hi[6][3];
+    for (int q = 0; q < 6; q++)
+      for (int k = 0; k < 3; k++) {
+        lo[q][k] = 1e300;
+        hi[q][k] = -1e300;
+      }
+    for (int32_t i = a; i < b; i++) {
+      double p[3], n[3];
+      hz_slice_vertex(S, i, p);
+      for (int k = 0; k < 3; k++)
+        p[k] = fr->org[k] + p[k] * fr->h;
+      hz_slice_normal(S, i, n);
+      /* Корзина — знаковая ГЛАВНАЯ ось нормали. */
+      int ax = 0;
+      for (int k = 1; k < 3; k++)
+        if (fabs(n[k]) > fabs(n[ax])) ax = k;
+      int q = 2 * ax + (n[ax] > 0.0 ? 1 : 0);
+      double side = fr->h * (double)((int32_t)1 << (lev - (int)S->c[i].lvl));
+      double ar = side * side;
+      ebin *bb = &e->b[q];
+      bb->area += ar;
+      for (int k = 0; k < 3; k++) {
+        bb->c[k] += p[k] * ar;
+        bb->n[k] += n[k] * ar;
+        if (p[k] < lo[q][k]) lo[q][k] = p[k];
+        if (p[k] > hi[q][k]) hi[q][k] = p[k];
+        bb->flux[k] += (double)irr[3 * (size_t)i + (size_t)k] * ar * alb(m, S->c[i].mat, k);
+      }
+      if (m->mtl != NULL && S->c[i].mat < m->nmtl && !m->mtl[S->c[i].mat].flat) e->rough = 1;
+    }
+    for (int q = 0; q < 6; q++) {
+      ebin *bb = &e->b[q];
+      if (!(bb->area > 0.0)) continue;
+      for (int k = 0; k < 3; k++) {
+        bb->c[k] /= bb->area;
+        bb->n[k] /= bb->area;
+      }
+      double nl = sqrt(bb->n[0] * bb->n[0] + bb->n[1] * bb->n[1] + bb->n[2] * bb->n[2]);
+      bb->nsum = nl * bb->area;
+      if (nl > 0.0)
+        for (int k = 0; k < 3; k++)
+          bb->n[k] /= nl;
+      double r2 = 0.0;
+      for (int k = 0; k < 3; k++) {
+        double d = 0.5 * (hi[q][k] - lo[q][k]);
+        r2 += d * d;
+      }
+      bb->rad = sqrt(r2);
     }
   }
-  if (e->area > 0.0)
-    for (int k = 0; k < 3; k++) {
-      e->c[k] /= e->area;
-      e->n[k] /= e->area;
-    }
-  double nl = sqrt(e->n[0] * e->n[0] + e->n[1] * e->n[1] + e->n[2] * e->n[2]);
-  if (nl > 0.0)
-    for (int k = 0; k < 3; k++)
-      e->n[k] /= nl;
-  double r2 = 0.0;
-  for (int k = 0; k < 3; k++) {
-    double d = 0.5 * (hi[k] - lo[k]);
-    r2 += d * d;
-  }
-  e->rad = sqrt(r2);
   if (b - a <= 1 || lvl >= lev) return me;
-  /* Разрез отрезка по биту координаты на этом уровне; ячейки в мортоновом
-   * порядке, поэтому границы находятся одним проходом. */
   int sh = lev - lvl - 1;
   int32_t bnd[9];
   bnd[0] = a;
@@ -1844,48 +1871,37 @@ static int32_t etree_build(etree *T, const hz_dcslice *S, const frame *fr, const
   return me;
 }
 
-/* Спуск по дереву излучателей для ОДНОГО приёмника (§516). Узел берётся
- * ЦЕЛИКОМ, если его угловой размер мал: `2·rad / расстояние <= eps`. Иначе
- * спускаемся. Это и есть огрубление по ВЗАИМНОМУ расстоянию: близкий излучатель
- * раскрывается до листьев, дальний берётся одним узлом.
- * `nlink` считает принятые связи — без него «стало быстро» неотличимо от
- * «перестало считать». */
-static void hgather_rec(const etree *T, int32_t ni, const double pi[3], const double ni_[3],
+/* Спуск ведётся ПО ОДНОЙ КОРЗИНЕ: каждое семейство поверхностей огрубляется
+ * независимо, и складка между семействами не усредняется никогда. */
+static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], const double ni_[3],
                         double eps, double rrecv, const opyr *P, const frame *fr, int vis,
                         double out[3], int64_t *nlink, double *sthru, double *sall) {
   const enode *e = &T->e[ni];
-  if (!(e->area > 0.0)) return;
+  const ebin *bb = &e->b[q];
+  if (!(bb->area > 0.0)) return;
   double w[3], r2 = 0.0;
   for (int k = 0; k < 3; k++) {
-    w[k] = e->c[k] - pi[k];
+    w[k] = bb->c[k] - pi[k];
     r2 += w[k] * w[k];
   }
   if (!(r2 > 0.0)) return;
   double r = sqrt(r2);
-  /* ДВА ОГРУБЛЕНИЯ СКЛАДЫВАЮТСЯ (указание пользователя 08-11). Первое — по
-   * ВЗАИМНОМУ расстоянию: далёкий излучатель берётся целиком. Второе — по
-   * размеру ПРИЁМНИКА: он усредняет по своей площади, и структура излучателя
-   * мельче его собственного размера для него не существует. Приёмник же
-   * огрублён камерой (срез), значит дальний от камеры приёмник останавливает
-   * спуск раньше — то есть камерное огрубление входит сюда САМО, без второго
-   * критерия. Если объект далёк и от света, и от камеры, спуск обрывается на
-   * первом же узле: остаётся ровно «там что-то есть». */
-  if (e->nch > 0 && 2.0 * e->rad > eps * r && 2.0 * e->rad > rrecv) {
+  double spread = 1.0 - bb->nsum / bb->area;
+  if (e->nch > 0 &&
+      (spread > eps || e->rough || (2.0 * bb->rad > eps * r && 2.0 * bb->rad > rrecv))) {
     for (int k = 0; k < e->nch; k++)
-      hgather_rec(T, e->ch[k], pi, ni_, eps, rrecv, P, fr, vis, out, nlink, sthru, sall);
+      hgather_rec(T, e->ch[k], q, pi, ni_, eps, rrecv, P, fr, vis, out, nlink, sthru, sall);
     return;
   }
   double ci = (w[0] * ni_[0] + w[1] * ni_[1] + w[2] * ni_[2]) / r;
-  double cj = -(w[0] * e->n[0] + w[1] * e->n[1] + w[2] * e->n[2]) / r;
+  double cj = -(w[0] * bb->n[0] + w[1] * bb->n[1] + w[2] * bb->n[2]) / r;
   if (!(ci > 0.0) || !(cj > 0.0)) return;
   (*nlink)++;
-  /* Форм-фактор точечной связи: `cos_i·cos_j/(π r²)`, и площадь уже внутри
-   * потока (`flux = Σ радианс·площадь·альбедо`). */
   double g = ci * cj / (3.14159265358979323846 * r2);
   int blocked = 0;
-  if (vis) blocked = shadowed(P, fr, pi, e->c, 0.5);
+  if (vis) blocked = shadowed(P, fr, pi, bb->c, 0.5);
   for (int k = 0; k < 3; k++) {
-    double v = e->flux[k] * g;
+    double v = bb->flux[k] * g;
     if (sall != NULL) {
       *sall += v;
       if (blocked && sthru != NULL) *sthru += v;
@@ -5093,8 +5109,9 @@ int main(int argc, char **argv) {
           pi[k] = fr.org[k] + pi[k] * fr.h;
         hz_slice_normal(&S, i, nn2);
         double rrecv = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
-        hgather_rec(&ET, 0, pi, nn2, g_hgather, rrecv, &P, &fr, indvis, acc2, &nlink, &sthru2,
-                    &sall2);
+        for (int q2 = 0; q2 < 6; q2++)
+          hgather_rec(&ET, 0, q2, pi, nn2, g_hgather, rrecv, &P, &fr, indvis, acc2, &nlink, &sthru2,
+                      &sall2);
         for (int k = 0; k < 3; k++)
           ind[3 * (size_t)i + (size_t)k] = (float)(acc2[k] * (alb0 ? 0.0 : alb(&m, S.c[i].mat, k)));
       }

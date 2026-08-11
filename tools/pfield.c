@@ -1765,6 +1765,8 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
 static int g_noshift = 0;
 /* Ф2' (§505): перенос вдоль ПРЯМОЙ вместо трёх осевых соседей. */
 static int g_raysweep = 0;
+/* §507: радиус засева окрестности источника маршем, в ячейках сетки свипа. */
+static int32_t g_seed = 0;
 
 typedef struct {
   unsigned char *vis; /* на ячейку: булева видимость (осевое и направленное правила) */
@@ -1772,20 +1774,23 @@ typedef struct {
   /* Ф1': профиль открытости, `P²` подпроб на ячейку, `uint8` (§425/§498: свип
    * упирается в память, а квант 1/255 на порядок ниже порога приёмки 0.05). */
   unsigned char *prof;
-  int32_t n;   /* сторона грубой сетки */
-  int drop;    /* lev − log2(n) */
-  int axis;    /* НЕГАТИВНЫЙ КОНТРОЛЬ: прежнее осевое наследование */
-  int frac;    /* Ш5а2: дробная открытость вместо булевой */
-  int round01; /* НЕГАТИВНЫЙ КОНТРОЛЬ Ш5а2: округлять F до 0/1 */
+  unsigned char *seeded; /* §507: ячейка засеяна маршем, свипом не пересчитывается */
+  int32_t n;             /* сторона грубой сетки */
+  int drop;              /* lev − log2(n) */
+  int axis;              /* НЕГАТИВНЫЙ КОНТРОЛЬ: прежнее осевое наследование */
+  int frac;              /* Ш5а2: дробная открытость вместо булевой */
+  int round01;           /* НЕГАТИВНЫЙ КОНТРОЛЬ Ш5а2: округлять F до 0/1 */
 } sweepgrid;
 
 static void sweep_free(sweepgrid *G) {
   free(G->vis);
   free(G->open);
   free(G->prof);
+  free(G->seeded);
   G->vis = NULL;
   G->open = NULL;
   G->prof = NULL;
+  G->seeded = NULL;
 }
 
 /* Один образец источника: заполнить видимость на всей грубой сетке. */
@@ -1795,6 +1800,7 @@ static void sweep_light(sweepgrid *G, const opyr *P, const frame *fr, const doub
   memset(G->vis, 0, nc);
   for (size_t i = 0; i < nc; i++)
     G->open[i] = 0.0f;
+  if (G->seeded != NULL) memset(G->seeded, 0, nc);
   /* Ячейка источника видима по определению — с неё начинается всякий путь. */
   int32_t s[3] = {0, 0, 0};
   for (int k = 0; k < 3; k++) {
@@ -1806,6 +1812,29 @@ static void sweep_light(sweepgrid *G, const opyr *P, const frame *fr, const doub
   G->vis[hz_occ_index(n, s[0], s[1], s[2])] = 1u;
   size_t sidx = hz_occ_index(n, s[0], s[1], s[2]);
   G->open[sidx] = 1.0f;
+  /* §507: ЗАСЕВ ОКРЕСТНОСТИ ИСТОЧНИКА МАРШЕМ. Образец источника есть ТОЧКА, а
+   * стартовая ячейка сетки свипа имеет сторону `2^drop` ячеек поля и «светит»
+   * всем своим объёмом во все стороны — включая те, куда из точки ничего не
+   * видно. Смещение от этого ПОСТОЯННО и не убывает ни с разрешением профиля,
+   * ни со схемой пути, ни с измельчением сетки (§503, §506). Здесь первый слой
+   * радиуса `g_seed` считается прямым маршем — ячеек там `(2R+1)³`, то есть
+   * десятки, — и свип стартует с верной угловой картины. */
+  if (g_seed > 0) {
+    double cw = fr->h * (double)((int32_t)1 << G->drop);
+    for (int32_t dz2 = -g_seed; dz2 <= g_seed; dz2++)
+      for (int32_t dy2 = -g_seed; dy2 <= g_seed; dy2++)
+        for (int32_t dx2 = -g_seed; dx2 <= g_seed; dx2++) {
+          int32_t cx2 = s[0] + dx2, cy2 = s[1] + dy2, cz2 = s[2] + dz2;
+          if (cx2 < 0 || cy2 < 0 || cz2 < 0 || cx2 >= n || cy2 >= n || cz2 >= n) continue;
+          size_t k2 = hz_occ_index(n, cx2, cy2, cz2);
+          double pw[3] = {fr->org[0] + ((double)cx2 + 0.5) * cw,
+                          fr->org[1] + ((double)cy2 + 0.5) * cw,
+                          fr->org[2] + ((double)cz2 + 0.5) * cw};
+          G->open[k2] = shadowed(P, fr, pw, q, 0.5) ? 0.0f : 1.0f;
+          G->vis[k2] = G->open[k2] > 0.0f ? 1u : 0u;
+          G->seeded[k2] = 1u;
+        }
+  }
   /* Источник в координатах ГРУБОЙ сетки — к нему и строится направление. */
   double sc[3];
   for (int k = 0; k < 3; k++)
@@ -1824,6 +1853,7 @@ static void sweep_light(sweepgrid *G, const opyr *P, const frame *fr, const doub
              * обнулял сам источник первым же шагом: у булевых правил его
              * защищал , а дробный путь идёт мимо него. */
             if (ci == sidx) continue;
+            if (G->seeded != NULL && G->seeded[ci]) continue; /* засеяно маршем (§507) */
             /* Ш5а2: ПЕРЕНОС ЧЕРЕЗ ГРАНИ С ВЕСАМИ (§423, А780). Открытость есть
              * взвешенное среднее открытостей входных соседей; веса — доли потока
              * через соответствующие грани. Ни максимума (оптимизм А778), ни
@@ -2059,6 +2089,7 @@ static void front_sweep(const hz_dcslice *S, const frame *fr, const opyr *P, con
   G.vis = malloc(gcells);
   G.open = malloc(gcells * sizeof *G.open);
   G.prof = HZ_SWEEP_P > 1 ? malloc(gcells * (size_t)(HZ_SWEEP_P * HZ_SWEEP_P)) : NULL;
+  G.seeded = calloc(gcells, 1);
   if (G.vis == NULL || G.open == NULL) exit(1);
   for (int32_t i = 0; i < 3 * S->n; i++)
     irr[i] = 0.0f;
@@ -2297,6 +2328,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xtrace") == 0) xtrace = 1;
     if (strcmp(argv[i], "noshift") == 0) g_noshift = 1;
     if (strcmp(argv[i], "raysweep") == 0) g_raysweep = 1;
+    if (strncmp(argv[i], "seed=", 5) == 0) g_seed = (int32_t)strtol(argv[i] + 5, NULL, 10);
     /* Р-7а: замер квантования плоскости. */
     if (strcmp(argv[i], "qplane") == 0) {
       qplane = 1;

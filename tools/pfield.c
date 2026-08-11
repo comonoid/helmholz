@@ -1767,6 +1767,8 @@ static int g_noshift = 0;
 static int g_raysweep = 0;
 /* §507: радиус засева окрестности источника маршем, в ячейках сетки свипа. */
 static int32_t g_seed = 0;
+/* §508: сколько проходов свипа подряд без обнуления поля. */
+static int g_passes = 1;
 
 typedef struct {
   unsigned char *vis; /* на ячейку: булева видимость (осевое и направленное правила) */
@@ -1841,218 +1843,225 @@ static void sweep_light(sweepgrid *G, const opyr *P, const frame *fr, const doub
     sc[k] = (q[k] - fr->org[k]) / (fr->h * (double)((int32_t)1 << G->drop));
   /* ВОСЕМЬ ОКТАНТОВ. Внутри октанта каждая ось идёт ОТ источника, поэтому сосед
    * со стороны источника уже посчитан — это и есть условие свипа. */
-  for (int oct = 0; oct < 8; oct++) {
-    int dx = (oct & 1) ? 1 : -1, dy = (oct & 2) ? 1 : -1, dz = (oct & 4) ? 1 : -1;
-    int32_t x0 = dx > 0 ? s[0] : s[0], y0 = dy > 0 ? s[1] : s[1], z0 = dz > 0 ? s[2] : s[2];
-    for (int32_t z = z0; z >= 0 && z < n; z += dz)
-      for (int32_t y = y0; y >= 0 && y < n; y += dy)
-        for (int32_t x = x0; x >= 0 && x < n; x += dx) {
-          size_t ci = hz_occ_index(n, x, y, z);
-          if (G->frac) {
-            /* ЯЧЕЙКА ИСТОЧНИКА НЕ ПЕРЕСЧИТЫВАЕТСЯ. Без этой оговорки свип
-             * обнулял сам источник первым же шагом: у булевых правил его
-             * защищал , а дробный путь идёт мимо него. */
-            if (ci == sidx) continue;
-            if (G->seeded != NULL && G->seeded[ci]) continue; /* засеяно маршем (§507) */
-            /* Ш5а2: ПЕРЕНОС ЧЕРЕЗ ГРАНИ С ВЕСАМИ (§423, А780). Открытость есть
-             * взвешенное среднее открытостей входных соседей; веса — доли потока
-             * через соответствующие грани. Ни максимума (оптимизм А778), ни
-             * одного пути (пессимизм А778) — первый порядок переноса. */
-            /* ЗАСЛОНОМ СЛУЖИТ ПРЕДШЕСТВЕННИК, А НЕ САМА ЯЧЕЙКА. Первая редакция
-             * обнуляла открытость у занятой ячейки — и тем гасила ровно те
-             * ячейки, ради которых всё считается: поверхность И ЕСТЬ занятые
-             * ячейки. Булево правило этой ошибки не имело, потому что проверяло
-             * занятость СОСЕДА. */
-            double c0[3] = {(double)x + 0.5, (double)y + 0.5, (double)z + 0.5};
-            double dd[3], sabs = 0.0;
-            for (int k = 0; k < 3; k++) {
-              dd[k] = sc[k] - c0[k];
-              sabs += fabs(dd[k]);
-            }
-            if (!(sabs > 0.0)) {
-              G->open[ci] = 1.0f;
-              continue;
-            }
-            if (g_raysweep) {
-              /* Ф2' (§505): ПЕРЕНОС ВДОЛЬ ПРЯМОЙ. Шаг назад делается только по
-               * ГЛАВНОЙ оси, а поперечное смещение точки входа берётся из самого
-               * направления — то есть путь есть прямая, а не лесенка. Четыре
-               * вкладчика лежат в ОДНОЙ плоскости, поперёк одного луча.
-               * ЗАНЯТЫЙ ВКЛАДЧИК ВХОДИТ НУЛЁМ: здесь он значит «эта доля сечения
-               * пучка заслонена», а не «этот путь закрыт», — и потому обнулять
-               * его физически верно (разбор в §505). */
-              int km = 0;
-              for (int k = 1; k < 3; k++)
-                if (fabs(dd[k]) > fabs(dd[km])) km = k;
-              int u2 = (km + 1) % 3, v2 = (km + 2) % 3;
-              double inv = fabs(dd[km]) > 0.0 ? 1.0 / fabs(dd[km]) : 0.0;
-              double fu = (double)(km == 0 ? x : (km == 1 ? y : z));
-              (void)fu;
-              double pu =
-                  (double)(u2 == 0 ? x : (u2 == 1 ? y : z)) + (g_noshift ? 0.0 : dd[u2] * inv);
-              double pv =
-                  (double)(v2 == 0 ? x : (v2 == 1 ? y : z)) + (g_noshift ? 0.0 : dd[v2] * inv);
-              int32_t bu = (int32_t)floor(pu), bv = (int32_t)floor(pv);
-              double tu = pu - (double)bu, tv = pv - (double)bv;
-              int32_t base[3] = {x, y, z};
-              base[km] += (dd[km] > 0.0 ? 1 : -1);
-              double accr = 0.0;
-              for (int au = 0; au < 2; au++)
-                for (int av = 0; av < 2; av++) {
-                  int32_t q2[3] = {base[0], base[1], base[2]};
-                  q2[u2] = bu + au;
-                  q2[v2] = bv + av;
-                  double w2 = (au ? tu : 1.0 - tu) * (av ? tv : 1.0 - tv);
-                  if (!(w2 > 0.0)) continue;
-                  if (q2[0] < 0 || q2[1] < 0 || q2[2] < 0 || q2[0] >= n || q2[1] >= n || q2[2] >= n)
-                    continue;
-                  size_t qi = hz_occ_index(n, q2[0], q2[1], q2[2]);
-                  if (hz_occ_get(P->b[P->lev - G->drop], qi)) continue; /* заслонено: ноль */
-                  accr += w2 * (double)G->open[qi];
-                }
-              if (G->round01) accr = accr >= 0.5 ? 1.0 : 0.0;
-              G->open[ci] = (float)accr;
-              continue;
-            }
-            double acc = 0.0, wsum = 0.0;
-            int32_t pp[3] = {x, y, z};
-            for (int k = 0; k < 3; k++) {
-              double w = fabs(dd[k]) / sabs;
-              if (!(w > 0.0)) continue;
-              int32_t save = pp[k];
-              pp[k] = save + (dd[k] > 0.0 ? 1 : -1);
-              if (pp[k] >= 0 && pp[k] < n) {
-                size_t pi = hz_occ_index(n, pp[0], pp[1], pp[2]);
-                /* ЗАКРЫТОЕ НАПРАВЛЕНИЕ ИСКЛЮЧАЕТСЯ ИЗ СРЕДНЕГО, А НЕ ВХОДИТ В
-                 * НЕГО НУЛЁМ. Иначе у стены одно направление из трёх всегда
-                 * закрыто, среднее падает на каждом шаге, и открытость ТАЕТ
-                 * вдоль стены — это ложное затухание, а не тень. Замерено на
-                 * первой редакции: средняя открытость 0.0605 против 0.3995 у
-                 * эталона. */
-                if (hz_occ_get(P->b[P->lev - G->drop], pi)) continue;
-                acc += w * (double)G->open[pi];
-                wsum += w;
+  /* §508: НЕСКОЛЬКО ПРОХОДОВ БЕЗ ОБНУЛЕНИЯ. Октантный свип обходит ячейку РОВНО
+   * ОДИН РАЗ, а в невыпуклой сцене свет может приходить путём, который в этом
+   * порядке ещё не посчитан. Второй проход по готовому полю это показывает: если
+   * значения меняются, виноват порядок; если нет — остаток есть диффузия самой
+   * схемы, и патчить её нечем. */
+  for (int pass = 0; pass < (g_passes > 0 ? g_passes : 1); pass++)
+    for (int oct = 0; oct < 8; oct++) {
+      int dx = (oct & 1) ? 1 : -1, dy = (oct & 2) ? 1 : -1, dz = (oct & 4) ? 1 : -1;
+      int32_t x0 = dx > 0 ? s[0] : s[0], y0 = dy > 0 ? s[1] : s[1], z0 = dz > 0 ? s[2] : s[2];
+      for (int32_t z = z0; z >= 0 && z < n; z += dz)
+        for (int32_t y = y0; y >= 0 && y < n; y += dy)
+          for (int32_t x = x0; x >= 0 && x < n; x += dx) {
+            size_t ci = hz_occ_index(n, x, y, z);
+            if (G->frac) {
+              /* ЯЧЕЙКА ИСТОЧНИКА НЕ ПЕРЕСЧИТЫВАЕТСЯ. Без этой оговорки свип
+               * обнулял сам источник первым же шагом: у булевых правил его
+               * защищал , а дробный путь идёт мимо него. */
+              if (ci == sidx) continue;
+              if (G->seeded != NULL && G->seeded[ci]) continue; /* засеяно маршем (§507) */
+              /* Ш5а2: ПЕРЕНОС ЧЕРЕЗ ГРАНИ С ВЕСАМИ (§423, А780). Открытость есть
+               * взвешенное среднее открытостей входных соседей; веса — доли потока
+               * через соответствующие грани. Ни максимума (оптимизм А778), ни
+               * одного пути (пессимизм А778) — первый порядок переноса. */
+              /* ЗАСЛОНОМ СЛУЖИТ ПРЕДШЕСТВЕННИК, А НЕ САМА ЯЧЕЙКА. Первая редакция
+               * обнуляла открытость у занятой ячейки — и тем гасила ровно те
+               * ячейки, ради которых всё считается: поверхность И ЕСТЬ занятые
+               * ячейки. Булево правило этой ошибки не имело, потому что проверяло
+               * занятость СОСЕДА. */
+              double c0[3] = {(double)x + 0.5, (double)y + 0.5, (double)z + 0.5};
+              double dd[3], sabs = 0.0;
+              for (int k = 0; k < 3; k++) {
+                dd[k] = sc[k] - c0[k];
+                sabs += fabs(dd[k]);
               }
-              pp[k] = save;
-            }
-            double f = wsum > 0.0 ? acc / wsum : 0.0;
+              if (!(sabs > 0.0)) {
+                G->open[ci] = 1.0f;
+                continue;
+              }
+              if (g_raysweep) {
+                /* Ф2' (§505): ПЕРЕНОС ВДОЛЬ ПРЯМОЙ. Шаг назад делается только по
+                 * ГЛАВНОЙ оси, а поперечное смещение точки входа берётся из самого
+                 * направления — то есть путь есть прямая, а не лесенка. Четыре
+                 * вкладчика лежат в ОДНОЙ плоскости, поперёк одного луча.
+                 * ЗАНЯТЫЙ ВКЛАДЧИК ВХОДИТ НУЛЁМ: здесь он значит «эта доля сечения
+                 * пучка заслонена», а не «этот путь закрыт», — и потому обнулять
+                 * его физически верно (разбор в §505). */
+                int km = 0;
+                for (int k = 1; k < 3; k++)
+                  if (fabs(dd[k]) > fabs(dd[km])) km = k;
+                int u2 = (km + 1) % 3, v2 = (km + 2) % 3;
+                double inv = fabs(dd[km]) > 0.0 ? 1.0 / fabs(dd[km]) : 0.0;
+                double fu = (double)(km == 0 ? x : (km == 1 ? y : z));
+                (void)fu;
+                double pu =
+                    (double)(u2 == 0 ? x : (u2 == 1 ? y : z)) + (g_noshift ? 0.0 : dd[u2] * inv);
+                double pv =
+                    (double)(v2 == 0 ? x : (v2 == 1 ? y : z)) + (g_noshift ? 0.0 : dd[v2] * inv);
+                int32_t bu = (int32_t)floor(pu), bv = (int32_t)floor(pv);
+                double tu = pu - (double)bu, tv = pv - (double)bv;
+                int32_t base[3] = {x, y, z};
+                base[km] += (dd[km] > 0.0 ? 1 : -1);
+                double accr = 0.0;
+                for (int au = 0; au < 2; au++)
+                  for (int av = 0; av < 2; av++) {
+                    int32_t q2[3] = {base[0], base[1], base[2]};
+                    q2[u2] = bu + au;
+                    q2[v2] = bv + av;
+                    double w2 = (au ? tu : 1.0 - tu) * (av ? tv : 1.0 - tv);
+                    if (!(w2 > 0.0)) continue;
+                    if (q2[0] < 0 || q2[1] < 0 || q2[2] < 0 || q2[0] >= n || q2[1] >= n ||
+                        q2[2] >= n)
+                      continue;
+                    size_t qi = hz_occ_index(n, q2[0], q2[1], q2[2]);
+                    if (hz_occ_get(P->b[P->lev - G->drop], qi)) continue; /* заслонено: ноль */
+                    accr += w2 * (double)G->open[qi];
+                  }
+                if (G->round01) accr = accr >= 0.5 ? 1.0 : 0.0;
+                G->open[ci] = (float)accr;
+                continue;
+              }
+              double acc = 0.0, wsum = 0.0;
+              int32_t pp[3] = {x, y, z};
+              for (int k = 0; k < 3; k++) {
+                double w = fabs(dd[k]) / sabs;
+                if (!(w > 0.0)) continue;
+                int32_t save = pp[k];
+                pp[k] = save + (dd[k] > 0.0 ? 1 : -1);
+                if (pp[k] >= 0 && pp[k] < n) {
+                  size_t pi = hz_occ_index(n, pp[0], pp[1], pp[2]);
+                  /* ЗАКРЫТОЕ НАПРАВЛЕНИЕ ИСКЛЮЧАЕТСЯ ИЗ СРЕДНЕГО, А НЕ ВХОДИТ В
+                   * НЕГО НУЛЁМ. Иначе у стены одно направление из трёх всегда
+                   * закрыто, среднее падает на каждом шаге, и открытость ТАЕТ
+                   * вдоль стены — это ложное затухание, а не тень. Замерено на
+                   * первой редакции: средняя открытость 0.0605 против 0.3995 у
+                   * эталона. */
+                  if (hz_occ_get(P->b[P->lev - G->drop], pi)) continue;
+                  acc += w * (double)G->open[pi];
+                  wsum += w;
+                }
+                pp[k] = save;
+              }
+              double f = wsum > 0.0 ? acc / wsum : 0.0;
 #if HZ_SWEEP_P > 1
-            /* Ф1' (§502): ПРОФИЛЬ НА ГРАНИ ВМЕСТО ОДНОГО ЧИСЛА. Ячейка несёт
-             * `P×P` подпроб открытости в плоскости, поперечной ГЛАВНОЙ оси
-             * направления на источник. Подпроба берётся у верхнего по потоку
-             * соседа ПО ГЛАВНОЙ ОСИ со сдвигом `P·d_u/|d_k|` — это и есть форма
-             * тени, переносимая вдоль луча, а не размазанная средним.
-             *
-             * ПРИБЛИЖЕНИЕ, НАЗВАННОЕ ЗДЕСЬ: два ПОБОЧНЫХ соседа отдают своё
-             * СРЕДНЕЕ, а не профиль. Их профили лежат в других плоскостях, и
-             * честный перенос потребовал бы поворота выборки. Главная ось несёт
-             * границу тени (по ней идёт основной поток), побочные подмешивают
-             * фон — то есть приближение бьёт по фону, а не по границе. Если
-             * замер покажет, что этого мало, следующий ход — общий профиль в
-             * плоскости, поперечной СРЕДНЕМУ направлению, а не по осям. */
-            int kmax = 0;
-            for (int k = 1; k < 3; k++)
-              if (fabs(dd[k]) > fabs(dd[kmax])) kmax = k;
-            int uu = (kmax + 1) % 3, vv = (kmax + 2) % 3;
-            unsigned char *pc = G->prof + ci * (size_t)(HZ_SWEEP_P * HZ_SWEEP_P);
-            int32_t up[3] = {x, y, z};
-            up[kmax] += (dd[kmax] > 0.0 ? 1 : -1);
-            int haveup = 0;
-            const unsigned char *pu = NULL;
-            if (up[0] >= 0 && up[0] < n && up[1] >= 0 && up[1] < n && up[2] >= 0 && up[2] < n) {
-              size_t ui = hz_occ_index(n, up[0], up[1], up[2]);
-              if (!hz_occ_get(P->b[P->lev - G->drop], ui)) {
-                pu = G->prof + ui * (size_t)(HZ_SWEEP_P * HZ_SWEEP_P);
-                haveup = 1;
-              }
-            }
-            /* Сдвиг в подпробах: пересечение ячейки вдоль `d` смещает луч на
-             * `d_u/|d_k|` ячейки поперёк, то есть на `P·d_u/|d_k|` подпроб. */
-            double shu = (double)HZ_SWEEP_P * dd[uu] / fabs(dd[kmax]);
-            double shv = (double)HZ_SWEEP_P * dd[vv] / fabs(dd[kmax]);
-            double bg = f * 255.0; /* фон — тот же взвешенный ответ, что и раньше */
-            double psum = 0.0;
-            for (int a = 0; a < HZ_SWEEP_P; a++)
-              for (int b = 0; b < HZ_SWEEP_P; b++) {
-                double val = bg;
-                if (haveup) {
-                  int sa = (int)lround((double)a + (g_noshift ? 0.0 : shu));
-                  int sb = (int)lround((double)b + (g_noshift ? 0.0 : shv));
-                  if (sa >= 0 && sa < HZ_SWEEP_P && sb >= 0 && sb < HZ_SWEEP_P)
-                    val = (double)pu[sa * HZ_SWEEP_P + sb];
-                  /* Вышли за грань — луч пришёл из СОСЕДНЕЙ ячейки того же
-                   * уровня; её профиля здесь нет, и берётся взвешенный фон.
-                   * Это та же диффузия, но только на краю профиля, а не везде. */
+              /* Ф1' (§502): ПРОФИЛЬ НА ГРАНИ ВМЕСТО ОДНОГО ЧИСЛА. Ячейка несёт
+               * `P×P` подпроб открытости в плоскости, поперечной ГЛАВНОЙ оси
+               * направления на источник. Подпроба берётся у верхнего по потоку
+               * соседа ПО ГЛАВНОЙ ОСИ со сдвигом `P·d_u/|d_k|` — это и есть форма
+               * тени, переносимая вдоль луча, а не размазанная средним.
+               *
+               * ПРИБЛИЖЕНИЕ, НАЗВАННОЕ ЗДЕСЬ: два ПОБОЧНЫХ соседа отдают своё
+               * СРЕДНЕЕ, а не профиль. Их профили лежат в других плоскостях, и
+               * честный перенос потребовал бы поворота выборки. Главная ось несёт
+               * границу тени (по ней идёт основной поток), побочные подмешивают
+               * фон — то есть приближение бьёт по фону, а не по границе. Если
+               * замер покажет, что этого мало, следующий ход — общий профиль в
+               * плоскости, поперечной СРЕДНЕМУ направлению, а не по осям. */
+              int kmax = 0;
+              for (int k = 1; k < 3; k++)
+                if (fabs(dd[k]) > fabs(dd[kmax])) kmax = k;
+              int uu = (kmax + 1) % 3, vv = (kmax + 2) % 3;
+              unsigned char *pc = G->prof + ci * (size_t)(HZ_SWEEP_P * HZ_SWEEP_P);
+              int32_t up[3] = {x, y, z};
+              up[kmax] += (dd[kmax] > 0.0 ? 1 : -1);
+              int haveup = 0;
+              const unsigned char *pu = NULL;
+              if (up[0] >= 0 && up[0] < n && up[1] >= 0 && up[1] < n && up[2] >= 0 && up[2] < n) {
+                size_t ui = hz_occ_index(n, up[0], up[1], up[2]);
+                if (!hz_occ_get(P->b[P->lev - G->drop], ui)) {
+                  pu = G->prof + ui * (size_t)(HZ_SWEEP_P * HZ_SWEEP_P);
+                  haveup = 1;
                 }
-                pc[a * HZ_SWEEP_P + b] =
-                    (unsigned char)(val < 0.0     ? 0
-                                    : val > 255.0 ? 255
-                                                  : (unsigned char)lround(val));
-                psum += (double)pc[a * HZ_SWEEP_P + b];
               }
-            f = psum / (255.0 * (double)(HZ_SWEEP_P * HZ_SWEEP_P));
+              /* Сдвиг в подпробах: пересечение ячейки вдоль `d` смещает луч на
+               * `d_u/|d_k|` ячейки поперёк, то есть на `P·d_u/|d_k|` подпроб. */
+              double shu = (double)HZ_SWEEP_P * dd[uu] / fabs(dd[kmax]);
+              double shv = (double)HZ_SWEEP_P * dd[vv] / fabs(dd[kmax]);
+              double bg = f * 255.0; /* фон — тот же взвешенный ответ, что и раньше */
+              double psum = 0.0;
+              for (int a = 0; a < HZ_SWEEP_P; a++)
+                for (int b = 0; b < HZ_SWEEP_P; b++) {
+                  double val = bg;
+                  if (haveup) {
+                    int sa = (int)lround((double)a + (g_noshift ? 0.0 : shu));
+                    int sb = (int)lround((double)b + (g_noshift ? 0.0 : shv));
+                    if (sa >= 0 && sa < HZ_SWEEP_P && sb >= 0 && sb < HZ_SWEEP_P)
+                      val = (double)pu[sa * HZ_SWEEP_P + sb];
+                    /* Вышли за грань — луч пришёл из СОСЕДНЕЙ ячейки того же
+                     * уровня; её профиля здесь нет, и берётся взвешенный фон.
+                     * Это та же диффузия, но только на краю профиля, а не везде. */
+                  }
+                  pc[a * HZ_SWEEP_P + b] =
+                      (unsigned char)(val < 0.0     ? 0
+                                      : val > 255.0 ? 255
+                                                    : (unsigned char)lround(val));
+                  psum += (double)pc[a * HZ_SWEEP_P + b];
+                }
+              f = psum / (255.0 * (double)(HZ_SWEEP_P * HZ_SWEEP_P));
 #endif
-            /* НЕГАТИВНЫЙ КОНТРОЛЬ (§423): округление до 0/1 обязано вернуть
-             * смещения булевых правил. */
-            if (G->round01) f = f >= 0.5 ? 1.0 : 0.0;
-            G->open[ci] = (float)f;
-            continue;
-          }
-          if (G->vis[ci]) continue;
-          int v = 0;
-          if (G->axis) {
-
-            /* НЕГАТИВНЫЙ КОНТРОЛЬ (§419): прежнее правило — максимум по трём
-             * ОСЕВЫМ соседям. Путь ступенчатый, свет заворачивает за угол, и
-             * расхождение с эталоном обязано вернуться к `18 %`. */
-            int32_t px = x - dx, py = y - dy, pz = z - dz;
-            if (px >= 0 && px < n) {
-              size_t pi = hz_occ_index(n, px, y, z);
-              if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
-            }
-            if (!v && py >= 0 && py < n) {
-              size_t pi = hz_occ_index(n, x, py, z);
-              if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
-            }
-            if (!v && pz >= 0 && pz < n) {
-              size_t pi = hz_occ_index(n, x, y, pz);
-              if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
-            }
-          } else {
-            /* Ш5а1: ПРЕДШЕСТВЕННИК ВДОЛЬ НАСТОЯЩЕГО НАПРАВЛЕНИЯ НА ИСТОЧНИК.
-             * Берётся ячейка, содержащая точку `центр − шаг·d`, где `d` —
-             * единичное направление на источник. Предшественник ОДИН, а не
-             * максимум по трём, — и потому свет не может «свернуть за угол»:
-             * путь идёт по прямой, а не ступенькой.
-             * Шаг — сторона ячейки: меньший шаг дал бы ту же ячейку, больший
-             * перепрыгнул бы заслон. */
-            double c0[3] = {(double)x + 0.5, (double)y + 0.5, (double)z + 0.5};
-            double d[3], dl = 0.0;
-            for (int k = 0; k < 3; k++) {
-              d[k] = sc[k] - c0[k];
-              dl += d[k] * d[k];
-            }
-            dl = sqrt(dl);
-            if (!(dl > 0.0)) {
-              G->vis[ci] = 1u;
+              /* НЕГАТИВНЫЙ КОНТРОЛЬ (§423): округление до 0/1 обязано вернуть
+               * смещения булевых правил. */
+              if (G->round01) f = f >= 0.5 ? 1.0 : 0.0;
+              G->open[ci] = (float)f;
               continue;
             }
-            int32_t qc[3];
-            int ok = 1;
-            for (int k = 0; k < 3; k++) {
-              double w = c0[k] + d[k] / dl;
-              int32_t iw = (int32_t)floor(w);
-              if (iw < 0 || iw >= n) ok = 0;
-              qc[k] = ok ? iw : 0;
+            if (G->vis[ci]) continue;
+            int v = 0;
+            if (G->axis) {
+
+              /* НЕГАТИВНЫЙ КОНТРОЛЬ (§419): прежнее правило — максимум по трём
+               * ОСЕВЫМ соседям. Путь ступенчатый, свет заворачивает за угол, и
+               * расхождение с эталоном обязано вернуться к `18 %`. */
+              int32_t px = x - dx, py = y - dy, pz = z - dz;
+              if (px >= 0 && px < n) {
+                size_t pi = hz_occ_index(n, px, y, z);
+                if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
+              }
+              if (!v && py >= 0 && py < n) {
+                size_t pi = hz_occ_index(n, x, py, z);
+                if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
+              }
+              if (!v && pz >= 0 && pz < n) {
+                size_t pi = hz_occ_index(n, x, y, pz);
+                if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
+              }
+            } else {
+              /* Ш5а1: ПРЕДШЕСТВЕННИК ВДОЛЬ НАСТОЯЩЕГО НАПРАВЛЕНИЯ НА ИСТОЧНИК.
+               * Берётся ячейка, содержащая точку `центр − шаг·d`, где `d` —
+               * единичное направление на источник. Предшественник ОДИН, а не
+               * максимум по трём, — и потому свет не может «свернуть за угол»:
+               * путь идёт по прямой, а не ступенькой.
+               * Шаг — сторона ячейки: меньший шаг дал бы ту же ячейку, больший
+               * перепрыгнул бы заслон. */
+              double c0[3] = {(double)x + 0.5, (double)y + 0.5, (double)z + 0.5};
+              double d[3], dl = 0.0;
+              for (int k = 0; k < 3; k++) {
+                d[k] = sc[k] - c0[k];
+                dl += d[k] * d[k];
+              }
+              dl = sqrt(dl);
+              if (!(dl > 0.0)) {
+                G->vis[ci] = 1u;
+                continue;
+              }
+              int32_t qc[3];
+              int ok = 1;
+              for (int k = 0; k < 3; k++) {
+                double w = c0[k] + d[k] / dl;
+                int32_t iw = (int32_t)floor(w);
+                if (iw < 0 || iw >= n) ok = 0;
+                qc[k] = ok ? iw : 0;
+              }
+              if (ok) {
+                size_t pi = hz_occ_index(n, qc[0], qc[1], qc[2]);
+                if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
+              }
             }
-            if (ok) {
-              size_t pi = hz_occ_index(n, qc[0], qc[1], qc[2]);
-              if (G->vis[pi] && !hz_occ_get(P->b[P->lev - G->drop], pi)) v = 1;
-            }
+            if (v) G->vis[ci] = 1u;
           }
-          if (v) G->vis[ci] = 1u;
-        }
-  }
+    }
 }
 
 static double sweep_vis(const sweepgrid *G, const frame *fr, const double p[3]) {
@@ -2329,6 +2338,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "noshift") == 0) g_noshift = 1;
     if (strcmp(argv[i], "raysweep") == 0) g_raysweep = 1;
     if (strncmp(argv[i], "seed=", 5) == 0) g_seed = (int32_t)strtol(argv[i] + 5, NULL, 10);
+    if (strncmp(argv[i], "passes=", 7) == 0) g_passes = (int)strtol(argv[i] + 7, NULL, 10);
     /* Р-7а: замер квантования плоскости. */
     if (strcmp(argv[i], "qplane") == 0) {
       qplane = 1;

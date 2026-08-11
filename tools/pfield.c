@@ -33,6 +33,8 @@
 #include "scene_cfg.h"
 #include "scene_obj.h"
 #include "transport/cam3.h"
+#include "transport/cut3.h"
+#include "transport/mesh3.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -208,6 +210,31 @@ static int hz_flipall = 0;
  * вывернутых по площади обязана ВЫРАСТИ; не шелохнётся — выбор диагонали ни на
  * что не влияет. */
 static int hz_longdiag = 0;
+
+/* Дерево по ЗАНЯТОСТИ для стыка с переносом (Ш13): пустая коробка остаётся
+ * крупным листом, занятая дробится до предела. Тот же предикат, что у
+ * `hz_dc_shape_occ`, поэтому сетка переноса и дерево DC согласованы по
+ * построению, а не по совпадению. */
+static void oct_by_occ(hz_octree *t, const opyr *P, int lev, int32_t x, int32_t y, int32_t z,
+                       int32_t size) {
+  int lv = lev;
+  int32_t s = size;
+  while (s > 1) {
+    lv--;
+    s /= 2;
+  }
+  int occ = hz_occ_get(P->b[lv], hz_occ_index((int32_t)1 << lv, x >> (lev - lv), y >> (lev - lv),
+                                             z >> (lev - lv))) != 0;
+  if (!occ || size == 1) {
+    int lo[3] = {(int)x, (int)y, (int)z}, hi[3] = {(int)(x + size), (int)(y + size),
+                                                  (int)(z + size)};
+    hz_oct_set_box(t, lo, hi, 1.0);
+    return;
+  }
+  int32_t h = size / 2;
+  for (int k = 0; k < 8; k++)
+    oct_by_occ(t, P, lev, x + ((k & 1) ? h : 0), y + ((k & 2) ? h : 0), z + ((k & 4) ? h : 0), h);
+}
 /* П2 §467: пометка «треугольник родом из СЛОЖЕННОГО квада». Объявлена здесь,
  * потому что ставит её обход, а читает укладка треугольника. */
 static int g_curfold = 0;
@@ -2090,6 +2117,7 @@ int main(int argc, char **argv) {
   }
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
   int nrmflip = 0, nonsum = 0, indvis = 0, indmeas = 0, dosolid = 0;
+  int doxfer = 0, xfernosolid = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
   double oven = 0.0, plates = 0.0;
   double lodthr = 1.0;
@@ -2112,6 +2140,17 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "indmeas") == 0) indmeas = 1;
     /* Ш12 (§475): заливка внутренностей и сверка со знаковым объёмом. */
     if (strcmp(argv[i], "solid") == 0) dosolid = 1;
+    /* Ш13 (§479): стык с переносом. `xfernosolid` — негативный контроль: без
+     * маски полных ячеек объём материала обязан рухнуть. */
+    if (strcmp(argv[i], "xfer") == 0) {
+      doxfer = 1;
+      dosolid = 1;
+    }
+    if (strcmp(argv[i], "xfernosolid") == 0) {
+      doxfer = 1;
+      dosolid = 1;
+      xfernosolid = 1;
+    }
     if (strcmp(argv[i], "indvis") == 0) {
       indmeas = 1;
       indvis = 1;
@@ -2295,6 +2334,7 @@ int main(int argc, char **argv) {
   /* ---- 2. эрмитовы рёбра: сцена строит и отдаёт ---- */
   hz_htab ht;
   if (hz_htab_init(&ht) != 0) exit(1);
+  unsigned char *solidmask = NULL; /* Ш12/Ш13: 0 тело, 1 полость, 2 наружное */
   /* ---- 2б. ЗАЛИВКА ВНУТРЕННОСТЕЙ (Ш12, §475) ---- */
   /* ЗАЧЕМ. Развёртке по ординатам нужен вход `solid[ncell]` — «ячейка целиком в
    * материале»; без него свет идёт СКВОЗЬ ТЕЛА (замерено в стыке: объём
@@ -2447,8 +2487,8 @@ int main(int argc, char **argv) {
            (vsig >= (double)nbody * cv && vsig <= (double)(nbody + nbnd) * cv) ? "В ВИЛКЕ"
                                                                                : "ВНЕ ВИЛКИ",
            (long long)nleak, (double)nc / 1048576.0);
-    free(fl);
     free(stk);
+    solidmask = fl; /* Ш13: маска нужна стыку переноса; освобождается в конце */
   }
 
   t0 = now_s();
@@ -2501,6 +2541,77 @@ int main(int argc, char **argv) {
          (double)hz_occ_bytes((size_t)fr.n * (size_t)fr.n * (size_t)fr.n) * (8.0 / 7.0) / 1048576.0,
          (double)T.nsumcap * 24.0 / 1048576.0,
          T.n > 0 ? (double)T.nsumcap * 24.0 / (double)T.n : 0.0);
+
+  /* ---- 3г. СТЫК С ПЕРЕНОСОМ (Ш13, §479) ---- */
+  /* ЧТО ЗДЕСЬ ПРОВЕРЯЕТСЯ. Развёртка по ординатам даёт глобальное освещение С
+   * ЗАСЛОНАМИ по построению — ту физику, что маршем стоит 65 с (§474). Её стык
+   * с геометрией — `tr3_cut_build`, и принимает он ровно то, что общий слой уже
+   * отдаёт: фасеты `hz_dc_facets` плюс маску «ячейка целиком в материале» из
+   * заливки Ш12. Здесь развёртка НЕ ЗАПУСКАЕТСЯ: шаг отвечает на один вопрос —
+   * принимает ли стык геометрию DC и при каком уровне.
+   * ДЕРЕВО СТРОИТСЯ ПО ЗАНЯТОСТИ, А НЕ ПО ОТБОРУ ФАСЕТОВ, как в `render3`: у
+   * него фасетов сотни (сфера), у нас их сотни тысяч, и `hz_facets_for_box` на
+   * каждую коробку стоил бы O(фасетов). Пирамида занятости отвечает на тот же
+   * вопрос за O(1) и по построению согласована с деревом DC. */
+  if (doxfer) {
+    double tx = now_s();
+    hz_facettab ftab;
+    hz_cutmap cmap;
+    if (hz_facettab_init(&ftab) != 0 || hz_cutmap_init(&cmap) != 0) exit(1);
+    int frc = hz_dc_facets(&T, NULL, NULL, &ftab, &cmap);
+    double t_fac = now_s() - tx;
+    printf("   СТЫК: фасетов %d, записей боковой таблицы %d, код %d, за %.2f с\n", ftab.n, cmap.nr,
+           frc, t_fac);
+    (void)0;
+    tx = now_s();
+    hz_octree ot;
+    if (hz_oct_init(&ot, lev, 0.0) != 0) exit(1);
+    oct_by_occ(&ot, &P, lev, 0, 0, 0, fr.n);
+    hz_frame ofr = {{fr.org[0], fr.org[1], fr.org[2]}, {fr.h, fr.h, fr.h}};
+    tr3_mesh mesh;
+    if (tr3_mesh_build(&mesh, &ot, &ofr) != 0) exit(1);
+    double t_mesh = now_s() - tx;
+    /* МАСКА ПОЛНЫХ ЯЧЕЕК — из заливки. У листа с поверхностью размер 1, у
+     * пустого — класс однороден по построению, поэтому хватает ОДНОЙ пробы в
+     * его нижнем углу. */
+    uint8_t *solid = calloc((size_t)mesh.ncell, 1);
+    if (solid == NULL) exit(1);
+    int64_t nsolid = 0;
+    for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+      size_t k = hz_occ_index(fr.n, mesh.clo[ci][0], mesh.clo[ci][1], mesh.clo[ci][2]);
+      if (solidmask != NULL && solidmask[k] == 0u && !hz_occ_get(P.b[lev], k)) {
+        solid[ci] = 1u;
+        nsolid++;
+      }
+    }
+    tx = now_s();
+    tr3_cut cut;
+    int crc = tr3_cut_build(&cut, &mesh, &ftab, &cmap, xfernosolid ? NULL : solid);
+    double t_cut = now_s() - tx;
+    double vfl = 0.0;
+    if (crc == 0)
+      for (int32_t ci = 0; ci < mesh.ncell; ci++)
+        vfl += cut.mvol[ci][0][0];
+    double vbox = 0.0;
+    for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+      double s = (double)mesh.csize[ci] * fr.h;
+      vbox += s * s * s;
+    }
+    printf("   СТЫК: ячеек сетки %d (полных в материале %lld), граней %d; сетка за %.2f с, "
+           "разрез за %.2f с, код %d\n",
+           mesh.ncell, (long long)nsolid, mesh.nf, t_mesh, t_cut, crc);
+    if (crc == 0)
+      printf("      nbad %d (нарушивших 1:1), nse %d (поверхностных элементов), nsebig %d "
+             "(многоугольник не поместился); ОБЪЁМ: куб %.3f, ФЛЮИД %.3f, материал %.3f м³%s\n",
+             cut.nbad, cut.nse, cut.nsebig, vbox, vfl, vbox - vfl,
+             xfernosolid ? "   [БЕЗ МАСКИ — НК]" : "");
+    if (crc == 0) tr3_cut_free(&cut);
+    free(solid);
+    tr3_mesh_free(&mesh);
+    hz_oct_free(&ot);
+    hz_facettab_free(&ftab);
+    hz_cutmap_free(&cmap);
+  }
 
   /* ---- 4. приёмка: потеря поля (популяция — ВХОД) ---- */
   celltris CT;

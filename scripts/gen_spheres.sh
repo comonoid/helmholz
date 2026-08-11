@@ -44,16 +44,16 @@ awk 'BEGIN {
     # вывернутых при ПОЛНОЙ ГЛУБИНЕ выходит нулём.
     for (i = 0; i < nu; i++) {
       i2 = (i + 1) % nu;
-      printf "f %d %d %d\n", np, base + 1 + i + 1, base + 1 + i2 + 1;
-      printf "f %d %d %d\n", sp, base + 1 + (nv-2)*nu + i2 + 1, base + 1 + (nv-2)*nu + i + 1;
+      printf "f %d %d %d\n", np, base + 1 + i2 + 1, base + 1 + i + 1;
+      printf "f %d %d %d\n", sp, base + 1 + (nv-2)*nu + i + 1, base + 1 + (nv-2)*nu + i2 + 1;
     }
     for (j = 1; j < nv - 1; j++)
       for (i = 0; i < nu; i++) {
         i2 = (i + 1) % nu;
         a = base + 1 + (j-1)*nu + i + 1; b = base + 1 + (j-1)*nu + i2 + 1;
         c = base + 1 + j*nu + i2 + 1;    e = base + 1 + j*nu + i + 1;
-        printf "f %d %d %d\n", a, e, c;
-        printf "f %d %d %d\n", a, c, b;
+        printf "f %d %d %d\n", a, c, e;
+        printf "f %d %d %d\n", a, b, c;
       }
     base += (nv - 1) * nu + 2;
   }

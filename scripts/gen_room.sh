@@ -68,14 +68,14 @@ function sphere(cx,cy,cz,r, nu,nw,   b,i,j,th,ph,np,sp,i2) {
   np = b + 1; sp = b + 1 + (nw-1)*nu + 1;
   for (i = 0; i < nu; i++) {
     i2 = (i + 1) % nu;
-    printf "f %d %d %d\n", np, b+1+i+1, b+1+i2+1;
-    printf "f %d %d %d\n", sp, b+1+(nw-2)*nu+i2+1, b+1+(nw-2)*nu+i+1;
+    printf "f %d %d %d\n", np, b+1+i2+1, b+1+i+1;
+    printf "f %d %d %d\n", sp, b+1+(nw-2)*nu+i+1, b+1+(nw-2)*nu+i2+1;
   }
   for (j = 1; j < nw - 1; j++)
     for (i = 0; i < nu; i++) {
       i2 = (i + 1) % nu;
-      printf "f %d %d %d\n", b+1+(j-1)*nu+i+1, b+1+j*nu+i+1,  b+1+j*nu+i2+1;
-      printf "f %d %d %d\n", b+1+(j-1)*nu+i+1, b+1+j*nu+i2+1, b+1+(j-1)*nu+i2+1;
+      printf "f %d %d %d\n", b+1+(j-1)*nu+i+1, b+1+j*nu+i2+1, b+1+j*nu+i+1;
+      printf "f %d %d %d\n", b+1+(j-1)*nu+i+1, b+1+(j-1)*nu+i2+1, b+1+j*nu+i2+1;
     }
 }
 # Цилиндр с крышками: ОДИНАРНАЯ кривизна — одна главная кривизна нулевая, и
@@ -91,10 +91,10 @@ function cyl(cx,cz,r, y0,y1, nu,   b,i,i2,c0,c1) {
   c1 = nv + 1; printf "v %.6f %.6f %.6f\n", cx, y1, cz; nv++;
   for (i = 0; i < nu; i++) {
     i2 = (i + 1) % nu;
-    printf "f %d %d %d\n", b+2*i+1, b+2*i2+1, b+2*i2+2;
-    printf "f %d %d %d\n", b+2*i+1, b+2*i2+2, b+2*i+2;
-    printf "f %d %d %d\n", c0, b+2*i2+1, b+2*i+1;
-    printf "f %d %d %d\n", c1, b+2*i+2, b+2*i2+2;
+    printf "f %d %d %d\n", b+2*i+1, b+2*i2+2, b+2*i2+1;
+    printf "f %d %d %d\n", b+2*i+1, b+2*i+2, b+2*i2+2;
+    printf "f %d %d %d\n", c0, b+2*i+1, b+2*i2+1;
+    printf "f %d %d %d\n", c1, b+2*i2+2, b+2*i+2;
   }
 }
 BEGIN {

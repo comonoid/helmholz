@@ -1773,6 +1773,8 @@ static int g_passes = 1;
 static double g_emitthr = 0.0;
 /* Ф4' (§511): свип по дереву вместо плоской сетки. */
 static int g_treesweep = 0;
+/* Ф5. (§514): порог дробления дерева свипа и камера для него. */
+static double g_sweepthr = 0.0, g_sweeppx = 1.0, g_sweepeye[3] = {0, 0, 0};
 
 /* --- Ф4' (§511): СВИП ПО ДЕРЕВУ ------------------------------------------- */
 
@@ -1803,9 +1805,16 @@ typedef struct {
   int32_t n, cap;
   int32_t *idx; /* ячейка сетки свипа -> ЛИСТ */
   int32_t nleaf;
-  unsigned char *occl; /* лист занят (заслон) — считается при постройке */
-  float *open;         /* открытость на УЗЕЛ */
-  int32_t gn;          /* сторона сетки свипа */
+  /* Ф5. (§514): дробление по ДОПУСКУ, а не только по занятости. Порог — тот же
+   * угловой, что у среза, чтобы подробность тени и подробность поверхности были
+   * согласованы. Невидимое огрубляется тем же правилом: далёкое и мелкое в
+   * кадре получает крупный узел. */
+  double eye[3], pxrad, thr;
+  unsigned char *occl;            /* лист занят (заслон) — считается при постройке */
+  int32_t *nbstart, *nblist, nnb; /* CSR: соседи листа по шести граням (§514) */
+  float *nbw;                     /* доля общей площади грани */
+  float *open;                    /* открытость на УЗЕЛ */
+  int32_t gn;                     /* сторона сетки свипа */
 } stree;
 
 static void stree_free(stree *T) {
@@ -1813,7 +1822,13 @@ static void stree_free(stree *T) {
   free(T->idx);
   free(T->open);
   free(T->occl);
+  free(T->nbstart);
+  free(T->nblist);
+  free(T->nbw);
   T->occl = NULL;
+  T->nbstart = NULL;
+  T->nblist = NULL;
+  T->nbw = NULL;
   T->nd = NULL;
   T->idx = NULL;
   T->open = NULL;
@@ -1850,6 +1865,20 @@ static void stree_rec(stree *T, const opyr *P, int lev, int drop, int32_t me) {
   int occ = hz_occ_get(P->b[lv], hz_occ_index((int32_t)1 << lv, x >> sh, y >> sh, z >> sh)) != 0;
   T->nd[me].child0 = -1;
   if (!occ || size == 1) return;
+  if (T->thr > 0.0) {
+    /* Расстояние до БЛИЖАЙШЕЙ точки коробки — та же осторожная мера, что у
+     * `lod_stop` (А733): у крупного узла оно разное в разных его точках. */
+    double d2 = 0.0;
+    for (int a = 0; a < 3; a++) {
+      double lo2 = (double)T->nd[me].lo[a], hi2 = lo2 + (double)size, e2 = T->eye[a];
+      double dd2 = e2 < lo2 ? lo2 - e2 : (e2 > hi2 ? e2 - hi2 : 0.0);
+      d2 += dd2 * dd2;
+    }
+    if (d2 > 0.0) {
+      double px = ((double)size / sqrt(d2)) / T->pxrad;
+      if (px <= T->thr) return; /* мельче допуска в кадре — лист */
+    }
+  }
   int32_t h = size >> 1;
   int32_t c0 = stree_alloc8(T);
   T->nd[me].child0 = c0;
@@ -1864,9 +1893,14 @@ static void stree_rec(stree *T, const opyr *P, int lev, int drop, int32_t me) {
     stree_rec(T, P, lev, drop, c0 + k);
 }
 
-static void stree_build(stree *T, const opyr *P, int lev, int drop, int32_t gn) {
+static void stree_build(stree *T, const opyr *P, int lev, int drop, int32_t gn, const double eye[3],
+                        double pxrad, double thr) {
   memset(T, 0, sizeof *T);
   T->gn = gn;
+  for (int k = 0; k < 3; k++)
+    T->eye[k] = eye[k];
+  T->pxrad = pxrad;
+  T->thr = thr;
   T->nd = malloc(sizeof *T->nd);
   if (T->nd == NULL) exit(1);
   T->cap = 1;
@@ -1944,6 +1978,71 @@ typedef struct {
  * свипа выполняется по построению — сортировать нечего. Правило переноса ТО ЖЕ,
  * что на плоской сетке (взвешенное среднее по трём верхним соседям), чтобы
  * сравнение шло схема в схему. */
+/* СПИСКИ СОСЕДЕЙ ПО ПЛОЩАДИ ГРАНИ (Ф5', §514). У градуированного дерева сосед
+ * через грань не один: крупный лист граничит с несколькими мелкими, и читать
+ * только того, кто накрывает центр грани, значит терять три четверти потока.
+ * Здесь для каждого листа и каждой из шести граней строится СПИСОК соседей с
+ * долями общей площади. Строится раз на кадр, стоит O(суммарной площади
+ * листьев), то есть по построению меньше объёма. */
+static void stree_links(stree *T, int32_t gn) {
+  free(T->nbstart);
+  free(T->nblist);
+  free(T->nbw);
+  T->nbstart = malloc(((size_t)T->n * 6 + 1) * sizeof *T->nbstart);
+  if (T->nbstart == NULL) exit(1);
+  int32_t cap = T->n * 6, cnt = 0;
+  T->nblist = malloc((size_t)cap * sizeof *T->nblist);
+  T->nbw = malloc((size_t)cap * sizeof *T->nbw);
+  if (T->nblist == NULL || T->nbw == NULL) exit(1);
+  for (int32_t i = 0; i < T->n; i++)
+    for (int f = 0; f < 6; f++) {
+      T->nbstart[(size_t)i * 6 + (size_t)f] = cnt;
+      const snode *s = &T->nd[i];
+      if (s->child0 >= 0) continue;
+      int ax = f / 2, sg = (f & 1) ? 1 : -1;
+      int u = (ax + 1) % 3, v = (ax + 2) % 3;
+      int32_t pos = sg > 0 ? s->lo[ax] + s->size : s->lo[ax] - 1;
+      if (pos < 0 || pos >= gn) continue;
+      /* Перебор ячеек грани в МЕЛКОЙ сетке; одинаковые соседи схлопываются.
+       * Площадь считается в мелких ячейках, доля — от площади грани листа. */
+      double tot = (double)s->size * (double)s->size;
+      int32_t seen = -1;
+      for (int32_t a = 0; a < s->size; a++)
+        for (int32_t b = 0; b < s->size; b++) {
+          int32_t q[3];
+          q[ax] = pos;
+          q[u] = s->lo[u] + a;
+          q[v] = s->lo[v] + b;
+          int32_t nj = T->idx[hz_occ_index(gn, q[0], q[1], q[2])];
+          if (nj == seen) continue; /* дёшево ловит длинные серии одного соседа */
+          int found = 0;
+          for (int32_t t = T->nbstart[(size_t)i * 6 + (size_t)f]; t < cnt; t++)
+            if (T->nblist[t] == nj) {
+              T->nbw[t] += 1.0f / (float)tot;
+              found = 1;
+              break;
+            }
+          if (!found) {
+            if (cnt >= cap) {
+              int32_t nc = cap * 2;
+              int32_t *l2 = realloc(T->nblist, (size_t)nc * sizeof *l2);
+              float *w2 = realloc(T->nbw, (size_t)nc * sizeof *w2);
+              if (l2 == NULL || w2 == NULL) exit(1);
+              T->nblist = l2;
+              T->nbw = w2;
+              cap = nc;
+            }
+            T->nblist[cnt] = nj;
+            T->nbw[cnt] = 1.0f / (float)tot;
+            cnt++;
+          }
+          seen = nj;
+        }
+    }
+  T->nbstart[(size_t)T->n * 6] = cnt;
+  T->nnb = cnt;
+}
+
 static void tsweep_rec(stree *T, const opyr *P, int lev, int drop, const double sc[3], int32_t ni) {
   const snode *nd = &T->nd[ni];
   if (nd->child0 >= 0) {
@@ -2347,8 +2446,12 @@ static void front_sweep(const hz_dcslice *S, const frame *fr, const opyr *P, con
   stree TR;
   if (g_treesweep) {
     double tt = now_s();
-    stree_build(&TR, P, fr->lev, G.drop, G.n);
+    double eyeg[3];
+    for (int k = 0; k < 3; k++)
+      eyeg[k] = g_sweepeye[k] / (double)((int32_t)1 << G.drop);
+    stree_build(&TR, P, fr->lev, G.drop, G.n, eyeg, g_sweeppx, g_sweepthr);
     G.tree = &TR;
+    stree_links(&TR, G.n);
     printf("   Ф4' ДЕРЕВО СВИПА: узлов %d против %lld ячеек плоской сетки (в %.1f раза меньше), "
            "перечень и индекс за %.1f мс\n",
            TR.nleaf, (long long)gcells, (double)gcells / (double)(TR.nleaf ? TR.nleaf : 1),
@@ -2599,6 +2702,10 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "passes=", 7) == 0) g_passes = (int)strtol(argv[i] + 7, NULL, 10);
     if (strncmp(argv[i], "emit=", 5) == 0) g_emitthr = strtod(argv[i] + 5, NULL);
     if (strcmp(argv[i], "treesweep") == 0) g_treesweep = 1;
+    if (strncmp(argv[i], "sweepthr=", 9) == 0) {
+      g_sweepthr = strtod(argv[i] + 9, NULL);
+      g_treesweep = 1;
+    }
     /* Р-7а: замер квантования плоскости. */
     if (strcmp(argv[i], "qplane") == 0) {
       qplane = 1;
@@ -4093,6 +4200,11 @@ int main(int argc, char **argv) {
     for (int a = 0; a < 3; a++)
       LL.eye[a] = (eyec[a] - fr.org[a]) / fr.h;
     LL.pxrad = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / (double)res;
+    /* Ф5. (§514): камера дерева свипа — та же, что у среза, и в тех же единицах.
+     * Разные камеры у тени и у поверхности дали бы несогласованную подробность. */
+    for (int a = 0; a < 3; a++)
+      g_sweepeye[a] = LL.eye[a];
+    g_sweeppx = LL.pxrad;
     LL.thr = lodthr;
     hz_dcslice S;
     if (hz_slice_init(&S, lev) != HZ_DC_OK) exit(1);
@@ -4296,6 +4408,13 @@ int main(int argc, char **argv) {
     float *irr2 = malloc(3 * (size_t)S.n * sizeof *irr2);
     if (irr2 == NULL) exit(1);
     double t_sw = 0.0, t_ga = 0.0;
+    /* Ф5. (§514): камера дерева свипа ставится ЗДЕСЬ, непосредственно перед
+     * прогоном. Прежде она ставилась в ветви `lit`, которая идёт ПОЗЖЕ, и
+     * дерево строилось с камерой в нуле — то есть порог не действовал вовсе.
+     * Замер это и показал: число листьев не менялось ни при каком пороге. */
+    for (int a2 = 0; a2 < 3; a2++)
+      g_sweepeye[a2] = LL.eye[a2];
+    g_sweeppx = LL.pxrad;
     front_sweep(&S, &fr, &P, &AL, irr2, &m, &t_sw, &t_ga, sweepaxis, sweepfrac, sweepr01);
     /* ДОЛЯ ОТКРЫТОСТИ, А НЕ ОБЛУЧЁННОСТЬ (§423, А781). Приёмка задана на долю,
      * поэтому нужен знаменатель — облучённость БЕЗ всякого затенения. Считается

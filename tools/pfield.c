@@ -199,6 +199,11 @@ static int u_occ(void *ctx, const int32_t lo[3], int32_t size) {
  * Ключ `gridalign` возвращает прежнюю раму: это НЕГАТИВНЫЙ КОНТРОЛЬ, и отношение
  * площади обязано вернуться к `1.5000` ТОЧНО. */
 static int hz_gridalign = 0;
+/* НЕГАТИВНЫЙ КОНТРОЛЬ §463 (`flipall`): обратить порядок вершин У ВСЕХ выданных
+ * треугольников. Доля вывернутых и по числу, и ПО ПЛОЩАДИ обязана стать почти
+ * единицей, а гистограмма косинуса — зеркально перевернуться. Не перевернётся —
+ * измеритель меряет не то, что называет. */
+static int hz_flipall = 0;
 
 static int seg_tri(const double *A, const double *B, const double *C, const double P0[3], int axis,
                    double h, double *tt, double nrm[3]) {
@@ -1003,8 +1008,8 @@ static int emesh_push(emesh *E, const double a[3], const double b[3], const doub
   double *d = E->v + 9 * (size_t)E->ntri;
   for (int k = 0; k < 3; k++) {
     d[k] = a[k];
-    d[3 + k] = b[k];
-    d[6 + k] = c[k];
+    d[3 + k] = hz_flipall ? c[k] : b[k]; /* НК §463: обмотка обращена у ВСЕХ */
+    d[6 + k] = hz_flipall ? b[k] : c[k];
   }
   int32_t ti = E->ntri++;
   /* ТРИ КЛАССА, А НЕ ДВА (правка по первому прогону, §457). Минимальная из
@@ -1178,8 +1183,68 @@ static int cmp_u64(const void *x, const void *y) {
  * нас. Поэтому величина берётся ДИФФЕРЕНЦИАЛЬНО: та же доля считается при
  * ПОЛНОЙ ГЛУБИНЕ, где перепада уровней нет вовсе, и сравниваются ДВЕ доли.
  * Разность и есть вклад перепада; общий уровень — свойство модели. */
+/* Разбор вывернутости (§463). Складывается рядом с самим счётом, чтобы
+ * популяция была та же самая до последнего треугольника. `NULL` = не считать. */
+typedef struct {
+  int64_t hist[7], histf[7], nzn, n, cap;
+  double asum, afl;
+  double *ar, *as;
+  uint8_t *fl;
+} flipdiag;
+
+static void flipdiag_init(flipdiag *D, int32_t ntri) {
+  memset(D, 0, sizeof *D);
+  D->cap = ntri > 0 ? ntri : 1;
+  D->ar = malloc((size_t)D->cap * sizeof *D->ar);
+  D->as = malloc((size_t)D->cap * sizeof *D->as);
+  D->fl = malloc((size_t)D->cap * sizeof *D->fl);
+  if (D->ar == NULL || D->as == NULL || D->fl == NULL) exit(1);
+}
+
+/* Медиана по подмножеству (только вывернутые, либо все) — медиана, а не среднее:
+ * у площадей длинный хвост, и среднее по нему сказало бы о хвосте, а не о том,
+ * каков типичный треугольник. */
+static double flipdiag_med(const flipdiag *D, const double *v, int onlyflip) {
+  int64_t k = 0;
+  double *tmp = malloc((size_t)(D->n > 0 ? D->n : 1) * sizeof *tmp);
+  if (tmp == NULL) exit(1);
+  for (int64_t i = 0; i < D->n; i++)
+    if (!onlyflip || D->fl[i]) tmp[k++] = v[i];
+  double r = 0.0;
+  if (k > 0) {
+    qsort(tmp, (size_t)k, sizeof *tmp, cmp_d);
+    r = tmp[k / 2];
+  }
+  free(tmp);
+  return r;
+}
+
+static void flipdiag_report(flipdiag *D, const char *what) {
+  static const char *nm[7] = {"[-1,-.9)", "[-.9,-.5)", "[-.5,-.1)", "[-.1,.1)",
+                              "[.1,.5)",  "[.5,.9)",   "[.9,1]"};
+  int64_t nfl = 0;
+  for (int b = 0; b < 7; b++)
+    nfl += D->histf[b];
+  printf("      §463 РАЗБОР ВЫВЕРНУТОСТИ (%s): доля ПО ПЛОЩАДИ %.3f %% (по числу считалась выше); "
+         "медиана площади вывернутых %.4f h² против всех %.4f h²; медиана АСПЕКТА вывернутых "
+         "%.4f против всех %.4f; нормаль ровно нулевая у %lld\n",
+         what, 100.0 * D->afl / (D->asum > 0.0 ? D->asum : 1.0), flipdiag_med(D, D->ar, 1),
+         flipdiag_med(D, D->ar, 0), flipdiag_med(D, D->as, 1), flipdiag_med(D, D->as, 0),
+         (long long)D->nzn);
+  printf("         КОСИНУС вывернутых по корзинам:");
+  for (int b = 0; b < 7; b++)
+    if (D->histf[b] > 0)
+      printf(" %s %lld (%.1f %%)", nm[b], (long long)D->histf[b],
+             100.0 * (double)D->histf[b] / (double)(nfl ? nfl : 1));
+  printf("\n");
+  free(D->ar);
+  free(D->as);
+  free(D->fl);
+  memset(D, 0, sizeof *D);
+}
+
 static int64_t emesh_flips(const emesh *E, celltris *CT, const frame *fr, const hz_objmesh *m,
-                           int64_t *ncmp, int64_t nfc[3], int64_t ncc[3]) {
+                           int64_t *ncmp, int64_t nfc[3], int64_t ncc[3], flipdiag *D) {
   int64_t nf = 0, nc = 0;
   for (int k = 0; k < 3; k++)
     nfc[k] = ncc[k] = 0;
@@ -1246,6 +1311,48 @@ static int64_t emesh_flips(const emesh *E, celltris *CT, const frame *fr, const 
     if (d < 0.0) {
       nf++;
       nfc[cl]++;
+    }
+    if (D == NULL) continue;
+    /* §463: РАЗДЕЛИТЬ НАСТОЯЩИЙ ПЕРЕВОРОТ И ВЫРОЖДЕННЫЙ ЧЕТЫРЁХУГОЛЬНИК.
+     * Косинус НОРМИРУЕТСЯ (А848): у знака длина не нужна, у гистограммы —
+     * нужна. Точное вырождение (нулевая нормаль) идёт в СВОЙ счётчик, а не в
+     * среднюю корзину, иначе исход (Б) подтверждался бы тем, что в него же и
+     * записано. */
+    double ln = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+    double lf = sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
+    double ar = 0.5 * ln / (fr->h * fr->h); /* площадь в долях h² */
+    D->asum += ar;
+    if (d < 0.0) D->afl += ar;
+    if (!(ln > 0.0) || !(lf > 0.0)) {
+      D->nzn++;
+      continue;
+    }
+    double cs = d / (ln * lf);
+    if (cs > 1.0) cs = 1.0;
+    if (cs < -1.0) cs = -1.0;
+    static const double edge[6] = {-0.9, -0.5, -0.1, 0.1, 0.5, 0.9};
+    int b = 0;
+    while (b < 6 && cs >= edge[b])
+      b++;
+    D->hist[b]++;
+    if (d < 0.0) D->histf[b]++;
+    /* АСПЕКТ (А850) — признак ИЗ ДРУГОЙ ПРИРОДЫ, чем площадь: у иглы он около
+     * нуля при любом масштабе. `4A/(√3 L²)`, где L — длиннейшая сторона; у
+     * равностороннего равен 1. */
+    double e3[3];
+    for (int c = 0; c < 3; c++)
+      e3[c] = w[2][c] - w[1][c];
+    double l2m = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
+    double t2 = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
+    double t3 = e3[0] * e3[0] + e3[1] * e3[1] + e3[2] * e3[2];
+    if (t2 > l2m) l2m = t2;
+    if (t3 > l2m) l2m = t3;
+    double asp = l2m > 0.0 ? (2.0 * ln) / (1.7320508075688772 * l2m) : 0.0;
+    if (D->n < D->cap) {
+      D->ar[D->n] = ar;
+      D->as[D->n] = asp;
+      D->fl[D->n] = d < 0.0 ? 1 : 0;
+      D->n++;
     }
   }
   if (ncmp != NULL) *ncmp = nc;
@@ -1961,6 +2068,7 @@ int main(int argc, char **argv) {
     /* НЕГАТИВНЫЙ КОНТРОЛЬ §451: рама, совпадающая с габаритом, — площадь
      * коробки обязана вернуться к `1.5000`, записей к `8 649`. */
     if (strcmp(argv[i], "gridalign") == 0) hz_gridalign = 1;
+    if (strcmp(argv[i], "flipall") == 0) hz_flipall = 1;
     /* ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ (§446/§450 П3): на любой сцене, без печи. */
     if (strcmp(argv[i], "area") == 0) {
       lit = 1;
@@ -2420,7 +2528,9 @@ int main(int argc, char **argv) {
         if (wrc0 == HZ_DC_EMULTI) printf("   (обход эталона: код 4, часть ячеек без вершины)\n");
       }
       int64_t nc0 = 0, nfc0[3], ncc0[3];
-      int64_t nf0 = emesh_flips(&E0, &CT, &fr, &m, &nc0, nfc0, ncc0);
+      flipdiag D0;
+      flipdiag_init(&D0, E0.ntri);
+      int64_t nf0 = emesh_flips(&E0, &CT, &fr, &m, &nc0, nfc0, ncc0, &D0);
       printf("   ЭТАЛОН ПОЛНОЙ ГЛУБИНЫ: треугольников %lld, ОБРАЩЁННЫХ %lld из %lld (%.3f %%) — "
              "это доля МОДЕЛИ, перепада уровней здесь нет\n",
              (long long)E0.ntri, (long long)nf0, (long long)nc0,
@@ -2433,6 +2543,7 @@ int main(int argc, char **argv) {
              (long long)nfc0[0], (long long)ncc0[0],
              100.0 * (double)nfc0[0] / (double)(ncc0[0] ? ncc0[0] : 1), (long long)nfc0[1],
              (long long)ncc0[1], (long long)nfc0[2], (long long)ncc0[2]);
+      flipdiag_report(&D0, "полная глубина");
       free(E0.v);
       free(E0.cls);
       free(E0.head);
@@ -2651,7 +2762,9 @@ int main(int argc, char **argv) {
              (long long)EM.ntri, p50, p90, p99, (long long)nmiss, (long long)(ne + nmiss));
       {
         int64_t nc2 = 0, nfc[3], ncc[3];
-        int64_t nf2 = emesh_flips(&EM, &CT, &fr, &m, &nc2, nfc, ncc);
+        flipdiag D2;
+        flipdiag_init(&D2, EM.ntri);
+        int64_t nf2 = emesh_flips(&EM, &CT, &fr, &m, &nc2, nfc, ncc, &D2);
         printf("      ОБРАЩЁННЫХ (А729, дифференциально): %lld из %lld (%.3f %%)\n", (long long)nf2,
                (long long)nc2, 100.0 * (double)nf2 / (double)(nc2 ? nc2 : 1));
         /* ТРИ КЛАССА (§457). МЕЛКИЙ — ни правило, ни огрубление не участвуют:
@@ -2669,6 +2782,7 @@ int main(int argc, char **argv) {
                100.0 * (double)ncc[0] / (double)(nc2 ? nc2 : 1),
                100.0 * (double)ncc[1] / (double)(nc2 ? nc2 : 1),
                100.0 * (double)ncc[2] / (double)(nc2 ? nc2 : 1));
+        flipdiag_report(&D2, "срез");
       }
       free(EM.v);
       free(EM.cls);

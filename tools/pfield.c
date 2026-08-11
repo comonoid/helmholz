@@ -2144,6 +2144,10 @@ static int g_treesweep = 0;
 static double g_sweepthr = 0.0, g_sweeppx = 1.0, g_sweepeye[3] = {0, 0, 0};
 /* Ф6. (§516): угловой порог иерархического отскока; 0 — прежний гатер N². */
 static double g_hgather = 0.0;
+/* Ф8'-0 (§524, А921): доля затронутых листьев печатается как ФУНКЦИЯ допуска, а
+ * не при одном пороге — иначе порог был бы магическим. Пять уровней, первый
+ * (0.0) есть точное неравенство, то есть отсутствие порога вовсе. */
+#define HZ_HS_NTOL 5
 /* НЕГАТИВНЫЙ КОНТРОЛЬ §520: все нормали в ОДНУ корзину — то есть усреднение
  * через складку, как было до §519. Энергия обязана уехать вдвое. */
 
@@ -3034,6 +3038,11 @@ int main(int argc, char **argv) {
     return 2;
   }
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
+  /* Ф8'-0 (§524): замер грязи после удара. `hitrad` — радиус сферы в метрах;
+   * `0.20` — то же значение, на котором сняты числа 4г, и негативный контроль
+   * меняет именно его. */
+  int hitsweep = 0, hitnoocc = 0;
+  double hitrad = 0.20;
   int nrmflip = 0, nonsum = 0, indvis = 0, indmeas = 0, dosolid = 0;
   int doxfer = 0, xfernosolid = 0, doxsweep = 0, nmu = 4, xcorner = 0, xinnerfluid = 0;
   int ss2 = 0, xtrace = 0, qplane = 0;
@@ -3110,6 +3119,18 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "vq1") == 0) vq1 = 1;
     /* Ш4: удар сферой, два случая врозь (А669). */
     if (strcmp(argv[i], "hit") == 0) hit = 1;
+    /* Ф8'-0 (§524): доля листьев свипа, затронутых ударом. `hitr=` — радиус
+     * сферы (негативный контроль — `hitr=2.0`, доля обязана уйти в десятки
+     * процентов); `hitnoocc` — проверка на ложный ноль, занятость не правится. */
+    if (strcmp(argv[i], "hitsweep") == 0) hitsweep = 1;
+    if (strncmp(argv[i], "hitr=", 5) == 0) {
+      hitrad = strtod(argv[i] + 5, NULL);
+      hitsweep = 1;
+    }
+    if (strcmp(argv[i], "hitnoocc") == 0) {
+      hitnoocc = 1;
+      hitsweep = 1;
+    }
     if (strcmp(argv[i], "nofix") == 0) {
       hit = 1;
       nofix = 1;
@@ -4564,6 +4585,218 @@ int main(int argc, char **argv) {
       hz_dc_forms_lazy(&T, &ht);
     }
     hz_slice_free(&S0);
+  }
+
+  /* ---- 4г2. ДОЛЯ ЛИСТЬЕВ СВИПА, ЗАТРОНУТЫХ УДАРОМ (Ф8'-0, §524) ---- */
+  /* ВОПРОС, НА КОТОРЫЙ ЭТО ОТВЕЧАЕТ. §523 хочет нести по дереву свипа радианс по
+   * направлениям. Возражение (конец §523): направленное поле есть состояние,
+   * протянутое ВДОЛЬ ЛУЧЕЙ, и правка геометрии обесценивает не шар вокруг
+   * удара, а ПУЧОК за ним. Пока не названа числом доля дерева, которую удар
+   * пачкает, идти туда нельзя.
+   *
+   * ЧТО ИМЕННО МЕРИТСЯ. Открытость считается свипом ДО и ПОСЛЕ удара на двух
+   * деревьях, построенных из ДВУХ пирамид; сличение идёт по ЯЧЕЙКАМ мелкой
+   * сетки свипа — ровно по тому, что читает `sweep_vis`. Грязь копится
+   * ОБЪЕДИНЕНИЕМ по всем образцам площадки: это множество, обесцененное ударом
+   * за весь проход прямого света, а не за один образец.
+   *
+   * ДОЛЯ ПЕЧАТАЕТСЯ КАК ФУНКЦИЯ ДОПУСКА, А НЕ ПРИ ОДНОМ ПОРОГЕ (А921). Один
+   * порог был бы магическим: моя первая редакция взяла `1/10` от `9.33 %`, а
+   * `9.33 %` есть ДОЛЯ разошедшихся ячеек, то есть частота, а не величина
+   * ошибки. Точка К88 называется явно — `1/10 × 1.799e−01 = 0.018` (§515,
+   * максимум расхождения с маршем при пороге 32), — и читается по столбцу
+   * `1e−2` как ближайшему снизу, то есть в сторону запаса.
+   *
+   * КАЙМА (А919). Цена инкрементного пересчёта есть доля ПОСЕЩЁННЫХ листьев, а
+   * не изменившихся: чтобы узнать, что значение не поехало, лист надо посетить.
+   * Кайма — листья, сами не затронутые, но соседние затронутым по `nb[6]`, —
+   * считается тут же и даром, и тогда цена зажата с обеих сторон.
+   *
+   * ЧЕГО ЗДЕСЬ НЕТ (А926): энергии. Открытость безразмерна, `1/r²`, косинуса и
+   * альбедо в ней нет, поэтому далёкий тёмный лист весит столько же, сколько
+   * ярко освещённый. Значит число — ВЕРХНЯЯ оценка энергетически значимой
+   * грязи. Для решения «идти или не идти» это сторона запаса; ЦЕНУ отсюда
+   * брать нельзя. */
+  if (hitsweep) {
+    /* Допуски: 0 — точное неравенство (порога нет вовсе). */
+    static const double TOL[HZ_HS_NTOL] = {0.0, 1e-3, 1e-2, 5e-2, 1e-1};
+    double eyec[3] = HZ_CFG_HALL_EYE, atc[3] = HZ_CFG_HALL_AT;
+    double eyeg[3];
+    for (int a = 0; a < 3; a++)
+      eyeg[a] = (eyec[a] - fr.org[a]) / fr.h;
+    /* КАМЕРА ДЕРЕВА СВИПА — ТА ЖЕ, ЧТО У ВЕТВИ `lit` (§514), и в тех же
+     * единицах: сетка свипа вчетверо грубее поля. Иначе замер мерил бы другое
+     * дерево, чем то, которое работает. */
+    for (int a = 0; a < 3; a++)
+      g_sweepeye[a] = eyeg[a];
+    g_sweeppx = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / (double)res;
+    arealight AL;
+    hall_light(&AL, &P, &fr, lo, hi, eyeg, 1);
+    double su[HZ_LIGHT_SAMPLES], sv[HZ_LIGHT_SAMPLES];
+    for (int a = 0; a < HZ_LIGHT_NS; a++)
+      for (int b = 0; b < HZ_LIGHT_NS; b++) {
+        su[a * HZ_LIGHT_NS + b] = lsamp(a);
+        sv[a * HZ_LIGHT_NS + b] = lsamp(b);
+      }
+    int32_t gn = (int32_t)1 << (fr.lev - HZ_SWEEP_DROP);
+    size_t gcells = (size_t)gn * (size_t)gn * (size_t)gn;
+    double eyes[3];
+    for (int a = 0; a < 3; a++)
+      eyes[a] = eyeg[a] / (double)((int32_t)1 << HZ_SWEEP_DROP);
+    printf("   Ф8'-0 ГРЯЗЬ ПОСЛЕ УДАРА: сфера r=%.2f м, сетка свипа %d^3, образцов площадки %d, "
+           "порог дерева %.1f%s\n",
+           hitrad, gn, HZ_LIGHT_SAMPLES, g_sweepthr, hitnoocc ? ", ЗАНЯТОСТЬ НЕ ПРАВИТСЯ" : "");
+    /* Два случая врозь (А669): доля зависит не только от структуры, но и от
+     * того, где камера относительно удара, — одно число было бы подменой. */
+    double dir[3], dl = 0.0;
+    for (int a = 0; a < 3; a++) {
+      dir[a] = atc[a] - eyec[a];
+      dl += dir[a] * dir[a];
+    }
+    dl = sqrt(dl);
+    for (int a = 0; a < 3; a++)
+      dir[a] /= dl;
+    static const char *nmh[2] = {"В УПОР", "ЗА СПИНОЙ"};
+    for (int cse = 0; cse < 2; cse++) {
+      /* ЦЕЛИТЬСЯ В ПОВЕРХНОСТЬ, А НЕ В ВОЗДУХ — то же правило, что в 4г: первая
+       * редакция там ставила сферу в метре по взгляду, попадала в пустоту и
+       * давала одни нули, неотличимые от «правка не работает». */
+      double c[3] = {0.0, 0.0, 0.0}, sgn = (cse == 0 ? 1.0 : -1.0), hdist = 0.0;
+      int found = 0;
+      for (double s = 0.0; s < 20.0 && !found; s += fr.h * 0.5) {
+        hdist = s;
+        int32_t cc[3];
+        int ok2 = 1;
+        for (int a = 0; a < 3; a++) {
+          double w = eyec[a] + dir[a] * sgn * s;
+          double f = floor((w - fr.org[a]) / fr.h);
+          if (!(f >= 0.0) || !(f < (double)fr.n)) ok2 = 0;
+          cc[a] = ok2 ? (int32_t)f : 0;
+          c[a] = w;
+        }
+        if (ok2 && hz_occ_get(P.b[lev], hz_occ_index(fr.n, cc[0], cc[1], cc[2]))) found = 1;
+      }
+      if (!found) {
+        printf("      УДАР %s: луч не встретил геометрии — случай не измерен\n", nmh[cse]);
+        continue;
+      }
+      /* КОПИЯ ПИРАМИДЫ: каждый случай бьёт по НЕТРОНУТОМУ полю, и исходная
+       * пирамида нужна дальше ветви `lit`. */
+      opyr P2;
+      P2.lev = P.lev;
+      for (int l = 0; l <= P.lev; l++) {
+        int32_t n = (int32_t)1 << l;
+        size_t nb2 = hz_occ_bytes((size_t)n * (size_t)n * (size_t)n);
+        P2.b[l] = malloc(nb2);
+        if (P2.b[l] == NULL) exit(1);
+        memcpy(P2.b[l], P.b[l], nb2);
+      }
+      int64_t nclr = 0, npart = 0;
+      double ta = now_s();
+      /* `hitnoocc` — ПРОВЕРКА НА ЛОЖНЫЙ НОЛЬ, а не негативный контроль (А10):
+       * пирамида копируется, но не правится, дерево строится заново из копии, и
+       * доля обязана выйти РОВНО нулём по ТОЧНОМУ неравенству. Не выйдет —
+       * точный критерий негоден сам по себе, и читать надо столбцы с допуском. */
+      if (!hitnoocc) nclr = hit_occ(&P2, &fr, c, hitrad, &npart);
+      double t_carve = now_s() - ta;
+
+      stree TA, TB;
+      ta = now_s();
+      stree_build(&TA, &P, fr.lev, HZ_SWEEP_DROP, gn, eyes, g_sweeppx, g_sweepthr);
+      stree_links(&TA, gn);
+      stree_build(&TB, &P2, fr.lev, HZ_SWEEP_DROP, gn, eyes, g_sweeppx, g_sweepthr);
+      stree_links(&TB, gn);
+      double t_build = now_s() - ta;
+
+      /* Грязь по ЯЧЕЙКАМ: бит на допуск. Копится объединением по образцам. */
+      unsigned char *dirty = calloc(gcells, 1);
+      if (dirty == NULL) exit(1);
+      double dmaxv = 0.0;
+      ta = now_s();
+      for (int sm = 0; sm < HZ_LIGHT_SAMPLES; sm++) {
+        double q[3];
+        for (int k = 0; k < 3; k++)
+          q[k] = AL.c[k] + AL.u[k] * su[sm] + AL.v[k] * sv[sm];
+        tsweep_light(&TA, &P, &fr, fr.lev, HZ_SWEEP_DROP, q);
+        tsweep_light(&TB, &P2, &fr, fr.lev, HZ_SWEEP_DROP, q);
+        for (size_t ci = 0; ci < gcells; ci++) {
+          float a2 = TA.open[TA.idx[ci]], b2 = TB.open[TB.idx[ci]];
+          /* ПОБИТОВО, а не по допуску: нижняя строка таблицы есть «порога нет
+           * вовсе», и сравнение представлений — точно то, что это значит. */
+          if (memcmp(&a2, &b2, sizeof a2) == 0) continue;
+          double d = fabs((double)a2 - (double)b2);
+          if (d > dmaxv) dmaxv = d;
+          unsigned m2 = 0;
+          for (int t = 0; t < HZ_HS_NTOL; t++)
+            if (d > TOL[t]) m2 |= 1u << t;
+          dirty[ci] |= (unsigned char)m2;
+        }
+      }
+      double t_sweep = now_s() - ta;
+
+      /* Лист затронут, если накрывает хотя бы одну грязную ячейку. Считается по
+       * обоим деревьям: топология у них разная, и доля от этого зависит. */
+      unsigned char *lfa = calloc((size_t)TA.n, 1), *lfb = calloc((size_t)TB.n, 1);
+      if (lfa == NULL || lfb == NULL) exit(1);
+      for (size_t ci = 0; ci < gcells; ci++) {
+        unsigned char m2 = dirty[ci];
+        if (m2 == 0) continue;
+        lfa[TA.idx[ci]] |= m2;
+        lfb[TB.idx[ci]] |= m2;
+      }
+      int64_t na2[HZ_HS_NTOL], nb2c[HZ_HS_NTOL], ncell2[HZ_HS_NTOL], rim[HZ_HS_NTOL];
+      for (int t = 0; t < HZ_HS_NTOL; t++)
+        na2[t] = nb2c[t] = ncell2[t] = rim[t] = 0;
+      for (size_t ci = 0; ci < gcells; ci++)
+        for (int t = 0; t < HZ_HS_NTOL; t++)
+          if (dirty[ci] & (1u << t)) ncell2[t]++;
+      for (int32_t i = 0; i < TA.n; i++)
+        for (int t = 0; t < HZ_HS_NTOL; t++)
+          if (lfa[i] & (1u << t)) na2[t]++;
+      for (int32_t i = 0; i < TB.n; i++)
+        for (int t = 0; t < HZ_HS_NTOL; t++)
+          if (lfb[i] & (1u << t)) nb2c[t]++;
+      /* КАЙМА (А919): лист НЕ затронут, но сосед по одной из шести ссылок —
+       * затронут. Это фронт, который пришлось бы посетить, чтобы убедиться, что
+       * дальше идти не надо; вместе с затронутыми он и есть цена. */
+      for (int32_t i = 0; i < TB.n; i++) {
+        if (TB.nd[i].child0 >= 0) continue;
+        for (int t = 0; t < HZ_HS_NTOL; t++) {
+          if (lfb[i] & (1u << t)) continue;
+          for (int f = 0; f < 6; f++) {
+            int32_t nj = TB.nd[i].nb[f];
+            if (nj >= 0 && (lfb[nj] & (1u << t))) {
+              rim[t]++;
+              break;
+            }
+          }
+        }
+      }
+      /* РАССТОЯНИЕ ОТ КАМЕРЫ ДО УДАРА ПЕЧАТАЕТСЯ, А НЕ ПОДРАЗУМЕВАЕТСЯ. Имя «в
+       * упор» говорит о НАПРАВЛЕНИИ (вперёд по взгляду), а не о близости: сфера
+       * ставится в ПЕРВУЮ ЗАНЯТУЮ ячейку вдоль луча, и она может оказаться в
+       * нескольких метрах. Без этого числа доля при пороге дерева читалась бы
+       * неверно — дробление задано УГЛОВЫМ размером, то есть расстоянием. */
+      printf("      УДАР %s (%.2f м от камеры): ячеек занятости СТЁРТО %lld, частично накрытых "
+             "%lld; листьев ДО %d, ПОСЛЕ %d; макс |Дельта открытости| %.4e; правка %.1f мс, "
+             "постройка двух деревьев %.1f мс, %d свипов %.0f мс\n",
+             nmh[cse], hdist, (long long)nclr, (long long)npart, TA.nleaf, TB.nleaf, dmaxv,
+             t_carve * 1e3, t_build * 1e3, 2 * HZ_LIGHT_SAMPLES, t_sweep * 1e3);
+      printf("         допуск | лист ДО | лист ПОСЛЕ | кайма ПОСЛЕ | ячейки сетки\n");
+      for (int t = 0; t < HZ_HS_NTOL; t++)
+        printf("         %-6.0e | %6.3f %% | %8.3f %% | %9.3f %% | %8.4f %%%s\n", TOL[t],
+               100.0 * (double)na2[t] / (double)(TA.nleaf ? TA.nleaf : 1),
+               100.0 * (double)nb2c[t] / (double)(TB.nleaf ? TB.nleaf : 1),
+               100.0 * (double)rim[t] / (double)(TB.nleaf ? TB.nleaf : 1),
+               100.0 * (double)ncell2[t] / (double)gcells,
+               t == 2 ? "   <- К88: 1/10 x 1.799e-01 = 0.018, читается отсюда" : "");
+      free(dirty);
+      free(lfa);
+      free(lfb);
+      stree_free(&TA);
+      stree_free(&TB);
+      opyr_free(&P2);
+    }
   }
 
   /* ---- 4д. КАДР СО СВЕТОМ (Ш5, часть первая) ---- */

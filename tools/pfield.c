@@ -1769,6 +1769,8 @@ static int g_raysweep = 0;
 static int32_t g_seed = 0;
 /* §508: сколько проходов свипа подряд без обнуления поля. */
 static int g_passes = 1;
+/* Ф3' (§510): порог LOD для среза ИЗЛУЧАТЕЛЕЙ; 0 — излучатели те же, что приёмники. */
+static double g_emitthr = 0.0;
 
 typedef struct {
   unsigned char *vis; /* на ячейку: булева видимость (осевое и направленное правила) */
@@ -2339,6 +2341,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "raysweep") == 0) g_raysweep = 1;
     if (strncmp(argv[i], "seed=", 5) == 0) g_seed = (int32_t)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "passes=", 7) == 0) g_passes = (int)strtol(argv[i] + 7, NULL, 10);
+    if (strncmp(argv[i], "emit=", 5) == 0) g_emitthr = strtod(argv[i] + 5, NULL);
     /* Р-7а: замер квантования плоскости. */
     if (strcmp(argv[i], "qplane") == 0) {
       qplane = 1;
@@ -4522,15 +4525,50 @@ int main(int argc, char **argv) {
     float *ind = calloc(3 * (size_t)S.n, sizeof *ind);
     if (ind == NULL) exit(1);
     {
+      /* Ф3' (§510): ИЗЛУЧАТЕЛИ С ОГРУБЛЁННОГО СРЕЗА. Приёмнику нужна
+       * подробность, излучателю — нет: дальняя стена светит как ОДНА площадка
+       * со своей средней яркостью. Второй срез того же дерева с бо́льшим порогом
+       * и есть эта огрублённая раздача; прямой свет на нём считается тем же
+       * `front_direct` (ячеек мало, цена ничтожна). */
+      hz_dcslice SE;
+      float *irre = irr;
+      const hz_dcslice *SRC2 = &S;
+      if (g_emitthr > 0.0) {
+        lodctx LE = LL;
+        LE.thr = g_emitthr;
+        if (hz_slice_init(&SE, lev) != HZ_DC_OK) exit(1);
+        if (hz_slice_build(&SE, &T, &ht, lod_stop, &LE) != HZ_DC_OK) exit(1);
+        for (int32_t i2 = 0; i2 < SE.n; i2++) {
+          double vw2[3];
+          hz_slice_vertex(&SE, i2, vw2);
+          int32_t cl2[3];
+          for (int a2 = 0; a2 < 3; a2++) {
+            double f2 = floor(vw2[a2]);
+            if (f2 < 0.0) f2 = 0.0;
+            if (f2 > (double)(fr.n - 1)) f2 = (double)(fr.n - 1);
+            cl2[a2] = (int32_t)f2;
+          }
+          const int32_t *ls2 = NULL;
+          if (ct_list(&CT, cl2, &ls2) == 0) continue;
+          int32_t mi2 = m.fm != NULL ? m.fm[ls2[0]] : 0;
+          SE.c[i2].mat = (uint8_t)(mi2 < 255 ? mi2 : 255);
+        }
+        irre = malloc(3 * (size_t)SE.n * sizeof *irre);
+        if (irre == NULL) exit(1);
+        front_direct(&SE, &fr, &P, &AL, irre, 0.5, 1, NULL, &m);
+        SRC2 = &SE;
+        printf("   Ф3' ОГРУБЛЁННЫЕ ИЗЛУЧАТЕЛИ: порог %.2f, ячеек %d против %d приёмников\n",
+               g_emitthr, SE.n, S.n);
+      }
       int32_t stride = 1;
-      while ((int64_t)(S.n / (stride > 0 ? stride : 1)) * (int64_t)S.n > 200000000LL)
+      while ((int64_t)(SRC2->n / (stride > 0 ? stride : 1)) * (int64_t)S.n > 200000000LL)
         stride *= 2;
       double tb = now_s();
       int64_t nemit = 0;
       double sthru = 0.0, sall = 0.0;
-      for (int32_t j = 0; j < S.n; j += stride) {
-        double ej[3] = {(double)irr[3 * (size_t)j], (double)irr[3 * (size_t)j + 1],
-                        (double)irr[3 * (size_t)j + 2]};
+      for (int32_t j = 0; j < SRC2->n; j += stride) {
+        double ej[3] = {(double)irre[3 * (size_t)j], (double)irre[3 * (size_t)j + 1],
+                        (double)irre[3 * (size_t)j + 2]};
         if (!(ej[0] + ej[1] + ej[2] > 0.0)) continue;
         nemit++;
         double pj[3], nj[3];
@@ -4538,7 +4576,7 @@ int main(int argc, char **argv) {
         for (int k = 0; k < 3; k++)
           pj[k] = fr.org[k] + pj[k] * fr.h;
         hz_slice_normal(&S, j, nj);
-        double cside = fr.h * (double)((int32_t)1 << (lev - (int)S.c[j].lvl));
+        double cside = fr.h * (double)((int32_t)1 << (lev - (int)SRC2->c[j].lvl));
         double aj = cside * cside * (double)stride;
         for (int32_t i = 0; i < S.n; i++) {
           if (i == j) continue;
@@ -4594,6 +4632,10 @@ int main(int argc, char **argv) {
                100.0 * sthru / (sall > 0.0 ? sall : 1.0), indvis ? " (и ОТБРОШЕНА)" : "");
       for (int32_t i = 0; i < 3 * S.n; i++)
         irr[i] += ind[i];
+      if (g_emitthr > 0.0) {
+        free(irre);
+        hz_slice_free(&SE);
+      }
     }
     free(ind);
 

@@ -1763,6 +1763,8 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
 /* НЕГАТИВНЫЙ КОНТРОЛЬ Ф1' (§502): профиль БЕЗ СДВИГА — все подпробы берутся из
  * одной клетки соседа. Расхождение обязано вернуться к уровню P = 1. */
 static int g_noshift = 0;
+/* Ф2' (§505): перенос вдоль ПРЯМОЙ вместо трёх осевых соседей. */
+static int g_raysweep = 0;
 
 typedef struct {
   unsigned char *vis; /* на ячейку: булева видимость (осевое и направленное правила) */
@@ -1839,6 +1841,47 @@ static void sweep_light(sweepgrid *G, const opyr *P, const frame *fr, const doub
             }
             if (!(sabs > 0.0)) {
               G->open[ci] = 1.0f;
+              continue;
+            }
+            if (g_raysweep) {
+              /* Ф2' (§505): ПЕРЕНОС ВДОЛЬ ПРЯМОЙ. Шаг назад делается только по
+               * ГЛАВНОЙ оси, а поперечное смещение точки входа берётся из самого
+               * направления — то есть путь есть прямая, а не лесенка. Четыре
+               * вкладчика лежат в ОДНОЙ плоскости, поперёк одного луча.
+               * ЗАНЯТЫЙ ВКЛАДЧИК ВХОДИТ НУЛЁМ: здесь он значит «эта доля сечения
+               * пучка заслонена», а не «этот путь закрыт», — и потому обнулять
+               * его физически верно (разбор в §505). */
+              int km = 0;
+              for (int k = 1; k < 3; k++)
+                if (fabs(dd[k]) > fabs(dd[km])) km = k;
+              int u2 = (km + 1) % 3, v2 = (km + 2) % 3;
+              double inv = fabs(dd[km]) > 0.0 ? 1.0 / fabs(dd[km]) : 0.0;
+              double fu = (double)(km == 0 ? x : (km == 1 ? y : z));
+              (void)fu;
+              double pu =
+                  (double)(u2 == 0 ? x : (u2 == 1 ? y : z)) + (g_noshift ? 0.0 : dd[u2] * inv);
+              double pv =
+                  (double)(v2 == 0 ? x : (v2 == 1 ? y : z)) + (g_noshift ? 0.0 : dd[v2] * inv);
+              int32_t bu = (int32_t)floor(pu), bv = (int32_t)floor(pv);
+              double tu = pu - (double)bu, tv = pv - (double)bv;
+              int32_t base[3] = {x, y, z};
+              base[km] += (dd[km] > 0.0 ? 1 : -1);
+              double accr = 0.0;
+              for (int au = 0; au < 2; au++)
+                for (int av = 0; av < 2; av++) {
+                  int32_t q2[3] = {base[0], base[1], base[2]};
+                  q2[u2] = bu + au;
+                  q2[v2] = bv + av;
+                  double w2 = (au ? tu : 1.0 - tu) * (av ? tv : 1.0 - tv);
+                  if (!(w2 > 0.0)) continue;
+                  if (q2[0] < 0 || q2[1] < 0 || q2[2] < 0 || q2[0] >= n || q2[1] >= n || q2[2] >= n)
+                    continue;
+                  size_t qi = hz_occ_index(n, q2[0], q2[1], q2[2]);
+                  if (hz_occ_get(P->b[P->lev - G->drop], qi)) continue; /* заслонено: ноль */
+                  accr += w2 * (double)G->open[qi];
+                }
+              if (G->round01) accr = accr >= 0.5 ? 1.0 : 0.0;
+              G->open[ci] = (float)accr;
               continue;
             }
             double acc = 0.0, wsum = 0.0;
@@ -2253,6 +2296,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "ss2") == 0) ss2 = 1;
     if (strcmp(argv[i], "xtrace") == 0) xtrace = 1;
     if (strcmp(argv[i], "noshift") == 0) g_noshift = 1;
+    if (strcmp(argv[i], "raysweep") == 0) g_raysweep = 1;
     /* Р-7а: замер квантования плоскости. */
     if (strcmp(argv[i], "qplane") == 0) {
       qplane = 1;
@@ -3994,8 +4038,8 @@ int main(int argc, char **argv) {
     }
     free(irro);
     {
-      int64_t ndiff = 0, nlit_r = 0, nlit_s = 0;
-      double emax = 0.0;
+      int64_t ndiff = 0, nlit_r = 0, nlit_s = 0, nsum_r = 0;
+      double emax = 0.0, sum_r = 0.0;
       for (int32_t i = 0; i < S.n; i++) {
         double a = irr[3 * (size_t)i], b = irr2[3 * (size_t)i];
         if (a > 0.0) nlit_r++;
@@ -4003,7 +4047,29 @@ int main(int argc, char **argv) {
         if ((a > 0.0) != (b > 0.0)) ndiff++;
         double d = fabs(a - b);
         if (d > emax) emax = d;
+        /* §506: РАЗОШЛИСЬ ПО МНОЖЕСТВУ СЧИТАЕТСЯ ПО «> 0», А У ДИФФУЗНОЙ СХЕМЫ
+         * ХВОСТЫ НИКОГДА НЕ ДОХОДЯТ ДО НУЛЯ. Значит счётчик может мерить не
+         * обтекание заслона, а экспоненциально малый шум. Здесь то же множество
+         * считается по долям от СРЕДНЕЙ облучённости — порога нет, есть
+         * зависимость, и она сама скажет, шум это или свет. */
+        sum_r += a;
+        nsum_r++;
       }
+      double mean_r = nsum_r > 0 ? sum_r / (double)nsum_r : 0.0;
+      int64_t ndf[3] = {0, 0, 0};
+      static const double frac3[3] = {0.01, 0.05, 0.20};
+      for (int32_t i = 0; i < S.n; i++) {
+        double a = irr[3 * (size_t)i], b = irr2[3 * (size_t)i];
+        for (int t2 = 0; t2 < 3; t2++) {
+          double th = frac3[t2] * mean_r;
+          if ((a > th) != (b > th)) ndf[t2]++;
+        }
+      }
+      printf("      §506 РАЗОШЛИСЬ ПО ПОРОГУ ОТ СРЕДНЕЙ: 1 %% — %lld (%.2f %%), 5 %% — %lld (%.2f "
+             "%%), 20 %% — %lld (%.2f %%)\n",
+             (long long)ndf[0], 100.0 * (double)ndf[0] / (double)(S.n ? S.n : 1), (long long)ndf[1],
+             100.0 * (double)ndf[1] / (double)(S.n ? S.n : 1), (long long)ndf[2],
+             100.0 * (double)ndf[2] / (double)(S.n ? S.n : 1));
       printf("   СВИП: %.1f мс на %d образцов; сетка %d^3 = %lld ячеек, %.2f нс НА ЯЧЕЙКУ СЕТКИ; "
              "%.0f нс на ячейку СРЕЗА (это цена для БЮДЖЕТА, а не цена обработки); сбор %.1f мс; "
              "освещённых ячеек "

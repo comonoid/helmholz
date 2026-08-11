@@ -1748,23 +1748,42 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
 /* Сетка свипа грубее сетки поля: тень не обязана иметь разрешение поверхности, а
  * цена свипа кубична по стороне. Уровень назван числом и проверяется замером
  * расхождения с эталоном-лучом. */
+#ifndef HZ_SWEEP_DROP
 #define HZ_SWEEP_DROP 2
+#endif
+
+/* РАЗРЕШЕНИЕ ПРОФИЛЯ НА ГРАНИ (Ф1', §502). `1` — прежнее поведение: одно число
+ * на ячейку. Больше — профиль `P×P` подпроб, несущий ФОРМУ тени. Число НЕ
+ * выводится из допуска (это следующий шаг), а перебирается замером: §425
+ * требует сперва кривую «цена — точность» при фиксированных `P`. */
+#ifndef HZ_SWEEP_P
+#define HZ_SWEEP_P 1
+#endif
+
+/* НЕГАТИВНЫЙ КОНТРОЛЬ Ф1' (§502): профиль БЕЗ СДВИГА — все подпробы берутся из
+ * одной клетки соседа. Расхождение обязано вернуться к уровню P = 1. */
+static int g_noshift = 0;
 
 typedef struct {
   unsigned char *vis; /* на ячейку: булева видимость (осевое и направленное правила) */
   float *open;        /* Ш5а2: ДОЛЯ ОТКРЫТОСТИ, переносимая с весами граней */
-  int32_t n;          /* сторона грубой сетки */
-  int drop;           /* lev − log2(n) */
-  int axis;           /* НЕГАТИВНЫЙ КОНТРОЛЬ: прежнее осевое наследование */
-  int frac;           /* Ш5а2: дробная открытость вместо булевой */
-  int round01;        /* НЕГАТИВНЫЙ КОНТРОЛЬ Ш5а2: округлять F до 0/1 */
+  /* Ф1': профиль открытости, `P²` подпроб на ячейку, `uint8` (§425/§498: свип
+   * упирается в память, а квант 1/255 на порядок ниже порога приёмки 0.05). */
+  unsigned char *prof;
+  int32_t n;   /* сторона грубой сетки */
+  int drop;    /* lev − log2(n) */
+  int axis;    /* НЕГАТИВНЫЙ КОНТРОЛЬ: прежнее осевое наследование */
+  int frac;    /* Ш5а2: дробная открытость вместо булевой */
+  int round01; /* НЕГАТИВНЫЙ КОНТРОЛЬ Ш5а2: округлять F до 0/1 */
 } sweepgrid;
 
 static void sweep_free(sweepgrid *G) {
   free(G->vis);
   free(G->open);
+  free(G->prof);
   G->vis = NULL;
   G->open = NULL;
+  G->prof = NULL;
 }
 
 /* Один образец источника: заполнить видимость на всей грубой сетке. */
@@ -1844,6 +1863,62 @@ static void sweep_light(sweepgrid *G, const opyr *P, const frame *fr, const doub
               pp[k] = save;
             }
             double f = wsum > 0.0 ? acc / wsum : 0.0;
+#if HZ_SWEEP_P > 1
+            /* Ф1' (§502): ПРОФИЛЬ НА ГРАНИ ВМЕСТО ОДНОГО ЧИСЛА. Ячейка несёт
+             * `P×P` подпроб открытости в плоскости, поперечной ГЛАВНОЙ оси
+             * направления на источник. Подпроба берётся у верхнего по потоку
+             * соседа ПО ГЛАВНОЙ ОСИ со сдвигом `P·d_u/|d_k|` — это и есть форма
+             * тени, переносимая вдоль луча, а не размазанная средним.
+             *
+             * ПРИБЛИЖЕНИЕ, НАЗВАННОЕ ЗДЕСЬ: два ПОБОЧНЫХ соседа отдают своё
+             * СРЕДНЕЕ, а не профиль. Их профили лежат в других плоскостях, и
+             * честный перенос потребовал бы поворота выборки. Главная ось несёт
+             * границу тени (по ней идёт основной поток), побочные подмешивают
+             * фон — то есть приближение бьёт по фону, а не по границе. Если
+             * замер покажет, что этого мало, следующий ход — общий профиль в
+             * плоскости, поперечной СРЕДНЕМУ направлению, а не по осям. */
+            int kmax = 0;
+            for (int k = 1; k < 3; k++)
+              if (fabs(dd[k]) > fabs(dd[kmax])) kmax = k;
+            int uu = (kmax + 1) % 3, vv = (kmax + 2) % 3;
+            unsigned char *pc = G->prof + ci * (size_t)(HZ_SWEEP_P * HZ_SWEEP_P);
+            int32_t up[3] = {x, y, z};
+            up[kmax] += (dd[kmax] > 0.0 ? 1 : -1);
+            int haveup = 0;
+            const unsigned char *pu = NULL;
+            if (up[0] >= 0 && up[0] < n && up[1] >= 0 && up[1] < n && up[2] >= 0 && up[2] < n) {
+              size_t ui = hz_occ_index(n, up[0], up[1], up[2]);
+              if (!hz_occ_get(P->b[P->lev - G->drop], ui)) {
+                pu = G->prof + ui * (size_t)(HZ_SWEEP_P * HZ_SWEEP_P);
+                haveup = 1;
+              }
+            }
+            /* Сдвиг в подпробах: пересечение ячейки вдоль `d` смещает луч на
+             * `d_u/|d_k|` ячейки поперёк, то есть на `P·d_u/|d_k|` подпроб. */
+            double shu = (double)HZ_SWEEP_P * dd[uu] / fabs(dd[kmax]);
+            double shv = (double)HZ_SWEEP_P * dd[vv] / fabs(dd[kmax]);
+            double bg = f * 255.0; /* фон — тот же взвешенный ответ, что и раньше */
+            double psum = 0.0;
+            for (int a = 0; a < HZ_SWEEP_P; a++)
+              for (int b = 0; b < HZ_SWEEP_P; b++) {
+                double val = bg;
+                if (haveup) {
+                  int sa = (int)lround((double)a + (g_noshift ? 0.0 : shu));
+                  int sb = (int)lround((double)b + (g_noshift ? 0.0 : shv));
+                  if (sa >= 0 && sa < HZ_SWEEP_P && sb >= 0 && sb < HZ_SWEEP_P)
+                    val = (double)pu[sa * HZ_SWEEP_P + sb];
+                  /* Вышли за грань — луч пришёл из СОСЕДНЕЙ ячейки того же
+                   * уровня; её профиля здесь нет, и берётся взвешенный фон.
+                   * Это та же диффузия, но только на краю профиля, а не везде. */
+                }
+                pc[a * HZ_SWEEP_P + b] =
+                    (unsigned char)(val < 0.0     ? 0
+                                    : val > 255.0 ? 255
+                                                  : (unsigned char)lround(val));
+                psum += (double)pc[a * HZ_SWEEP_P + b];
+              }
+            f = psum / (255.0 * (double)(HZ_SWEEP_P * HZ_SWEEP_P));
+#endif
             /* НЕГАТИВНЫЙ КОНТРОЛЬ (§423): округление до 0/1 обязано вернуть
              * смещения булевых правил. */
             if (G->round01) f = f >= 0.5 ? 1.0 : 0.0;
@@ -1940,6 +2015,7 @@ static void front_sweep(const hz_dcslice *S, const frame *fr, const opyr *P, con
   size_t gcells = (size_t)G.n * (size_t)G.n * (size_t)G.n;
   G.vis = malloc(gcells);
   G.open = malloc(gcells * sizeof *G.open);
+  G.prof = HZ_SWEEP_P > 1 ? malloc(gcells * (size_t)(HZ_SWEEP_P * HZ_SWEEP_P)) : NULL;
   if (G.vis == NULL || G.open == NULL) exit(1);
   for (int32_t i = 0; i < 3 * S->n; i++)
     irr[i] = 0.0f;
@@ -2176,6 +2252,7 @@ int main(int argc, char **argv) {
     /* Ш18 (§494): растр в `res`, на диск вдвое меньше свёрткой 2×2. */
     if (strcmp(argv[i], "ss2") == 0) ss2 = 1;
     if (strcmp(argv[i], "xtrace") == 0) xtrace = 1;
+    if (strcmp(argv[i], "noshift") == 0) g_noshift = 1;
     /* Р-7а: замер квантования плоскости. */
     if (strcmp(argv[i], "qplane") == 0) {
       qplane = 1;

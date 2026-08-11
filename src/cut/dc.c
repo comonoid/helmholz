@@ -281,6 +281,9 @@ int hz_dc_init(hz_dctree *t, int log2size) {
    * `nbigmask` — по той же причине: его печатают как «обязан быть 0». */
   t->unsgn = 0;
   t->nbigmask = 0;
+  t->nsum = NULL;
+  t->nsumcap = 0;
+  t->nzeronrm = 0;
   t->nd = calloc((size_t)t->cap, sizeof(hz_dcnode));
   if (t->nd == NULL) return HZ_DC_ENOMEM;
   t->nd[0].child0 = -1;
@@ -292,7 +295,50 @@ int hz_dc_init(hz_dctree *t, int log2size) {
 void hz_dc_free(hz_dctree *t) {
   free(t->nd);
   t->nd = NULL;
+  free(t->nsum);
+  t->nsum = NULL;
+  t->nsumcap = 0;
   t->n = t->cap = 0;
+}
+
+/* Индекс побочного массива по узлу. ПРОВЕРЯЕТСЯ, а не выводится из веры в
+ * распределитель: `child0` обязан быть >= 1 и кратен 8 плюс 1 (блоки идут с
+ * единицы, по восемь подряд). Не так — величины нет, и это не молчание, а
+ * возврат «нет». */
+static int32_t nsum_slot(const hz_dctree *t, int32_t ni) {
+  if (ni < 0 || ni >= t->n) return -1;
+  int32_t c0 = t->nd[ni].child0;
+  if (c0 < 1 || ((c0 - 1) % 8) != 0) return -1;
+  int32_t k = (c0 - 1) / 8;
+  return k < t->nsumcap ? k : -1;
+}
+
+int hz_dc_nsum(const hz_dctree *t, int32_t ni, double s[3]) {
+  s[0] = s[1] = s[2] = 0.0;
+  int32_t k = nsum_slot(t, ni);
+  if (k < 0 || t->nsum == NULL) return 0;
+  for (int a = 0; a < 3; a++)
+    s[a] = t->nsum[k][a];
+  return 1;
+}
+
+/* Побочный массив держится под ЧИСЛО УЗЛОВ ДЕРЕВА, а не под точное число
+ * внутренних: считать вторые пришлось бы отдельным проходом, а память та же с
+ * точностью до восьмушки. Заводится ПОСЛЕ спуска, когда дерево уже не растёт. */
+static int nsum_alloc(hz_dctree *t) {
+  int32_t need = t->n / 8 + 1;
+  if (t->nsum != NULL && t->nsumcap >= need) {
+    memset(t->nsum, 0, (size_t)t->nsumcap * sizeof *t->nsum);
+    return HZ_DC_OK;
+  }
+  free(t->nsum);
+  t->nsum = calloc((size_t)need, sizeof *t->nsum);
+  if (t->nsum == NULL) {
+    t->nsumcap = 0;
+    return HZ_DC_ENOMEM;
+  }
+  t->nsumcap = need;
+  return HZ_DC_OK;
 }
 
 /* Блок из 8 подряд, строго вперёд — дословно node_alloc8 октодерева: на «индекс
@@ -534,22 +580,21 @@ int hz_dc_shape_occ(hz_dctree *t, int log2size, hz_dc_occ oc, void *ctx) {
  * пересечение есть, и при двух пересечениях сразу он НЕ ОПРЕДЕЛЁН — долг Ш3
  * (А708). При полной глубине обход читает маску только у самой мелкой из
  * четырёх ячеек (Г43), то есть всегда у ребра сетки, и долг не наступает. */
+static void leaf_masks(hz_dctree *t, int32_t ni, const int32_t lo[3], const hz_htab *ht,
+                       double nsum[3]);
+
 static void masks_occ_rec(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size,
-                          const hz_htab *ht) {
+                          const hz_htab *ht, double nsum[3]) {
   hz_dcnode *nd = &t->nd[ni];
+  nsum[0] = nsum[1] = nsum[2] = 0.0;
   if (nd->child0 < 0) {
+    /* ОДИН КОД С ПОЧИНКОЙ, А НЕ ВТОРАЯ КОПИЯ ФОРМУЛЫ (найдено 08-11, А841:
+     * комментарий над `leaf_masks` обещал единый код, а копий было две — здесь
+     * своя. Побитовость починки против сборки на этом и стоит). */
     nd->ecross = 0;
     nd->edir = 0;
     if (size != 1) return;
-    for (int i = 0; i < 12; i++) {
-      int axis, off[3];
-      unit_edge(i, &axis, off);
-      int32_t p[3] = {lo[0] + off[0], lo[1] + off[1], lo[2] + off[2]};
-      const hz_hedge *e = hz_htab_find(ht, axis, p);
-      if (e == NULL || e->in_lo == HZ_HEDGE_ERASED) continue;
-      nd->ecross = (uint16_t)(nd->ecross | (1u << i));
-      if (e->nrm[axis] > 0.0) nd->edir = (uint16_t)(nd->edir | (1u << i));
-    }
+    leaf_masks(t, ni, lo, ht, nsum);
     return;
   }
   int32_t c0 = nd->child0, half = size / 2;
@@ -557,7 +602,16 @@ static void masks_occ_rec(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t
     int32_t clo[3];
     for (int a = 0; a < 3; a++)
       clo[a] = lo[a] + (((k >> a) & 1) ? half : 0);
-    masks_occ_rec(t, c0 + k, clo, half, ht);
+    double cs[3];
+    masks_occ_rec(t, c0 + k, clo, half, ht, cs);
+    for (int a = 0; a < 3; a++)
+      nsum[a] += cs[a];
+  }
+  {
+    int32_t sl = nsum_slot(t, ni);
+    if (sl >= 0)
+      for (int a = 0; a < 3; a++)
+        t->nsum[sl][a] = nsum[a];
   }
   uint16_t ec = 0, ed = 0;
   for (int i = 0; i < 12; i++) {
@@ -592,9 +646,24 @@ static void masks_check_rec(hz_dctree *t, int32_t ni, int32_t size) {
 
 int hz_dc_masks_occ(hz_dctree *t, const hz_htab *ht) {
   int32_t zero[3] = {0, 0, 0};
-  masks_occ_rec(t, 0, zero, (int32_t)1 << t->log2size, ht);
+  int rc = nsum_alloc(t);
+  if (rc != HZ_DC_OK) return rc;
+  double root[3];
+  masks_occ_rec(t, 0, zero, (int32_t)1 << t->log2size, ht, root);
   t->nbigmask = 0;
   masks_check_rec(t, 0, (int32_t)1 << t->log2size);
+  /* А834: сумма может сократиться ТОЧНО — двусторонний лист внутри узла. Тогда
+   * направления нет, и это не «нормаль (0,0,0)», а отсутствие величины. Здесь
+   * оно СЧИТАЕТСЯ; молчать про остаток запрещено. */
+  t->nzeronrm = 0;
+  for (int32_t i = 0; i < t->n; i++) {
+    int32_t sl = nsum_slot(t, i);
+    if (sl < 0) continue;
+    const double *s = t->nsum[sl];
+    if (!(s[0] < 0.0) && !(s[0] > 0.0) && !(s[1] < 0.0) && !(s[1] > 0.0) && !(s[2] < 0.0) &&
+        !(s[2] > 0.0))
+      t->nzeronrm++;
+  }
   return HZ_DC_OK;
 }
 
@@ -603,10 +672,12 @@ int hz_dc_masks_occ(hz_dctree *t, const hz_htab *ht) {
 /* Маска ОДНОГО листа из таблицы — та же формула, что в , вынесена
  * затем, чтобы починка и полная сборка считали её ОДНИМ кодом: разойдись они,
  * побитовая сверка Г49 мерила бы разницу двух копий формулы. */
-static void leaf_masks(hz_dctree *t, int32_t ni, const int32_t lo[3], const hz_htab *ht) {
+static void leaf_masks(hz_dctree *t, int32_t ni, const int32_t lo[3], const hz_htab *ht,
+                       double nsum[3]) {
   hz_dcnode *nd = &t->nd[ni];
   nd->ecross = 0;
   nd->edir = 0;
+  if (nsum != NULL) nsum[0] = nsum[1] = nsum[2] = 0.0;
   for (int i = 0; i < 12; i++) {
     int axis, off[3];
     unit_edge(i, &axis, off);
@@ -615,6 +686,10 @@ static void leaf_masks(hz_dctree *t, int32_t ni, const int32_t lo[3], const hz_h
     if (e == NULL || e->in_lo == HZ_HEDGE_ERASED) continue;
     nd->ecross = (uint16_t)(nd->ecross | (1u << i));
     if (e->nrm[axis] > 0.0) nd->edir = (uint16_t)(nd->edir | (1u << i));
+    /* Ш9: сумма нормалей набирается из ТЕХ ЖЕ найденных записей. */
+    if (nsum != NULL)
+      for (int a = 0; a < 3; a++)
+        nsum[a] += e->nrm[a];
   }
 }
 
@@ -637,6 +712,38 @@ static void node_masks_from_children(hz_dctree *t, int32_t ni) {
   }
   t->nd[ni].ecross = ec;
   t->nd[ni].edir = ed;
+}
+
+/* Сумма нормалей узла ИЗ ДЕТЕЙ — для починки за O(глубины) (Ш9). Ребёнок отдаёт
+ * величину тремя разными путями, и все три законны: внутренний — из побочного
+ * массива; лист размера 1 — пересчётом из таблицы (12 поисков, как при сборке);
+ * крупный лист — ноль, потому что рёбер у него нет вовсе (А709). Иначе крупные
+ * нормали остались бы после удара несвежими МОЛЧА: сверка Г49 сличает ячейки
+ * среза, и до Ш9 бита ориентации в них не было вовсе. */
+static void node_nsum_from_children(hz_dctree *t, const hz_htab *ht, int32_t ni,
+                                    const int32_t lo[3], int32_t size) {
+  int32_t sl = nsum_slot(t, ni);
+  if (sl < 0) return;
+  int32_t c0 = t->nd[ni].child0, half = size / 2;
+  double acc[3] = {0.0, 0.0, 0.0};
+  for (int k = 0; k < 8; k++) {
+    int32_t ci = c0 + k, clo[3];
+    for (int a = 0; a < 3; a++)
+      clo[a] = lo[a] + (((k >> a) & 1) ? half : 0);
+    double cs[3] = {0.0, 0.0, 0.0};
+    if (t->nd[ci].child0 >= 0) {
+      hz_dc_nsum(t, ci, cs);
+    } else if (half == 1) {
+      hz_dcnode save = t->nd[ci];
+      leaf_masks(t, ci, clo, ht, cs);
+      t->nd[ci].ecross = save.ecross; /* маску трогать не наше дело: её уже */
+      t->nd[ci].edir = save.edir;     /* пересчитал node_masks_from_children */
+    }
+    for (int a = 0; a < 3; a++)
+      acc[a] += cs[a];
+  }
+  for (int a = 0; a < 3; a++)
+    t->nsum[sl][a] = acc[a];
 }
 
 int hz_dc_fix_cell(hz_dctree *t, const hz_htab *ht, const int32_t cell[3]) {
@@ -663,7 +770,7 @@ int hz_dc_fix_cell(hz_dctree *t, const hz_htab *ht, const int32_t cell[3]) {
     size = half;
   }
   if (size != 1) return HZ_DC_OK; /* ячейка под неразделённым узлом — трогать нечего */
-  leaf_masks(t, ni, lo, ht);
+  leaf_masks(t, ni, lo, ht, NULL);
   leaf_qef(t, ni, lo, ht);
   solve_node(t, ni, lo, size);
   /* Подъём: форма и маска родителя пересчитываются ИЗ ДЕТЕЙ, то есть O(глубины),
@@ -671,6 +778,7 @@ int hz_dc_fix_cell(hz_dctree *t, const hz_htab *ht, const int32_t cell[3]) {
   for (int d = depth - 1; d >= 0; d--) {
     sum_children(t, path[d], psize[d]);
     node_masks_from_children(t, path[d]);
+    node_nsum_from_children(t, ht, path[d], plo[d], psize[d]);
     solve_node(t, path[d], plo[d], psize[d]);
   }
   return HZ_DC_OK;

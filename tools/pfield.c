@@ -1917,6 +1917,7 @@ int main(int argc, char **argv) {
     return 2;
   }
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
+  int nrmflip = 0, nonsum = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
   double oven = 0.0, plates = 0.0;
   double lodthr = 1.0;
@@ -1926,6 +1927,13 @@ int main(int argc, char **argv) {
     /* НЕГАТИВНЫЙ КОНТРОЛЬ (§393): все нормали рёбер осевые. Вершины обязаны
      * остаться (ребро пересечено — вершина есть), а качество обязано упасть. */
     if (strcmp(argv[i], "nonrm") == 0) nonrm = 1;
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ Ш9 (НК-2): подать в измеритель ОБРАЩЁННУЮ нормаль
+     * ячейки — угол обязан стать 180° − x. Если не станет, измеритель меряет
+     * длину, а не направление. */
+    if (strcmp(argv[i], "nrmflip") == 0) nrmflip = 1;
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ Ш9 (НК-1): вернуть прежнее поведение — крупной ячейке
+     * нормаль не считать вовсе. Доля noct == 0 обязана вернуться к 100 %. */
+    if (strcmp(argv[i], "nonsum") == 0) nonsum = 1;
     /* НЕГАТИВНЫЙ КОНТРОЛЬ §397: вершина среза в один бит на ось. */
     if (strcmp(argv[i], "vq1") == 0) vq1 = 1;
     /* Ш4: удар сферой, два случая врозь (А669). */
@@ -2124,6 +2132,10 @@ int main(int argc, char **argv) {
   t0 = now_s();
   hz_dc_masks_occ(&T, &ht);
   double t_masks = now_s() - t0;
+  /* НК-1 Ш9: обнулить сложенные суммы — тогда крупная ячейка снова остаётся без
+   * нормали, ровно как до правки. Контроль стоит У ПОТРЕБИТЕЛЯ, а не ключом в
+   * общем слое: ядро не должно уметь работать неправильно по флагу. */
+  if (nonsum && T.nsum != NULL) memset(T.nsum, 0, (size_t)T.nsumcap * sizeof *T.nsum);
   t0 = now_s();
   rc = hz_dc_forms_lazy(&T, &ht);
   double t_dc = now_s() - t0;
@@ -2139,11 +2151,16 @@ int main(int argc, char **argv) {
          "(рёбер/вершину %.3f)\n",
          (long long)nv, (double)ht.n / (double)(nv ? nv : 1), (long long)nvl,
          (double)ht.n / (double)(nvl ? nvl : 1));
-  printf("   ПАМЯТЬ: дерево DC %.1f МБ (%zu Б/узел), рёбра %.1f МБ, пирамида %.1f МБ\n",
+  /* СУММЫ НОРМАЛЕЙ ПЕЧАТАЮТСЯ ОТДЕЛЬНОЙ СТРОКОЙ, А НЕ ПРЯЧУТСЯ В «Б/узел»:
+   * побочный массив в `sizeof(hz_dcnode)` не входит, и умолчание о нём читалось
+   * бы как «правка Ш9 памяти не стоит». */
+  printf("   ПАМЯТЬ: дерево DC %.1f МБ (%zu Б/узел), рёбра %.1f МБ, пирамида %.1f МБ, СУММЫ "
+         "НОРМАЛЕЙ %.1f МБ (%.1f Б/узел)\n",
          (double)T.n * (double)sizeof(hz_dcnode) / 1048576.0, sizeof(hz_dcnode),
          (double)ht.n * (double)sizeof(hz_hedge) / 1048576.0,
-         (double)hz_occ_bytes((size_t)fr.n * (size_t)fr.n * (size_t)fr.n) * (8.0 / 7.0) /
-             1048576.0);
+         (double)hz_occ_bytes((size_t)fr.n * (size_t)fr.n * (size_t)fr.n) * (8.0 / 7.0) / 1048576.0,
+         (double)T.nsumcap * 24.0 / 1048576.0,
+         T.n > 0 ? (double)T.nsumcap * 24.0 / (double)T.n : 0.0);
 
   /* ---- 4. приёмка: потеря поля (популяция — ВХОД) ---- */
   celltris CT;
@@ -2448,6 +2465,90 @@ int main(int argc, char **argv) {
           nz0f++;
         else
           nz0c++;
+      }
+      /* УГОЛ НОРМАЛИ ЯЧЕЙКИ ПРОТИВ ИСТИННОЙ (Ш9, §459). Эталон — нормаль
+       * БЛИЖАЙШЕГО исходного треугольника к вершине ячейки; «первый в ячейке»
+       * запрещён после А824. ОГОВОРКА А835, без неё число не читается: у
+       * крупной ячейки сравнивается СРЕДНЯЯ по куску нормаль с МЕСТНОЙ, поэтому
+       * метрика меряет «наша ошибка + кривизна куска» и систематически завышает.
+       * Мелкие ячейки печатаются рядом как внутренний эталон: их путь не тронут,
+       * и их угол обязан не измениться ни у одной.
+       * НЕГАТИВНЫЙ КОНТРОЛЬ (флаг `nrmflip`): нормаль ячейки подаётся
+       * ОБРАЩЁННОЙ, и угол обязан стать 180° − x. Не станет — метрика меряет
+       * длину, а не направление, и всё, что она подтвердила, не подтверждено. */
+      {
+        double *ang[2];
+        int64_t na2[2] = {0, 0}, nomiss = 0;
+        for (int cl2 = 0; cl2 < 2; cl2++) {
+          ang[cl2] = malloc((size_t)(A.n > 0 ? A.n : 1) * sizeof *ang[cl2]);
+          if (ang[cl2] == NULL) exit(1);
+        }
+        for (int32_t i = 0; i < A.n; i++) {
+          double v[3], nn[3];
+          hz_slice_vertex(&A, i, v);
+          hz_slice_normal(&A, i, nn);
+          if (nrmflip)
+            for (int c = 0; c < 3; c++)
+              nn[c] = -nn[c];
+          double w[3];
+          for (int c = 0; c < 3; c++)
+            w[c] = fr.org[c] + v[c] * fr.h;
+          int32_t cell[3];
+          int ok = 1;
+          for (int c = 0; c < 3; c++) {
+            double f = floor((w[c] - fr.org[c]) / fr.h);
+            if (!(f >= 0.0) || !(f < (double)fr.n)) ok = 0;
+            cell[c] = ok ? (int32_t)f : 0;
+          }
+          const int32_t *ls = NULL;
+          int32_t nls = ok ? ct_list(&CT, cell, &ls) : 0;
+          if (nls == 0) {
+            nomiss++;
+            continue;
+          }
+          double bd = 1e300, fn[3] = {0.0, 0.0, 0.0};
+          for (int32_t q = 0; q < nls; q++) {
+            const double *Aq, *Bq, *Cq;
+            tri_verts(&m, ls[q], &Aq, &Bq, &Cq);
+            double dq = pt_tri_d2(w, Aq, Bq, Cq);
+            if (dq >= bd) continue;
+            bd = dq;
+            double f1[3], f2[3];
+            for (int c = 0; c < 3; c++) {
+              f1[c] = Bq[c] - Aq[c];
+              f2[c] = Cq[c] - Aq[c];
+            }
+            fn[0] = f1[1] * f2[2] - f1[2] * f2[1];
+            fn[1] = f1[2] * f2[0] - f1[0] * f2[2];
+            fn[2] = f1[0] * f2[1] - f1[1] * f2[0];
+          }
+          double fl = sqrt(fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2]);
+          if (!(fl > 0.0)) {
+            nomiss++;
+            continue;
+          }
+          double cs = (nn[0] * fn[0] + nn[1] * fn[1] + nn[2] * fn[2]) / fl;
+          if (cs > 1.0) cs = 1.0;
+          if (cs < -1.0) cs = -1.0;
+          int fine = A.c[i].lvl == (uint8_t)lev;
+          ang[fine ? 0 : 1][na2[fine ? 0 : 1]++] = acos(cs) * 180.0 / 3.14159265358979323846;
+        }
+        double q50[2] = {0, 0}, q90[2] = {0, 0}, qmx[2] = {0, 0};
+        for (int cl2 = 0; cl2 < 2; cl2++) {
+          if (na2[cl2] > 0) {
+            qsort(ang[cl2], (size_t)na2[cl2], sizeof *ang[cl2], cmp_d);
+            q50[cl2] = ang[cl2][na2[cl2] / 2];
+            q90[cl2] = ang[cl2][(na2[cl2] * 9) / 10];
+            qmx[cl2] = ang[cl2][na2[cl2] - 1];
+          }
+          free(ang[cl2]); /* БЕЗУСЛОВНО: пустой класс тоже был выделен (утечка
+                           * 192 Б, пойманная санитайзером на зале — А833). */
+        }
+        printf("      Ш9 УГОЛ НОРМАЛИ ЯЧЕЙКИ (град, эталон — ближайший исходный треугольник%s): "
+               "МЕЛКИЕ p50 %.1f p90 %.1f max %.1f (%lld шт); КРУПНЫЕ p50 %.1f p90 %.1f max %.1f "
+               "(%lld шт); без эталона %lld\n",
+               nrmflip ? ", НОРМАЛЬ ОБРАЩЕНА — НК" : "", q50[0], q90[0], qmx[0], (long long)na2[0],
+               q50[1], q90[1], qmx[1], (long long)na2[1], (long long)nomiss);
       }
       int64_t half = A.n / 2, acc2 = 0;
       int lmed = 0, lmin = 99, lmax = -1;

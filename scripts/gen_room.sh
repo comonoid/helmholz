@@ -36,17 +36,19 @@ awk -v THIN="$thin" -v SOUP="$soup" '
 # Порядок вершин коробки: бит 1 = x, 2 = y, 4 = z — как у ячейки октодерева.
 # Обходы граней ВЫВЕДЕНЫ, а не подобраны: для каждой считано векторное
 # произведение и проверен знак нормали. dir = +1 нормали наружу, -1 внутрь.
+function setm(a,b2,c,d,e,f) { FM[0]=a; FM[1]=b2; FM[2]=c; FM[3]=d; FM[4]=e; FM[5]=f; }
+function one(a) { setm(a,a,a,a,a,a); }
 function box(x0,y0,z0, x1,y1,z1, dir,   b,i) {
   b = nv;
   for (i = 0; i < 8; i++)
     printf "v %.6f %.6f %.6f\n", (i%2 ? x1 : x0), (int(i/2)%2 ? y1 : y0), (int(i/4)%2 ? z1 : z0);
   nv += 8;
-  quad(b+1, b+2, b+6, b+5, dir); # y = y0, нормаль -y
-  quad(b+3, b+7, b+8, b+4, dir); # y = y1, нормаль +y
-  quad(b+1, b+3, b+4, b+2, dir); # z = z0, нормаль -z
-  quad(b+5, b+6, b+8, b+7, dir); # z = z1, нормаль +z
-  quad(b+1, b+5, b+7, b+3, dir); # x = x0, нормаль -x
-  quad(b+2, b+4, b+8, b+6, dir); # x = x1, нормаль +x
+  printf "usemtl %s\n", FM[0]; quad(b+1, b+2, b+6, b+5, dir); # y = y0, нормаль -y
+  printf "usemtl %s\n", FM[1]; quad(b+3, b+7, b+8, b+4, dir); # y = y1, нормаль +y
+  printf "usemtl %s\n", FM[2]; quad(b+1, b+3, b+4, b+2, dir); # z = z0
+  printf "usemtl %s\n", FM[3]; quad(b+5, b+6, b+8, b+7, dir); # z = z1
+  printf "usemtl %s\n", FM[4]; quad(b+1, b+5, b+7, b+3, dir); # x = x0
+  printf "usemtl %s\n", FM[5]; quad(b+2, b+4, b+8, b+6, dir); # x = x1
 }
 function quad(a,b,c,d, dir) {
   if (dir > 0) { printf "f %d %d %d\n", a, b, c; printf "f %d %d %d\n", a, c, d; }
@@ -55,6 +57,7 @@ function quad(a,b,c,d, dir) {
 # Сфера: полюс ОДНОЙ вершиной, иначе рёбра полюса остаются с одним владельцем.
 function sphere(cx,cy,cz,r, nu,nw,   b,i,j,th,ph,np,sp,i2) {
   b = nv;
+  printf "usemtl %s\n", FM[0];
   printf "v %.6f %.6f %.6f\n", cx, cy + r, cz; nv++;
   for (j = 1; j < nw; j++) {
     th = PI * j / nw;
@@ -83,6 +86,7 @@ function sphere(cx,cy,cz,r, nu,nw,   b,i,j,th,ph,np,sp,i2) {
 # иначе край остался бы с одним владельцем.
 function cyl(cx,cz,r, y0,y1, nu,   b,i,i2,c0,c1) {
   b = nv;
+  printf "usemtl %s\n", FM[0];
   for (i = 0; i < nu; i++) {
     printf "v %.6f %.6f %.6f\n", cx + r*cos(2*PI*i/nu), y0, cz + r*sin(2*PI*i/nu); nv++;
     printf "v %.6f %.6f %.6f\n", cx + r*cos(2*PI*i/nu), y1, cz + r*sin(2*PI*i/nu); nv++;
@@ -102,18 +106,25 @@ BEGIN {
   nv = 0;
   printf "# КОМНАТА-ИНСТРУМЕНТ (§470). Замкнутые тела, согласованная обмотка,\n";
   printf "# стены С ТОЛЩИНОЙ. Сгенерировано scripts/gen_room.sh — не править руками.\n";
+  printf "mtllib room.mtl\n";
 
+  # МАТЕРИАЛЫ ПО ГРАНЯМ, А НЕ ПО ТЕЛАМ: у полости пол, потолок и стены разные,
+  # и без этого комната читается как одна серая коробка (замечание пользователя
+  # 08-11). Порядок граней в box(): y0, y1, z0, z1, x0, x1.
+  one("outer");
   box(-4.2,-0.2,-3.2,  4.2, 2.4, 3.2,  1);   # наружная оболочка, нормали наружу
+  setm("floor", "ceiling", "wall", "wall", "wall", "wall");
   box(-4.0, 0.0,-3.0,  4.0, 2.2, 3.0, -1);   # полость, нормали В КОМНАТУ
 
-  sphere(-1.5, 0.70, 1.5, 0.70, 48, 24);     # три масштаба двойной кривизны
-  sphere( 0.6, 0.40,-1.2, 0.40, 40, 20);
-  sphere( 2.6, 0.25, 0.8, 0.25, 32, 16);
+  one("ballred");   sphere(-1.5, 0.70, 1.5, 0.70, 48, 24);
+  one("ballblue");  sphere( 0.6, 0.40,-1.2, 0.40, 40, 20);
+  one("ballgreen"); sphere( 2.6, 0.25, 0.8, 0.25, 32, 16);
 
-  cyl(-2.8, -1.6, 0.25, 0.0, 2.2, 48);       # колонна: одинарная кривизна
+  one("stone"); cyl(-2.8, -1.6, 0.25, 0.0, 2.2, 48);
 
-  box( 0.2, 0.72,-0.4,  1.8, 0.78, 0.4,  1); # стол: плоскости и острые складки
-  box( 0.28,0.00,-0.32, 0.36,0.72,-0.24, 1); # ножки тонкие, но НЕ нулевые
+  one("tabletop"); box( 0.2, 0.72,-0.4,  1.8, 0.78, 0.4,  1);
+  one("metal");
+  box( 0.28,0.00,-0.32, 0.36,0.72,-0.24, 1);
   box( 1.64,0.00,-0.32, 1.72,0.72,-0.24, 1);
   box( 0.28,0.00, 0.24, 0.36,0.72, 0.32, 1);
   box( 1.64,0.00, 0.24, 1.72,0.72, 0.32, 1);

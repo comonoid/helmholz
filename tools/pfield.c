@@ -2120,6 +2120,7 @@ int main(int argc, char **argv) {
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
   int nrmflip = 0, nonsum = 0, indvis = 0, indmeas = 0, dosolid = 0;
   int doxfer = 0, xfernosolid = 0, doxsweep = 0, nmu = 4, xcorner = 0, xinnerfluid = 0;
+  int ss2 = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
   double oven = 0.0, plates = 0.0;
   double lodthr = 1.0;
@@ -2147,6 +2148,8 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "nmu=", 4) == 0) nmu = (int)strtol(argv[i] + 4, NULL, 10);
     /* Ш14 (§482): запустить саму развёртку по ординатам на стыке. */
     /* НК Ш16: чтение радианса по УГЛУ (как до §486) и наружное как ФЛЮИД. */
+    /* Ш18 (§494): растр в `res`, на диск вдвое меньше свёрткой 2×2. */
+    if (strcmp(argv[i], "ss2") == 0) ss2 = 1;
     if (strcmp(argv[i], "xcorner") == 0) xcorner = 1;
     if (strcmp(argv[i], "xinnerfluid") == 0) xinnerfluid = 1;
     if (strcmp(argv[i], "xsweep") == 0) {
@@ -2678,6 +2681,17 @@ int main(int argc, char **argv) {
           nlit++;
         }
       }
+      /* ВХОД РАЗВЁРТКИ, А НЕ ТОЛЬКО ЕЁ ВЫХОД (А807). Ложный ноль на выходе
+       * неотличим от «источник не задан», пока не напечатан сам источник. */
+      int64_t nlitfac = 0, nlitfluid = 0;
+      for (int32_t i = 0; i < ftab.n; i++)
+        if (femit[i] > 0.0) nlitfac++;
+      for (int32_t k = 0; k < cut.nse; k++)
+        if (femit[cut.se[k].facet] > 0.0 && cut.mvol[cut.se[k].cell][0][0] > 0.0) nlitfluid++;
+      printf("      ВХОД РАЗВЁРТКИ: светящихся ФАСЕТОВ %lld из %d, светящихся элементов во "
+             "ФЛЮИДНЫХ ячейках %lld из %lld; альбедо фасета %.2f, ординат %d\n",
+             (long long)nlitfac, ftab.n, (long long)nlitfluid, (long long)nlit, frho[0],
+             2 * nmu * 4 * nmu);
       tr3_dirs dirs;
       if (tr3_dirs_product(&dirs, nmu, nmu) != 0) exit(1);
       tr3_problem prob = {.m = &mesh,
@@ -4365,8 +4379,30 @@ int main(int argc, char **argv) {
       int wrc = hz_dc_walk(&T, lod_stop, &LL, lit_poly, &LC);
       double t_rast = now_s() - ta;
       char path[256];
-      snprintf(path, sizeof path, "img/pfield_lit_L%d_%d.ppm", lev, res);
-      int prc = hz_ppm_write_rgb(path, rgb, res, res);
+      /* Ш18 (§494): СГЛАЖИВАНИЕ. Растр идёт в `res`, а на диск пишется вдвое
+       * меньше со свёрткой коробкой 2×2 — четыре пробы на пиксель. Это НЕ
+       * полноценное сглаживание: края ГЕОМЕТРИИ остаются ступенчатыми на уровне
+       * ячейки, сглаживается только край многоугольника. Так и называется. */
+      int outres = ss2 ? res / 2 : res;
+      unsigned char *outrgb = rgb;
+      if (ss2) {
+        outrgb = malloc((size_t)outres * (size_t)outres * 3);
+        if (outrgb == NULL) exit(1);
+        for (int y = 0; y < outres; y++)
+          for (int x = 0; x < outres; x++)
+            for (int c = 0; c < 3; c++) {
+              unsigned s4 = 0;
+              for (int dy = 0; dy < 2; dy++)
+                for (int dx = 0; dx < 2; dx++)
+                  s4 += rgb[3 * ((size_t)(2 * y + dy) * (size_t)res + (size_t)(2 * x + dx)) +
+                            (size_t)c];
+              outrgb[3 * ((size_t)y * (size_t)outres + (size_t)x) + (size_t)c] =
+                  (unsigned char)((s4 + 2u) / 4u);
+            }
+      }
+      snprintf(path, sizeof path, "img/pfield_lit_L%d_%d.ppm", lev, outres);
+      int prc = hz_ppm_write_rgb(path, outrgb, outres, outres);
+      if (ss2) free(outrgb);
       printf("   ОТСЕЧЕНИЕ: пришло %lld многоугольников, отброшено %lld (%.1f %%)\n",
              (long long)LC.nseen, (long long)LC.ncull,
              100.0 * (double)LC.ncull / (double)(LC.nseen ? LC.nseen : 1));

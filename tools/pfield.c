@@ -2716,6 +2716,50 @@ int main(int argc, char **argv) {
       if (st.sout != NULL)
         for (int32_t k = 0; k < cut.nse; k++)
           if (st.sout[4 * (size_t)k] > soutmax) soutmax = st.sout[4 * (size_t)k];
+      /* §489: ПОЧЕМУ У ЧАСТИ ЯЧЕЕК СРЕЗА НЕТ РАДИАНСА. Два множества по одной
+       * сетке: A — ячейки с ВЕРШИНОЙ DC (из них собирается срез), B — ячейки с
+       * хотя бы одним ПОВЕРХНОСТНЫМ ЭЛЕМЕНТОМ. Предикаты разные (вершина против
+       * «плоскость режет коробку»), и совпадать они не обязаны. Считается
+       * прямо, а не оценивается. */
+      {
+        hz_dcslice SF;
+        int64_t na = 0, nb = 0, nab = 0;
+        if (hz_slice_init(&SF, lev) != HZ_DC_OK) exit(1);
+        if (hz_slice_build(&SF, &T, &ht, NULL, NULL) != HZ_DC_OK) exit(1);
+        unsigned char *hasel = calloc((size_t)fr.n * (size_t)fr.n * (size_t)fr.n, 1);
+        if (hasel == NULL) exit(1);
+        for (int32_t k = 0; k < cut.nse; k++) {
+          int32_t ci2 = cut.se[k].cell;
+          hasel[hz_occ_index(fr.n, mesh.clo[ci2][0], mesh.clo[ci2][1], mesh.clo[ci2][2])] = 1u;
+        }
+        for (size_t i2 = 0; i2 < (size_t)fr.n * (size_t)fr.n * (size_t)fr.n; i2++)
+          if (hasel[i2]) nb++;
+        for (int32_t i2 = 0; i2 < SF.n; i2++) {
+          size_t g = hz_occ_index(fr.n, SF.c[i2].lo[0], SF.c[i2].lo[1], SF.c[i2].lo[2]);
+          na++;
+          if (hasel[g]) nab++;
+        }
+        /* РЕШАЮЩЕЕ ЧИСЛО (§490): сколько ячеек СЕТКИ ПЕРЕНОСА вообще нашли свою
+         * запись в боковой таблице. Ключом там служит индекс узла, и деревьев
+         * ДВА — DC и hz_octree, — а нумерация у них своя. Если совпадений
+         * заметно меньше числа записей, ключи разные, и фасеты розданы не тем
+         * ячейкам. */
+        int64_t nrecfound = 0;
+        for (int32_t c2 = 0; c2 < mesh.ncell; c2++)
+          if (hz_cutmap_find(&cmap, mesh.node[c2]) != NULL) nrecfound++;
+        printf("      §490 КЛЮЧ БОКОВОЙ ТАБЛИЦЫ: записей %d, ячеек сетки переноса, нашедших "
+               "запись, %lld (%.1f %%)\n",
+               cmap.nr, (long long)nrecfound,
+               100.0 * (double)nrecfound / (double)(cmap.nr ? cmap.nr : 1));
+        printf("      §489 МНОЖЕСТВА: с вершиной DC %lld, с поверхностным элементом %lld, "
+               "пересечение %lld (%.1f %% от вершин); вершин без элемента %lld, элементов без "
+               "вершины %lld\n",
+               (long long)na, (long long)nb, (long long)nab,
+               100.0 * (double)nab / (double)(na ? na : 1), (long long)(na - nab),
+               (long long)(nb - nab));
+        free(hasel);
+        hz_slice_free(&SF);
+      }
       printf("   РАЗВЁРТКА: направлений %d, светящихся элементов %lld; код %d, итераций %d, "
              "невязка %.2e, за %.2f с\n",
              dirs.n, (long long)nlit, src, st.iters, st.resid, tsw);

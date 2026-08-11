@@ -1771,6 +1771,119 @@ static int32_t g_seed = 0;
 static int g_passes = 1;
 /* Ф3' (§510): порог LOD для среза ИЗЛУЧАТЕЛЕЙ; 0 — излучатели те же, что приёмники. */
 static double g_emitthr = 0.0;
+/* Ф4' (§511): свип по дереву вместо плоской сетки. */
+static int g_treesweep = 0;
+
+/* --- Ф4' (§511): СВИП ПО ДЕРЕВУ ------------------------------------------- */
+
+/* ЗАЧЕМ. Плоский свип ходит по всем ячейкам сетки; адаптивное покрытие того же
+ * уровня на комнате вдесятеро меньше (`200 593` против `2 097 152`), потому что
+ * пустой блок не дробится и фронт обязан проносить его ЗА ОДИН ШАГ.
+ *
+ * УСТРОЙСТВО. Узлы перечисляются спуском по пирамиде занятости: пустой блок —
+ * один узел, занятый дробится до уровня свипа. Индекс «ячейка → узел» строится
+ * ОДИН РАЗ на кадр и делает поиск соседа O(1); он стоит O(объёма), но не на
+ * образец, а на кадр, и потому дешёв.
+ *
+ * ПОРЯДОК ОБХОДА — рекурсивный спуск с детьми в порядке октанта: ближний к
+ * источнику раньше. Условие свипа («сосед со стороны источника посчитан») тогда
+ * выполняется по построению, и сортировать ничего не надо. */
+typedef struct {
+  int32_t lo[3], size;
+  int32_t child0; /* индекс первого из 8 детей, -1 у листа */
+} snode;
+
+typedef struct {
+  snode *nd;
+  int32_t n, cap;
+  int32_t *idx; /* ячейка сетки свипа -> ЛИСТ */
+  int32_t nleaf;
+  float *open;  /* открытость на УЗЕЛ */
+  int32_t gn;   /* сторона сетки свипа */
+} stree;
+
+static void stree_free(stree *T) {
+  free(T->nd);
+  free(T->idx);
+  free(T->open);
+  T->nd = NULL;
+  T->idx = NULL;
+  T->open = NULL;
+  T->n = T->cap = 0;
+}
+
+/* Восемь детей выделяются ПОДРЯД, и только потом каждый достраивается. Первая
+ * редакция создавала их рекурсивно, и они ложились вразнобой, а обход считал
+ * `child0 + k` — то есть ходил не туда. Замер поймал это ложным нулём: свип
+ * выдал 0 освещённых ячеек за 3.8 мс. */
+static int32_t stree_alloc8(stree *T) {
+  if (T->n + 8 > T->cap) {
+    int32_t nc = T->cap > 0 ? T->cap * 2 : 4096;
+    if (nc < T->n + 8) nc = T->n + 8;
+    snode *nn = realloc(T->nd, (size_t)nc * sizeof *nn);
+    if (nn == NULL) exit(1);
+    T->nd = nn;
+    T->cap = nc;
+  }
+  int32_t b = T->n;
+  T->n += 8;
+  return b;
+}
+
+static void stree_rec(stree *T, const opyr *P, int lev, int drop, int32_t me) {
+  int32_t x = T->nd[me].lo[0], y = T->nd[me].lo[1], z = T->nd[me].lo[2], size = T->nd[me].size;
+  int lv = lev - drop, sh = 0;
+  int32_t s2 = size;
+  while (s2 > 1) {
+    lv--;
+    sh++;
+    s2 >>= 1;
+  }
+  int occ = hz_occ_get(P->b[lv], hz_occ_index((int32_t)1 << lv, x >> sh, y >> sh, z >> sh)) != 0;
+  T->nd[me].child0 = -1;
+  if (!occ || size == 1) return;
+  int32_t h = size >> 1;
+  int32_t c0 = stree_alloc8(T);
+  T->nd[me].child0 = c0;
+  for (int k = 0; k < 8; k++) {
+    T->nd[c0 + k].lo[0] = x + ((k & 1) ? h : 0);
+    T->nd[c0 + k].lo[1] = y + ((k & 2) ? h : 0);
+    T->nd[c0 + k].lo[2] = z + ((k & 4) ? h : 0);
+    T->nd[c0 + k].size = h;
+    T->nd[c0 + k].child0 = -1;
+  }
+  for (int k = 0; k < 8; k++)
+    stree_rec(T, P, lev, drop, c0 + k);
+}
+
+static void stree_build(stree *T, const opyr *P, int lev, int drop, int32_t gn) {
+  memset(T, 0, sizeof *T);
+  T->gn = gn;
+  T->nd = malloc(sizeof *T->nd);
+  if (T->nd == NULL) exit(1);
+  T->cap = 1;
+  T->n = 1;
+  T->nd[0].lo[0] = T->nd[0].lo[1] = T->nd[0].lo[2] = 0;
+  T->nd[0].size = gn;
+  T->nd[0].child0 = -1;
+  stree_rec(T, P, lev, drop, 0);
+  size_t nc = (size_t)gn * (size_t)gn * (size_t)gn;
+  T->idx = malloc(nc * sizeof *T->idx);
+  T->open = malloc((size_t)T->n * sizeof *T->open);
+  if (T->idx == NULL || T->open == NULL) exit(1);
+  /* Индексируются ТОЛЬКО листья: внутренние узлы нужны обходу, но накрывают те
+   * же ячейки, и запись их поверх листьев испортила бы индекс. */
+  T->nleaf = 0;
+  for (int32_t i = 0; i < T->n; i++) {
+    const snode *s = &T->nd[i];
+    if (s->child0 >= 0) continue;
+    T->nleaf++;
+    for (int32_t z = s->lo[2]; z < s->lo[2] + s->size; z++)
+      for (int32_t y = s->lo[1]; y < s->lo[1] + s->size; y++)
+        for (int32_t x = s->lo[0]; x < s->lo[0] + s->size; x++)
+          T->idx[hz_occ_index(gn, x, y, z)] = i;
+  }
+}
 
 typedef struct {
   unsigned char *vis; /* на ячейку: булева видимость (осевое и направленное правила) */
@@ -1784,7 +1897,101 @@ typedef struct {
   int axis;              /* НЕГАТИВНЫЙ КОНТРОЛЬ: прежнее осевое наследование */
   int frac;              /* Ш5а2: дробная открытость вместо булевой */
   int round01;           /* НЕГАТИВНЫЙ КОНТРОЛЬ Ш5а2: округлять F до 0/1 */
+  stree *tree;           /* Ф4': свип по дереву; NULL — плоская сетка */
 } sweepgrid;
+
+/* Обход дерева в порядке октанта: дети, ближние к источнику, раньше. Условие
+ * свипа выполняется по построению — сортировать нечего. Правило переноса ТО ЖЕ,
+ * что на плоской сетке (взвешенное среднее по трём верхним соседям), чтобы
+ * сравнение шло схема в схему. */
+static void tsweep_rec(stree *T, const opyr *P, int lev, int drop, const double sc[3], int32_t ni) {
+  const snode *nd = &T->nd[ni];
+  if (nd->child0 >= 0) {
+    /* Дети в порядке октанта: ближний к источнику раньше. Условие свипа тогда
+     * выполняется по построению, и сортировать нечего. */
+    double cx = (double)nd->lo[0] + 0.5 * (double)nd->size;
+    double cy = (double)nd->lo[1] + 0.5 * (double)nd->size;
+    double cz = (double)nd->lo[2] + 0.5 * (double)nd->size;
+    int bx = sc[0] > cx ? 1 : 0, by = sc[1] > cy ? 1 : 0, bz = sc[2] > cz ? 1 : 0;
+    for (int i = 0; i < 8; i++) {
+      int kx = (i & 1) ? 1 - bx : bx, ky = (i & 2) ? 1 - by : by, kz = (i & 4) ? 1 - bz : bz;
+      tsweep_rec(T, P, lev, drop, sc, nd->child0 + (kx | (ky << 1) | (kz << 2)));
+    }
+    return;
+  }
+  if (T->open[ni] >= 0.0f) return; /* засеяно маршем либо уже посчитано */
+  double c0[3] = {(double)nd->lo[0] + 0.5 * (double)nd->size,
+                  (double)nd->lo[1] + 0.5 * (double)nd->size,
+                  (double)nd->lo[2] + 0.5 * (double)nd->size};
+  double dd[3], sabs = 0.0;
+  for (int k = 0; k < 3; k++) {
+    dd[k] = sc[k] - c0[k];
+    sabs += fabs(dd[k]);
+  }
+  if (!(sabs > 0.0)) {
+    T->open[ni] = 1.0f;
+    return;
+  }
+  double acc = 0.0, wsum = 0.0;
+  for (int k = 0; k < 3; k++) {
+    double w = fabs(dd[k]) / sabs;
+    if (!(w > 0.0)) continue;
+    double pp[3] = {c0[0], c0[1], c0[2]};
+    pp[k] += (dd[k] > 0.0 ? 1.0 : -1.0) * (0.5 * (double)nd->size + 0.5);
+    int32_t q2[3];
+    int ok = 1;
+    for (int a = 0; a < 3; a++) {
+      double f2 = floor(pp[a]);
+      if (!(f2 >= 0.0) || !(f2 < (double)T->gn)) ok = 0;
+      q2[a] = ok ? (int32_t)f2 : 0;
+    }
+    if (!ok) continue;
+    size_t qi = hz_occ_index(T->gn, q2[0], q2[1], q2[2]);
+    if (hz_occ_get(P->b[lev - drop], qi)) continue; /* заслон: направление исключается */
+    int32_t nj = T->idx[qi];
+    if (T->open[nj] < 0.0f) continue; /* ещё не посчитан — не наш порядок */
+    acc += w * (double)T->open[nj];
+    wsum += w;
+  }
+  T->open[ni] = (float)(wsum > 0.0 ? acc / wsum : 0.0);
+}
+
+static void tsweep_light(stree *T, const opyr *P, const frame *fr, int lev, int drop,
+                         const double q[3]) {
+  for (int32_t i = 0; i < T->n; i++)
+    T->open[i] = -1.0f;
+  double sc[3];
+  for (int k = 0; k < 3; k++)
+    sc[k] = (q[k] - fr->org[k]) / (fr->h * (double)((int32_t)1 << drop));
+  /* Узел источника открыт по определению. */
+  int32_t s[3];
+  for (int k = 0; k < 3; k++) {
+    double f = floor(sc[k]);
+    if (f < 0.0) f = 0.0;
+    if (f > (double)(T->gn - 1)) f = (double)(T->gn - 1);
+    s[k] = (int32_t)f;
+  }
+  T->open[T->idx[hz_occ_index(T->gn, s[0], s[1], s[2])]] = 1.0f;
+  /* §507: засев окрестности источника маршем — тот же, что у плоского свипа. */
+  if (g_seed > 0) {
+    double cw = fr->h * (double)((int32_t)1 << drop);
+    for (int32_t dz2 = -g_seed; dz2 <= g_seed; dz2++)
+      for (int32_t dy2 = -g_seed; dy2 <= g_seed; dy2++)
+        for (int32_t dx2 = -g_seed; dx2 <= g_seed; dx2++) {
+          int32_t cx2 = s[0] + dx2, cy2 = s[1] + dy2, cz2 = s[2] + dz2;
+          if (cx2 < 0 || cy2 < 0 || cz2 < 0 || cx2 >= T->gn || cy2 >= T->gn || cz2 >= T->gn)
+            continue;
+          double pw[3] = {fr->org[0] + ((double)cx2 + 0.5) * cw,
+                          fr->org[1] + ((double)cy2 + 0.5) * cw,
+                          fr->org[2] + ((double)cz2 + 0.5) * cw};
+          T->open[T->idx[hz_occ_index(T->gn, cx2, cy2, cz2)]] =
+              shadowed(P, fr, pw, q, 0.5) ? 0.0f : 1.0f;
+        }
+  }
+  tsweep_rec(T, P, lev, drop, sc, 0);
+  for (int32_t i = 0; i < T->n; i++)
+    if (T->open[i] < 0.0f) T->open[i] = 0.0f;
+}
 
 static void sweep_free(sweepgrid *G) {
   free(G->vis);
@@ -2074,6 +2281,7 @@ static double sweep_vis(const sweepgrid *G, const frame *fr, const double p[3]) 
     c[k] = (int32_t)f;
   }
   size_t ci = hz_occ_index(G->n, c[0], c[1], c[2]);
+  if (G->tree != NULL) return (double)G->tree->open[G->tree->idx[ci]];
   return G->frac ? (double)G->open[ci] : (G->vis[ci] ? 1.0 : 0.0);
 }
 
@@ -2102,6 +2310,16 @@ static void front_sweep(const hz_dcslice *S, const frame *fr, const opyr *P, con
   G.prof = HZ_SWEEP_P > 1 ? malloc(gcells * (size_t)(HZ_SWEEP_P * HZ_SWEEP_P)) : NULL;
   G.seeded = calloc(gcells, 1);
   if (G.vis == NULL || G.open == NULL) exit(1);
+  stree TR;
+  if (g_treesweep) {
+    double tt = now_s();
+    stree_build(&TR, P, fr->lev, G.drop, G.n);
+    G.tree = &TR;
+    printf("   Ф4' ДЕРЕВО СВИПА: узлов %d против %lld ячеек плоской сетки (в %.1f раза меньше), "
+           "перечень и индекс за %.1f мс\n",
+           TR.nleaf, (long long)gcells, (double)gcells / (double)(TR.nleaf ? TR.nleaf : 1),
+           (now_s() - tt) * 1e3);
+  }
   for (int32_t i = 0; i < 3 * S->n; i++)
     irr[i] = 0.0f;
   *t_sweep = 0.0;
@@ -2111,7 +2329,10 @@ static void front_sweep(const hz_dcslice *S, const frame *fr, const opyr *P, con
     for (int k = 0; k < 3; k++)
       q[k] = L->c[k] + L->u[k] * su[sm] + L->v[k] * sv[sm];
     double ta = now_s();
-    sweep_light(&G, P, fr, q);
+    if (g_treesweep)
+      tsweep_light(&TR, P, fr, fr->lev, G.drop, q);
+    else
+      sweep_light(&G, P, fr, q);
     *t_sweep += now_s() - ta;
     ta = now_s();
     for (int32_t i = 0; i < S->n; i++) {
@@ -2137,6 +2358,7 @@ static void front_sweep(const hz_dcslice *S, const frame *fr, const opyr *P, con
     }
     *t_gather += now_s() - ta;
   }
+  if (g_treesweep) stree_free(&TR);
   sweep_free(&G);
 }
 /* --- 3ж. РАСТЕРИЗАЦИЯ СО СВЕТОМ (Ш5) --------------------------------------- */
@@ -2342,6 +2564,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "seed=", 5) == 0) g_seed = (int32_t)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "passes=", 7) == 0) g_passes = (int)strtol(argv[i] + 7, NULL, 10);
     if (strncmp(argv[i], "emit=", 5) == 0) g_emitthr = strtod(argv[i] + 5, NULL);
+    if (strcmp(argv[i], "treesweep") == 0) g_treesweep = 1;
     /* Р-7а: замер квантования плоскости. */
     if (strcmp(argv[i], "qplane") == 0) {
       qplane = 1;

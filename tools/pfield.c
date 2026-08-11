@@ -1721,6 +1721,179 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
   }
 }
 
+/* --- Ф6' (§516): ДЕРЕВО ИЗЛУЧАТЕЛЕЙ ---------------------------------------- */
+
+/* ЗАЧЕМ. Гатер «каждая с каждой» стоит `N²` пар (`3.7e8` на комнате) и занимает
+ * 94 % кадра. Но приёмнику не нужен каждый излучатель по отдельности: дальняя
+ * стена светит как ОДНА площадка. Огрубление идёт по ВЗАИМНОМУ расстоянию, а не
+ * по расстоянию до глаза — §510 проверил обратное и был наказан замером
+ * (энергия упала вдвое при падении числа излучателей на треть).
+ *
+ * УЗЕЛ НЕСЁТ ПОТОК, А НЕ ЯРКОСТЬ: `flux = Σ радианс·площадь` по детям. Тогда
+ * сложение точное, а яркость восстанавливается делением на площадь там, где
+ * нужна. Складывать яркости было бы неверно — они не аддитивны. */
+typedef struct {
+  double c[3];    /* центр тяжести, мир */
+  double n[3];    /* средняя нормаль, единичная */
+  double flux[3]; /* Σ радианс·площадь·альбедо по каналам */
+  double area;    /* суммарная площадь */
+  double rad;     /* радиус: полудиагональ коробки, мир */
+  int32_t ch[8];  /* дети; -1 там, где пусто. НЕ подряд: каждый строит своё
+                   * поддерево, поэтому «первый плюс k» здесь неверно — эта
+                   * ошибка уже стоила ложного нуля в свипе по дереву (§512). */
+  int nch;
+} enode;
+
+typedef struct {
+  enode *e;
+  int32_t n, cap;
+} etree;
+
+static void etree_free(etree *T) {
+  free(T->e);
+  T->e = NULL;
+  T->n = T->cap = 0;
+}
+
+static int32_t etree_alloc(etree *T, int32_t k) {
+  if (T->n + k > T->cap) {
+    int32_t nc = T->cap > 0 ? T->cap * 2 : 4096;
+    if (nc < T->n + k) nc = T->n + k;
+    enode *nn = realloc(T->e, (size_t)nc * sizeof *nn);
+    if (nn == NULL) exit(1);
+    T->e = nn;
+    T->cap = nc;
+  }
+  int32_t b = T->n;
+  T->n += k;
+  return b;
+}
+
+/* Дерево строится ПРЯМО ПО СРЕЗУ, потому что срез лежит в МОРТОНОВОМ порядке
+ * (dcslice.h): у любого узла его ячейки образуют НЕПРЕРЫВНЫЙ отрезок массива, и
+ * разбиение на восьмерых детей есть разрезание отрезка по биту координаты. Ни
+ * хеша, ни второго индекса не нужно — и это прямая выгода от решения хранить
+ * срез массивом, а не деревом (§382). */
+static int32_t etree_build(etree *T, const hz_dcslice *S, const frame *fr, const float *irr,
+                           const hz_objmesh *m, int32_t a, int32_t b, int lvl, int lev) {
+  int32_t me = etree_alloc(T, 1);
+  enode *e = &T->e[me];
+  memset(e, 0, sizeof *e);
+  e->nch = 0;
+  for (int k = 0; k < 8; k++)
+    e->ch[k] = -1;
+  double lo[3] = {1e300, 1e300, 1e300}, hi[3] = {-1e300, -1e300, -1e300};
+  for (int32_t i = a; i < b; i++) {
+    double p[3], n[3];
+    hz_slice_vertex(S, i, p);
+    for (int k = 0; k < 3; k++)
+      p[k] = fr->org[k] + p[k] * fr->h;
+    hz_slice_normal(S, i, n);
+    double side = fr->h * (double)((int32_t)1 << (lev - (int)S->c[i].lvl));
+    double ar = side * side;
+    e->area += ar;
+    for (int k = 0; k < 3; k++) {
+      e->c[k] += p[k] * ar;
+      e->n[k] += n[k] * ar;
+      if (p[k] < lo[k]) lo[k] = p[k];
+      if (p[k] > hi[k]) hi[k] = p[k];
+      e->flux[k] += (double)irr[3 * (size_t)i + (size_t)k] * ar * alb(m, S->c[i].mat, k);
+    }
+  }
+  if (e->area > 0.0)
+    for (int k = 0; k < 3; k++) {
+      e->c[k] /= e->area;
+      e->n[k] /= e->area;
+    }
+  double nl = sqrt(e->n[0] * e->n[0] + e->n[1] * e->n[1] + e->n[2] * e->n[2]);
+  if (nl > 0.0)
+    for (int k = 0; k < 3; k++)
+      e->n[k] /= nl;
+  double r2 = 0.0;
+  for (int k = 0; k < 3; k++) {
+    double d = 0.5 * (hi[k] - lo[k]);
+    r2 += d * d;
+  }
+  e->rad = sqrt(r2);
+  if (b - a <= 1 || lvl >= lev) return me;
+  /* Разрез отрезка по биту координаты на этом уровне; ячейки в мортоновом
+   * порядке, поэтому границы находятся одним проходом. */
+  int sh = lev - lvl - 1;
+  int32_t bnd[9];
+  bnd[0] = a;
+  int32_t cur = a;
+  for (int k = 1; k <= 8; k++) {
+    while (cur < b) {
+      const hz_dccell *c = &S->c[cur];
+      int bit =
+          (((c->lo[0] >> sh) & 1) | (((c->lo[1] >> sh) & 1) << 1) | (((c->lo[2] >> sh) & 1) << 2));
+      if (bit >= k) break;
+      cur++;
+    }
+    bnd[k] = cur;
+  }
+  int nc2 = 0;
+  int32_t ch2[8];
+  for (int k = 0; k < 8; k++) {
+    if (bnd[k + 1] <= bnd[k]) continue;
+    ch2[nc2++] = etree_build(T, S, fr, irr, m, bnd[k], bnd[k + 1], lvl + 1, lev);
+  }
+  for (int k = 0; k < nc2; k++)
+    T->e[me].ch[k] = ch2[k];
+  T->e[me].nch = nc2;
+  return me;
+}
+
+/* Спуск по дереву излучателей для ОДНОГО приёмника (§516). Узел берётся
+ * ЦЕЛИКОМ, если его угловой размер мал: `2·rad / расстояние <= eps`. Иначе
+ * спускаемся. Это и есть огрубление по ВЗАИМНОМУ расстоянию: близкий излучатель
+ * раскрывается до листьев, дальний берётся одним узлом.
+ * `nlink` считает принятые связи — без него «стало быстро» неотличимо от
+ * «перестало считать». */
+static void hgather_rec(const etree *T, int32_t ni, const double pi[3], const double ni_[3],
+                        double eps, double rrecv, const opyr *P, const frame *fr, int vis,
+                        double out[3], int64_t *nlink, double *sthru, double *sall) {
+  const enode *e = &T->e[ni];
+  if (!(e->area > 0.0)) return;
+  double w[3], r2 = 0.0;
+  for (int k = 0; k < 3; k++) {
+    w[k] = e->c[k] - pi[k];
+    r2 += w[k] * w[k];
+  }
+  if (!(r2 > 0.0)) return;
+  double r = sqrt(r2);
+  /* ДВА ОГРУБЛЕНИЯ СКЛАДЫВАЮТСЯ (указание пользователя 08-11). Первое — по
+   * ВЗАИМНОМУ расстоянию: далёкий излучатель берётся целиком. Второе — по
+   * размеру ПРИЁМНИКА: он усредняет по своей площади, и структура излучателя
+   * мельче его собственного размера для него не существует. Приёмник же
+   * огрублён камерой (срез), значит дальний от камеры приёмник останавливает
+   * спуск раньше — то есть камерное огрубление входит сюда САМО, без второго
+   * критерия. Если объект далёк и от света, и от камеры, спуск обрывается на
+   * первом же узле: остаётся ровно «там что-то есть». */
+  if (e->nch > 0 && 2.0 * e->rad > eps * r && 2.0 * e->rad > rrecv) {
+    for (int k = 0; k < e->nch; k++)
+      hgather_rec(T, e->ch[k], pi, ni_, eps, rrecv, P, fr, vis, out, nlink, sthru, sall);
+    return;
+  }
+  double ci = (w[0] * ni_[0] + w[1] * ni_[1] + w[2] * ni_[2]) / r;
+  double cj = -(w[0] * e->n[0] + w[1] * e->n[1] + w[2] * e->n[2]) / r;
+  if (!(ci > 0.0) || !(cj > 0.0)) return;
+  (*nlink)++;
+  /* Форм-фактор точечной связи: `cos_i·cos_j/(π r²)`, и площадь уже внутри
+   * потока (`flux = Σ радианс·площадь·альбедо`). */
+  double g = ci * cj / (3.14159265358979323846 * r2);
+  int blocked = 0;
+  if (vis) blocked = shadowed(P, fr, pi, e->c, 0.5);
+  for (int k = 0; k < 3; k++) {
+    double v = e->flux[k] * g;
+    if (sall != NULL) {
+      *sall += v;
+      if (blocked && sthru != NULL) *sthru += v;
+    }
+    if (!(blocked && vis)) out[k] += v;
+  }
+}
+
 /* --- 3з. СВИП ПОТОКОМ (Ш5, §383) ------------------------------------------- */
 
 /* ЧТО ЗДЕСЬ ДЕЛАЕТСЯ И ЧЕМ ЭТО ОТЛИЧАЕТСЯ ОТ ЛУЧА. Луч платит `O(шаги)` за
@@ -1775,6 +1948,8 @@ static double g_emitthr = 0.0;
 static int g_treesweep = 0;
 /* Ф5. (§514): порог дробления дерева свипа и камера для него. */
 static double g_sweepthr = 0.0, g_sweeppx = 1.0, g_sweepeye[3] = {0, 0, 0};
+/* Ф6. (§516): угловой порог иерархического отскока; 0 — прежний гатер N². */
+static double g_hgather = 0.0;
 
 /* --- Ф4' (§511): СВИП ПО ДЕРЕВУ ------------------------------------------- */
 
@@ -2702,6 +2877,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "passes=", 7) == 0) g_passes = (int)strtol(argv[i] + 7, NULL, 10);
     if (strncmp(argv[i], "emit=", 5) == 0) g_emitthr = strtod(argv[i] + 5, NULL);
     if (strcmp(argv[i], "treesweep") == 0) g_treesweep = 1;
+    if (strncmp(argv[i], "hgather=", 8) == 0) g_hgather = strtod(argv[i] + 8, NULL);
     if (strncmp(argv[i], "sweepthr=", 9) == 0) {
       g_sweepthr = strtod(argv[i] + 9, NULL);
       g_treesweep = 1;
@@ -4900,8 +5076,49 @@ int main(int argc, char **argv) {
      * обосновывающий свип, а не попытка уложиться в бюджет. */
     float *ind = calloc(3 * (size_t)S.n, sizeof *ind);
     if (ind == NULL) exit(1);
-    {
-      /* Ф3' (§510): ИЗЛУЧАТЕЛИ С ОГРУБЛЁННОГО СРЕЗА. Приёмнику нужна
+    if (g_hgather > 0.0) {
+      /* Ф6. (§516): ОТСКОК ПО ИЕРАРХИИ ИЗЛУЧАТЕЛЕЙ. */
+      etree ET;
+      memset(&ET, 0, sizeof ET);
+      double tb2 = now_s();
+      etree_build(&ET, &S, &fr, irr, &m, 0, S.n, 0, lev);
+      double t_build = now_s() - tb2;
+      tb2 = now_s();
+      int64_t nlink = 0;
+      double sthru2 = 0.0, sall2 = 0.0;
+      for (int32_t i = 0; i < S.n; i++) {
+        double pi[3], nn2[3], acc2[3] = {0, 0, 0};
+        hz_slice_vertex(&S, i, pi);
+        for (int k = 0; k < 3; k++)
+          pi[k] = fr.org[k] + pi[k] * fr.h;
+        hz_slice_normal(&S, i, nn2);
+        double rrecv = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
+        hgather_rec(&ET, 0, pi, nn2, g_hgather, rrecv, &P, &fr, indvis, acc2, &nlink, &sthru2,
+                    &sall2);
+        for (int k = 0; k < 3; k++)
+          ind[3 * (size_t)i + (size_t)k] = (float)(acc2[k] * (alb0 ? 0.0 : alb(&m, S.c[i].mat, k)));
+      }
+      double t_g2 = now_s() - tb2;
+      double sd2 = 0.0, si2 = 0.0;
+      for (int32_t i = 0; i < S.n; i++)
+        for (int k = 0; k < 3; k++) {
+          sd2 += (double)irr[3 * (size_t)i + (size_t)k];
+          si2 += (double)ind[3 * (size_t)i + (size_t)k];
+        }
+      printf("   Ф6. ИЕРАРХИЧЕСКИЙ ОТСКОК: eps %.3f, узлов дерева %d, СВЯЗЕЙ %lld против %lld пар "
+             "(в %.0f раз меньше); дерево %.1f мс, сбор %.1f мс; СУММА косвенного / прямого = "
+             "%.4f%s\n",
+             g_hgather, ET.n, (long long)nlink, (long long)S.n * (long long)S.n,
+             (double)((long long)S.n * (long long)S.n) / (double)(nlink ? nlink : 1), t_build * 1e3,
+             t_g2 * 1e3, si2 / (sd2 > 0.0 ? sd2 : 1.0), indvis ? " [С ЗАСЛОНАМИ]" : "");
+      if (indmeas || indvis)
+        printf("      §474 СКВОЗЬ ЗАСЛОНЫ: %.2f %%\n",
+               100.0 * sthru2 / (sall2 > 0.0 ? sall2 : 1.0));
+      for (int32_t i = 0; i < 3 * S.n; i++)
+        irr[i] += ind[i];
+      etree_free(&ET);
+    } else {
+      /* Ф3. (§510): ИЗЛУЧАТЕЛИ С ОГРУБЛЁННОГО СРЕЗА. Приёмнику нужна
        * подробность, излучателю — нет: дальняя стена светит как ОДНА площадка
        * со своей средней яркостью. Второй срез того же дерева с бо́льшим порогом
        * и есть эта огрублённая раздача; прямой свет на нём считается тем же

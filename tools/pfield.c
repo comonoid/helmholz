@@ -2089,7 +2089,7 @@ int main(int argc, char **argv) {
     return 2;
   }
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
-  int nrmflip = 0, nonsum = 0;
+  int nrmflip = 0, nonsum = 0, indvis = 0, indmeas = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
   double oven = 0.0, plates = 0.0;
   double lodthr = 1.0;
@@ -2106,6 +2106,14 @@ int main(int argc, char **argv) {
     /* НЕГАТИВНЫЙ КОНТРОЛЬ Ш9 (НК-1): вернуть прежнее поведение — крупной ячейке
      * нормаль не считать вовсе. Доля noct == 0 обязана вернуться к 100 %. */
     if (strcmp(argv[i], "nonsum") == 0) nonsum = 1;
+    /* §474: `indmeas` считает долю косвенного, приходящую СКВОЗЬ заслоны;
+     * `indvis` вдобавок её отбрасывает. Порознь затем, что первое — замер
+     * приближения, а второе — уже другая физика. */
+    if (strcmp(argv[i], "indmeas") == 0) indmeas = 1;
+    if (strcmp(argv[i], "indvis") == 0) {
+      indmeas = 1;
+      indvis = 1;
+    }
     /* НЕГАТИВНЫЙ КОНТРОЛЬ §397: вершина среза в один бит на ось. */
     if (strcmp(argv[i], "vq1") == 0) vq1 = 1;
     /* Ш4: удар сферой, два случая врозь (А669). */
@@ -3692,6 +3700,7 @@ int main(int argc, char **argv) {
         stride *= 2;
       double tb = now_s();
       int64_t nemit = 0;
+      double sthru = 0.0, sall = 0.0;
       for (int32_t j = 0; j < S.n; j += stride) {
         double ej[3] = {(double)irr[3 * (size_t)j], (double)irr[3 * (size_t)j + 1],
                         (double)irr[3 * (size_t)j + 2]};
@@ -3720,11 +3729,24 @@ int main(int argc, char **argv) {
           double ci = (w[0] * ni[0] + w[1] * ni[1] + w[2] * ni[2]) / r;
           double cj = -(w[0] * nj[0] + w[1] * nj[1] + w[2] * nj[2]) / r;
           if (!(ci > 0.0) || !(cj > 0.0)) continue;
+          /* §474: СКОЛЬКО КОСВЕННОГО ПРИХОДИТ СКВОЗЬ СТЕНЫ. Приближение (1)
+           * названо в коде с самого начала, но НЕ ИЗМЕРЕНО ни разу; в закрытой
+           * комнате оно перестаёт быть безобидным — наружная сторона стены
+           * светит внутрь. Здесь тем же маршем, что у прямого света, считается
+           * доля энергии, чей путь пересекает занятую ячейку. Ключ `indvis`
+           * её ЗАСЛОНЯЕТ, `indmeas` — только считает. */
           double ff = ci * cj * aj / (3.14159265358979323846 * r2);
-          for (int k = 0; k < 3; k++)
-            ind[3 * (size_t)i + (size_t)k] +=
-                (float)(ej[k] * (alb0 ? 0.0 : alb(&m, S.c[j].mat, k)) * ff *
-                        alb(&m, S.c[i].mat, k));
+          int blocked = 0;
+          if (indmeas) blocked = shadowed(&P, &fr, pi, pj, 0.5);
+          for (int k = 0; k < 3; k++) {
+            double e = ej[k] * (alb0 ? 0.0 : alb(&m, S.c[j].mat, k)) * ff * alb(&m, S.c[i].mat, k);
+            if (indmeas) {
+              sall += e;
+              if (blocked) sthru += e;
+            }
+            if (blocked && indvis) continue;
+            ind[3 * (size_t)i + (size_t)k] += (float)e;
+          }
         }
       }
       tb = now_s() - tb;
@@ -3739,6 +3761,10 @@ int main(int argc, char **argv) {
              "(прореживание %d); СУММА косвенного / прямого = %.4f\n",
              tb, tb / (t_dir > 0.0 ? t_dir : 1.0), (long long)nemit, S.n, stride,
              si / (sd > 0.0 ? sd : 1.0));
+      if (indmeas)
+        printf("      §474 СКВОЗЬ ЗАСЛОНЫ: %.2f %% энергии отскока идёт путём, пересекающим "
+               "занятую ячейку%s\n",
+               100.0 * sthru / (sall > 0.0 ? sall : 1.0), indvis ? " (и ОТБРОШЕНА)" : "");
       for (int32_t i = 0; i < 3 * S.n; i++)
         irr[i] += ind[i];
     }

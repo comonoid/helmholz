@@ -2120,7 +2120,7 @@ int main(int argc, char **argv) {
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
   int nrmflip = 0, nonsum = 0, indvis = 0, indmeas = 0, dosolid = 0;
   int doxfer = 0, xfernosolid = 0, doxsweep = 0, nmu = 4, xcorner = 0, xinnerfluid = 0;
-  int ss2 = 0;
+  int ss2 = 0, xtrace = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
   double oven = 0.0, plates = 0.0;
   double lodthr = 1.0;
@@ -2150,6 +2150,7 @@ int main(int argc, char **argv) {
     /* НК Ш16: чтение радианса по УГЛУ (как до §486) и наружное как ФЛЮИД. */
     /* Ш18 (§494): растр в `res`, на диск вдвое меньше свёрткой 2×2. */
     if (strcmp(argv[i], "ss2") == 0) ss2 = 1;
+    if (strcmp(argv[i], "xtrace") == 0) xtrace = 1;
     if (strcmp(argv[i], "xcorner") == 0) xcorner = 1;
     if (strcmp(argv[i], "xinnerfluid") == 0) xinnerfluid = 1;
     if (strcmp(argv[i], "xsweep") == 0) {
@@ -2702,7 +2703,8 @@ int main(int argc, char **argv) {
                           .nfacet = ftab.n,
                           .sig_t = sig_t,
                           .sig_s = sig_s,
-                          .limiter = 1};
+                          .limiter = 1,
+                          .trace = xtrace};
       tr3_stats st;
       memset(&st, 0, sizeof st);
       double tsw = now_s();

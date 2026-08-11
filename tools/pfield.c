@@ -204,6 +204,13 @@ static int hz_gridalign = 0;
  * единицей, а гистограмма косинуса — зеркально перевернуться. Не перевернётся —
  * измеритель меряет не то, что называет. */
 static int hz_flipall = 0;
+/* НЕГАТИВНЫЙ КОНТРОЛЬ Ш10 (`longdiag`): резать квад по ДЛИННОЙ диагонали. Доля
+ * вывернутых по площади обязана ВЫРАСТИ; не шелохнётся — выбор диагонали ни на
+ * что не влияет. */
+static int hz_longdiag = 0;
+/* П2 §467: пометка «треугольник родом из СЛОЖЕННОГО квада». Объявлена здесь,
+ * потому что ставит её обход, а читает укладка треугольника. */
+static int g_curfold = 0;
 
 static int seg_tri(const double *A, const double *B, const double *C, const double P0[3], int axis,
                    double h, double *tt, double nrm[3]) {
@@ -1025,7 +1032,8 @@ static int emesh_push(emesh *E, const double a[3], const double b[3], const doub
     if (ref[k].size < msz) msz = ref[k].size;
     if (ref[k].size > xsz) xsz = ref[k].size;
   }
-  E->cls[ti] = (uint8_t)(msz > 1 ? 1 : (xsz > 1 ? 2 : 0));
+  /* Биты 0-1 — класс уровня (§457), бит 2 — «родом из сложенного квада» (П2). */
+  E->cls[ti] = (uint8_t)((msz > 1 ? 1 : (xsz > 1 ? 2 : 0)) | (g_curfold ? 4 : 0));
   /* Габарит треугольника в клетках индекса. Координаты — в ячейках сетки уровня
    * `lev`, клетка индекса шире в `1 << (lev - HZ_EGRID)` раз. */
   int sh = E->lev - HZ_EGRID;
@@ -1050,11 +1058,58 @@ static int emesh_push(emesh *E, const double a[3], const double b[3], const doub
   return 0;
 }
 
+/* Нормаль треугольника по трём точкам — векторное произведение, НЕ нормированное:
+ * дальше нужен только знак и длина как площадь. */
+static void tri_nrm(const double a[3], const double b[3], const double c[3], double n[3]) {
+  double e1[3], e2[3];
+  for (int k = 0; k < 3; k++) {
+    e1[k] = b[k] - a[k];
+    e2[k] = c[k] - a[k];
+  }
+  n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+  n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+  n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+}
+
+/* Ш10 (§467): СЛОЖЕННЫЕ КВАДЫ И ВЫБОР ДИАГОНАЛИ. Считаются глобально, потому
+ * что обход зовёт `emesh_emit` через указатель и второго канала для чисел нет. */
+static int64_t g_quad = 0, g_fold = 0;
+
 static int emesh_emit(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv) {
   emesh *E = (emesh *)ctx;
-  double a[3] = {v[0][0], v[0][1], v[0][2]};
-  for (int i = 1; i + 1 < nv; i++)
-    if (emesh_push(E, a, v[i], v[i + 1], ref, nv) != 0) return 1;
+  int i0 = 0;
+  g_curfold = 0;
+  if (nv == 4) {
+    /* СЛОЖЕННОСТЬ — свойство самого квада, эталон для неё не нужен: две
+     * половины веера сравниваются между собой. Знак берётся у веера от `v[0]`,
+     * то есть у того разбиения, которое было до этого шага. */
+    double n1[3], n2[3];
+    tri_nrm(v[0], v[1], v[2], n1);
+    tri_nrm(v[0], v[2], v[3], n2);
+    g_quad++;
+    if (n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2] < 0.0) {
+      g_fold++;
+      g_curfold = 1;
+    }
+    /* ДИАГОНАЛЬ ПО КОРОТКОЙ. Веер от `v[0]` режет по `v0–v2`, веер от `v[1]` —
+     * по `v1–v3`; берётся та, что короче. У неплоского квада это не косметика:
+     * длинная диагональ проходит дальше от поверхности, и её половины сильнее
+     * расходятся по нормали (та же причина, по которой А796 требовал считать
+     * ОБА веера для площади). */
+    double d02 = 0.0, d13 = 0.0;
+    for (int k = 0; k < 3; k++) {
+      double x = v[0][k] - v[2][k], y = v[1][k] - v[3][k];
+      d02 += x * x;
+      d13 += y * y;
+    }
+    int shortis1 = d13 < d02;
+    i0 = (hz_longdiag ? !shortis1 : shortis1) ? 1 : 0;
+  }
+  double a[3] = {v[i0][0], v[i0][1], v[i0][2]};
+  for (int i = 1; i + 1 < nv; i++) {
+    const double *b = v[(i0 + i) % nv], *c = v[(i0 + i + 1) % nv];
+    if (emesh_push(E, a, b, c, ref, nv) != 0) return 1;
+  }
   return 0;
 }
 
@@ -1186,7 +1241,7 @@ static int cmp_u64(const void *x, const void *y) {
 /* Разбор вывернутости (§463). Складывается рядом с самим счётом, чтобы
  * популяция была та же самая до последнего треугольника. `NULL` = не считать. */
 typedef struct {
-  int64_t hist[7], histf[7], nzn, n, cap;
+  int64_t hist[7], histf[7], nzn, n, cap, nfoldtri, nfoldfl;
   double asum, afl;
   double *ar, *as;
   uint8_t *fl;
@@ -1231,6 +1286,11 @@ static void flipdiag_report(flipdiag *D, const char *what) {
          what, 100.0 * D->afl / (D->asum > 0.0 ? D->asum : 1.0), flipdiag_med(D, D->ar, 1),
          flipdiag_med(D, D->ar, 0), flipdiag_med(D, D->as, 1), flipdiag_med(D, D->as, 0),
          (long long)D->nzn);
+  printf("         П2: треугольников из СЛОЖЕННЫХ квадов %lld, из них вывернутых %lld (%.1f %%); а "
+         "среди ВСЕХ вывернутых доля родом из сложенных %.1f %%\n",
+         (long long)D->nfoldtri, (long long)D->nfoldfl,
+         100.0 * (double)D->nfoldfl / (double)(D->nfoldtri ? D->nfoldtri : 1),
+         100.0 * (double)D->nfoldfl / (double)(nfl ? nfl : 1));
   printf("         КОСИНУС вывернутых по корзинам:");
   for (int b = 0; b < 7; b++)
     if (D->histf[b] > 0)
@@ -1305,7 +1365,12 @@ static int64_t emesh_flips(const emesh *E, celltris *CT, const frame *fr, const 
     fn[1] = f1[2] * f2[0] - f1[0] * f2[2];
     fn[2] = f1[0] * f2[1] - f1[1] * f2[0];
     double d = nn[0] * fn[0] + nn[1] * fn[1] + nn[2] * fn[2];
-    int cl = E->cls[i] < 3u ? (int)E->cls[i] : 0;
+    int cl = (int)(E->cls[i] & 3u);
+    if (cl > 2) cl = 0;
+    if (D != NULL && (E->cls[i] & 4u)) {
+      D->nfoldtri++;
+      if (d < 0.0) D->nfoldfl++;
+    }
     nc++;
     ncc[cl]++;
     if (d < 0.0) {
@@ -2069,6 +2134,7 @@ int main(int argc, char **argv) {
      * коробки обязана вернуться к `1.5000`, записей к `8 649`. */
     if (strcmp(argv[i], "gridalign") == 0) hz_gridalign = 1;
     if (strcmp(argv[i], "flipall") == 0) hz_flipall = 1;
+    if (strcmp(argv[i], "longdiag") == 0) hz_longdiag = 1;
     /* ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ (§446/§450 П3): на любой сцене, без печи. */
     if (strcmp(argv[i], "area") == 0) {
       lit = 1;
@@ -2544,6 +2610,9 @@ int main(int argc, char **argv) {
              100.0 * (double)nfc0[0] / (double)(ncc0[0] ? ncc0[0] : 1), (long long)nfc0[1],
              (long long)ncc0[1], (long long)nfc0[2], (long long)ncc0[2]);
       flipdiag_report(&D0, "полная глубина");
+      printf("      Ш10 СЛОЖЕННЫХ КВАДОВ: %lld из %lld (%.3f %%)%s\n", (long long)g_fold,
+             (long long)g_quad, 100.0 * (double)g_fold / (double)(g_quad ? g_quad : 1),
+             hz_longdiag ? "   [ДЛИННАЯ ДИАГОНАЛЬ — НК]" : "");
       free(E0.v);
       free(E0.cls);
       free(E0.head);

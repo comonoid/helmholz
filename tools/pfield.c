@@ -2119,7 +2119,7 @@ int main(int argc, char **argv) {
   }
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
   int nrmflip = 0, nonsum = 0, indvis = 0, indmeas = 0, dosolid = 0;
-  int doxfer = 0, xfernosolid = 0, doxsweep = 0, nmu = 4;
+  int doxfer = 0, xfernosolid = 0, doxsweep = 0, nmu = 4, xcorner = 0, xinnerfluid = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
   double oven = 0.0, plates = 0.0;
   double lodthr = 1.0;
@@ -2146,6 +2146,9 @@ int main(int argc, char **argv) {
      * маски полных ячеек объём материала обязан рухнуть. */
     if (strncmp(argv[i], "nmu=", 4) == 0) nmu = (int)strtol(argv[i] + 4, NULL, 10);
     /* Ш14 (§482): запустить саму развёртку по ординатам на стыке. */
+    /* НК Ш16: чтение радианса по УГЛУ (как до §486) и наружное как ФЛЮИД. */
+    if (strcmp(argv[i], "xcorner") == 0) xcorner = 1;
+    if (strcmp(argv[i], "xinnerfluid") == 0) xinnerfluid = 1;
     if (strcmp(argv[i], "xsweep") == 0) {
       doxfer = 1;
       dosolid = 1;
@@ -2343,8 +2346,8 @@ int main(int argc, char **argv) {
   /* ---- 2. эрмитовы рёбра: сцена строит и отдаёт ---- */
   hz_htab ht;
   if (hz_htab_init(&ht) != 0) exit(1);
-  float *xrad = NULL;              /* Ш15: радианс развёртки на сетке, для картинки */
-  unsigned char *solidmask = NULL; /* Ш12/Ш13: 0 тело, 1 полость, 2 наружное */
+  float *xrad = NULL, **xradlv = NULL; /* Ш15: радианс развёртки на сетке, для картинки */
+  unsigned char *solidmask = NULL;     /* Ш12/Ш13: 0 тело, 1 полость, 2 наружное */
   /* ---- 2б. ЗАЛИВКА ВНУТРЕННОСТЕЙ (Ш12, §475) ---- */
   /* ЗАЧЕМ. Развёртке по ординатам нужен вход `solid[ncell]` — «ячейка целиком в
    * материале»; без него свет идёт СКВОЗЬ ТЕЛА (замерено в стыке: объём
@@ -2589,7 +2592,12 @@ int main(int argc, char **argv) {
     int64_t nsolid = 0;
     for (int32_t ci = 0; ci < mesh.ncell; ci++) {
       size_t k = hz_occ_index(fr.n, mesh.clo[ci][0], mesh.clo[ci][1], mesh.clo[ci][2]);
-      if (solidmask != NULL && solidmask[k] == 0u && !hz_occ_get(P.b[lev], k)) {
+      /* Ш16 (§486): НАРУЖНОЕ тоже сплошное. Снаружи замкнутой комнаты свету
+       * взяться неоткуда, а флюид там даёт 458 м³ бесполезной работы и щепки с
+       * φ = 1.9e+05. Это утверждение о СЦЕНЕ, а не приближение. */
+      int cls = solidmask != NULL ? solidmask[k] : 1u;
+      if (solidmask != NULL && (cls == 0u || (cls == 2u && !xinnerfluid)) &&
+          !hz_occ_get(P.b[lev], k)) {
         solid[ci] = 1u;
         nsolid++;
       }
@@ -2691,6 +2699,7 @@ int main(int argc, char **argv) {
        * подозреваемой стадии, а не только её выход). */
       double phimax = 0.0, phisum = 0.0, soutmax = 0.0, phimax_in = 0.0, phimax_out = 0.0;
       double volmin_at_max = 0.0;
+      int32_t maxcell = -1;
       for (int32_t ci = 0; ci < mesh.ncell; ci++) {
         double p0 = phi[4 * (size_t)ci];
         size_t kk = hz_occ_index(fr.n, mesh.clo[ci][0], mesh.clo[ci][1], mesh.clo[ci][2]);
@@ -2698,6 +2707,7 @@ int main(int argc, char **argv) {
         if (p0 > phimax) {
           phimax = p0;
           volmin_at_max = cut.mvol[ci][0][0];
+          maxcell = ci;
         }
         if (inner && p0 > phimax_in) phimax_in = p0;
         if (!inner && p0 > phimax_out) phimax_out = p0;
@@ -2715,6 +2725,22 @@ int main(int argc, char **argv) {
       printf("      ГДЕ МАКСИМУМ: в полости %.4e, вне её %.4e; флюидный объём ячейки с "
              "максимумом %.3e м³ (у целой ячейки %.3e)\n",
              phimax_in, phimax_out, volmin_at_max, pow((double)(1 << (lev - 6)) * fr.h, 3.0));
+      /* ГДЕ ИМЕННО эта ячейка — координата, размер, занятость, класс заливки и
+       * число поверхностных элементов. Без этих пяти чисел «вне полости»
+       * остаётся догадкой: у ПОГРАНИЧНОЙ ячейки половина лежит по одну сторону
+       * стены, половина по другую, и классифицировать её по нижнему углу
+       * нельзя (найдено этим же прогоном). */
+      if (maxcell >= 0) {
+        size_t km =
+            hz_occ_index(fr.n, mesh.clo[maxcell][0], mesh.clo[maxcell][1], mesh.clo[maxcell][2]);
+        printf("      ЯЧЕЙКА МАКСИМУМА: мир (%.3f, %.3f, %.3f), размер %d, занята %d, класс "
+               "заливки %d, поверхностных элементов %d\n",
+               fr.org[0] + (double)mesh.clo[maxcell][0] * fr.h,
+               fr.org[1] + (double)mesh.clo[maxcell][1] * fr.h,
+               fr.org[2] + (double)mesh.clo[maxcell][2] * fr.h, mesh.csize[maxcell],
+               hz_occ_get(P.b[lev], km) ? 1 : 0, solidmask != NULL ? (int)solidmask[km] : -1,
+               cut.sestart[maxcell + 1] - cut.sestart[maxcell]);
+      }
       /* Ш15: исходящий радианс поверхностных элементов — на СЕТКУ, чтобы его
        * могла прочесть картинка. Берётся постоянный член DG1; у ячейки с
        * несколькими элементами — наибольший (они суть куски одной поверхности
@@ -2732,6 +2758,40 @@ int main(int argc, char **argv) {
             xrad[3 * g + 1] = v * 0.92f;
             xrad[3 * g + 2] = v * 0.78f;
           }
+        }
+        /* ПИРАМИДА (Ш16, §486). Ячейка среза уровнем выше самого мелкого
+         * адресуется своим НИЖНИМ УГЛОМ, а элементы живут только на мелком —
+         * отсюда 55.4 % чёрных ячеек, читавшихся как тень. Свёртка вверх:
+         * СРЕДНЕЕ ПО НЕПУСТЫМ детям. Пустой ребёнок значит «поверхности нет», а
+         * не «темно»; включить его нулём — то же ложное затухание, что ловилось
+         * в §424. */
+        xradlv = calloc((size_t)lev + 1, sizeof *xradlv);
+        if (xradlv == NULL) exit(1);
+        xradlv[lev] = xrad;
+        for (int l = lev - 1; l >= 0; l--) {
+          int32_t nl = (int32_t)1 << l;
+          xradlv[l] = calloc(3 * (size_t)nl * (size_t)nl * (size_t)nl, sizeof **xradlv);
+          if (xradlv[l] == NULL) exit(1);
+          const float *up = xradlv[l + 1];
+          int32_t nu = nl * 2;
+          for (int32_t z = 0; z < nl; z++)
+            for (int32_t y = 0; y < nl; y++)
+              for (int32_t x = 0; x < nl; x++) {
+                double acc[3] = {0, 0, 0};
+                int cnt = 0;
+                for (int d = 0; d < 8; d++) {
+                  size_t gu = hz_occ_index(nu, 2 * x + (d & 1), 2 * y + ((d >> 1) & 1),
+                                           2 * z + ((d >> 2) & 1));
+                  if (!(up[3 * gu] > 0.0f)) continue;
+                  for (size_t c = 0; c < 3; c++)
+                    acc[c] += (double)up[3 * gu + c];
+                  cnt++;
+                }
+                if (cnt == 0) continue;
+                size_t gl = hz_occ_index(nl, x, y, z);
+                for (size_t c = 0; c < 3; c++)
+                  xradlv[l][3 * gl + c] = (float)(acc[c] / (double)cnt);
+              }
         }
       }
       free(st.bout);
@@ -3596,10 +3656,16 @@ int main(int argc, char **argv) {
     if (xrad != NULL) {
       int64_t nfound = 0;
       for (int32_t i = 0; i < S.n; i++) {
-        size_t k = hz_occ_index(fr.n, S.c[i].lo[0], S.c[i].lo[1], S.c[i].lo[2]);
+        /* Ячейка читает СВОЙ уровень пирамиды, а не угол на самом мелком. НК
+         * `xcorner` возвращает прежнее чтение. */
+        int lv = xcorner ? lev : (int)S.c[i].lvl;
+        int32_t nl = (int32_t)1 << lv;
+        int sh = lev - lv;
+        size_t k = hz_occ_index(nl, S.c[i].lo[0] >> sh, S.c[i].lo[1] >> sh, S.c[i].lo[2] >> sh);
+        const float *src = xradlv != NULL ? xradlv[lv] : xrad;
         for (int c = 0; c < 3; c++)
-          irr[3 * (size_t)i + (size_t)c] = xrad[3 * k + (size_t)c];
-        if (xrad[3 * k] > 0.0f) nfound++;
+          irr[3 * (size_t)i + (size_t)c] = src[3 * k + (size_t)c];
+        if (src[3 * k] > 0.0f) nfound++;
       }
       printf("   КАРТИНКА ИЗ РАЗВЁРТКИ: ячеек среза с радиансом %lld из %d (%.1f %%)\n",
              (long long)nfound, S.n, 100.0 * (double)nfound / (double)(S.n ? S.n : 1));

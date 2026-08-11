@@ -1654,16 +1654,37 @@ static int shadowed_h(const opyr *P, const frame *fr, const double a[3], const d
   return 0;
 }
 
-/* Прямая облучённость ячейки среза по трём каналам. Площадка берётся четырьмя
- * образцами — число НАЗВАНО, а не подобрано: это углы, то есть худший случай для
- * полутени, и увеличение его только сгладит край. */
-#define HZ_LIGHT_SAMPLES 4
+/* Прямая облучённость ячейки среза по трём каналам.
+ *
+ * ЧИСЛО ПРОБ ПЛОЩАДКИ ВЫВЕДЕНО ИЗ РАЗРЯДНОСТИ ВЫВОДА, А НЕ ПОДОБРАНО (правка
+ * 08-11 по замечанию пользователя «рваные тени»). Прежние ЧЕТЫРЕ пробы стояли
+ * по углам площадки, то есть полутень имела ровно ПЯТЬ ступеней — и они видны
+ * на картинке как ступеньки, а не как градиент. Сетка `N×N` даёт `N²+1`
+ * ступеней; чтобы ступенька была ниже кванта восьмибитного вывода (1/255),
+ * нужно `N² >= 255`, то есть `N >= 16`. Это дорого (цена прямого света линейна
+ * по пробам), поэтому берётся `N = 8`: `65` ступеней, квант `1.5 %` — на глаз
+ * уже градиент, а цена растёт вчетверо, а не в шестнадцать. Число названо
+ * вместе с ценой и с тем, чего оно НЕ ДАЁТ: полной гладкости полутени.
+ *
+ * ПРОБЫ СТОЯТ В ЦЕНТРАХ ЯЧЕЕК сетки, а не по углам: угловая сетка смещена
+ * наружу и переоценивает полутень у самого края площадки. */
+#define HZ_LIGHT_NS 8
+#define HZ_LIGHT_SAMPLES (HZ_LIGHT_NS * HZ_LIGHT_NS)
+
+/* Смещение `s`-й пробы в долях полуоси, в `[-1, 1]`. */
+static double lsamp(int i) {
+  return (2.0 * ((double)i + 0.5) / (double)HZ_LIGHT_NS) - 1.0;
+}
 
 static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, const arealight *L,
                          float *irr, double stepfrac, int hier, int64_t *nstep,
                          const hz_objmesh *A) {
-  static const double su[HZ_LIGHT_SAMPLES] = {-0.5, 0.5, -0.5, 0.5};
-  static const double sv[HZ_LIGHT_SAMPLES] = {-0.5, -0.5, 0.5, 0.5};
+  double su[HZ_LIGHT_SAMPLES], sv[HZ_LIGHT_SAMPLES];
+  for (int a = 0; a < HZ_LIGHT_NS; a++)
+    for (int b = 0; b < HZ_LIGHT_NS; b++) {
+      su[a * HZ_LIGHT_NS + b] = lsamp(a);
+      sv[a * HZ_LIGHT_NS + b] = lsamp(b);
+    }
   for (int32_t i = 0; i < S->n; i++) {
     double p[3], n[3];
     hz_slice_vertex(S, i, p);
@@ -1903,8 +1924,12 @@ static double sweep_vis(const sweepgrid *G, const frame *fr, const double p[3]) 
 static void front_sweep(const hz_dcslice *S, const frame *fr, const opyr *P, const arealight *L,
                         float *irr, const hz_objmesh *A, double *t_sweep, double *t_gather,
                         int axismode, int fracmode, int round01) {
-  static const double su[HZ_LIGHT_SAMPLES] = {-0.5, 0.5, -0.5, 0.5};
-  static const double sv[HZ_LIGHT_SAMPLES] = {-0.5, -0.5, 0.5, 0.5};
+  double su[HZ_LIGHT_SAMPLES], sv[HZ_LIGHT_SAMPLES];
+  for (int a = 0; a < HZ_LIGHT_NS; a++)
+    for (int b = 0; b < HZ_LIGHT_NS; b++) {
+      su[a * HZ_LIGHT_NS + b] = lsamp(a);
+      sv[a * HZ_LIGHT_NS + b] = lsamp(b);
+    }
   sweepgrid G;
   memset(&G, 0, sizeof G);
   G.drop = HZ_SWEEP_DROP;
@@ -3703,6 +3728,12 @@ int main(int argc, char **argv) {
           ytop = y - 1;
           break;
         }
+      /* ПАНЕЛЬ ЗАПОДЛИЦО С ПОТОЛКОМ, А НЕ ВИСЯЩАЯ ПОД НИМ (правка 08-11 по
+       * картинке). Отступ `0.10` м делал из площадки ПАРЯЩИЙ светильник, и
+       * `N×N` его проб рисовали на потолке сетку пятен — артефакт выборки, а не
+       * свет. У панели заподлицо потолок получает `cos ~ 0` и не светится
+       * вовсе, что и есть физика. Отступ теперь — ПОЛЯЧЕЙКИ: панель обязана
+       * лежать в полости, а не в материале, и это единственное требование. */
       AL.c[1] = ytop >= 0 ? fr.org[1] + ((double)ytop + 0.5) * fr.h - 0.10 : hi[1] - 0.10;
       printf("   ИСТОЧНИК: потолок полости найден по занятости на y = %.3f м, площадка на "
              "%.3f м\n",

@@ -553,7 +553,8 @@ int main(int argc, char **argv) {
    * картинок, где различие вышло во весь сигнал. */
   if (cam || usemark || img) {
     double e[3], at[3];
-    if (strstr(argv[1], "conference") != NULL) {
+    /* Зал удалён 08-11; его камера теперь у комнаты-инструмента. */
+    if (strstr(argv[1], "room") != NULL) {
       double a1[3] = HZ_CFG_HALL_EYE, a2[3] = HZ_CFG_HALL_AT;
       memcpy(e, a1, sizeof e);
       memcpy(at, a2, sizeof at);

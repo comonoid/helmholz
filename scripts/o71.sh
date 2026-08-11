@@ -11,7 +11,7 @@ R=${R:-result/O71_march.txt}
 CAP=${CAP:-32G}
 : > $R
 SM=assets/San_Miguel/san-miguel.obj
-HALL=assets/conference/conference.obj
+HALL=assets/synth/room.obj  # зал удалён 08-11, роль у комнаты-инструмента
 CITY=assets/rungholt/rungholt.obj
 
 run() { echo "### $*" | tee -a $R; scripts/cap.sh $CAP ./build/pmarchx "$@" 2>&1 | tee -a $R; echo | tee -a $R; }

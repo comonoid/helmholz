@@ -23,7 +23,7 @@
 # ВЫХОД: код возврата команды; 137 значит «снят по потолку» — это ЗАКОНОМЕРНЫЙ
 # исход, а не сбой стенда, и читать его надо как «задача в потолок не влезла».
 #
-# ПРИМЕР: scripts/cap.sh 48G ./build/pstow assets/conference/conference.obj 0.003
+# ПРИМЕР: scripts/cap.sh 48G ./build/pstow assets/synth/room.obj 1.0
 set -u
 if [ $# -lt 2 ]; then
   echo "usage: cap.sh <MAX, напр. 48G> <команда> [аргументы...]" >&2

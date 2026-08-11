@@ -6,7 +6,7 @@ set -u
 R=result/O70_stow.txt
 : > $R
 SM=assets/San_Miguel/san-miguel.obj
-HALL=assets/conference/conference.obj
+HALL=assets/synth/room.obj  # зал удалён 08-11, роль у комнаты-инструмента
 CITY=assets/rungholt/rungholt.obj
 
 # ПОТОЛОК ПАМЯТИ ОБЯЗАТЕЛЕН (CLAUDE.md: «ulimit -v a sane cap in any long-running

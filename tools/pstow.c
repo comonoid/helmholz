@@ -675,7 +675,8 @@ int main(int argc, char **argv) {
    * камеры там НАЙДЕНЫ ЗАМЕРОМ, а не назначены. */
   const char *eyesrc = "ключ eye=";
   if (!haseye) {
-    if (strstr(argv[1], "conference") != NULL) {
+    /* Зал удалён 08-11; его камера теперь у комнаты-инструмента. */
+    if (strstr(argv[1], "room") != NULL) {
       double e0[3] = HZ_CFG_HALL_EYE;
       memcpy(eye, e0, sizeof eye);
       eyesrc = "scene_cfg.h HALL_EYE";

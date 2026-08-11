@@ -1721,6 +1721,9 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
   }
 }
 
+/* §520: допуск на разброс нормалей — отдельно от углового. */
+static double g_hspread = 0.25;
+
 /* НЕГАТИВНЫЙ КОНТРОЛЬ §520: все нормали в ОДНУ корзину — усреднение через
  * складку, как было до §519. Энергия обязана уехать вдвое. */
 static int g_onebin = 0;
@@ -1746,26 +1749,41 @@ static int g_onebin = 0;
  * ноль. Больше корзин — точнее конус, но дороже узел; число проверяется
  * замером, а не назначается навсегда. */
 typedef struct {
-  double c[3], n[3], flux[3];
-  double area, nsum, rad;
+  float c[3], n[3], flux[3];
+  float area, nsum, rad;
+  signed char q; /* номер корзины: хранятся только НЕПУСТЫЕ */
 } ebin;
 
+/* УЗЕЛ — ЗАГОЛОВОК, А НЕ КОНТЕЙНЕР (§521, замечание пользователя «СКОЛЬКО?!»).
+ * Первая редакция держала ШЕСТЬ корзин у КАЖДОГО узла и всё в `double`: 616 Б на
+ * узел при том, что непустых корзин обычно одна-две. Это нарушение правила,
+ * записанного мною же сутки назад (§498: считать байты на элемент ДО того, как
+ * структура написана). Теперь корзины лежат общим массивом, у узла — диапазон;
+ * полезная нагрузка во `float` (координаты и потоки ограничены по диапазону, а
+ * относительная точность 1e-7 на порядок ниже допуска спуска). */
 typedef struct {
-  ebin b[6];     /* семейства по знаковой главной оси нормали (§519) */
-  int rough;     /* внутри есть шероховатый материал (hz_flat = 0) */
-  int32_t ch[8]; /* дети; -1 там, где пусто. НЕ подряд: каждый строит своё
-                  * поддерево, поэтому «первый плюс k» здесь неверно — эта
-                  * ошибка уже стоила ложного нуля в свипе по дереву (§512). */
-  int nch;
+  int32_t b0;    /* первая корзина в общем массиве */
+  int32_t ch[8]; /* дети; -1 там, где пусто. НЕ подряд (§512). */
+  signed char nb, nch;
 } enode;
 
 typedef struct {
   enode *e;
+  /* ГРУППЫ ЛЕЖАТ ОБЩИМ МАССИВОМ, У УЗЛА — ДИАПАЗОН (§521, замечание
+   * пользователя). Первая редакция держала ШЕСТЬ корзин у КАЖДОГО узла и всё в
+   * `double` — 616 Б на узел при том, что непустых обычно одна-две. Это
+   * нарушение правила, записанного сутки назад (§498). Теперь узел есть
+   * ЗАГОЛОВОК: диапазон групп плюс дети. */
+  ebin *b;
+  int32_t nb, bcap;
   int32_t n, cap;
 } etree;
 
 static void etree_free(etree *T) {
   free(T->e);
+  free(T->b);
+  T->b = NULL;
+  T->nb = T->bcap = 0;
   T->e = NULL;
   T->n = T->cap = 0;
 }
@@ -1789,15 +1807,26 @@ static int32_t etree_alloc(etree *T, int32_t k) {
  * разбиение на восьмерых детей есть разрезание отрезка по биту координаты. Ни
  * хеша, ни второго индекса не нужно — и это прямая выгода от решения хранить
  * срез массивом, а не деревом (§382). */
+static int32_t ebin_alloc(etree *T, int k) {
+  if (T->nb + k > T->bcap) {
+    int32_t nc = T->bcap > 0 ? T->bcap * 2 : 8192;
+    if (nc < T->nb + k) nc = T->nb + k;
+    ebin *nn = realloc(T->b, (size_t)nc * sizeof *nn);
+    if (nn == NULL) exit(1);
+    T->b = nn;
+    T->bcap = nc;
+  }
+  int32_t r = T->nb;
+  T->nb += k;
+  return r;
+}
+
 static int32_t etree_build(etree *T, const hz_dcslice *S, const frame *fr, const float *irr,
                            const hz_objmesh *m, int32_t a, int32_t b, int lvl, int lev) {
   int32_t me = etree_alloc(T, 1);
   {
-    enode *e = &T->e[me];
-    memset(e, 0, sizeof *e);
-    e->nch = 0;
-    for (int k = 0; k < 8; k++)
-      e->ch[k] = -1;
+    /* Шесть корзин набираются во ВРЕМЕННЫХ, а хранятся только непустые. */
+    double c[6][3] = {{0}}, n[6][3] = {{0}}, fl[6][3] = {{0}}, ar[6] = {0};
     double lo[6][3], hi[6][3];
     for (int q = 0; q < 6; q++)
       for (int k = 0; k < 3; k++) {
@@ -1805,53 +1834,59 @@ static int32_t etree_build(etree *T, const hz_dcslice *S, const frame *fr, const
         hi[q][k] = -1e300;
       }
     for (int32_t i = a; i < b; i++) {
-      double p[3], n[3];
+      double p[3], nn[3];
       hz_slice_vertex(S, i, p);
       for (int k = 0; k < 3; k++)
         p[k] = fr->org[k] + p[k] * fr->h;
-      hz_slice_normal(S, i, n);
-      /* Корзина — знаковая ГЛАВНАЯ ось нормали. */
+      hz_slice_normal(S, i, nn);
       int ax = 0;
       for (int k = 1; k < 3; k++)
-        if (fabs(n[k]) > fabs(n[ax])) ax = k;
-      int q = g_onebin ? 0 : 2 * ax + (n[ax] > 0.0 ? 1 : 0);
+        if (fabs(nn[k]) > fabs(nn[ax])) ax = k;
+      int q = g_onebin ? 0 : 2 * ax + (nn[ax] > 0.0 ? 1 : 0);
       double side = fr->h * (double)((int32_t)1 << (lev - (int)S->c[i].lvl));
-      double ar = side * side;
-      ebin *bb = &e->b[q];
-      bb->area += ar;
+      double aa = side * side;
+      ar[q] += aa;
       for (int k = 0; k < 3; k++) {
-        bb->c[k] += p[k] * ar;
-        bb->n[k] += n[k] * ar;
+        c[q][k] += p[k] * aa;
+        n[q][k] += nn[k] * aa;
         if (p[k] < lo[q][k]) lo[q][k] = p[k];
         if (p[k] > hi[q][k]) hi[q][k] = p[k];
-        bb->flux[k] += (double)irr[3 * (size_t)i + (size_t)k] * ar * alb(m, S->c[i].mat, k);
+        fl[q][k] += (double)irr[3 * (size_t)i + (size_t)k] * aa * alb(m, S->c[i].mat, k);
       }
-      /* ПОМЕТКА ЧИТАЕТСЯ, НО НЕ ПРИМЕНЯЕТСЯ ПО УМОЛЧАНИЮ (§520). `hz_flat` в `.mtl`
-       * отсутствует у всех нынешних материалов, а поле по умолчанию `0`, и
-       * прочесть это как «шероховатый» значит запретить агрегацию ВЕЗДЕ — что я и
-       * сделал, и замер показал одинаковое число связей при любых порогах.
-       * Отсутствие пометки есть НЕИЗВЕСТНО, а не «шероховатый»; шероховатость
-       * обязана объявляться явно, и такой строки в формате пока нет. */
-      (void)0;
     }
+    int nbq = 0;
+    for (int q = 0; q < 6; q++)
+      if (ar[q] > 0.0) nbq++;
+    int32_t b0 = ebin_alloc(T, nbq);
+    T->e[me].b0 = b0;
+    T->e[me].nb = (signed char)nbq;
+    T->e[me].nch = 0;
+    for (int k = 0; k < 8; k++)
+      T->e[me].ch[k] = -1;
+    int j = 0;
     for (int q = 0; q < 6; q++) {
-      ebin *bb = &e->b[q];
-      if (!(bb->area > 0.0)) continue;
+      if (!(ar[q] > 0.0)) continue;
+      ebin *bb = &T->b[b0 + j++];
+      memset(bb, 0, sizeof *bb);
+      bb->q = (signed char)q;
+      bb->area = (float)ar[q];
+      double nl = 0.0;
       for (int k = 0; k < 3; k++) {
-        bb->c[k] /= bb->area;
-        bb->n[k] /= bb->area;
+        bb->c[k] = (float)(c[q][k] / ar[q]);
+        bb->flux[k] = (float)fl[q][k];
+        double nk = n[q][k] / ar[q];
+        nl += nk * nk;
       }
-      double nl = sqrt(bb->n[0] * bb->n[0] + bb->n[1] * bb->n[1] + bb->n[2] * bb->n[2]);
-      bb->nsum = nl * bb->area;
-      if (nl > 0.0)
-        for (int k = 0; k < 3; k++)
-          bb->n[k] /= nl;
+      nl = sqrt(nl);
+      bb->nsum = (float)(nl * ar[q]);
+      for (int k = 0; k < 3; k++)
+        bb->n[k] = (float)(nl > 0.0 ? (n[q][k] / ar[q]) / nl : 0.0);
       double r2 = 0.0;
       for (int k = 0; k < 3; k++) {
         double d = 0.5 * (hi[q][k] - lo[q][k]);
         r2 += d * d;
       }
-      bb->rad = sqrt(r2);
+      bb->rad = (float)sqrt(r2);
     }
   }
   if (b - a <= 1 || lvl >= lev) return me;
@@ -1861,9 +1896,9 @@ static int32_t etree_build(etree *T, const hz_dcslice *S, const frame *fr, const
   int32_t cur = a;
   for (int k = 1; k <= 8; k++) {
     while (cur < b) {
-      const hz_dccell *c = &S->c[cur];
-      int bit =
-          (((c->lo[0] >> sh) & 1) | (((c->lo[1] >> sh) & 1) << 1) | (((c->lo[2] >> sh) & 1) << 2));
+      const hz_dccell *cc = &S->c[cur];
+      int bit = (((cc->lo[0] >> sh) & 1) | (((cc->lo[1] >> sh) & 1) << 1) |
+                 (((cc->lo[2] >> sh) & 1) << 2));
       if (bit >= k) break;
       cur++;
     }
@@ -1877,41 +1912,48 @@ static int32_t etree_build(etree *T, const hz_dcslice *S, const frame *fr, const
   }
   for (int k = 0; k < nc2; k++)
     T->e[me].ch[k] = ch2[k];
-  T->e[me].nch = nc2;
+  T->e[me].nch = (signed char)nc2;
   return me;
 }
 
-/* Спуск ведётся ПО ОДНОЙ КОРЗИНЕ: каждое семейство поверхностей огрубляется
- * независимо, и складка между семействами не усредняется никогда. */
+/* Спуск ведётся ПО ОДНОЙ КОРЗИНЕ; корзины узла лежат подряд, и пустых среди них
+ * нет — поэтому обход читает ровно то, что нужно, и ни байтом больше. */
 static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], const double ni_[3],
                         double eps, double rrecv, const opyr *P, const frame *fr, int vis,
                         double out[3], int64_t *nlink, double *sthru, double *sall) {
   const enode *e = &T->e[ni];
-  const ebin *bb = &e->b[q];
-  if (!(bb->area > 0.0)) return;
+  const ebin *bb = NULL;
+  for (int k = 0; k < e->nb; k++)
+    if (T->b[e->b0 + k].q == q) {
+      bb = &T->b[e->b0 + k];
+      break;
+    }
+  if (bb == NULL) return;
   double w[3], r2 = 0.0;
   for (int k = 0; k < 3; k++) {
-    w[k] = bb->c[k] - pi[k];
+    w[k] = (double)bb->c[k] - pi[k];
     r2 += w[k] * w[k];
   }
   if (!(r2 > 0.0)) return;
-  double r = sqrt(r2);
-  double spread = 1.0 - bb->nsum / bb->area;
-  if (e->nch > 0 &&
-      (spread > eps || e->rough || (2.0 * bb->rad > eps * r && 2.0 * bb->rad > rrecv))) {
+  /* Корень — только на принятой связи: критерий спуска через КВАДРАТЫ. */
+  double d4 = 4.0 * (double)bb->rad * (double)bb->rad;
+  double spread = 1.0 - (double)bb->nsum / (double)bb->area;
+  if (e->nch > 0 && (spread > g_hspread || (d4 > eps * r2 && 2.0 * (double)bb->rad > rrecv))) {
     for (int k = 0; k < e->nch; k++)
       hgather_rec(T, e->ch[k], q, pi, ni_, eps, rrecv, P, fr, vis, out, nlink, sthru, sall);
     return;
   }
-  double ci = (w[0] * ni_[0] + w[1] * ni_[1] + w[2] * ni_[2]) / r;
-  double cj = -(w[0] * bb->n[0] + w[1] * bb->n[1] + w[2] * bb->n[2]) / r;
-  if (!(ci > 0.0) || !(cj > 0.0)) return;
+  double di = w[0] * ni_[0] + w[1] * ni_[1] + w[2] * ni_[2];
+  double dj = -(w[0] * (double)bb->n[0] + w[1] * (double)bb->n[1] + w[2] * (double)bb->n[2]);
+  if (!(di > 0.0) || !(dj > 0.0)) return; /* отсев БЕЗ корня */
+  double rr = sqrt(r2);
   (*nlink)++;
-  double g = ci * cj / (3.14159265358979323846 * r2);
+  double g = (di / rr) * (dj / rr) / (3.14159265358979323846 * r2);
   int blocked = 0;
-  if (vis) blocked = shadowed(P, fr, pi, bb->c, 0.5);
+  double cw[3] = {(double)bb->c[0], (double)bb->c[1], (double)bb->c[2]};
+  if (vis) blocked = shadowed(P, fr, pi, cw, 0.5);
   for (int k = 0; k < 3; k++) {
-    double v = bb->flux[k] * g;
+    double v = (double)bb->flux[k] * g;
     if (sall != NULL) {
       *sall += v;
       if (blocked && sthru != NULL) *sthru += v;
@@ -1976,8 +2018,6 @@ static int g_treesweep = 0;
 static double g_sweepthr = 0.0, g_sweeppx = 1.0, g_sweepeye[3] = {0, 0, 0};
 /* Ф6. (§516): угловой порог иерархического отскока; 0 — прежний гатер N². */
 static double g_hgather = 0.0;
-/* §520: допуск на разброс нормалей — отдельно от углового. */
-static double g_hspread = 0.25;
 /* НЕГАТИВНЫЙ КОНТРОЛЬ §520: все нормали в ОДНУ корзину — то есть усреднение
  * через складку, как было до §519. Энергия обязана уехать вдвое. */
 

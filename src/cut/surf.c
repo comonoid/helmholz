@@ -351,3 +351,46 @@ int hz_cutmap_hspaces(const hz_facettab *ft, const hz_cutmap *m, const hz_cutrec
   }
   return (int)r->nf;
 }
+
+/* --- Р-7а: квантование плоскости (PLAN_CUT.md, Г51/Г54) --------------------- */
+
+/* Разбор — в заголовке. Здесь одно замечание про порядок действий: нормаль
+ * СНАЧАЛА приводится к единичной длине, и лишь потом округляется. Иначе шаг
+ * решётки направления зависел бы от длины входного вектора, то есть от того,
+ * кто и как построил плоскость, — а водонепроницаемость держится на том, что
+ * две ячейки, сославшиеся на один фасет, получают ПОБИТОВО одно и то же. */
+int hz_plane_quant(const double n[3], double off, double rad_units, const hz_frame *fr,
+                   int64_t nq[3], int64_t *offq, double *dmax_add) {
+  double len = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  if (!(len > 0.0)) return 1; /* нулевая нормаль — не плоскость, отказ */
+  double un[3], uoff = off / len;
+  for (int k = 0; k < 3; k++)
+    un[k] = n[k] / len;
+  const double sn = (double)((int64_t)1 << HZ_P3_NBITS);
+  const double sf = (double)((int64_t)1 << HZ_P3_FRAC);
+  for (int k = 0; k < 3; k++)
+    nq[k] = (int64_t)llround(un[k] * sn);
+  if (nq[0] == 0 && nq[1] == 0 && nq[2] == 0) return 1; /* направление потеряно */
+  *offq = (int64_t)llround(uoff * sn * sf);
+  /* Обратный перевод — ТОЛЬКО ради оценки ошибки; в предикатах он запрещён. */
+  double qn[3], qlen = 0.0;
+  for (int k = 0; k < 3; k++) {
+    qn[k] = (double)nq[k] / sn;
+    qlen += qn[k] * qn[k];
+  }
+  qlen = sqrt(qlen);
+  double dn = 0.0;
+  for (int k = 0; k < 3; k++) {
+    double d = fabs(un[k] - qn[k]);
+    dn += d * d;
+  }
+  dn = sqrt(dn);
+  double doff = fabs(uoff - (double)*offq / (sn * sf));
+  /* Масштаб рамы: берётся НАИБОЛЬШИЙ по осям — оценка обязана быть верхней и на
+   * анизотропной раме тоже (Г15). */
+  double u = fr->u[0];
+  if (fr->u[1] > u) u = fr->u[1];
+  if (fr->u[2] > u) u = fr->u[2];
+  if (dmax_add != NULL) *dmax_add = (dn * rad_units + doff) / qlen * u;
+  return 0;
+}

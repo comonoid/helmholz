@@ -2120,7 +2120,7 @@ int main(int argc, char **argv) {
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
   int nrmflip = 0, nonsum = 0, indvis = 0, indmeas = 0, dosolid = 0;
   int doxfer = 0, xfernosolid = 0, doxsweep = 0, nmu = 4, xcorner = 0, xinnerfluid = 0;
-  int ss2 = 0, xtrace = 0;
+  int ss2 = 0, xtrace = 0, qplane = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
   double oven = 0.0, plates = 0.0;
   double lodthr = 1.0;
@@ -2151,6 +2151,12 @@ int main(int argc, char **argv) {
     /* Ш18 (§494): растр в `res`, на диск вдвое меньше свёрткой 2×2. */
     if (strcmp(argv[i], "ss2") == 0) ss2 = 1;
     if (strcmp(argv[i], "xtrace") == 0) xtrace = 1;
+    /* Р-7а: замер квантования плоскости. */
+    if (strcmp(argv[i], "qplane") == 0) {
+      qplane = 1;
+      doxfer = 1;
+      dosolid = 1;
+    }
     if (strcmp(argv[i], "xcorner") == 0) xcorner = 1;
     if (strcmp(argv[i], "xinnerfluid") == 0) xinnerfluid = 1;
     if (strcmp(argv[i], "xsweep") == 0) {
@@ -2576,6 +2582,44 @@ int main(int argc, char **argv) {
     hz_cutmap cmap;
     if (hz_facettab_init(&ftab) != 0 || hz_cutmap_init(&cmap) != 0) exit(1);
     int frc = hz_dc_facets(&T, NULL, NULL, &ftab, &cmap);
+    /* Р-7а (§Р-7а): ЗАМЕР КВАНТОВАНИЯ ПЛОСКОСТИ. Вклад в `dmax` считается на
+     * ВСЕХ фасетах сцены, радиус — половина диагонали ЕДИНИЧНОЙ ячейки
+     * (разрезанная ячейка всегда самого мелкого уровня, условие 1:1). Отдельно
+     * считаются ОСЕВЫЕ плоскости: у них нормаль есть орт, и вклад обязан быть
+     * РОВНО НОЛЬ — это проверка измерителя, а не измеряемого. */
+    if (qplane) {
+      hz_frame ofr2 = {{fr.org[0], fr.org[1], fr.org[2]}, {fr.h, fr.h, fr.h}};
+      double *qd = malloc((size_t)(ftab.n > 0 ? ftab.n : 1) * sizeof *qd);
+      if (qd == NULL) exit(1);
+      int64_t nq2 = 0, naxis = 0, naxisbad = 0, nfail = 0;
+      double dmaxmax = 0.0;
+      for (int32_t i = 0; i < ftab.n; i++) {
+        int64_t nqi[3], offqi;
+        double add = 0.0;
+        if (hz_plane_quant(ftab.f[i].n, ftab.f[i].off, 0.8660254037844386, &ofr2, nqi, &offqi,
+                           &add) != 0) {
+          nfail++;
+          continue;
+        }
+        int axis = 0;
+        for (int k = 0; k < 3; k++)
+          if (fabs(fabs(ftab.f[i].n[k]) - 1.0) < 1e-12) axis = 1;
+        if (axis) {
+          naxis++;
+          if (add > 0.0) naxisbad++;
+        }
+        qd[nq2++] = add;
+        if (add > dmaxmax) dmaxmax = add;
+      }
+      qsort(qd, (size_t)nq2, sizeof *qd, cmp_d);
+      printf("      Р-7а КВАНТОВАНИЕ ПЛОСКОСТИ (FRAC %d, NBITS %d): фасетов %lld, вклад в dmax "
+             "p50 %.3e p90 %.3e max %.3e м (ячейка %.4f м); ОСЕВЫХ %lld, из них с ненулевым "
+             "вкладом %lld; отказов %lld\n",
+             HZ_P3_FRAC, HZ_P3_NBITS, (long long)nq2, nq2 ? qd[nq2 / 2] : 0.0,
+             nq2 ? qd[(nq2 * 9) / 10] : 0.0, dmaxmax, fr.h, (long long)naxis, (long long)naxisbad,
+             (long long)nfail);
+      free(qd);
+    }
     double t_fac = now_s() - tx;
     printf("   СТЫК: фасетов %d, записей боковой таблицы %d, код %d, за %.2f с\n", ftab.n, cmap.nr,
            frc, t_fac);

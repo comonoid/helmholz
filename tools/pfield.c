@@ -1721,6 +1721,10 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
   }
 }
 
+/* НЕГАТИВНЫЙ КОНТРОЛЬ §520: все нормали в ОДНУ корзину — усреднение через
+ * складку, как было до §519. Энергия обязана уехать вдвое. */
+static int g_onebin = 0;
+
 /* --- Ф6' (§516): ДЕРЕВО ИЗЛУЧАТЕЛЕЙ ---------------------------------------- */
 
 /* ЗАЧЕМ. Гатер «каждая с каждой» стоит `N²` пар (`3.7e8` на комнате) и занимает
@@ -1810,7 +1814,7 @@ static int32_t etree_build(etree *T, const hz_dcslice *S, const frame *fr, const
       int ax = 0;
       for (int k = 1; k < 3; k++)
         if (fabs(n[k]) > fabs(n[ax])) ax = k;
-      int q = 2 * ax + (n[ax] > 0.0 ? 1 : 0);
+      int q = g_onebin ? 0 : 2 * ax + (n[ax] > 0.0 ? 1 : 0);
       double side = fr->h * (double)((int32_t)1 << (lev - (int)S->c[i].lvl));
       double ar = side * side;
       ebin *bb = &e->b[q];
@@ -1822,7 +1826,13 @@ static int32_t etree_build(etree *T, const hz_dcslice *S, const frame *fr, const
         if (p[k] > hi[q][k]) hi[q][k] = p[k];
         bb->flux[k] += (double)irr[3 * (size_t)i + (size_t)k] * ar * alb(m, S->c[i].mat, k);
       }
-      if (m->mtl != NULL && S->c[i].mat < m->nmtl && !m->mtl[S->c[i].mat].flat) e->rough = 1;
+      /* ПОМЕТКА ЧИТАЕТСЯ, НО НЕ ПРИМЕНЯЕТСЯ ПО УМОЛЧАНИЮ (§520). `hz_flat` в `.mtl`
+       * отсутствует у всех нынешних материалов, а поле по умолчанию `0`, и
+       * прочесть это как «шероховатый» значит запретить агрегацию ВЕЗДЕ — что я и
+       * сделал, и замер показал одинаковое число связей при любых порогах.
+       * Отсутствие пометки есть НЕИЗВЕСТНО, а не «шероховатый»; шероховатость
+       * обязана объявляться явно, и такой строки в формате пока нет. */
+      (void)0;
     }
     for (int q = 0; q < 6; q++) {
       ebin *bb = &e->b[q];
@@ -1966,6 +1976,10 @@ static int g_treesweep = 0;
 static double g_sweepthr = 0.0, g_sweeppx = 1.0, g_sweepeye[3] = {0, 0, 0};
 /* Ф6. (§516): угловой порог иерархического отскока; 0 — прежний гатер N². */
 static double g_hgather = 0.0;
+/* §520: допуск на разброс нормалей — отдельно от углового. */
+static double g_hspread = 0.25;
+/* НЕГАТИВНЫЙ КОНТРОЛЬ §520: все нормали в ОДНУ корзину — то есть усреднение
+ * через складку, как было до §519. Энергия обязана уехать вдвое. */
 
 /* --- Ф4' (§511): СВИП ПО ДЕРЕВУ ------------------------------------------- */
 
@@ -2894,6 +2908,8 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "emit=", 5) == 0) g_emitthr = strtod(argv[i] + 5, NULL);
     if (strcmp(argv[i], "treesweep") == 0) g_treesweep = 1;
     if (strncmp(argv[i], "hgather=", 8) == 0) g_hgather = strtod(argv[i] + 8, NULL);
+    if (strncmp(argv[i], "hspread=", 8) == 0) g_hspread = strtod(argv[i] + 8, NULL);
+    if (strcmp(argv[i], "onebin") == 0) g_onebin = 1;
     if (strncmp(argv[i], "sweepthr=", 9) == 0) {
       g_sweepthr = strtod(argv[i] + 9, NULL);
       g_treesweep = 1;

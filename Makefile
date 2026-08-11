@@ -388,8 +388,8 @@ build/pflow: tools/pflow.c $(PFULL) | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pflow.c $(PFULL) -lm'
 
 # pfield — источник эрмитова поля из меша (§365). Общий слой `cut/` плюс отсечение.
-build/pfield: tools/pfield.c src/scene_obj.c src/pclip.c src/cut/dcslice.c src/cut/dc.c src/cut/qef.c src/cut/poly3.c src/cut/surf.c src/image.c src/transport/cam3.c src/transport/ray3.c src/transport/mesh3.c src/transport/cut3.c src/transport/quad.c src/transport/tet3.c src/octree.c | build
-	$(RUN) 'gcc $(CFLAGS) -I tools -o $@ tools/pfield.c src/scene_obj.c src/pclip.c src/cut/dcslice.c src/cut/dc.c src/cut/qef.c src/cut/poly3.c src/cut/surf.c src/image.c src/transport/cam3.c src/transport/ray3.c src/transport/mesh3.c src/transport/cut3.c src/transport/quad.c src/transport/tet3.c src/octree.c -lm'
+build/pfield: tools/pfield.c src/scene_obj.c src/pclip.c src/cut/dcslice.c src/cut/dc.c src/cut/qef.c src/cut/poly3.c src/cut/surf.c src/image.c src/transport/cam3.c src/transport/ray3.c src/transport/mesh3.c src/transport/sweep3.c src/transport/dirs3.c src/transport/cut3.c src/transport/quad.c src/transport/tet3.c src/octree.c | build
+	$(RUN) 'gcc $(CFLAGS) -I tools -o $@ tools/pfield.c src/scene_obj.c src/pclip.c src/cut/dcslice.c src/cut/dc.c src/cut/qef.c src/cut/poly3.c src/cut/surf.c src/image.c src/transport/cam3.c src/transport/ray3.c src/transport/mesh3.c src/transport/sweep3.c src/transport/dirs3.c src/transport/cut3.c src/transport/quad.c src/transport/tet3.c src/octree.c -lm'
 
 # poccref — ЭТАЛОН ЗАНЯТОСТИ (§385, шаг Ш0). Ни деревьев, ни ускорителей:
 # только меш и отсечение. Он обязан пережить удаление адаптера в Ш1б, поэтому и

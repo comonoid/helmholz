@@ -34,7 +34,9 @@
 #include "scene_obj.h"
 #include "transport/cam3.h"
 #include "transport/cut3.h"
+#include "transport/dirs3.h"
 #include "transport/mesh3.h"
+#include "transport/sweep3.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -224,10 +226,10 @@ static void oct_by_occ(hz_octree *t, const opyr *P, int lev, int32_t x, int32_t 
     s /= 2;
   }
   int occ = hz_occ_get(P->b[lv], hz_occ_index((int32_t)1 << lv, x >> (lev - lv), y >> (lev - lv),
-                                             z >> (lev - lv))) != 0;
+                                              z >> (lev - lv))) != 0;
   if (!occ || size == 1) {
-    int lo[3] = {(int)x, (int)y, (int)z}, hi[3] = {(int)(x + size), (int)(y + size),
-                                                  (int)(z + size)};
+    int lo[3] = {(int)x, (int)y, (int)z},
+        hi[3] = {(int)(x + size), (int)(y + size), (int)(z + size)};
     hz_oct_set_box(t, lo, hi, 1.0);
     return;
   }
@@ -2117,7 +2119,7 @@ int main(int argc, char **argv) {
   }
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
   int nrmflip = 0, nonsum = 0, indvis = 0, indmeas = 0, dosolid = 0;
-  int doxfer = 0, xfernosolid = 0;
+  int doxfer = 0, xfernosolid = 0, doxsweep = 0, nmu = 4;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
   double oven = 0.0, plates = 0.0;
   double lodthr = 1.0;
@@ -2142,6 +2144,13 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "solid") == 0) dosolid = 1;
     /* Ш13 (§479): стык с переносом. `xfernosolid` — негативный контроль: без
      * маски полных ячеек объём материала обязан рухнуть. */
+    if (strncmp(argv[i], "nmu=", 4) == 0) nmu = (int)strtol(argv[i] + 4, NULL, 10);
+    /* Ш14 (§482): запустить саму развёртку по ординатам на стыке. */
+    if (strcmp(argv[i], "xsweep") == 0) {
+      doxfer = 1;
+      dosolid = 1;
+      doxsweep = 1;
+    }
     if (strcmp(argv[i], "xfer") == 0) {
       doxfer = 1;
       dosolid = 1;
@@ -2605,6 +2614,115 @@ int main(int argc, char **argv) {
              "(многоугольник не поместился); ОБЪЁМ: куб %.3f, ФЛЮИД %.3f, материал %.3f м³%s\n",
              cut.nbad, cut.nse, cut.nsebig, vbox, vfl, vbox - vfl,
              xfernosolid ? "   [БЕЗ МАСКИ — НК]" : "");
+    /* ---- РАЗВЁРТКА ПО ОРДИНАТАМ (Ш14, §482) ---- */
+    /* ИСТОЧНИК — САМ ПОТОЛОК, А НЕ ОТДЕЛЬНОЕ ТЕЛО. Лампа в `pfield` есть
+     * площадка под потолком, геометрии у неё нет; развёртка же светит
+     * ПОВЕРХНОСТЯМИ. Поэтому светящимися объявляются те фасеты, чьи
+     * поверхностные элементы лежат в прямоугольнике лампы — физически это
+     * люминесцентная панель заподлицо с потолком, и новой геометрии не надо.
+     * СТЕНКИ КУБА ЧЁРНЫЕ: они лежат ВНЕ комнаты, свет до них не доходит, а
+     * ненулевое отражение на них добавило бы энергию из ниоткуда. */
+    if (crc == 0 && doxsweep) {
+      double *frho = calloc((size_t)ftab.n, sizeof *frho);
+      double *femit = calloc((size_t)ftab.n, sizeof *femit);
+      double *sig_t = calloc((size_t)mesh.ncell, sizeof *sig_t);
+      double *sig_s = calloc((size_t)mesh.ncell, sizeof *sig_s);
+      double *phi = calloc((size_t)mesh.ncell * 4, sizeof *phi);
+      if (frho == NULL || femit == NULL || sig_t == NULL || sig_s == NULL || phi == NULL) exit(1);
+      for (int32_t i = 0; i < ftab.n; i++)
+        frho[i] = 0.7;
+      double lc[3], lu = 0.0, lv = 0.0;
+      for (int k = 0; k < 3; k++)
+        lc[k] = 0.5 * (lo[k] + hi[k]);
+      /* ПОТОЛОК ПОЛОСТИ — тем же спуском от КАМЕРЫ вверх, что и у площадки в
+       * ветви `lit` (§472): «пусто» в занятости значит «нет поверхности», а не
+       * «нет материала», поэтому считать сверху нельзя. */
+      double eyew[3] = HZ_CFG_HALL_EYE;
+      int32_t ex = (int32_t)((eyew[0] - fr.org[0]) / fr.h);
+      int32_t ez = (int32_t)((eyew[2] - fr.org[2]) / fr.h);
+      int32_t ey = (int32_t)((eyew[1] - fr.org[1]) / fr.h);
+      if (ex < 0) ex = 0;
+      if (ez < 0) ez = 0;
+      if (ey < 0) ey = 0;
+      if (ex >= fr.n) ex = fr.n - 1;
+      if (ez >= fr.n) ez = fr.n - 1;
+      if (ey >= fr.n) ey = fr.n - 1;
+      double ceilY = hi[1];
+      for (int32_t yy = ey; yy < fr.n; yy++)
+        if (hz_occ_get(P.b[lev], hz_occ_index(fr.n, ex, yy, ez)) != 0) {
+          ceilY = fr.org[1] + ((double)yy + 0.5) * fr.h;
+          break;
+        }
+      lc[1] = ceilY;
+      lu = 0.25 * (hi[0] - lo[0]);
+      lv = 0.25 * (hi[2] - lo[2]);
+      int64_t nlit = 0;
+      for (int32_t k = 0; k < cut.nse; k++) {
+        if (cut.se[k].nv <= 0) continue;
+        double c[3] = {0, 0, 0};
+        for (int q = 0; q < cut.se[k].nv; q++)
+          for (int a = 0; a < 3; a++)
+            c[a] += cut.se[k].v[q][a] / (double)cut.se[k].nv;
+        if (fabs(c[0] - lc[0]) <= lu && fabs(c[2] - lc[2]) <= lv && c[1] >= lc[1] - 2.0 * fr.h &&
+            c[1] <= lc[1] + 2.0 * fr.h) {
+          femit[cut.se[k].facet] = 1.0;
+          nlit++;
+        }
+      }
+      tr3_dirs dirs;
+      if (tr3_dirs_product(&dirs, nmu, nmu) != 0) exit(1);
+      tr3_problem prob = {.m = &mesh,
+                          .d = &dirs,
+                          .cut = &cut,
+                          .facet_rho = frho,
+                          .facet_emit = femit,
+                          .nfacet = ftab.n,
+                          .sig_t = sig_t,
+                          .sig_s = sig_s,
+                          .limiter = 1};
+      tr3_stats st;
+      memset(&st, 0, sizeof st);
+      double tsw = now_s();
+      int src = tr3_sweep_solve(&prob, 30, 1e-4, phi, &st);
+      tsw = now_s() - tsw;
+      /* ГДЕ максимум — в комнате или снаружи. Без этого «φ = 1.9e5» неотличимо
+       * от «φ велико в ячейке-щепке вне сцены» (правило А807: печатать вход
+       * подозреваемой стадии, а не только её выход). */
+      double phimax = 0.0, phisum = 0.0, soutmax = 0.0, phimax_in = 0.0, phimax_out = 0.0;
+      double volmin_at_max = 0.0;
+      for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+        double p0 = phi[4 * (size_t)ci];
+        size_t kk = hz_occ_index(fr.n, mesh.clo[ci][0], mesh.clo[ci][1], mesh.clo[ci][2]);
+        int inner = solidmask != NULL && solidmask[kk] == 1u;
+        if (p0 > phimax) {
+          phimax = p0;
+          volmin_at_max = cut.mvol[ci][0][0];
+        }
+        if (inner && p0 > phimax_in) phimax_in = p0;
+        if (!inner && p0 > phimax_out) phimax_out = p0;
+        phisum += p0;
+      }
+      if (st.sout != NULL)
+        for (int32_t k = 0; k < cut.nse; k++)
+          if (st.sout[4 * (size_t)k] > soutmax) soutmax = st.sout[4 * (size_t)k];
+      printf("   РАЗВЁРТКА: направлений %d, светящихся элементов %lld; код %d, итераций %d, "
+             "невязка %.2e, за %.2f с\n",
+             dirs.n, (long long)nlit, src, st.iters, st.resid, tsw);
+      printf("      ЭНЕРГИЯ: втекло %.4e, вытекло %.4e, поглощено %.4e, баланс %.2e; в "
+             "поверхности %.4e, из них %.4e; max φ %.4e, max исходящий радианс %.4e\n",
+             st.pin, st.pout, st.pabs, st.balance, st.psin, st.psout, phimax, soutmax);
+      printf("      ГДЕ МАКСИМУМ: в полости %.4e, вне её %.4e; флюидный объём ячейки с "
+             "максимумом %.3e м³ (у целой ячейки %.3e)\n",
+             phimax_in, phimax_out, volmin_at_max, pow((double)(1 << (lev - 6)) * fr.h, 3.0));
+      free(st.bout);
+      free(st.sout);
+      tr3_dirs_free(&dirs);
+      free(frho);
+      free(femit);
+      free(sig_t);
+      free(sig_s);
+      free(phi);
+    }
     if (crc == 0) tr3_cut_free(&cut);
     free(solid);
     tr3_mesh_free(&mesh);

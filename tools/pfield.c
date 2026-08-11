@@ -731,6 +731,81 @@ static int lod_stop(void *ctx, const hz_dctree *t, const hz_dcref *r) {
   return px <= L->thr;
 }
 
+/* СКОЛЬКО РАБОТЫ ПРИХОДИТ В СТАДИЮ, А НЕ ТОЛЬКО ЧТО ИЗ НЕЁ ВЫХОДИТ (А791, А807;
+ * §457). Прежде чем судить о ПРАВИЛЕ выбора `edir` у крупного узла, надо знать,
+ * СКОЛЬКО РАЗ оно вообще неоднозначно: «правило ни при чём» и «данные его ни
+ * разу не проверили» — разные утверждения, и без этого счёта они неотличимы.
+ *
+ * Для каждого КРУПНОГО листа среза перебираются его 12 рёбер, и на каждом —
+ * все накрытые сеточные рёбра из таблицы. Считается:
+ *   - крупных рёбер с ХОТЯ БЫ ОДНИМ пересечением;
+ *   - из них с БОЛЕЕ ЧЕМ ОДНИМ;
+ *   - из них с РАЗНЫМИ знаками проекции нормали на ось (только здесь правило и
+ *     значит что-нибудь);
+ *   - на скольких ПРЕЖНЕЕ правило («первое пересечение от нижнего конца», в
+ *     точности то, во что разворачивается «бит первого ребёнка с пересечением»)
+ *     даёт бит, ОТЛИЧНЫЙ от знака суммы проекций.
+ * Последнее число и есть верхняя оценка того, что вообще могла бы изменить
+ * правка Ш7. Ноль в нём означает, что менять нечего. */
+typedef struct {
+  const hz_htab *ht;
+  const hz_dctree *t;
+  hz_dc_stop stop;
+  void *sctx;
+  int64_t nbig, nedge1, nedgem, ndis, nchange, nzero;
+} ambctx;
+
+static void amb_rec(ambctx *C, int32_t ni, const int32_t lo[3], int32_t size) {
+  hz_dcref r = {ni, {lo[0], lo[1], lo[2]}, size};
+  int leaf = C->t->nd[ni].child0 < 0 || (C->stop != NULL && C->stop(C->sctx, C->t, &r));
+  if (!leaf) {
+    int32_t half = size / 2;
+    for (int k = 0; k < 8; k++) {
+      int32_t clo[3];
+      for (int a = 0; a < 3; a++)
+        clo[a] = lo[a] + (((k >> a) & 1) ? half : 0);
+      amb_rec(C, C->t->nd[ni].child0 + k, clo, half);
+    }
+    return;
+  }
+  if (size == 1) return;
+  C->nbig++;
+  for (int i = 0; i < 12; i++) {
+    /* Нумерация рёбер — та же, что у `unit_edge` в dc.c и у сборки среза. */
+    int a = i / 4, kk = i % 4, u = (a + 1) % 3, v = (a + 2) % 3;
+    int32_t p0[3] = {lo[0], lo[1], lo[2]};
+    p0[u] += (kk & 1) * size;
+    p0[v] += ((kk >> 1) & 1) * size;
+    int64_t npos = 0, nneg = 0;
+    double sum = 0.0;
+    int first = 0, got = 0;
+    for (int32_t s = 0; s < size; s++) {
+      int32_t p[3] = {p0[0], p0[1], p0[2]};
+      p[a] += s;
+      const hz_hedge *e = hz_htab_find(C->ht, a, p);
+      if (e == NULL || e->in_lo == HZ_HEDGE_ERASED) continue;
+      sum += e->nrm[a];
+      if (e->nrm[a] > 0.0)
+        npos++;
+      else
+        nneg++;
+      if (!got) {
+        got = 1;
+        first = e->nrm[a] > 0.0;
+      }
+    }
+    if (!got) continue;
+    C->nedge1++;
+    if (npos + nneg > 1) C->nedgem++;
+    if (npos > 0 && nneg > 0) C->ndis++;
+    /* ТОЧНЫЙ ноль, а не «почти»: порога здесь быть не может, ничья — это
+     * ровное сокращение. Записано так, а не `sum == 0.0`, только чтобы не
+     * будить -Wfloat-equal: сравнение остаётся точным. */
+    if (!(sum < 0.0) && !(sum > 0.0)) C->nzero++;
+    if ((sum > 0.0) != (first != 0)) C->nchange++;
+  }
+}
+
 /* ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ (§446). Мера площадки `h²` на ЯЧЕЙКУ не может
  * быть верной для листа нулевой толщины: ячеек по обе стороны листа вдвое
  * больше, чем листов (§445). Площадь по ВЫДАННЫМ МНОГОУГОЛЬНИКАМ двойного счёта
@@ -878,6 +953,14 @@ static int area_emit(void *ctx, const hz_dcref *ref, const double (*v)[3], int n
 
 typedef struct {
   double *v; /* 9 на треугольник: три вершины в координатах ДЕРЕВА */
+  /* КЛАСС ТРЕУГОЛЬНИКА ПО ТОМУ, УЧАСТВОВАЛО ЛИ ПРАВИЛО (Ш7, А823). Обход берёт
+   * бит ориентации у САМОЙ МЕЛКОЙ из четырёх ячеек ребра, поэтому свёртка
+   * `edir` по детям участвует тогда и только тогда, когда минимальная из
+   * четырёх — КРУПНАЯ. 0 = класс F (min size == 1, бит прямо из таблицы,
+   * правкой не затронут), 1 = класс G (min size > 1). Класс F служит
+   * ВНУТРЕННИМ эталоном в том же прогоне: доля обращённых в нём от правки
+   * зависеть не может. */
+  uint8_t *cls;
   int32_t ntri, cap;
   int32_t *head; /* на клетку индекса: первое вхождение, -1 — нет */
   int32_t *nxt;  /* следующее вхождение */
@@ -912,6 +995,9 @@ static int emesh_push(emesh *E, const double a[3], const double b[3], const doub
     double *nv2 = realloc(E->v, (size_t)nc * 9 * sizeof *nv2);
     if (nv2 == NULL) return -1;
     E->v = nv2;
+    uint8_t *nc2 = realloc(E->cls, (size_t)nc * sizeof *nc2);
+    if (nc2 == NULL) return -1;
+    E->cls = nc2;
     E->cap = nc;
   }
   double *d = E->v + 9 * (size_t)E->ntri;
@@ -921,8 +1007,20 @@ static int emesh_push(emesh *E, const double a[3], const double b[3], const doub
     d[6 + k] = c[k];
   }
   int32_t ti = E->ntri++;
-  (void)ref;
-  (void)nv;
+  /* ТРИ КЛАССА, А НЕ ДВА (правка по первому прогону, §457). Минимальная из
+   * ячеек решает, ОТКУДА ВЗЯТ БИТ (А823); максимальная решает, ОГРУБЛЕНА ЛИ
+   * ГЕОМЕТРИЯ полигона. Это разные вопросы, и слив их в один класс делает
+   * величину неразличающей:
+   *   0 = ВСЕ ЧЕТЫРЕ МЕЛКИЕ — ни правило, ни огрубление не участвуют (эталон);
+   *   1 = min > 1 — бит из свёртки по детям, то есть предмет Ш7;
+   *   2 = СМЕШАННЫЙ (min == 1, max > 1) — бит из таблицы, но геометрия
+   *       огрублена: этот класс и отделяет вклад ПРАВИЛА от вклада ОГРУБЛЕНИЯ. */
+  int32_t msz = ref[0].size, xsz = ref[0].size;
+  for (int k = 1; k < nv; k++) {
+    if (ref[k].size < msz) msz = ref[k].size;
+    if (ref[k].size > xsz) xsz = ref[k].size;
+  }
+  E->cls[ti] = (uint8_t)(msz > 1 ? 1 : (xsz > 1 ? 2 : 0));
   /* Габарит треугольника в клетках индекса. Координаты — в ячейках сетки уровня
    * `lev`, клетка индекса шире в `1 << (lev - HZ_EGRID)` раз. */
   int sh = E->lev - HZ_EGRID;
@@ -1081,8 +1179,10 @@ static int cmp_u64(const void *x, const void *y) {
  * ПОЛНОЙ ГЛУБИНЕ, где перепада уровней нет вовсе, и сравниваются ДВЕ доли.
  * Разность и есть вклад перепада; общий уровень — свойство модели. */
 static int64_t emesh_flips(const emesh *E, celltris *CT, const frame *fr, const hz_objmesh *m,
-                           int64_t *ncmp) {
+                           int64_t *ncmp, int64_t nfc[3], int64_t ncc[3]) {
   int64_t nf = 0, nc = 0;
+  for (int k = 0; k < 3; k++)
+    nfc[k] = ncc[k] = 0;
   for (int32_t i = 0; i < E->ntri; i++) {
     const double *tv = E->v + 9 * (size_t)i;
     double w[3][3], ctr[3] = {0, 0, 0};
@@ -1108,9 +1208,29 @@ static int64_t emesh_flips(const emesh *E, celltris *CT, const frame *fr, const 
     }
     if (!ok) continue;
     const int32_t *ls = NULL;
-    if (ct_list(CT, cell, &ls) == 0) continue;
+    int32_t nls = ct_list(CT, cell, &ls);
+    if (nls == 0) continue;
+    /* ЭТАЛОННЫЙ ТРЕУГОЛЬНИК — БЛИЖАЙШИЙ, А НЕ ПЕРВЫЙ (§457). Первый в списке —
+     * произвольный: в приграничной ячейке сферы лежат и передняя, и задняя
+     * грань, и их нормали смотрят ВРОЗЬ, так что «первый» давал бы вывернутость
+     * там, где её нет. Это ровно класс «подмена величины»: мажоранта вместо
+     * точного. Ближайший ищется по расстоянию от ЦЕНТРА выданного треугольника
+     * до исходного — той же точной формулой, что и ошибка поверхности. */
+    int32_t bi = ls[0];
+    if (nls > 1) {
+      double bd = 1e300;
+      for (int32_t q = 0; q < nls; q++) {
+        const double *Aq, *Bq, *Cq;
+        tri_verts(m, ls[q], &Aq, &Bq, &Cq);
+        double dq = pt_tri_d2(ctr, Aq, Bq, Cq);
+        if (dq < bd) {
+          bd = dq;
+          bi = ls[q];
+        }
+      }
+    }
     const double *A2, *B2, *C2;
-    tri_verts(m, ls[0], &A2, &B2, &C2);
+    tri_verts(m, bi, &A2, &B2, &C2);
     double f1[3], f2[3], fn[3];
     for (int c = 0; c < 3; c++) {
       f1[c] = B2[c] - A2[c];
@@ -1120,8 +1240,13 @@ static int64_t emesh_flips(const emesh *E, celltris *CT, const frame *fr, const 
     fn[1] = f1[2] * f2[0] - f1[0] * f2[2];
     fn[2] = f1[0] * f2[1] - f1[1] * f2[0];
     double d = nn[0] * fn[0] + nn[1] * fn[1] + nn[2] * fn[2];
+    int cl = E->cls[i] < 3u ? (int)E->cls[i] : 0;
     nc++;
-    if (d < 0.0) nf++;
+    ncc[cl]++;
+    if (d < 0.0) {
+      nf++;
+      nfc[cl]++;
+    }
   }
   if (ncmp != NULL) *ncmp = nc;
   return nf;
@@ -2256,6 +2381,7 @@ int main(int argc, char **argv) {
       E0.ntri = 0;
       E0.cap = 1024;
       E0.v = malloc((size_t)E0.cap * 9 * sizeof *E0.v);
+      E0.cls = malloc((size_t)E0.cap * sizeof *E0.cls);
       E0.gn = (int32_t)1 << (lev < HZ_EGRID ? lev : HZ_EGRID);
       E0.lev = lev;
       E0.tri = NULL;
@@ -2263,7 +2389,7 @@ int main(int argc, char **argv) {
       E0.nxt = NULL;
       E0.ncap = 0;
       E0.nn = 0;
-      if (E0.v == NULL || E0.head == NULL) exit(1);
+      if (E0.v == NULL || E0.cls == NULL || E0.head == NULL) exit(1);
       for (int64_t i = 0; i < (int64_t)E0.gn * E0.gn * E0.gn; i++)
         E0.head[i] = -1;
       /* HZ_DC_EMULTI (код 4) НЕ ФАТАЛЕН: обход так помечает ячейки, где вершины
@@ -2276,12 +2402,22 @@ int main(int argc, char **argv) {
         if (wrc0 != HZ_DC_OK && wrc0 != HZ_DC_EMULTI) exit(1);
         if (wrc0 == HZ_DC_EMULTI) printf("   (обход эталона: код 4, часть ячеек без вершины)\n");
       }
-      int64_t nc0 = 0, nf0 = emesh_flips(&E0, &CT, &fr, &m, &nc0);
+      int64_t nc0 = 0, nfc0[3], ncc0[3];
+      int64_t nf0 = emesh_flips(&E0, &CT, &fr, &m, &nc0, nfc0, ncc0);
       printf("   ЭТАЛОН ПОЛНОЙ ГЛУБИНЫ: треугольников %lld, ОБРАЩЁННЫХ %lld из %lld (%.3f %%) — "
              "это доля МОДЕЛИ, перепада уровней здесь нет\n",
              (long long)E0.ntri, (long long)nf0, (long long)nc0,
              100.0 * (double)nf0 / (double)(nc0 ? nc0 : 1));
+      /* А815: класс F при полной глубине — это ВСЕ полигоны, и печатается он
+       * затем, чтобы было с чем сравнивать класс F на срезе. Разойдись они —
+       * класс F не представителен, и критерий механизма читать нельзя. */
+      printf("      из них класс МЕЛКИЙ %lld из %lld (%.3f %%), класс ПРАВИЛО %lld из %lld, класс "
+             "СМЕШАННЫЙ %lld из %lld\n",
+             (long long)nfc0[0], (long long)ncc0[0],
+             100.0 * (double)nfc0[0] / (double)(ncc0[0] ? ncc0[0] : 1), (long long)nfc0[1],
+             (long long)ncc0[1], (long long)nfc0[2], (long long)ncc0[2]);
       free(E0.v);
+      free(E0.cls);
       free(E0.head);
       free(E0.nxt);
       free(E0.tri);
@@ -2298,6 +2434,21 @@ int main(int argc, char **argv) {
       double ts = now_s() - t0;
       for (int32_t i = 0; i < A.n; i++)
         L.hist[A.c[i].lvl]++;
+      /* А813: ЛОЖНЫЙ НОЛЬ НОРМАЛИ У КРУПНОЙ ЯЧЕЙКИ. `hz_slice_build` набирает
+       * сумму нормалей только при size == 1, у крупной ячейки код нормали
+       * остаётся нулём — а раскодируется он не в «нормали нет», а в вектор
+       * (0, 0, −1). Здесь это СЧИТАЕТСЯ, порознь по мелким и крупным. Чинится
+       * не в Ш7 (объём шага): число нужно, чтобы находка не осталась чтением. */
+      int64_t nz0f = 0, nz0c = 0, ncoarse = 0;
+      for (int32_t i = 0; i < A.n; i++) {
+        int fine = A.c[i].lvl == (uint8_t)lev;
+        if (!fine) ncoarse++;
+        if (A.c[i].noct != 0) continue;
+        if (fine)
+          nz0f++;
+        else
+          nz0c++;
+      }
       int64_t half = A.n / 2, acc2 = 0;
       int lmed = 0, lmin = 99, lmax = -1;
       for (int i = 0; i <= HZ_DC_MAX_LOG2SIZE + 1; i++) {
@@ -2318,6 +2469,7 @@ int main(int argc, char **argv) {
       EM.ntri = 0;
       EM.cap = 1024;
       EM.v = malloc((size_t)EM.cap * 9 * sizeof *EM.v);
+      EM.cls = malloc((size_t)EM.cap * sizeof *EM.cls);
       EM.gn = (int32_t)1 << (lev < HZ_EGRID ? lev : HZ_EGRID);
       EM.lev = lev;
       EM.tri = NULL;
@@ -2325,7 +2477,7 @@ int main(int argc, char **argv) {
       EM.nxt = NULL;
       EM.ncap = 0;
       EM.nn = 0;
-      if (EM.v == NULL || EM.head == NULL) exit(1);
+      if (EM.v == NULL || EM.cls == NULL || EM.head == NULL) exit(1);
       for (int64_t i = 0; i < (int64_t)EM.gn * EM.gn * EM.gn; i++)
         EM.head[i] = -1;
       {
@@ -2373,18 +2525,52 @@ int main(int argc, char **argv) {
         p99 = er[(ne * 99) / 100];
       }
       free(er);
+      {
+        ambctx C;
+        memset(&C, 0, sizeof C);
+        C.ht = &ht;
+        C.t = &T;
+        C.stop = lod_stop;
+        C.sctx = &L;
+        int32_t zlo[3] = {0, 0, 0};
+        amb_rec(&C, 0, zlo, fr.n);
+        printf("      §457 НЕОДНОЗНАЧНОСТЬ ПРАВИЛА: крупных листьев %lld; их рёбер с "
+               "пересечением %lld, из них с ДВУМЯ и более %lld, со ВСТРЕЧНЫМИ знаками %lld; "
+               "сумма РОВНО ноль %lld; БИТ ИЗМЕНИЛСЯ БЫ на %lld рёбрах\n",
+               (long long)C.nbig, (long long)C.nedge1, (long long)C.nedgem, (long long)C.ndis,
+               (long long)C.nzero, (long long)C.nchange);
+      }
+      printf("      А813 НОРМАЛЬ СРЕЗА == 0 (раскодируется в (0,0,-1)): у мелких %lld из %lld, у "
+             "КРУПНЫХ %lld из %lld\n",
+             (long long)nz0f, (long long)(A.n - ncoarse), (long long)nz0c, (long long)ncoarse);
       printf("   СРЕЗ порог %.2f пикс: ячеек %d, доля %.4f, уровни %d..%d медиана %d, сборка "
              "%.3f с, треугольников %lld; ОШИБКА ДО ВЫДАННОЙ ПОВЕРХНОСТИ p50 %.5f p90 %.5f "
              "p99 %.5f м; без поверхности %lld из %lld\n",
              L.thr, A.n, (double)A.n / (double)(nvl ? nvl : 1), lmin, lmax, lmed, ts,
              (long long)EM.ntri, p50, p90, p99, (long long)nmiss, (long long)(ne + nmiss));
       {
-        int64_t nc2 = 0;
-        int64_t nf2 = emesh_flips(&EM, &CT, &fr, &m, &nc2);
+        int64_t nc2 = 0, nfc[3], ncc[3];
+        int64_t nf2 = emesh_flips(&EM, &CT, &fr, &m, &nc2, nfc, ncc);
         printf("      ОБРАЩЁННЫХ (А729, дифференциально): %lld из %lld (%.3f %%)\n", (long long)nf2,
                (long long)nc2, 100.0 * (double)nf2 / (double)(nc2 ? nc2 : 1));
+        /* ТРИ КЛАССА (§457). МЕЛКИЙ — ни правило, ни огрубление не участвуют:
+         * эталон в этом же прогоне. ПРАВИЛО — бит из свёртки по детям, то есть
+         * предмет Ш7. СМЕШАННЫЙ — бит из таблицы, но геометрия огрублена: он и
+         * отделяет вклад ПРАВИЛА от вклада ОГРУБЛЕНИЯ. Без третьего класса
+         * первые два неразличимы, и первая редакция замера на этом и сбилась. */
+        printf("      МЕЛКИЙ %lld/%lld (%.3f %%); ПРАВИЛО (min>1) %lld/%lld (%.3f %%); СМЕШАННЫЙ "
+               "%lld/%lld (%.3f %%); доли по числу %.1f/%.1f/%.1f %%\n",
+               (long long)nfc[0], (long long)ncc[0],
+               100.0 * (double)nfc[0] / (double)(ncc[0] ? ncc[0] : 1), (long long)nfc[1],
+               (long long)ncc[1], 100.0 * (double)nfc[1] / (double)(ncc[1] ? ncc[1] : 1),
+               (long long)nfc[2], (long long)ncc[2],
+               100.0 * (double)nfc[2] / (double)(ncc[2] ? ncc[2] : 1),
+               100.0 * (double)ncc[0] / (double)(nc2 ? nc2 : 1),
+               100.0 * (double)ncc[1] / (double)(nc2 ? nc2 : 1),
+               100.0 * (double)ncc[2] / (double)(nc2 ? nc2 : 1));
       }
       free(EM.v);
+      free(EM.cls);
       free(EM.head);
       free(EM.nxt);
       free(EM.tri);

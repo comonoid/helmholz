@@ -2089,7 +2089,7 @@ int main(int argc, char **argv) {
     return 2;
   }
   int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
-  int nrmflip = 0, nonsum = 0, indvis = 0, indmeas = 0;
+  int nrmflip = 0, nonsum = 0, indvis = 0, indmeas = 0, dosolid = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
   double oven = 0.0, plates = 0.0;
   double lodthr = 1.0;
@@ -2110,6 +2110,8 @@ int main(int argc, char **argv) {
      * `indvis` вдобавок её отбрасывает. Порознь затем, что первое — замер
      * приближения, а второе — уже другая физика. */
     if (strcmp(argv[i], "indmeas") == 0) indmeas = 1;
+    /* Ш12 (§475): заливка внутренностей и сверка со знаковым объёмом. */
+    if (strcmp(argv[i], "solid") == 0) dosolid = 1;
     if (strcmp(argv[i], "indvis") == 0) {
       indmeas = 1;
       indvis = 1;
@@ -2293,6 +2295,162 @@ int main(int argc, char **argv) {
   /* ---- 2. эрмитовы рёбра: сцена строит и отдаёт ---- */
   hz_htab ht;
   if (hz_htab_init(&ht) != 0) exit(1);
+  /* ---- 2б. ЗАЛИВКА ВНУТРЕННОСТЕЙ (Ш12, §475) ---- */
+  /* ЗАЧЕМ. Развёртке по ординатам нужен вход `solid[ncell]` — «ячейка целиком в
+   * материале»; без него свет идёт СКВОЗЬ ТЕЛА (замерено в стыке: объём
+   * материала выходил 29.4 вместо 164.6). У беззнакового DC такой величины нет
+   * вовсе, и это Р7, а не недоделка: у сцены из односторонних треугольников
+   * «внутри» не существует (§391). У ЗАМКНУТОЙ сцены существует, и здесь это
+   * проверяется ЧИСЛОМ: знаковый объём меша (теорема о дивергенции) обязан
+   * лежать в вилке [ТЕЛО, ТЕЛО + ГРАНИЦА] (А877).
+   * Волна идёт от ячейки КАМЕРЫ — точки, заведомо лежащей в полости.
+   * ОГРАНИЧЕНИЕ (А878): заливается ТА полость, где камера. На сцене с двумя
+   * комнатами вторая будет объявлена сплошным телом, и молча. Названо. */
+  if (dosolid) {
+    double tsl = now_s();
+    size_t nc = (size_t)fr.n * (size_t)fr.n * (size_t)fr.n;
+    unsigned char *fl = calloc(nc, 1);
+    int32_t *stk = malloc(nc * sizeof *stk > 0 ? (size_t)(1 << 22) * sizeof *stk : 1);
+    if (fl == NULL || stk == NULL) exit(1);
+    int32_t scap = 1 << 22, ntop = 0;
+    double eyec[3] = HZ_CFG_HALL_EYE;
+    int32_t e0[3];
+    for (int k = 0; k < 3; k++) {
+      double f = floor((eyec[k] - fr.org[k]) / fr.h);
+      if (f < 0.0) f = 0.0;
+      if (f > (double)(fr.n - 1)) f = (double)(fr.n - 1);
+      e0[k] = (int32_t)f;
+    }
+    int64_t nfluid = 0;
+    if (!hz_occ_get(P.b[lev], hz_occ_index(fr.n, e0[0], e0[1], e0[2]))) {
+      /* Стек хранит МОРТОНОВ-НЕЗАВИСИМЫЙ линейный индекс; ёмкость растёт. */
+      stk[ntop++] = (int32_t)hz_occ_index(fr.n, e0[0], e0[1], e0[2]);
+      fl[hz_occ_index(fr.n, e0[0], e0[1], e0[2])] = 1u;
+      nfluid = 1;
+      while (ntop > 0) {
+        size_t ci = (size_t)stk[--ntop];
+        /* Раскладка индекса — обратная hz_occ_index: (z·n + y)·n + x. */
+        int32_t x = (int32_t)(ci % (size_t)fr.n);
+        int32_t y = (int32_t)((ci / (size_t)fr.n) % (size_t)fr.n);
+        int32_t z = (int32_t)(ci / ((size_t)fr.n * (size_t)fr.n));
+        static const int8_t dxs[6] = {1, -1, 0, 0, 0, 0};
+        static const int8_t dys[6] = {0, 0, 1, -1, 0, 0};
+        static const int8_t dzs[6] = {0, 0, 0, 0, 1, -1};
+        for (int d = 0; d < 6; d++) {
+          int32_t nx = x + dxs[d], ny = y + dys[d], nz = z + dzs[d];
+          if (nx < 0 || ny < 0 || nz < 0 || nx >= fr.n || ny >= fr.n || nz >= fr.n) continue;
+          size_t k2 = hz_occ_index(fr.n, nx, ny, nz);
+          if (fl[k2] || hz_occ_get(P.b[lev], k2)) continue;
+          fl[k2] = 1u;
+          nfluid++;
+          if (ntop >= scap) {
+            int32_t nsc = scap * 2;
+            int32_t *ns = realloc(stk, (size_t)nsc * sizeof *ns);
+            if (ns == NULL) exit(1);
+            stk = ns;
+            scap = nsc;
+          }
+          stk[ntop++] = (int32_t)k2;
+        }
+      }
+    }
+    /* ВТОРАЯ ВОЛНА — ОТ ГРАНИЦЫ КУБА (найдено прогоном, §477). Правило
+     * «недостижимо из полости ⇒ тело» неверно: сетка есть КУБ по наибольшему
+     * габариту, и всё, что лежит вне сцены (над потолком, за стенами, в запасе
+     * по короткой оси), недостижимо из полости, но материалом не является.
+     * Замерено до правки: ТЕЛО вышло 491.6 м³ при истинных 36.5.
+     * Поэтому классов ЧЕТЫРЕ: полость, оболочка, НАРУЖНОЕ, тело. */
+    for (int32_t a = 0; a < fr.n; a++)
+      for (int32_t b2 = 0; b2 < fr.n; b2++) {
+        static const int8_t f6[6][3] = {{0, 1, 2}, {0, 1, 2}, {1, 0, 2},
+                                        {1, 0, 2}, {2, 0, 1}, {2, 1, 0}};
+        (void)f6;
+        int32_t st[6][3] = {{0, a, b2},        {fr.n - 1, a, b2}, {a, 0, b2},
+                            {a, fr.n - 1, b2}, {a, b2, 0},        {a, b2, fr.n - 1}};
+        for (int d = 0; d < 6; d++) {
+          size_t k2 = hz_occ_index(fr.n, st[d][0], st[d][1], st[d][2]);
+          if (fl[k2] || hz_occ_get(P.b[lev], k2)) continue;
+          fl[k2] = 2u;
+          if (ntop >= scap) {
+            int32_t nsc = scap * 2;
+            int32_t *ns = realloc(stk, (size_t)nsc * sizeof *ns);
+            if (ns == NULL) exit(1);
+            stk = ns;
+            scap = nsc;
+          }
+          stk[ntop++] = (int32_t)k2;
+        }
+      }
+    int64_t nout = 0;
+    while (ntop > 0) {
+      size_t ci = (size_t)stk[--ntop];
+      nout++;
+      int32_t x = (int32_t)(ci % (size_t)fr.n);
+      int32_t y = (int32_t)((ci / (size_t)fr.n) % (size_t)fr.n);
+      int32_t z = (int32_t)(ci / ((size_t)fr.n * (size_t)fr.n));
+      static const int8_t dxs[6] = {1, -1, 0, 0, 0, 0};
+      static const int8_t dys[6] = {0, 0, 1, -1, 0, 0};
+      static const int8_t dzs[6] = {0, 0, 0, 0, 1, -1};
+      for (int d = 0; d < 6; d++) {
+        int32_t nx = x + dxs[d], ny = y + dys[d], nz = z + dzs[d];
+        if (nx < 0 || ny < 0 || nz < 0 || nx >= fr.n || ny >= fr.n || nz >= fr.n) continue;
+        size_t k2 = hz_occ_index(fr.n, nx, ny, nz);
+        if (fl[k2] || hz_occ_get(P.b[lev], k2)) continue;
+        fl[k2] = 2u;
+        if (ntop >= scap) {
+          int32_t nsc = scap * 2;
+          int32_t *ns = realloc(stk, (size_t)nsc * sizeof *ns);
+          if (ns == NULL) exit(1);
+          stk = ns;
+          scap = nsc;
+        }
+        stk[ntop++] = (int32_t)k2;
+      }
+    }
+    int64_t nbnd = 0;
+    for (size_t i = 0; i < nc; i++)
+      if (hz_occ_get(P.b[lev], i)) nbnd++;
+    int64_t nbody = (int64_t)nc - nfluid - nbnd - nout;
+    double cv = fr.h * fr.h * fr.h;
+    /* ПРОТЕЧКА: флюид на самой границе габарита. Волна пущена изнутри полости,
+     * значит любая её ячейка у стенки куба означает дыру в оболочке. */
+    int64_t nleak = 0;
+    for (int32_t a = 0; a < fr.n; a++)
+      for (int32_t b2 = 0; b2 < fr.n; b2++) {
+        /* СЧИТАЕТСЯ ТОЛЬКО ВНУТРЕННЯЯ волна (fl == 1): наружная стоит на стенке
+         * куба по построению, и путать их значит мерить собственный алгоритм. */
+        if (fl[hz_occ_index(fr.n, 0, a, b2)] == 1u) nleak++;
+        if (fl[hz_occ_index(fr.n, fr.n - 1, a, b2)] == 1u) nleak++;
+        if (fl[hz_occ_index(fr.n, a, 0, b2)] == 1u) nleak++;
+        if (fl[hz_occ_index(fr.n, a, fr.n - 1, b2)] == 1u) nleak++;
+        if (fl[hz_occ_index(fr.n, a, b2, 0)] == 1u) nleak++;
+        if (fl[hz_occ_index(fr.n, a, b2, fr.n - 1)] == 1u) nleak++;
+      }
+    /* ЭТАЛОН: знаковый объём меша (А868). Считается ЗДЕСЬ, а не однострочником
+     * в докладе: у него теперь есть потребитель. Для НЕзамкнутой сцены он
+     * бессмыслен (А879), и это сказано рядом с числом. */
+    double vsig = 0.0;
+    for (int32_t t2 = 0; t2 < m.nt; t2++) {
+      const double *A2, *B2, *C2;
+      tri_verts(&m, t2, &A2, &B2, &C2);
+      vsig += (A2[0] * (B2[1] * C2[2] - B2[2] * C2[1]) - A2[1] * (B2[0] * C2[2] - B2[2] * C2[0]) +
+               A2[2] * (B2[0] * C2[1] - B2[1] * C2[0])) /
+              6.0;
+    }
+    printf("   ЗАЛИВКА за %.2f с: ФЛЮИД %lld (%.3f м³), НАРУЖНОЕ %.3f м³, ГРАНИЦА %lld (%.3f м³), "
+           "ТЕЛО %lld "
+           "(%.3f м³); ВИЛКА [%.3f, %.3f] м³ против знакового объёма меша %.4f м³ — %s; "
+           "ПРОТЕЧКА %lld ячеек на стенке куба; маска %.0f МБ\n",
+           now_s() - tsl, (long long)nfluid, (double)nfluid * cv, (double)nout * cv,
+           (long long)nbnd, (double)nbnd * cv, (long long)nbody, (double)nbody * cv,
+           (double)nbody * cv, (double)(nbody + nbnd) * cv, vsig,
+           (vsig >= (double)nbody * cv && vsig <= (double)(nbody + nbnd) * cv) ? "В ВИЛКЕ"
+                                                                               : "ВНЕ ВИЛКИ",
+           (long long)nleak, (double)nc / 1048576.0);
+    free(fl);
+    free(stk);
+  }
+
   t0 = now_s();
   int64_t nhit = edges_build(&ht, &m, &fr, nonrm);
   int32_t ndrop = 0;

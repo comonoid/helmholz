@@ -1791,6 +1791,11 @@ static int g_treesweep = 0;
 typedef struct {
   int32_t lo[3], size;
   int32_t child0; /* индекс первого из 8 детей, -1 у листа */
+  /* ССЫЛКИ НА СОСЕДЕЙ ПО ШЕСТИ ГРАНЯМ, предвычисленные при постройке (§513).
+   * Иначе обход на каждого соседа считает координату и лезет в индекс размером
+   * с сетку (8 МБ при 128³) — случайный доступ мимо кэша, и он же оказался
+   * главной статьёй 43 нс на лист. Порядок: -x, +x, -y, +y, -z, +z. */
+  int32_t nb[6];
 } snode;
 
 typedef struct {
@@ -1798,14 +1803,17 @@ typedef struct {
   int32_t n, cap;
   int32_t *idx; /* ячейка сетки свипа -> ЛИСТ */
   int32_t nleaf;
-  float *open;  /* открытость на УЗЕЛ */
-  int32_t gn;   /* сторона сетки свипа */
+  unsigned char *occl; /* лист занят (заслон) — считается при постройке */
+  float *open;         /* открытость на УЗЕЛ */
+  int32_t gn;          /* сторона сетки свипа */
 } stree;
 
 static void stree_free(stree *T) {
   free(T->nd);
   free(T->idx);
   free(T->open);
+  free(T->occl);
+  T->occl = NULL;
   T->nd = NULL;
   T->idx = NULL;
   T->open = NULL;
@@ -1870,7 +1878,12 @@ static void stree_build(stree *T, const opyr *P, int lev, int drop, int32_t gn) 
   size_t nc = (size_t)gn * (size_t)gn * (size_t)gn;
   T->idx = malloc(nc * sizeof *T->idx);
   T->open = malloc((size_t)T->n * sizeof *T->open);
-  if (T->idx == NULL || T->open == NULL) exit(1);
+  T->occl = calloc((size_t)T->n, 1);
+  if (T->idx == NULL || T->open == NULL || T->occl == NULL) exit(1);
+  /* Ссылки на соседей: лист, накрывающий ЦЕНТР соответствующей грани. Для
+   * крупного узла сосед через грань может быть не один; берётся тот же, что
+   * брала прежняя редакция по координате, — значит замер сравнивает СКОРОСТЬ,
+   * а не схему. */
   /* Индексируются ТОЛЬКО листья: внутренние узлы нужны обходу, но накрывают те
    * же ячейки, и запись их поверх листьев испортила бы индекс. */
   T->nleaf = 0;
@@ -1878,10 +1891,37 @@ static void stree_build(stree *T, const opyr *P, int lev, int drop, int32_t gn) 
     const snode *s = &T->nd[i];
     if (s->child0 >= 0) continue;
     T->nleaf++;
+    /* Занятость листа решается ЗДЕСЬ, один раз: у листа размера 1 — по пирамиде
+     * мелкого уровня, у крупного она ноль по построению (он пуст, иначе бы
+     * дробился). */
+    T->occl[i] = (s->size == 1 &&
+                  hz_occ_get(P->b[lev - drop], hz_occ_index(gn, s->lo[0], s->lo[1], s->lo[2])))
+                     ? 1u
+                     : 0u;
     for (int32_t z = s->lo[2]; z < s->lo[2] + s->size; z++)
       for (int32_t y = s->lo[1]; y < s->lo[1] + s->size; y++)
         for (int32_t x = s->lo[0]; x < s->lo[0] + s->size; x++)
           T->idx[hz_occ_index(gn, x, y, z)] = i;
+  }
+  for (int32_t i = 0; i < T->n; i++) {
+    snode *s = &T->nd[i];
+    if (s->child0 >= 0) continue;
+    double c[3] = {(double)s->lo[0] + 0.5 * (double)s->size,
+                   (double)s->lo[1] + 0.5 * (double)s->size,
+                   (double)s->lo[2] + 0.5 * (double)s->size};
+    for (int f = 0; f < 6; f++) {
+      int ax = f / 2, sg = (f & 1) ? 1 : -1;
+      double p[3] = {c[0], c[1], c[2]};
+      p[ax] += (double)sg * (0.5 * (double)s->size + 0.5);
+      int32_t q[3];
+      int ok = 1;
+      for (int a = 0; a < 3; a++) {
+        double f2 = floor(p[a]);
+        if (!(f2 >= 0.0) || !(f2 < (double)gn)) ok = 0;
+        q[a] = ok ? (int32_t)f2 : 0;
+      }
+      s->nb[f] = ok ? T->idx[hz_occ_index(gn, q[0], q[1], q[2])] : -1;
+    }
   }
 }
 
@@ -1936,19 +1976,13 @@ static void tsweep_rec(stree *T, const opyr *P, int lev, int drop, const double 
   for (int k = 0; k < 3; k++) {
     double w = fabs(dd[k]) / sabs;
     if (!(w > 0.0)) continue;
-    double pp[3] = {c0[0], c0[1], c0[2]};
-    pp[k] += (dd[k] > 0.0 ? 1.0 : -1.0) * (0.5 * (double)nd->size + 0.5);
-    int32_t q2[3];
-    int ok = 1;
-    for (int a = 0; a < 3; a++) {
-      double f2 = floor(pp[a]);
-      if (!(f2 >= 0.0) || !(f2 < (double)T->gn)) ok = 0;
-      q2[a] = ok ? (int32_t)f2 : 0;
-    }
-    if (!ok) continue;
-    size_t qi = hz_occ_index(T->gn, q2[0], q2[1], q2[2]);
-    if (hz_occ_get(P->b[lev - drop], qi)) continue; /* заслон: направление исключается */
-    int32_t nj = T->idx[qi];
+    /* СОСЕД ПО ПРЕДВЫЧИСЛЕННОЙ ССЫЛКЕ (§513): ни координаты, ни индекса, ни
+     * запроса пирамиды — одно чтение. Заслон опознаётся тем, что у занятого
+     * листа открытость нулевая по построению (он ничего не пропускает). */
+    int f = 2 * k + (dd[k] > 0.0 ? 1 : 0);
+    int32_t nj = nd->nb[f];
+    if (nj < 0) continue;
+    if (T->occl[nj]) continue;        /* заслон: направление исключается */
     if (T->open[nj] < 0.0f) continue; /* ещё не посчитан — не наш порядок */
     acc += w * (double)T->open[nj];
     wsum += w;

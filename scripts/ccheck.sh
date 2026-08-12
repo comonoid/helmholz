@@ -23,7 +23,7 @@ EXTRA="${CCHECK_EXTRA:-}"
 
 # All engines + project deps (openblas/lapacke) in one nix-shell so includes
 # resolve and nothing is re-fetched between tools.
-nix-shell -p gcc clang-tools cppcheck lapack blas pkg-config --run "
+nix-shell -p gcc clang-tools cppcheck lapack blas pkg-config llvmPackages.openmp --run "
 set -uo pipefail
 # INC = include/define flags only (safe for cppcheck); CF adds -std for gcc/clang.
 INC=\"\$(pkg-config --cflags lapacke 2>/dev/null) -I$HZ/src $EXTRA\"

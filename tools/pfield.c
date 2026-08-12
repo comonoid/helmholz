@@ -2229,6 +2229,12 @@ static int g_diffbench = 0, g_onenb = 0, g_schar = 0, g_scharax = 0;
 /* Ф14. (§557): поячеечное сличение свипа с гатером; `cmpself` — подсунуть один
  * и тот же массив дважды (проверка на ложный ноль, А1002). */
 static int g_cmpcell = 0, g_cmpself = 0, g_fnoclamp = 0;
+/* КАМЕРА ДЛЯ ЛЮБОЙ СЦЕНЫ (08-12). Прежде все восемь мест читали `HZ_CFG_HALL_EYE`
+ * напрямую, и никакая сцена кроме комнаты не рендерилась вовсе. `cam=` задаёт
+ * шесть чисел явно; `camauto` ставит взгляд снаружи габарита — для предметов
+ * (шары, дом), а для города и интерьера камеру надо задавать руками. */
+static double g_eye[3] = HZ_CFG_HALL_EYE, g_at[3] = HZ_CFG_HALL_AT;
+static int g_camauto = 0;
 /* А1001: прореживание излучателей гатера — ручкой, чтобы мерить ЕГО собственный
  * разброс тем же прибором. 0 — прежний автоматический выбор. */
 static int g_gstride = 0;
@@ -3973,6 +3979,19 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "fzero") == 0) g_fzero = 1;
     if (strcmp(argv[i], "fnotrans") == 0) g_fnotrans = 1;
     if (strcmp(argv[i], "fnoclamp") == 0) g_fnoclamp = 1;
+    if (strcmp(argv[i], "camauto") == 0) g_camauto = 1;
+    if (strncmp(argv[i], "cam=", 4) == 0) {
+      const char *cp = argv[i] + 4;
+      char *ep = NULL;
+      for (int a = 0; a < 3; a++) {
+        g_eye[a] = strtod(cp, &ep);
+        cp = (*ep == ',') ? ep + 1 : ep;
+      }
+      for (int a = 0; a < 3; a++) {
+        g_at[a] = strtod(cp, &ep);
+        cp = (*ep == ',') ? ep + 1 : ep;
+      }
+    }
     /* Ф12. (§549): стенд на диффузию правила переноса. */
     if (strncmp(argv[i], "diffbench=", 10) == 0) g_diffbench = (int)strtol(argv[i] + 10, NULL, 10);
     if (strcmp(argv[i], "onenb") == 0) g_onenb = 1;
@@ -4154,6 +4173,30 @@ int main(int argc, char **argv) {
         0.5 * (lo[c] + hi[c]) - 0.5 * (double)fr.n * fr.h + (hz_gridalign ? 0.0 : 0.5 * fr.h);
   printf("== ПОЛЕ (БЕЗЗНАКОВОЕ DC, Р7): %s, треугольников %d, сетка %d^3, ячейка %.4f м%s\n",
          argv[1], m.nt, fr.n, fr.h, nonrm ? "  [НОРМАЛИ ОСЕВЫЕ]" : "");
+  /* ГАБАРИТ ПЕЧАТАЕТСЯ ВСЕГДА: без него камеру для новой сцены не назначить, а
+   * без камеры сцена не рендерится вовсе (до 08-12 все восемь мест читали
+   * координаты комнаты). */
+  printf("   ГАБАРИТ: [%.2f %.2f %.2f] … [%.2f %.2f %.2f] м, размах %.2f × %.2f × %.2f\n", lo[0],
+         lo[1], lo[2], hi[0], hi[1], hi[2], hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]);
+  if (g_camauto) {
+    /* ВЗГЛЯД СНАРУЖИ ГАБАРИТА — годится ПРЕДМЕТУ (шары, дом), но НЕ интерьеру и
+     * не городу: там камера обязана стоять внутри, и её задают ключом `cam=`.
+     * Правило простое и без подгонки: глаз отодвинут на диагональ габарита от
+     * его центра по направлению (−1, +0.6, −1), взгляд — в центр. */
+    double c2[3], dg = 0.0;
+    for (int a = 0; a < 3; a++) {
+      c2[a] = 0.5 * (lo[a] + hi[a]);
+      dg += (hi[a] - lo[a]) * (hi[a] - lo[a]);
+    }
+    dg = sqrt(dg);
+    double dv[3] = {-1.0, 0.6, -1.0}, dl2 = sqrt(1.0 + 0.36 + 1.0);
+    for (int a = 0; a < 3; a++) {
+      g_at[a] = c2[a];
+      g_eye[a] = c2[a] + dv[a] / dl2 * dg * 0.75;
+    }
+  }
+  printf("   КАМЕРА: глаз (%.2f %.2f %.2f) -> (%.2f %.2f %.2f)%s\n", g_eye[0], g_eye[1], g_eye[2],
+         g_at[0], g_at[1], g_at[2], g_camauto ? "  [camauto]" : "");
 
   /* ---- 1. занятость ---- */
   double t0 = now_s();
@@ -4249,7 +4292,7 @@ int main(int argc, char **argv) {
     int32_t *stk = malloc(nc * sizeof *stk > 0 ? (size_t)(1 << 22) * sizeof *stk : 1);
     if (fl == NULL || stk == NULL) exit(1);
     int32_t scap = 1 << 22, ntop = 0;
-    double eyec[3] = HZ_CFG_HALL_EYE;
+    double eyec[3] = {g_eye[0], g_eye[1], g_eye[2]};
     int32_t e0[3];
     for (int k = 0; k < 3; k++) {
       double f = floor((eyec[k] - fr.org[k]) / fr.h);
@@ -4567,7 +4610,7 @@ int main(int argc, char **argv) {
       /* ПОТОЛОК ПОЛОСТИ — тем же спуском от КАМЕРЫ вверх, что и у площадки в
        * ветви `lit` (§472): «пусто» в занятости значит «нет поверхности», а не
        * «нет материала», поэтому считать сверху нельзя. */
-      double eyew[3] = HZ_CFG_HALL_EYE;
+      double eyew[3] = {g_eye[0], g_eye[1], g_eye[2]};
       int32_t ex = (int32_t)((eyew[0] - fr.org[0]) / fr.h);
       int32_t ez = (int32_t)((eyew[2] - fr.org[2]) / fr.h);
       int32_t ey = (int32_t)((eyew[1] - fr.org[1]) / fr.h);
@@ -4806,7 +4849,8 @@ int main(int argc, char **argv) {
   /* ---- 5. картинка ---- */
   {
     tr3_camera cam;
-    double eye[3] = HZ_CFG_HALL_EYE, at[3] = HZ_CFG_HALL_AT, up[3] = HZ_CFG_UP;
+    double eye[3] = {g_eye[0], g_eye[1], g_eye[2]}, at[3] = {g_at[0], g_at[1], g_at[2]},
+           up[3] = HZ_CFG_UP;
     if (tr3_camera_look(&cam, eye, at, up, HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0, 512,
                         512) == 0) {
       size_t np = (size_t)512u * 512u;
@@ -4966,7 +5010,7 @@ int main(int argc, char **argv) {
     lodctx L;
     memset(&L, 0, sizeof L);
     {
-      double eyec[3] = HZ_CFG_HALL_EYE;
+      double eyec[3] = {g_eye[0], g_eye[1], g_eye[2]};
       for (int a = 0; a < 3; a++)
         L.eye[a] = (eyec[a] - fr.org[a]) / fr.h;
       /* А737 ПРОВЕРЯЕТСЯ ПРЯМО: сколько ВНУТРЕННИХ узлов имеют невязку РОВНО НОЛЬ
@@ -5323,7 +5367,7 @@ int main(int argc, char **argv) {
       if (hz_slice_build(&A, &T, &ht, lod_stop, &L) != HZ_DC_OK) exit(1);
       double step_m = 1.4 / 30.0;
       /* шаг вдоль взгляда: камера идёт туда, куда смотрит */
-      double eyec[3] = HZ_CFG_HALL_EYE, atc[3] = HZ_CFG_HALL_AT, dir[3];
+      double eyec[3] = {g_eye[0], g_eye[1], g_eye[2]}, atc[3] = {g_at[0], g_at[1], g_at[2]}, dir[3];
       double dl = 0.0;
       for (int a = 0; a < 3; a++) {
         dir[a] = atc[a] - eyec[a];
@@ -5374,7 +5418,7 @@ int main(int argc, char **argv) {
      * сняты числа §405. Менять его в этом шаге нельзя. */
     lodctx LH;
     memset(&LH, 0, sizeof LH);
-    double eyec[3] = HZ_CFG_HALL_EYE, atc[3] = HZ_CFG_HALL_AT;
+    double eyec[3] = {g_eye[0], g_eye[1], g_eye[2]}, atc[3] = {g_at[0], g_at[1], g_at[2]};
     for (int a = 0; a < 3; a++)
       LH.eye[a] = (eyec[a] - fr.org[a]) / fr.h;
     LH.pxrad = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / 512.0;
@@ -5543,7 +5587,7 @@ int main(int argc, char **argv) {
   if (hitsweep) {
     /* Допуски: 0 — точное неравенство (порога нет вовсе). */
     static const double TOL[HZ_HS_NTOL] = {0.0, 1e-3, 1e-2, 5e-2, 1e-1};
-    double eyec[3] = HZ_CFG_HALL_EYE, atc[3] = HZ_CFG_HALL_AT;
+    double eyec[3] = {g_eye[0], g_eye[1], g_eye[2]}, atc[3] = {g_at[0], g_at[1], g_at[2]};
     double eyeg[3];
     for (int a = 0; a < 3; a++)
       eyeg[a] = (eyec[a] - fr.org[a]) / fr.h;
@@ -5726,7 +5770,8 @@ int main(int argc, char **argv) {
   if (lit) {
     lodctx LL;
     memset(&LL, 0, sizeof LL);
-    double eyec[3] = HZ_CFG_HALL_EYE, atc[3] = HZ_CFG_HALL_AT, upc[3] = HZ_CFG_UP;
+    double eyec[3] = {g_eye[0], g_eye[1], g_eye[2]}, atc[3] = {g_at[0], g_at[1], g_at[2]},
+           upc[3] = HZ_CFG_UP;
     for (int a = 0; a < 3; a++)
       LL.eye[a] = (eyec[a] - fr.org[a]) / fr.h;
     LL.pxrad = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / (double)res;

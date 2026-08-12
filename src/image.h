@@ -36,3 +36,12 @@ int hz_ppm_write_signed(const char *path, const double *field, int w, int h);
 int hz_ppm_write_rgb(const char *path, const unsigned char *rgb, int w, int h);
 
 #endif
+
+/* Ш8 (§575): ЧИТАТЕЛЬ PPM `P6`. В проекте до 08-12 были только писатели;
+ * читатель понадобился текстурам. PNG сюда НЕ вносится сознательно: это чужой
+ * формат со своим `inflate`, а конверсия делается один раз снаружи
+ * (`scripts/tex_prep.sh`). Формат разбирается строго: магия `P6`, три числа,
+ * `maxval = 255`, дальше `w*h*3` байт. Всё прочее — отказ, а не догадка:
+ * это чтение НЕДОВЕРЕННОГО входа.
+ * Возвращает 0 при успехе; `*rgb` — `malloc`, освобождает вызывающий. */
+int hz_ppm_read(const char *path, unsigned char **rgb, int *w, int *h);

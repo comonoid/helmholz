@@ -2279,6 +2279,9 @@ static double g_lodceil = 1.0;
  * же число, потому что макрос определён ниже по файлу). Негативный контроль
  * `gam16` ломает её нарочно — картинка обязана пойти полосами. */
 static int g_gamn = 4096;
+/* НЕГАТИВНЫЙ КОНТРОЛЬ §575: вернуть постоянное альбедо вместо выборки. Картинка
+ * обязана вернуться к СЕРОЙ побитово. */
+static int g_texflat = 0;
 /* Секундомеры сводки: заполняются рабочими стадиями по ходу. */
 static double g_t0 = 0.0, g_t_frame = 0.0, g_t_fslice = 0.0, g_t_fdir = 0.0, g_t_fras = 0.0,
               g_t_bounce = 0.0;
@@ -3794,6 +3797,16 @@ typedef struct {
   double white;
   int nocull;           /* НЕГАТИВНЫЙ КОНТРОЛЬ: отсечение выключено */
   int64_t nseen, ncull; /* сколько многоугольников пришло и сколько отброшено */
+  /* Ш8 (§575): текстуры. Таблица по МАТЕРИАЛУ; `uv` и материал кладутся в
+   * отложенный буфер вместе с цветом и выбираются ОДИН раз на видимый пиксель.
+   * Т1: альбедо применяется при ЧТЕНИИ поля, поэтому в перенос текстура не
+   * входит вовсе — и цветного непрямого света от неё не будет (§575). */
+  unsigned char **texrgb;
+  int *texw, *texh;
+  const float *uvs;
+  float *defuv;
+  unsigned char *defmat;
+  int64_t ntexpx;
   /* Р3 (§572): буфер отложенного затенения — радианс на пиксель, три канала.
    * `nfrag` — сколько фрагментов прошло z; отношение к числу закрытых пикселей
    * есть ГЛУБИНА ПЕРЕКРЫТИЯ, и от неё прямо зависит выигрыш Р3. */
@@ -3822,7 +3835,8 @@ static int lit_find(const litctx *L, const hz_dcref *r) {
   return -1;
 }
 
-static void lit_tri(litctx *L, const double p[3][3], const double col[3][3]) {
+static void lit_tri(litctx *L, const double p[3][3], const double col[3][3], const double uv[3][2],
+                    int mat) {
   const tr3_camera *cm = L->cam;
   double sx[3], sy[3], sz[3];
   for (int k = 0; k < 3; k++) {
@@ -3876,6 +3890,12 @@ static void lit_tri(litctx *L, const double p[3][3], const double col[3][3]) {
       for (int c = 0; c < 3; c++)
         L->defcol[3 * k + (size_t)c] =
             (float)(col[0][c] + u * (col[1][c] - col[0][c]) + v * (col[2][c] - col[0][c]));
+      if (L->defuv != NULL) {
+        for (int c = 0; c < 2; c++)
+          L->defuv[2 * k + (size_t)c] =
+              (float)(uv[0][c] + u * (uv[1][c] - uv[0][c]) + v * (uv[2][c] - uv[0][c]));
+        L->defmat[k] = (unsigned char)mat;
+      }
     }
 }
 
@@ -3911,6 +3931,34 @@ static void lit_resolve(litctx *L, int gamn) {
       if (w995 > 0.0) L->white = w995;
     }
     free(v);
+  }
+  /* Ш8 (§575): ВЫБОРКА ТЕКСТУРЫ — ОДИН РАЗ НА ВИДИМЫЙ ПИКСЕЛЬ. Отложенный
+   * буфер (Р3 §572), сделанный ради скорости, здесь окупается второй раз:
+   * перекрытые фрагменты текстуру не читают вовсе.
+   * Правило Т1: текстура умножается на радианс ПРИ ЧТЕНИИ поля. В перенос она
+   * не входит, поэтому цветного непрямого света от неё не будет — цена названа
+   * в §575 и платится сознательно.
+   * `v` растёт вверх в OBJ и вниз в изображении — отсюда `1 − v`. */
+  if (L->texrgb != NULL && L->defuv != NULL) {
+    for (size_t k = 0; k < npx; k++) {
+      if (L->z[k] >= 1e299) continue;
+      int mt = L->defmat[k];
+      const unsigned char *tx = L->texrgb[mt];
+      if (tx == NULL) continue;
+      int tw = L->texw[mt], th = L->texh[mt];
+      double uu = (double)L->defuv[2 * k + 0], vv = 1.0 - (double)L->defuv[2 * k + 1];
+      uu -= floor(uu);
+      vv -= floor(vv);
+      int ix = (int)(uu * (double)tw), iy = (int)(vv * (double)th);
+      if (ix < 0) ix = 0;
+      if (iy < 0) iy = 0;
+      if (ix >= tw) ix = tw - 1;
+      if (iy >= th) iy = th - 1;
+      const unsigned char *px = tx + 3 * ((size_t)iy * (size_t)tw + (size_t)ix);
+      for (int c = 0; c < 3; c++)
+        L->defcol[3 * k + (size_t)c] *= (float)((double)px[c] / 255.0);
+      L->ntexpx++;
+    }
   }
   unsigned char *lut = malloc((size_t)gamn);
   if (lut == NULL) exit(1);
@@ -3983,13 +4031,21 @@ static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv
     L->ncull++;
     return 0;
   }
+  double uvv[4][2];
+  int matp = 0;
   for (int i = 0; i < nv; i++) {
     int idx = lit_find(L, &ref[i]);
     for (int c = 0; c < 3; c++)
       col[i][c] = idx >= 0 ? (double)L->irr[3 * (size_t)idx + (size_t)c] : 0.0;
+    uvv[i][0] = uvv[i][1] = 0.0;
+    if (idx >= 0 && L->uvs != NULL) {
+      uvv[i][0] = (double)L->uvs[2 * (size_t)idx + 0];
+      uvv[i][1] = (double)L->uvs[2 * (size_t)idx + 1];
+      matp = L->S->c[idx].mat;
+    }
   }
   for (int i = 1; i + 1 < nv; i++) {
-    double p3[3][3], c3[3][3];
+    double p3[3][3], c3[3][3], u3[3][2];
     for (int c = 0; c < 3; c++) {
       p3[0][c] = w[0][c];
       p3[1][c] = w[i][c];
@@ -3998,7 +4054,12 @@ static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv
       c3[1][c] = col[i][c];
       c3[2][c] = col[i + 1][c];
     }
-    lit_tri(L, p3, c3);
+    for (int c = 0; c < 2; c++) {
+      u3[0][c] = uvv[0][c];
+      u3[1][c] = uvv[i][c];
+      u3[2][c] = uvv[i + 1][c];
+    }
+    lit_tri(L, p3, c3, u3, matp);
   }
   return 0;
 }
@@ -4115,6 +4176,8 @@ int main(int argc, char **argv) {
     /* §570: СОЛНЦЕ — направленный источник для наружной сцены. */
     if (strcmp(argv[i], "sun") == 0) g_sun = 1;
     if (strcmp(argv[i], "gam16") == 0) g_gamn = 16;
+    if (strcmp(argv[i], "texflat") == 0) g_texflat = 1;
+    if (strcmp(argv[i], "texflat") == 0) g_texflat = 1;
     if (strncmp(argv[i], "sun=", 4) == 0) {
       const char *sp = argv[i] + 4;
       char *se = NULL;
@@ -6102,8 +6165,9 @@ int main(int argc, char **argv) {
      * них, а не оба — граница пройдёт по ячейкам среза, то есть с точностью
      * LOD. Для отскока это законно (энергия), для резкой границы текстуры —
      * нет; текстур пока и нет. */
+    float *uvs = (m.vt != NULL && m.ft != NULL) ? calloc(2 * (size_t)S.n, sizeof *uvs) : NULL;
     {
-      int64_t nmat = 0;
+      int64_t nmat = 0, nuv = 0;
       for (int32_t i = 0; i < S.n; i++) {
         /* ЧИТАТЬ ПО ВЕРШИНЕ, А НЕ ПО УГЛУ (найдено 08-11 картинкой с
          * материалами). У крупной ячейки среза нижний угол лежит ГДЕ УГОДНО —
@@ -6129,9 +6193,55 @@ int main(int argc, char **argv) {
         if (mi < 0 || mi >= m.nmtl) mi = 0;
         S.c[i].mat = (uint8_t)(mi < 255 ? mi : 255);
         nmat++;
+        /* Ш8 (§575): КООРДИНАТА ТЕКСТУРЫ БЕРЁТСЯ ОТТУДА ЖЕ, ОТКУДА МАТЕРИАЛ —
+         * по ТОМУ ЖЕ треугольнику `ls[0]`, барицентрикой в точке вершины DC.
+         * Вершина лежит НА поверхности по построению, поэтому проекции не
+         * нужно; барицентрика считается в плоскости треугольника, и при выходе
+         * за него (вершина ячейки чуть в стороне) координаты не отбрасываются,
+         * а ЗАЖИМАЮТСЯ — иначе край поверхности остался бы без текстуры. */
+        if (uvs != NULL && m.ft != NULL && m.vt != NULL) {
+          const double *A2, *B2, *C2;
+          tri_verts(&m, ls[0], &A2, &B2, &C2);
+          double e1[3], e2[3], vp[3];
+          for (int k = 0; k < 3; k++) {
+            e1[k] = B2[k] - A2[k];
+            e2[k] = C2[k] - A2[k];
+            vp[k] = fr.org[k] + vw[k] * fr.h - A2[k];
+          }
+          double d11 = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
+          double d12 = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
+          double d22 = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
+          double dp1 = vp[0] * e1[0] + vp[1] * e1[1] + vp[2] * e1[2];
+          double dp2 = vp[0] * e2[0] + vp[1] * e2[1] + vp[2] * e2[2];
+          double dn = d11 * d22 - d12 * d12;
+          if (fabs(dn) > 0.0) {
+            double bu = (d22 * dp1 - d12 * dp2) / dn;
+            double bv = (d11 * dp2 - d12 * dp1) / dn;
+            if (bu < 0.0) bu = 0.0;
+            if (bv < 0.0) bv = 0.0;
+            if (bu + bv > 1.0) {
+              double s2 = bu + bv;
+              bu /= s2;
+              bv /= s2;
+            }
+            int32_t q0 = m.ft[3 * (size_t)ls[0] + 0], q1 = m.ft[3 * (size_t)ls[0] + 1],
+                    q2 = m.ft[3 * (size_t)ls[0] + 2];
+            if (q0 >= 0 && q1 >= 0 && q2 >= 0 && q0 < m.nvt && q1 < m.nvt && q2 < m.nvt) {
+              for (int k = 0; k < 2; k++)
+                uvs[2 * (size_t)i + (size_t)k] = (float)(m.vt[2 * (size_t)q0 + (size_t)k] +
+                                                         bu * (m.vt[2 * (size_t)q1 + (size_t)k] -
+                                                               m.vt[2 * (size_t)q0 + (size_t)k]) +
+                                                         bv * (m.vt[2 * (size_t)q2 + (size_t)k] -
+                                                               m.vt[2 * (size_t)q0 + (size_t)k]));
+              nuv++;
+            }
+          }
+        }
       }
-      printf("   МАТЕРИАЛ В СРЕЗЕ: назначен %lld ячейкам из %d, материалов в сцене %d\n",
-             (long long)nmat, S.n, m.nmtl);
+      printf("   МАТЕРИАЛ В СРЕЗЕ: назначен %lld ячейкам из %d, материалов в сцене %d; "
+             "КООРДИНАТА ТЕКСТУРЫ у %lld (%.1f %%)\n",
+             (long long)nmat, S.n, m.nmtl, (long long)nuv,
+             100.0 * (double)nuv / (double)(S.n ? S.n : 1));
     }
 
     float *irr = malloc(3 * (size_t)S.n * sizeof *irr);
@@ -7552,7 +7662,16 @@ int main(int argc, char **argv) {
       if (w995 > 0.0) white = w995;
       free(tmpw);
     }
-    litctx LC = {&S, key, ord, irr, &fr, NULL, NULL, 0, 0, NULL, white, nocull, 0, 0, NULL, 0};
+    litctx LC;
+    memset(&LC, 0, sizeof LC);
+    LC.S = &S;
+    LC.key = key;
+    LC.ord = ord;
+    LC.irr = irr;
+    LC.fr = &fr;
+    LC.white = white;
+    LC.nocull = nocull;
+    LC.uvs = uvs;
     tr3_camera cam;
     if (tr3_camera_look(&cam, eyec, atc, upc, HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0, res,
                         res) == 0) {
@@ -7569,6 +7688,53 @@ int main(int argc, char **argv) {
       LC.h = res;
       LC.defcol = calloc(np * 3, sizeof *LC.defcol);
       if (LC.defcol == NULL) exit(1);
+      /* Ш8 (§575): ЗАГРУЗКА ТЕКСТУР. Имя из `map_Kd`, каталог — `ppm256` рядом
+       * с текстурами сцены (готовит `scripts/tex_prep.sh`). Отсутствующая
+       * текстура НЕ ошибка: материал остаётся одноцветным, и число таких
+       * ПЕЧАТАЕТСЯ, а не замалчивается (А891). */
+      if (uvs != NULL && !g_texflat) {
+        LC.texrgb = calloc((size_t)m.nmtl, sizeof *LC.texrgb);
+        LC.texw = calloc((size_t)m.nmtl, sizeof *LC.texw);
+        LC.texh = calloc((size_t)m.nmtl, sizeof *LC.texh);
+        LC.defuv = calloc(np * 2, sizeof *LC.defuv);
+        LC.defmat = calloc(np, 1);
+        if (LC.texrgb == NULL || LC.texw == NULL || LC.texh == NULL || LC.defuv == NULL ||
+            LC.defmat == NULL)
+          exit(1);
+        char dir[512];
+        snprintf(dir, sizeof dir, "%s", argv[1]);
+        char *sl = strrchr(dir, '/');
+        if (sl != NULL)
+          *sl = '\0';
+        else
+          dir[0] = '\0';
+        int64_t nload = 0, nmiss = 0, tbytes = 0;
+        double tt0 = now_s();
+        for (int32_t mi2 = 0; mi2 < m.nmtl; mi2++) {
+          if (m.mtl[mi2].tex[0] == '\0') continue;
+          /* ПУТЬ В `map_Kd` ОТБРАСЫВАЕТСЯ, И РАЗДЕЛИТЕЛЬ ТАМ ОБРАТНЫЙ. У
+           * Сан-Мигеля стоит `textures\individual_b.png` — экспортёр писал под
+           * Windows. Берём только имя файла: каталог у нас свой (`ppm256`), и
+           * доверять пути из чужого файла на недоверенном входе нельзя тем
+           * более. Замерено: без этого нашлось `0` текстур из `271`. */
+          const char *nm2 = m.mtl[mi2].tex;
+          for (const char *s2 = nm2; *s2 != '\0'; s2++)
+            if (*s2 == '/' || *s2 == '\\') nm2 = s2 + 1;
+          char base[160];
+          snprintf(base, sizeof base, "%s", nm2);
+          char *dot = strrchr(base, '.');
+          if (dot != NULL) *dot = '\0';
+          char path2[900];
+          snprintf(path2, sizeof path2, "%s/textures/ppm256/%s.ppm", dir, base);
+          if (hz_ppm_read(path2, &LC.texrgb[mi2], &LC.texw[mi2], &LC.texh[mi2]) == 0) {
+            nload++;
+            tbytes += (int64_t)LC.texw[mi2] * LC.texh[mi2] * 3;
+          } else
+            nmiss++;
+        }
+        printf("   Ш8 ТЕКСТУРЫ: загружено %lld, не найдено %lld, память %.1f МБ, за %.2f с\n",
+               (long long)nload, (long long)nmiss, (double)tbytes / 1048576.0, now_s() - tt0);
+      }
       ta = now_s();
       /* §573: РАЗДЕЛЕНИЕ ОБХОДА И РАСТЕРИЗАЦИИ. «УБИВАЕТ» §572 сработало
        * (126 мс против порога 100), и условие требует профилировать, а не

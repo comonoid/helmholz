@@ -75,11 +75,12 @@ static const char *parse_int(const char *p, long *out, int *ok) {
 /* Один угол грани: `v`, `v/vt`, `v//vn`, `v/vt/vn`. Индексы 1-базовые, а
  * отрицательные отсчитываются от ЧИСЛА ВИДЕННЫХ К ЭТОМУ МОМЕНТУ (см. заголовок).
  * `*ivn` = −1, если нормали у угла нет. */
-static const char *parse_fvert(const char *p, int32_t nv_seen, int32_t nvn_seen, int32_t *iv,
-                               int32_t *ivn, int *ok) {
+static const char *parse_fvert(const char *p, int32_t nv_seen, int32_t nvn_seen, int32_t nvt_seen,
+                               int32_t *iv, int32_t *ivn, int32_t *ivt, int *ok) {
   long a = 0;
   int got = 0;
   *ivn = -1;
+  *ivt = -1;
   p = parse_int(p, &a, &got);
   if (!got) {
     *ok = 0;
@@ -94,11 +95,15 @@ static const char *parse_fvert(const char *p, int32_t nv_seen, int32_t nvn_seen,
   if (*p == '/') {
     p++;
     if (*p != '/') {
+      /* Ш8 (§575): координата текстуры БОЛЬШЕ НЕ ВЫБРАСЫВАЕТСЯ. Отсрочка §2
+       * снята: без `vt` текстуру некуда прикладывать. */
       long vt = 0;
       int g2 = 0;
-      p = parse_int(p, &vt, &g2); /* координата текстуры: до Ш8 не нужна */
-      (void)vt;
-      (void)g2;
+      p = parse_int(p, &vt, &g2);
+      if (g2) {
+        long tdx = (vt > 0) ? vt - 1 : (long)nvt_seen + vt;
+        if (tdx >= 0 && tdx < (long)nvt_seen) *ivt = (int32_t)tdx;
+      }
     }
     if (*p == '/') {
       p++;
@@ -226,6 +231,19 @@ static void mtl_load(hz_objmesh *m, const char *objpath, const char *name, size_
       m->mtl[cur].ior = strtod(p + 2, NULL);
     } else if (p[0] == 0x64 && is_sp(p[1]) && cur >= 0) {
       m->mtl[cur].alpha = strtod(p + 1, NULL);
+    } else if (strncmp(p, "map_Kd", 6) == 0 && is_sp(p[6]) && cur >= 0) {
+      /* Ш8 (§575): имя файла диффузной текстуры. Хранится ИМЯ, а не картинка:
+       * загрузчик сцены не должен знать форматов изображений. */
+      const char *q2 = skip_sp(p + 6);
+      const char *e2 = q2;
+      while (*e2 != '\0' && *e2 != '\n' && *e2 != '\r')
+        e2++;
+      while (e2 > q2 && is_sp(e2[-1]))
+        e2--;
+      size_t ln = (size_t)(e2 - q2);
+      if (ln >= sizeof m->mtl[cur].tex) ln = sizeof m->mtl[cur].tex - 1;
+      memcpy(m->mtl[cur].tex, q2, ln);
+      m->mtl[cur].tex[ln] = '\0';
     } else if (strncmp(p, "hz_flat", 7) == 0 && is_sp(p[7]) && cur >= 0) {
       m->mtl[cur].flat = (strtod(p + 7, NULL) > 0.5);
     }
@@ -239,6 +257,8 @@ static void mtl_load(hz_objmesh *m, const char *objpath, const char *name, size_
 void hz_obj_free(hz_objmesh *m) {
   free(m->v);
   free(m->vn);
+  free(m->vt);
+  free(m->ft);
   free(m->f);
   free(m->fn);
   free(m->fm);
@@ -284,13 +304,15 @@ int hz_obj_parse(hz_objmesh *m, const char *buf, double scale, const char *objpa
   if (buf == NULL) return 3;
 
   /* --- проход 1: счёт. Растущих массивов нет ровно поэтому. --- */
-  int64_t nv = 0, nvn = 0, ntri = 0, nquad = 0;
+  int64_t nv = 0, nvn = 0, nvt = 0, ntri = 0, nquad = 0;
   for (const char *p = buf; *p != '\0'; p = skip_line(p)) {
     const char *q = skip_sp(p);
     if (q[0] == 'v' && is_sp(q[1])) {
       nv++;
     } else if (q[0] == 'v' && q[1] == 'n' && is_sp(q[2])) {
       nvn++;
+    } else if (q[0] == 'v' && q[1] == 't' && is_sp(q[2])) {
+      nvt++;
     } else if (q[0] == 'f' && is_sp(q[1])) {
       int k = count_tokens(q + 1);
       if (k >= 3) {
@@ -306,6 +328,11 @@ int hz_obj_parse(hz_objmesh *m, const char *buf, double scale, const char *objpa
 
   m->v = malloc((size_t)(nv > 0 ? nv : 1) * 3 * sizeof *m->v);
   m->vn = (nvn > 0) ? malloc((size_t)nvn * 3 * sizeof *m->vn) : NULL;
+  /* Ш8 (§575): координаты текстуры. `NULL`, если их в файле нет, — и тогда
+   * текстура к сцене неприменима, что говорится числом, а не молчанием. */
+  m->vt = (nvt > 0) ? malloc((size_t)nvt * 2 * sizeof *m->vt) : NULL;
+  m->ft = (nvt > 0) ? malloc((size_t)(ntri > 0 ? ntri : 1) * 3 * sizeof *m->ft) : NULL;
+  m->nvt = (int32_t)nvt;
   m->f = malloc((size_t)(ntri > 0 ? ntri : 1) * 3 * sizeof *m->f);
   m->fn = malloc((size_t)(ntri > 0 ? ntri : 1) * 3 * sizeof *m->fn);
   m->fm = malloc((size_t)(ntri > 0 ? ntri : 1) * sizeof *m->fm);
@@ -327,7 +354,7 @@ int hz_obj_parse(hz_objmesh *m, const char *buf, double scale, const char *objpa
     m->lo[a] = 1e300;
     m->hi[a] = -1e300;
   }
-  int32_t cv = 0, cvn = 0, cur_mtl = 0;
+  int32_t cv = 0, cvn = 0, cvt = 0, cur_mtl = 0;
   int64_t ct = 0, ndeg = 0;
   int bad = 0;
 
@@ -363,6 +390,13 @@ int hz_obj_parse(hz_objmesh *m, const char *buf, double scale, const char *objpa
       m->vn[(size_t)cvn * 3 + 1] = y / n;
       m->vn[(size_t)cvn * 3 + 2] = z / n;
       cvn++;
+    } else if (q[0] == 'v' && q[1] == 't' && is_sp(q[2]) && m->vt != NULL) {
+      char *e = NULL;
+      double u = strtod(q + 2, &e);
+      double v2 = strtod(e, &e);
+      m->vt[(size_t)cvt * 2 + 0] = u;
+      m->vt[(size_t)cvt * 2 + 1] = v2;
+      cvt++;
     } else if (strncmp(q, "usemtl", 6) == 0 && is_sp(q[6])) {
       const char *s = skip_sp(q + 6);
       const char *e = skip_token(s);
@@ -374,14 +408,14 @@ int hz_obj_parse(hz_objmesh *m, const char *buf, double scale, const char *objpa
       if (objpath != NULL) mtl_load(m, objpath, s, (size_t)(e - s));
     } else if (q[0] == 'f' && is_sp(q[1])) {
       /* Веер (0, i, i+1): грани входа плоские и выпуклые (заголовок). */
-      int32_t first = -1, prev = -1, fnfirst = -1, fnprev = -1;
+      int32_t first = -1, prev = -1, fnfirst = -1, fnprev = -1, ftfirst = -1, ftprev = -1;
       const char *s = q + 1;
       for (;;) {
         s = skip_sp(s);
         if (is_eol(*s)) break;
-        int32_t iv = 0, ivn = -1;
+        int32_t iv = 0, ivn = -1, ivt = -1;
         int ok = 0;
-        s = parse_fvert(s, cv, cvn, &iv, &ivn, &ok);
+        s = parse_fvert(s, cv, cvn, cvt, &iv, &ivn, &ivt, &ok);
         if (!ok) {
           bad = 1;
           break;
@@ -390,9 +424,11 @@ int hz_obj_parse(hz_objmesh *m, const char *buf, double scale, const char *objpa
         if (first < 0) {
           first = iv;
           fnfirst = ivn;
+          ftfirst = ivt;
         } else if (prev < 0) {
           prev = iv;
           fnprev = ivn;
+          ftprev = ivt;
         } else {
           m->f[(size_t)ct * 3 + 0] = first;
           m->f[(size_t)ct * 3 + 1] = prev;
@@ -400,6 +436,11 @@ int hz_obj_parse(hz_objmesh *m, const char *buf, double scale, const char *objpa
           m->fn[(size_t)ct * 3 + 0] = fnfirst;
           m->fn[(size_t)ct * 3 + 1] = fnprev;
           m->fn[(size_t)ct * 3 + 2] = ivn;
+          if (m->ft != NULL) {
+            m->ft[(size_t)ct * 3 + 0] = ftfirst;
+            m->ft[(size_t)ct * 3 + 1] = ftprev;
+            m->ft[(size_t)ct * 3 + 2] = ivt;
+          }
           m->fm[ct] = cur_mtl;
           if (hz_obj_tri_area(m, (int32_t)ct) > 0.0) {
             ct++;
@@ -408,6 +449,7 @@ int hz_obj_parse(hz_objmesh *m, const char *buf, double scale, const char *objpa
           }
           prev = iv;
           fnprev = ivn;
+          ftprev = ivt;
         }
       }
     }

@@ -136,3 +136,68 @@ int hz_ppm_write_signed(const char *path, const double *field, int w, int h) {
   free(rgb);
   return rc;
 }
+
+/* Ш8 (§575): читатель PPM `P6` — см. заголовок. Комментарии по одному пробелу
+ * между полями допускаются (`#` до конца строки), потому что их пишет
+ * ImageMagick. */
+static int ppm_tok(FILE *f, long *out) {
+  int c;
+  for (;;) {
+    do {
+      c = fgetc(f);
+    } while (c == 32 || c == 9 || c == 10 || c == 13);
+    if (c == 35) { /* комментарий до конца строки */
+      do {
+        c = fgetc(f);
+      } while (c != 10 && c != 13 && c != EOF);
+      continue;
+    }
+    break;
+  }
+  if (c < 48 || c > 57) return -1;
+  long v = 0;
+  while (c >= 48 && c <= 57) {
+    if (v > 100000000L) return -1; /* битый вход, а не большая картинка */
+    v = v * 10 + (c - 48);
+    c = fgetc(f);
+  }
+  *out = v;
+  return 0;
+}
+
+int hz_ppm_read(const char *path, unsigned char **rgb, int *w, int *h) {
+  *rgb = NULL;
+  *w = *h = 0;
+  FILE *f = fopen(path, "rb");
+  if (f == NULL) return 1;
+  int c1 = fgetc(f), c2 = fgetc(f);
+  if (c1 != 80 || c2 != 54) { /* "P6" */
+    fclose(f);
+    return 2;
+  }
+  long ww = 0, hh = 0, mx = 0;
+  if (ppm_tok(f, &ww) != 0 || ppm_tok(f, &hh) != 0 || ppm_tok(f, &mx) != 0) {
+    fclose(f);
+    return 3;
+  }
+  if (ww <= 0 || hh <= 0 || mx != 255 || ww > 16384 || hh > 16384) {
+    fclose(f);
+    return 4;
+  }
+  size_t n = (size_t)ww * (size_t)hh * 3;
+  unsigned char *b = malloc(n);
+  if (b == NULL) {
+    fclose(f);
+    return 5;
+  }
+  if (fread(b, 1, n, f) != n) {
+    free(b);
+    fclose(f);
+    return 6;
+  }
+  fclose(f);
+  *rgb = b;
+  *w = (int)ww;
+  *h = (int)hh;
+  return 0;
+}

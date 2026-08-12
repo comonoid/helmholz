@@ -2226,6 +2226,12 @@ static int g_lobetest = 0, g_dlobeflat = 0;
 static int g_ffull = 0, g_fzero = 0, g_fnotrans = 0;
 /* Ф12. (§549): сторона коробки стенда; 0 — стенд не гоняется. */
 static int g_diffbench = 0, g_onenb = 0, g_schar = 0, g_scharax = 0;
+/* Ф14. (§557): поячеечное сличение свипа с гатером; `cmpself` — подсунуть один
+ * и тот же массив дважды (проверка на ложный ноль, А1002). */
+static int g_cmpcell = 0, g_cmpself = 0;
+/* А1001: прореживание излучателей гатера — ручкой, чтобы мерить ЕГО собственный
+ * разброс тем же прибором. 0 — прежний автоматический выбор. */
+static int g_gstride = 0;
 /* Перебивка узости и зеркальной доли для СВИПА без правки сцены; -1 у `dks` —
  * «не перебивать», брать из материала. */
 static double g_dns = 0.0, g_dks = -1.0;
@@ -3911,6 +3917,18 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "onenb") == 0) g_onenb = 1;
     /* Ф13. (§553): короткие характеристики; `scharax` — негативный контроль. */
     if (strcmp(argv[i], "schar") == 0) g_schar = 1;
+    if (strcmp(argv[i], "cmpcell") == 0) {
+      g_cmpcell = 1;
+      g_dsweep = 1;
+      lit = 1;
+    }
+    if (strncmp(argv[i], "gstride=", 8) == 0) g_gstride = (int)strtol(argv[i] + 8, NULL, 10);
+    if (strcmp(argv[i], "cmpself") == 0) {
+      g_cmpself = 1;
+      g_cmpcell = 1;
+      g_dsweep = 1;
+      lit = 1;
+    }
     if (strcmp(argv[i], "scharax") == 0) {
       g_schar = 1;
       g_scharax = 1;
@@ -6332,6 +6350,7 @@ int main(int argc, char **argv) {
      * ЦЕНА ОЖИДАЕТСЯ ПЛОХОЙ И ПРЕДСКАЗАНА ДО ПРОГОНА (§430, П5б.3): это замер,
      * обосновывающий свип, а не попытка уложиться в бюджет. */
     float *ind = calloc(3 * (size_t)S.n, sizeof *ind);
+    float *indsw = NULL;
     if (ind == NULL) exit(1);
     /* ---- Ф9' (§536): САМАЯ УЗКАЯ ДОЛЯ, КОТОРУЮ НЕСЁТ ДАННОЕ ND ---- */
     /* ЗАМЕР БЕЗ ПЕРЕНОСА, И ЭТО СОЗНАТЕЛЬНО. Граница «до какой узости ординаты
@@ -6745,8 +6764,16 @@ int main(int argc, char **argv) {
           free(aw3);
         }
       }
-      for (int32_t i = 0; i < 3 * S.n; i++)
-        irr[i] += ind[i];
+      /* Ф14. (§557): при сличении свип не вливается в `irr` — иначе гатер, идущий
+       * следом, считал бы отскок от уже подсвеченной поверхности. */
+      if (g_cmpcell) {
+        indsw = malloc(3 * (size_t)S.n * sizeof *indsw);
+        if (indsw == NULL) exit(1);
+        memcpy(indsw, ind, 3 * (size_t)S.n * sizeof *indsw);
+        memset(ind, 0, 3 * (size_t)S.n * sizeof *ind);
+      } else
+        for (int32_t i = 0; i < 3 * S.n; i++)
+          irr[i] += ind[i];
       free(D.Ld);
       free(D.Bs);
       free(D.Bn);
@@ -6850,6 +6877,7 @@ int main(int argc, char **argv) {
       int32_t stride = 1;
       while ((int64_t)(SRC2->n / (stride > 0 ? stride : 1)) * (int64_t)S.n > 200000000LL)
         stride *= 2;
+      if (g_gstride > 0) stride = g_gstride;
       double tb = now_s();
       int64_t nemit = 0;
       double sthru = 0.0, sall = 0.0;
@@ -6929,8 +6957,109 @@ int main(int argc, char **argv) {
         printf("      §474 СКВОЗЬ ЗАСЛОНЫ: %.2f %% энергии отскока идёт путём, пересекающим "
                "занятую ячейку%s\n",
                100.0 * sthru / (sall > 0.0 ? sall : 1.0), indvis ? " (и ОТБРОШЕНА)" : "");
+      /* ---- Ф14' (§557): ПОЯЧЕЕЧНОЕ СЛИЧЕНИЕ СВИПА С ГАТЕРОМ ---- */
+      /* СУММАРНОЕ ЧИСЛО НЕ РАЗЛИЧАЕТ ДВЕ БОЛЕЗНИ: постоянный множитель (тогда
+       * это ошибка нормировки, и схема ни при чём) и потерю с расстоянием
+       * (тогда виноват перенос). Спутать их — потерять целый шаг на постройку
+       * схемы, которая не нужна; в проекте так уже выходило трижды (А933,
+       * А955, А994).
+       * ОТНОШЕНИЕ С НУЛЯМИ — НЕ ВЕЛИЧИНА (А999): берутся ячейки, где ГАТЕР выше
+       * порога от собственной медианы, а выброшенное считается тремя
+       * счётчиками, а не прячется.
+       * ГАТЕР — НЕ ИСТИНА, А ВТОРАЯ СХЕМА (А1001): его собственный разброс
+       * меряется тем же прибором через `hgather=` и `stride`. */
+      if (g_cmpcell && indsw != NULL) {
+        const float *A1 = indsw, *B1 = g_cmpself ? indsw : ind;
+        double *gv = malloc((size_t)S.n * sizeof *gv);
+        double *rt = malloc((size_t)S.n * sizeof *rt);
+        if (gv == NULL || rt == NULL) exit(1);
+        int64_t ng = 0;
+        for (int32_t i = 0; i < S.n; i++) {
+          double b = 0.0;
+          for (int k = 0; k < 3; k++)
+            b += (double)B1[3 * (size_t)i + (size_t)k];
+          if (b > 0.0) gv[ng++] = b;
+        }
+        double gmed = 0.0;
+        if (ng > 0) {
+          qsort(gv, (size_t)ng, sizeof *gv, cmp_d);
+          gmed = gv[ng / 2];
+        }
+        /* Порог назван ОТ ДАННЫХ, а не с потолка: тысячная медианы гатера. */
+        double thr2 = 1e-3 * gmed;
+        int64_t nboth0 = 0, ngz = 0, nsz = 0, nuse = 0;
+        /* Корзины по расстоянию ДО БЛИЖАЙШЕГО ИЗЛУЧАТЕЛЯ ПО ПРЯМОЙ. Величина
+         * названа честно (А1000): за стеной она даёт НИЖНЮЮ оценку длины пути,
+         * и если зависимость на такой оси найдётся — вывод тем крепче. */
+        static const double DB[4] = {0.5, 1.5, 3.0, 1e9};
+        double bs[4] = {0, 0, 0, 0}, bn[4] = {0, 0, 0, 0};
+        for (int32_t i = 0; i < S.n; i++) {
+          double a = 0.0, b = 0.0;
+          for (int k = 0; k < 3; k++) {
+            a += (double)A1[3 * (size_t)i + (size_t)k];
+            b += (double)B1[3 * (size_t)i + (size_t)k];
+          }
+          if (!(a > 0.0) && !(b > 0.0)) {
+            nboth0++;
+            continue;
+          }
+          if (!(b > thr2)) {
+            if (a > 0.0) ngz++;
+            continue;
+          }
+          if (!(a > 0.0)) nsz++;
+          rt[nuse++] = a / b;
+          double pw[3];
+          hz_slice_vertex(&S, i, pw);
+          for (int k = 0; k < 3; k++)
+            pw[k] = fr.org[k] + pw[k] * fr.h;
+          double dmin = 1e300;
+          for (int32_t j = 0; j < S.n; j += 16) {
+            if (!(irr[3 * (size_t)j] > 0.0f)) continue;
+            double pj2[3], d2 = 0.0;
+            hz_slice_vertex(&S, j, pj2);
+            for (int k = 0; k < 3; k++) {
+              double dd = fr.org[k] + pj2[k] * fr.h - pw[k];
+              d2 += dd * dd;
+            }
+            if (d2 < dmin) dmin = d2;
+          }
+          dmin = sqrt(dmin);
+          for (int bq = 0; bq < 4; bq++)
+            if (dmin < DB[bq]) {
+              bs[bq] += a / b;
+              bn[bq] += 1.0;
+              break;
+            }
+        }
+        if (nuse > 0) {
+          qsort(rt, (size_t)nuse, sizeof *rt, cmp_d);
+          double p10 = rt[nuse / 10], p50 = rt[nuse / 2], p90 = rt[(nuse * 9) / 10];
+          printf("   Ф14' СВИП / ГАТЕР ПОЯЧЕЕЧНО%s: p10 %.4f, p50 %.4f, p90 %.4f, "
+                 "p90/p10 = %.2f по %lld ячейкам\n",
+                 g_cmpself ? " [cmpself: обязано быть 1.0000]" : "", p10, p50, p90,
+                 p10 > 0.0 ? p90 / p10 : 0.0, (long long)nuse);
+          printf("      ВЫБРОШЕНО: обе нули %lld, гатер ниже порога при ненулевом свипе %lld, "
+                 "свип ноль при живом гатере %lld (порог %.3e = 1e-3 медианы)\n",
+                 (long long)nboth0, (long long)ngz, (long long)nsz, thr2);
+          printf("      ПО РАССТОЯНИЮ ДО БЛИЖАЙШЕГО ИЗЛУЧАТЕЛЯ (по прямой, НИЖНЯЯ оценка "
+                 "пути):\n");
+          static const char *DN[4] = {"< 0.5 м", "0.5…1.5 м", "1.5…3 м", "> 3 м"};
+          for (int bq = 0; bq < 4; bq++)
+            printf("         %-10s среднее отношение %.4f по %.0f ячейкам\n", DN[bq],
+                   bn[bq] > 0.0 ? bs[bq] / bn[bq] : 0.0, bn[bq]);
+        }
+        free(gv);
+        free(rt);
+      }
       for (int32_t i = 0; i < 3 * S.n; i++)
         irr[i] += ind[i];
+      if (indsw != NULL) {
+        for (int32_t i = 0; i < 3 * S.n; i++)
+          irr[i] += indsw[i];
+        free(indsw);
+        indsw = NULL;
+      }
       if (g_emitthr > 0.0) {
         free(irre);
         hz_slice_free(&SE);

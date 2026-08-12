@@ -2225,7 +2225,7 @@ static int g_lobetest = 0, g_dlobeflat = 0;
 /* Ф11. (§545): `ffull` — вернуть булев заслон (сведение); `fzero` — НК. */
 static int g_ffull = 0, g_fzero = 0, g_fnotrans = 0;
 /* Ф12. (§549): сторона коробки стенда; 0 — стенд не гоняется. */
-static int g_diffbench = 0, g_onenb = 0;
+static int g_diffbench = 0, g_onenb = 0, g_schar = 0, g_scharax = 0;
 /* Перебивка узости и зеркальной доли для СВИПА без правки сцены; -1 у `dks` —
  * «не перебивать», брать из материала. */
 static double g_dns = 0.0, g_dks = -1.0;
@@ -2577,6 +2577,10 @@ typedef struct {
    * поперечного перемешивания нет вовсе. Разброс обязан остаться нулём, а
    * коридор — пропустить почти всё. */
   int onenb;
+  /* Ф13. (§553): короткие характеристики; `scharax` — НК (шаг назад вдоль оси,
+   * а не вдоль ω); счётчики опор — сколько раз сработала перенормировка. */
+  int schar, scharax;
+  int64_t nschar, nrenorm;
   double *fstat;
   int64_t nfstat, nfone;
 } dfield;
@@ -2638,11 +2642,77 @@ static void dsweep_leaf(const stree *T, dfield *D, int32_t ni, const double om[3
   if (D->vis[ni]) return;
   double lin[3] = {0.0, 0.0, 0.0}, wsum = 0.0;
   int amj = 0;
-  if (D->onenb) {
-    for (int a = 1; a < 3; a++)
-      if (fabs(om[a]) > fabs(om[amj])) amj = a;
+  for (int a = 1; a < 3; a++)
+    if (fabs(om[a]) > fabs(om[amj])) amj = a;
+  /* --- КОРОТКИЕ ХАРАКТЕРИСТИКИ (Ф13', §553) --------------------------------
+   * Трёхгранное среднее раздаёт значение всем трём нисходящим соседям, отчего
+   * носитель растёт на ячейку за шаг — конус, а не диффузия (§551). Здесь
+   * вместо среднего берётся значение В ТОЧКЕ, ОТКУДА ЛУЧ ПРИШЁЛ: из центра
+   * листа шагнуть назад вдоль `ω` до входной грани и интерполировать там
+   * билинейно по четырём соседям. Направление тогда помнится геометрически, а
+   * не «в среднем».
+   * ЗАСЛОНЁННЫЕ И НЕПОСЧИТАННЫЕ ОПОРЫ исключаются из веса, а сумма
+   * нормируется на принятые — то же правило, без которого §534 потерял
+   * тридцатикратно (А943). Сколько раз перенормировка сработала, СЧИТАЕТСЯ
+   * (А990): если часто, у результата есть названная оговорка. */
+  if (D->schar) {
+    int u = (amj + 1) % 3, v = (amj + 2) % 3;
+    double s = (double)T->nd[ni].size;
+    double c[3];
+    for (int a = 0; a < 3; a++)
+      c[a] = (double)T->nd[ni].lo[a] + 0.5 * s;
+    /* Шаг назад до входной грани. `scharax` — НЕГАТИВНЫЙ КОНТРОЛЬ: шагать вдоль
+     * главной ОСИ, то есть брать точку не на луче. Снос центроида обязан
+     * вырасти линейно, и если он не вырастет — стенд к направлению слеп. */
+    /* ШАГ НАЗАД — ДО ПЛОСКОСТИ ЦЕНТРОВ СОСЕДЕЙ, А НЕ ДО ГРАНИ. Первая редакция
+     * брала `0.5·s/|ω|` (до грани), а опорные значения при этом лежат на
+     * ПОЛКЛЕТКИ дальше — в центрах соседних ячеек. Рассогласование в половину
+     * шага давало ЛИНЕЙНЫЙ СНОС пучка: замерено `3.896` ячейки к слою 32 при
+     * счётном `0.5·|ω_⊥|/|ω_amj|·32 = 3.89`. Поймано ровно тем, что стенд
+     * печатает снос ОТДЕЛЬНО от разброса (А992) — одной величиной это читалось
+     * бы как «схема стала резче». */
+    double t = s / fabs(om[amj]);
+    double p[3];
+    for (int a = 0; a < 3; a++)
+      p[a] = D->scharax ? c[a] : c[a] - om[a] * t;
+    p[amj] = om[amj] > 0.0 ? (double)T->nd[ni].lo[amj] - 0.5 : (double)T->nd[ni].lo[amj] + s + 0.5;
+    double fu = p[u] - 0.5, fv = p[v] - 0.5;
+    double bu = floor(fu), bv = floor(fv);
+    double gu = fu - bu, gv = fv - bv;
+    double acc2[3] = {0.0, 0.0, 0.0}, aw2 = 0.0;
+    int dropped = 0;
+    for (int du = 0; du < 2; du++)
+      for (int dv = 0; dv < 2; dv++) {
+        double ww = (du ? gu : 1.0 - gu) * (dv ? gv : 1.0 - gv);
+        if (!(ww > 0.0)) continue;
+        int32_t q[3];
+        q[amj] = (int32_t)floor(p[amj]);
+        q[u] = (int32_t)bu + du;
+        q[v] = (int32_t)bv + dv;
+        int ok = 1;
+        for (int a = 0; a < 3; a++)
+          if (q[a] < 0 || q[a] >= T->gn) ok = 0;
+        if (!ok) {
+          dropped = 1;
+          continue;
+        }
+        int32_t nj = T->idx[hz_occ_index(T->gn, q[0], q[1], q[2])];
+        if (nj < 0 || !D->vis[nj]) {
+          dropped = 1;
+          continue;
+        }
+        aw2 += ww;
+        for (int k = 0; k < 3; k++)
+          acc2[k] += ww * (double)D->Ld[3 * (size_t)nj + (size_t)k];
+      }
+    if (aw2 > 0.0)
+      for (int k = 0; k < 3; k++)
+        lin[k] = acc2[k] / aw2;
+    if (dropped) D->nrenorm++;
+    D->nschar++;
+    wsum = 1.0; /* реконструкция закончена: дальше — только граничное условие */
   }
-  for (int a = 0; a < 3; a++) {
+  for (int a = 0; a < 3 && !D->schar; a++) {
     if (D->onenb && a != amj) continue;
     double w = fabs(om[a]);
     if (!(w > 0.0)) continue;
@@ -2810,6 +2880,8 @@ static void diffbench(int nb, int corridor) {
   D.cstart = calloc((size_t)T.n + 1, sizeof *D.cstart);
   D.cw = 1.0;
   D.onenb = g_onenb;
+  D.schar = g_schar;
+  D.scharax = g_scharax;
   if (D.Ld == NULL || D.srf == NULL || D.vis == NULL || D.cstart == NULL || D.Ap == NULL) exit(1);
   /* НАПРАВЛЕНИЯ ВЫБИРАЮТСЯ ЧИСЛОМ (А981): «почти осевое» — с наибольшим
    * `max|ω_a| / Σ|ω_a|`, «диагональное» — с наименьшим. Осевых в наборе нет по
@@ -2898,26 +2970,46 @@ static void diffbench(int nb, int corridor) {
     for (int k = 0; k < 3; k++)
       D.Ld[3 * (size_t)pl + (size_t)k] = 1.0f;
     dsweep_rec(&T, &D, 0, om, 1.0, 0);
-    printf("   A2 КАРАНДАШ (%s): слой |  max L  | Σ L (поток) | разброс σ, ячеек\n", dnm[t]);
+    /* СНОС И РАЗБРОС ПОРОЗНЬ (А992). В §551 они были смешаны: у `onenb` пучок
+     * не расплывается вовсе, но целиком уезжает с луча, и одна величина
+     * показывала это как «разброс». Снос — смещение ЦЕНТРОИДА от точного луча;
+     * разброс — среднеквадратичное ВОКРУГ ЦЕНТРОИДА. */
+    printf("   A2 КАРАНДАШ (%s): слой |  max L  | Σ L поток | СНОС | разброс | ненулевых\n",
+           dnm[t]);
     for (int32_t kk = 4; kk <= nb - 4; kk *= 2) {
-      double mx2 = 0.0, s0 = 0.0, s2 = 0.0;
-      for (int32_t i = 0; i < T.n; i++) {
-        if (T.nd[i].child0 >= 0) continue;
-        int32_t cm = T.nd[i].lo[amaj];
-        int32_t off = om[amaj] > 0.0 ? cm - pc[amaj] : pc[amaj] - cm;
-        if (off != kk) continue;
-        double v = (double)D.Ld[3 * (size_t)i];
-        if (v > mx2) mx2 = v;
-        s0 += v;
-        double dd = 0.0;
-        for (int a = 0; a < 3; a++) {
-          if (a == amaj) continue;
-          double ax2 = (double)T.nd[i].lo[a] - ((double)pc[a] + (double)kk * om[a] / om[amaj]);
-          dd += ax2 * ax2;
+      int u2 = (amaj + 1) % 3, v2 = (amaj + 2) % 3;
+      double eu = (double)pc[u2] + (double)kk * om[u2] / fabs(om[amaj]);
+      double ev = (double)pc[v2] + (double)kk * om[v2] / fabs(om[amaj]);
+      double mx2 = 0.0, s0 = 0.0, cu = 0.0, cv = 0.0, s2 = 0.0;
+      int64_t nnz = 0;
+      for (int pass2 = 0; pass2 < 2; pass2++) {
+        for (int32_t i = 0; i < T.n; i++) {
+          if (T.nd[i].child0 >= 0) continue;
+          int32_t cm = T.nd[i].lo[amaj];
+          int32_t off = om[amaj] > 0.0 ? cm - pc[amaj] : pc[amaj] - cm;
+          if (off != kk) continue;
+          double vv = (double)D.Ld[3 * (size_t)i];
+          if (!(vv > 0.0)) continue;
+          double du = (double)T.nd[i].lo[u2], dv = (double)T.nd[i].lo[v2];
+          if (pass2 == 0) {
+            if (vv > mx2) mx2 = vv;
+            s0 += vv;
+            cu += vv * du;
+            cv += vv * dv;
+            nnz++;
+          } else {
+            double au = du - cu, av = dv - cv;
+            s2 += vv * (au * au + av * av);
+          }
         }
-        s2 += v * dd;
+        if (pass2 == 0 && s0 > 0.0) {
+          cu /= s0;
+          cv /= s0;
+        }
       }
-      printf("      %4d  | %.6f | %.6f | %.3f\n", kk, mx2, s0, s0 > 0.0 ? sqrt(s2 / s0) : 0.0);
+      printf("      %4d  | %.6f | %.6f | %.3f | %.3f | %lld\n", kk, mx2, s0,
+             sqrt((cu - eu) * (cu - eu) + (cv - ev) * (cv - ev)), s0 > 0.0 ? sqrt(s2 / s0) : 0.0,
+             (long long)nnz);
     }
   }
   if (corridor) {
@@ -3817,6 +3909,12 @@ int main(int argc, char **argv) {
     /* Ф12. (§549): стенд на диффузию правила переноса. */
     if (strncmp(argv[i], "diffbench=", 10) == 0) g_diffbench = (int)strtol(argv[i] + 10, NULL, 10);
     if (strcmp(argv[i], "onenb") == 0) g_onenb = 1;
+    /* Ф13. (§553): короткие характеристики; `scharax` — негативный контроль. */
+    if (strcmp(argv[i], "schar") == 0) g_schar = 1;
+    if (strcmp(argv[i], "scharax") == 0) {
+      g_schar = 1;
+      g_scharax = 1;
+    }
     /* НЕГАТИВНЫЙ КОНТРОЛЬ §541: прежняя ТОЧЕЧНАЯ формула. Закон обязан пасть. */
     if (strcmp(argv[i], "ptlight") == 0) g_ptlight = 1;
     if (strncmp(argv[i], "dns=", 4) == 0) g_dns = strtod(argv[i] + 4, NULL);
@@ -6359,6 +6457,9 @@ int main(int argc, char **argv) {
       D.fone = g_ffull;
       D.fzero = g_fzero;
       D.fnotrans = g_fnotrans;
+      D.schar = g_schar;
+      D.scharax = g_scharax;
+      D.onenb = g_onenb;
       D.cw = fr.h * (double)((int32_t)1 << HZ_SWEEP_DROP);
       D.Ap = calloc((size_t)TD.n, sizeof *D.Ap);
       D.fstat = malloc((size_t)HZ_FSTAT_CAP * sizeof *D.fstat);

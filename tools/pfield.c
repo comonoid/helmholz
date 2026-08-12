@@ -2228,7 +2228,7 @@ static int g_ffull = 0, g_fzero = 0, g_fnotrans = 0;
 static int g_diffbench = 0, g_onenb = 0, g_schar = 0, g_scharax = 0;
 /* Ф14. (§557): поячеечное сличение свипа с гатером; `cmpself` — подсунуть один
  * и тот же массив дважды (проверка на ложный ноль, А1002). */
-static int g_cmpcell = 0, g_cmpself = 0;
+static int g_cmpcell = 0, g_cmpself = 0, g_fnoclamp = 0;
 /* А1001: прореживание излучателей гатера — ручкой, чтобы мерить ЕГО собственный
  * разброс тем же прибором. 0 — прежний автоматический выбор. */
 static int g_gstride = 0;
@@ -2586,6 +2586,12 @@ typedef struct {
   /* Ф13. (§553): короткие характеристики; `scharax` — НК (шаг назад вдоль оси,
    * а не вдоль ω); счётчики опор — сколько раз сработала перенормировка. */
   int schar, scharax;
+  /* Ф15. (§561): бюджет излучения. `fnoclamp` — снять обрезку ТОЛЬКО в
+   * излучающем члене (А1010); `emitact`/`emitcut` — излучено и обрезано;
+   * `frawv` — выборка сырых `f` среди упёршихся в единицу. */
+  int fnoclamp;
+  double *emitact, *emitcut, *frawv;
+  int64_t nfraw;
   int64_t nschar, nrenorm;
   double *fstat;
   int64_t nfstat, nfone;
@@ -2785,7 +2791,22 @@ static void dsweep_leaf(const stree *T, dfield *D, int32_t ni, const double om[3
       double h = (double)T->nd[ni].size * D->cw;
       double cell = h * h * sab;
       f = cell > 0.0 ? (double)D->Ap[ni] * fabs(dn) / cell : 1.0;
-      if (f > 1.0) f = 1.0;
+      /* БЮДЖЕТ ИЗЛУЧЕНИЯ (Ф15', §561). Обрезка `min(1, f)` выбрасывает энергию
+       * там, где ячейка среза шире листа и вся её площадь свалена в один узел.
+       * Считается ДВЕ величины порознь (А1009): сколько обрезано и сколько
+       * площади лежит сверх собственного сечения листа — вторая и есть перекос
+       * раскладки, первая лишь его следствие. */
+      double fraw = f;
+      if (f > 1.0) {
+        if (D->emitcut != NULL)
+          *D->emitcut += wd * (fraw - 1.0) * (double)D->Bs[3 * (size_t)ni] * cell;
+        if (D->frawv != NULL && D->nfraw < (int64_t)HZ_FSTAT_CAP) D->frawv[D->nfraw++] = fraw;
+        /* А1010: обрезка снимается ТОЛЬКО в излучающем члене; иначе проходящий
+         * член `(1−f)` стал бы отрицательным, и опыт мерил бы бессмыслицу. */
+        if (!D->fnoclamp) f = 1.0;
+      }
+      if (D->emitact != NULL)
+        *D->emitact += wd * (f > 1.0 ? f : f) * (double)D->Bs[3 * (size_t)ni] * cell;
       if (D->fzero) f = 0.0;
       if (D->fstat != NULL) {
         D->fstat[D->nfstat & (HZ_FSTAT_CAP - 1)] = f;
@@ -2817,7 +2838,7 @@ static void dsweep_leaf(const stree *T, dfield *D, int32_t ni, const double om[3
        * насквозь. Чтобы сказать, какая половина что делает, `fnotrans`
        * оставляет первую и выключает вторую. */
       D->Ld[3 * (size_t)ni + (size_t)k] =
-          (float)(f * bo + (D->fnotrans ? 0.0 : (1.0 - f) * lin[k]));
+          (float)(f * bo + (D->fnotrans ? 0.0 : (f < 1.0 ? 1.0 - f : 0.0) * lin[k]));
     }
   } else if (D->srf[ni] == 2 && !D->blkopen) {
     for (int k = 0; k < 3; k++)
@@ -3584,6 +3605,45 @@ static double alight_sum(const arealight *L, const double p[3], const double nr[
   return acc;
 }
 
+/* САМОПРОВЕРКА БЮДЖЕТА ИЗЛУЧЕНИЯ (§561, требование А1008). Прежде чем читать
+ * невязку на сцене, надо убедиться, что `Φ_факт` и `Φ_аналит` — одна и та же
+ * величина, а не спор о `π`. Ответ известен точно: площадка `A` с радиосити `B`
+ * излучает в полусферу поток `A·B`.
+ * `Φ_факт` в коде складывается как `Σ_d w_d · f · Bs · h²Σ|ω_a|`, где
+ * `Bs = B/π` — радианс, `f = A|ω·n|/(h²Σ|ω_a|)`. Подставив, получаем
+ * `Σ_d w_d · A|ω·n| · B/π` — а это в точности `A·B/π · ∫|cos| dω` по полусфере,
+ * то есть `A·B/π · π = A·B`. Проверяется квадратурой, а не рассуждением. */
+static void emitbudget_selftest(void) {
+  const double PI = 3.14159265358979323846;
+  tr3_dirs DR;
+  if (tr3_dirs_product(&DR, 4, 4) != 0) exit(1);
+  double A = 0.37, B = 2.4, h = 1.0; /* площадка меньше сечения листа: обрезки нет */
+  double n[3] = {0.0, 1.0, 0.0};
+  double acc = 0.0;
+  int64_t ncut = 0;
+  for (int d = 0; d < DR.n; d++) {
+    double om[3] = {DR.ox[d], DR.oy[d], DR.oz[d]};
+    double dn = om[0] * n[0] + om[1] * n[1] + om[2] * n[2];
+    if (!(dn > 0.0)) continue; /* наружная полусфера */
+    double sab = fabs(om[0]) + fabs(om[1]) + fabs(om[2]);
+    double cell = h * h * sab;
+    double f = A * fabs(dn) / cell;
+    if (f > 1.0) {
+      f = 1.0;
+      ncut++;
+    }
+    acc += DR.w[d] * f * (B / PI) * cell;
+  }
+  printf("== БЮДЖЕТ ИЗЛУЧЕНИЯ, САМОПРОВЕРКА (§561): Φ_факт = %.6f против A·B = %.6f, "
+         "расхождение %.3f %% (порог 2 %%); обрезано направлений %lld\n",
+         acc, A * B, 100.0 * fabs(acc - A * B) / (A * B), (long long)ncut);
+  if (!(fabs(acc - A * B) / (A * B) < 0.02)) {
+    printf("   ПРОВАЛ: Φ_факт и Φ_аналит — разные величины, невязку на сцене читать нельзя.\n");
+    exit(3);
+  }
+  tr3_dirs_free(&DR);
+}
+
 static void alight_selftest(void) {
   const double PI = 3.14159265358979323846;
   arealight L;
@@ -3912,6 +3972,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "ffull") == 0) g_ffull = 1;
     if (strcmp(argv[i], "fzero") == 0) g_fzero = 1;
     if (strcmp(argv[i], "fnotrans") == 0) g_fnotrans = 1;
+    if (strcmp(argv[i], "fnoclamp") == 0) g_fnoclamp = 1;
     /* Ф12. (§549): стенд на диффузию правила переноса. */
     if (strncmp(argv[i], "diffbench=", 10) == 0) g_diffbench = (int)strtol(argv[i] + 10, NULL, 10);
     if (strcmp(argv[i], "onenb") == 0) g_onenb = 1;
@@ -4046,6 +4107,7 @@ int main(int argc, char **argv) {
    * И всё же ДО всякого счёта: смысл исполнителя в том, чтобы негодная модель
    * света не доживала до первого замера. */
   alight_selftest();
+  emitbudget_selftest();
   if (g_diffbench > 0) {
     diffbench(g_diffbench, 1);
     return 0;
@@ -6476,6 +6538,12 @@ int main(int argc, char **argv) {
       D.fone = g_ffull;
       D.fzero = g_fzero;
       D.fnotrans = g_fnotrans;
+      D.fnoclamp = g_fnoclamp;
+      double emact = 0.0, emcut = 0.0;
+      D.emitact = &emact;
+      D.emitcut = &emcut;
+      D.frawv = malloc((size_t)HZ_FSTAT_CAP * sizeof *D.frawv);
+      if (D.frawv == NULL) exit(1);
       D.schar = g_schar;
       D.scharax = g_scharax;
       D.onenb = g_onenb;
@@ -6738,6 +6806,41 @@ int main(int argc, char **argv) {
                  (long long)D.nfstat);
           free(fc);
         }
+        /* Ф15' (§561): БЮДЖЕТ ИЗЛУЧЕНИЯ. `Φ_аналит` — сколько поверхность
+         * обязана излучить в полусферу (`Σ A_i·irr_i`); `Φ_факт` — сколько
+         * излучено; `Φ_обрезано` — съеденное обрезкой `min(1, f)`.
+         * ПЕРЕКОС РАСКЛАДКИ (А1009) считается ОТДЕЛЬНО: `Σ max(0, A_p − h²)` —
+         * сколько площади лежит в листьях сверх их собственного сечения. Это и
+         * есть болезнь; обрезка — лишь её следствие. */
+        {
+          double phan = 0.0, over = 0.0, atot2 = 0.0;
+          for (int32_t i = 0; i < S.n; i++)
+            for (int k = 0; k < 3; k++)
+              phan += sar[i] * (double)irr[3 * (size_t)i + (size_t)k];
+          for (int32_t l3 = 0; l3 < TD.n; l3++) {
+            if (TD.nd[l3].child0 >= 0 || D.srf[l3] != 1) continue;
+            double hl = (double)TD.nd[l3].size * D.cw;
+            atot2 += (double)D.Ap[l3];
+            if ((double)D.Ap[l3] > hl * hl) over += (double)D.Ap[l3] - hl * hl;
+          }
+          printf("      Ф15' БЮДЖЕТ ИЗЛУЧЕНИЯ: Φ_аналит %.4e, Φ_факт %.4e, Φ_обрезано %.4e; "
+                 "невязка %.2f %%%s\n",
+                 phan, emact * 3.0, emcut * 3.0,
+                 100.0 * (phan - emact * 3.0 - emcut * 3.0) / (phan > 0.0 ? phan : 1.0),
+                 g_fnoclamp ? "  [fnoclamp: обрезка СНЯТА]" : "");
+          printf("      Ф15' ПЕРЕКОС РАСКЛАДКИ (А1009): площади сверх сечения листа %.4e из "
+                 "%.4e (%.1f %%)\n",
+                 over, atot2, 100.0 * over / (atot2 > 0.0 ? atot2 : 1.0));
+          if (D.nfraw > 0) {
+            qsort(D.frawv, (size_t)D.nfraw, sizeof *D.frawv, cmp_d);
+            printf("      Ф15' СЫРОЕ f СРЕДИ УПЁРШИХСЯ: p50 %.3f, p90 %.3f, max %.3f по %lld "
+                   "случаям\n",
+                   D.frawv[D.nfraw / 2], D.frawv[(D.nfraw * 9) / 10], D.frawv[D.nfraw - 1],
+                   (long long)D.nfraw);
+          }
+          emact = emcut = 0.0;
+          D.nfraw = 0;
+        }
         D.nfstat = 0;
         D.nfone = 0;
         /* МНОГОКРАТНЫЕ ОТРАЖЕНИЯ БЕЗ МАТРИЦЫ (довод №3 §523): следующая
@@ -6782,6 +6885,7 @@ int main(int argc, char **argv) {
       free(D.Bns);
       free(D.Ap);
       free(D.fstat);
+      free(D.frawv);
       free(D.srf);
       free(D.vis);
       free(D.cstart);

@@ -2224,6 +2224,8 @@ static int g_dsweep = 0, g_dnmu = 2, g_dnphi = 2, g_dpass = 1, g_dirsall = 0, g_
 static int g_lobetest = 0, g_dlobeflat = 0;
 /* Ф11. (§545): `ffull` — вернуть булев заслон (сведение); `fzero` — НК. */
 static int g_ffull = 0, g_fzero = 0, g_fnotrans = 0;
+/* Ф12. (§549): сторона коробки стенда; 0 — стенд не гоняется. */
+static int g_diffbench = 0, g_onenb = 0;
 /* Перебивка узости и зеркальной доли для СВИПА без правки сцены; -1 у `dks` —
  * «не перебивать», брать из материала. */
 static double g_dns = 0.0, g_dks = -1.0;
@@ -2571,11 +2573,32 @@ typedef struct {
   float *Ap;
   double cw;
   int fone, fzero, fnotrans;
+  /* НЕГАТИВНЫЙ КОНТРОЛЬ §549: брать ОДНОГО входного соседа по главной оси —
+   * поперечного перемешивания нет вовсе. Разброс обязан остаться нулём, а
+   * коридор — пропустить почти всё. */
+  int onenb;
   double *fstat;
   int64_t nfstat, nfone;
 } dfield;
 
-/* --- Ф9' (§536): ШИРИНА ДОЛИ РАССЕЯНИЯ ИЗ МАТЕРИАЛА ------------------------ */
+/* --- Ф12. (§549): СТЕНД НА ДИФФУЗИЮ ПРАВИЛА ПЕРЕНОСА ---------------------- */
+
+/* ЗАЧЕМ СТЕНД, А НЕ СЦЕНА. На комнате в одном числе смешаны четыре механизма
+ * (угловая дискретизация, толщина заслона, поглощение, диффузия), и А977 отверг
+ * три из них замером, оставив четвёртый непроверенным. Здесь ответ ИЗВЕСТЕН:
+ * в пустоте радианс постоянен вдоль луча, пучок не расплывается, поток
+ * сохраняется. Всё, что схема сделает сверх этого, и есть её диффузия.
+ *
+ * ПРАВИЛО БЕРЁТСЯ НАСТОЯЩЕЕ. Дерево строится синтетически (пирамида занятости —
+ * все единицы, отчего листья выходят размера 1 и равномерными), а зовутся те же
+ * `stree_links` и `dsweep_rec`. Копия правила разошлась бы с оригиналом, и цена
+ * этому в проекте уже заплачена (§531, §541).
+ *
+ * КОНСЕРВАТИВНОСТЬ ДОКАЗЫВАЕТСЯ БАЛАНСОМ, А НЕ ПОТОКОМ ЧЕРЕЗ СЛОЙ (А979): у
+ * косого `ω` часть пучка уходит в боковую грань раньше, чем доходит до слоя, и
+ * падение потока через слой смешало бы «схема теряет» с «пучок вышел». Поэтому
+ * считается вытекшее ЧЕРЕЗ ВСЕ ГРАНИ и сверяется с втекшим. */
+/* --- Ф9. (§536): ШИРИНА ДОЛИ РАССЕЯНИЯ ИЗ МАТЕРИАЛА ------------------------ */
 
 /* ЧТО ЗАДАЁТСЯ ОДНИМ ЧИСЛОМ. `f_r = ρ_d/π + ρ_s·(s+2)/(2π)·cos^s α`, где `α` —
  * угол между исходящим направлением и зеркальным отражением входящего
@@ -2607,8 +2630,20 @@ static double lobe(double cosa, double ns) {
  * бы собственное излучение. */
 static void dsweep_leaf(const stree *T, dfield *D, int32_t ni, const double om[3], double wd,
                         int dirsall) {
+  /* УЖЕ ПОСЧИТАН — не трогать. В рабочем пути этого не случается никогда
+   * (`vis` обнуляется перед каждым направлением, а обход посещает лист ровно
+   * раз), и потому поведение не меняется; проверяется побитовостью (§549 П5).
+   * Нужно это СТЕНДУ (§551): им он зажигает входную грань и защищает её от
+   * пересчёта, пользуясь НАСТОЯЩИМ правилом, а не копией. */
+  if (D->vis[ni]) return;
   double lin[3] = {0.0, 0.0, 0.0}, wsum = 0.0;
+  int amj = 0;
+  if (D->onenb) {
+    for (int a = 1; a < 3; a++)
+      if (fabs(om[a]) > fabs(om[amj])) amj = a;
+  }
   for (int a = 0; a < 3; a++) {
+    if (D->onenb && a != amj) continue;
     double w = fabs(om[a]);
     if (!(w > 0.0)) continue;
     /* Входная грань по оси `a`: свет идёт в сторону `sign(om[a])`, значит
@@ -2734,6 +2769,229 @@ static void dsweep_rec(const stree *T, dfield *D, int32_t ni, const double om[3]
     return;
   }
   dsweep_leaf(T, D, ni, om, wd, dirsall);
+}
+
+/* ОТСТУПЛЕНИЕ ОТ §549, ЗАПИСАННОЕ, А НЕ СДЕЛАННОЕ МОЛЧА. План велел доказывать
+ * консервативность балансом «втекло = вышло сбоку + дошло» (А979). Здесь стоит
+ * проверка СТРОЖЕ и проще: РАВНОМЕРНЫЙ ВТОК. Если вся входная граница горит
+ * `L = 1`, точное решение есть `L ≡ 1` во всём объёме, бокового вытока нет по
+ * построению, и любое отклонение от единицы — ошибка схемы, без примесей.
+ * Возражение А979 при этом снимается само: терять некуда. Карандаш остаётся —
+ * он меряет не потери, а РАСПЛЫВАНИЕ, и для него баланс не нужен. */
+static void diffbench(int nb, int corridor) {
+  int lev = 0;
+  while ((1 << lev) < nb)
+    lev++;
+  opyr P;
+  memset(&P, 0, sizeof P);
+  P.lev = lev;
+  for (int l = 0; l <= lev; l++) {
+    int32_t n2 = (int32_t)1 << l;
+    size_t byc = hz_occ_bytes((size_t)n2 * (size_t)n2 * (size_t)n2);
+    P.b[l] = malloc(byc);
+    if (P.b[l] == NULL) exit(1);
+    memset(P.b[l], 0xFF, byc); /* всё занято ⇒ дерево дробится до листа-ячейки */
+  }
+  stree T;
+  double eye0[3] = {0.0, 0.0, 0.0};
+  stree_build(&T, &P, lev, 0, nb, eye0, 1.0, 0.0);
+  stree_links(&T, nb);
+  dfield D;
+  memset(&D, 0, sizeof D);
+  D.Ld = calloc(3 * (size_t)T.n, sizeof *D.Ld);
+  D.Bs = calloc(3 * (size_t)T.n, sizeof *D.Bs);
+  D.Bn = calloc(3 * (size_t)T.n, sizeof *D.Bn);
+  D.Bsp = calloc(3 * (size_t)T.n, sizeof *D.Bsp);
+  D.Bwi = calloc(3 * (size_t)T.n, sizeof *D.Bwi);
+  D.Bns = calloc((size_t)T.n, sizeof *D.Bns);
+  D.Ap = calloc((size_t)T.n, sizeof *D.Ap);
+  D.srf = calloc((size_t)T.n, 1);
+  D.vis = calloc((size_t)T.n, 1);
+  D.cstart = calloc((size_t)T.n + 1, sizeof *D.cstart);
+  D.cw = 1.0;
+  D.onenb = g_onenb;
+  if (D.Ld == NULL || D.srf == NULL || D.vis == NULL || D.cstart == NULL || D.Ap == NULL) exit(1);
+  /* НАПРАВЛЕНИЯ ВЫБИРАЮТСЯ ЧИСЛОМ (А981): «почти осевое» — с наибольшим
+   * `max|ω_a| / Σ|ω_a|`, «диагональное» — с наименьшим. Осевых в наборе нет по
+   * построению (`dirs3.h`), и на глаз их не отобрать. */
+  tr3_dirs DR;
+  if (tr3_dirs_product(&DR, 2, 4) != 0) exit(1);
+  int dax = 0, ddg = 0;
+  double bax = -1.0, bdg = 2.0;
+  for (int d = 0; d < DR.n; d++) {
+    double ax = fabs(DR.ox[d]), ay = fabs(DR.oy[d]), az = fabs(DR.oz[d]);
+    double mx = ax > ay ? (ax > az ? ax : az) : (ay > az ? ay : az);
+    double q = mx / (ax + ay + az);
+    if (q > bax) {
+      bax = q;
+      dax = d;
+    }
+    if (q < bdg) {
+      bdg = q;
+      ddg = d;
+    }
+  }
+  printf("== Ф12' СТЕНД НА ДИФФУЗИЮ: коробка %d³, листьев %d\n"
+         "   почти осевое ω = (%.4f, %.4f, %.4f), max|ω|/Σ|ω| = %.4f\n"
+         "   диагональное ω = (%.4f, %.4f, %.4f), max|ω|/Σ|ω| = %.4f\n",
+         nb, T.nleaf, DR.ox[dax], DR.oy[dax], DR.oz[dax], bax, DR.ox[ddg], DR.oy[ddg], DR.oz[ddg],
+         bdg);
+  int dsel[2] = {dax, ddg};
+  const char *dnm[2] = {"почти осевое", "диагональное"};
+  for (int t = 0; t < 2; t++) {
+    int d = dsel[t];
+    double om[3] = {DR.ox[d], DR.oy[d], DR.oz[d]};
+    /* --- A1. РАВНОМЕРНЫЙ ВТОК: точный ответ L ≡ 1 --- */
+    memset(D.vis, 0, (size_t)T.n);
+    memset(D.Ld, 0, 3 * (size_t)T.n * sizeof *D.Ld);
+    for (int32_t i = 0; i < T.n; i++) {
+      if (T.nd[i].child0 >= 0) continue;
+      int on = 0;
+      for (int a = 0; a < 3; a++) {
+        int32_t c = T.nd[i].lo[a];
+        if (om[a] > 0.0 ? (c == 0) : (c == nb - 1)) on = 1;
+      }
+      if (!on) continue;
+      D.vis[i] = 1u;
+      for (int k = 0; k < 3; k++)
+        D.Ld[3 * (size_t)i + (size_t)k] = 1.0f;
+    }
+    dsweep_rec(&T, &D, 0, om, 1.0, 0);
+    double wmin = 1e300, wmax = -1e300;
+    int64_t nin = 0;
+    for (int32_t i = 0; i < T.n; i++) {
+      if (T.nd[i].child0 >= 0) continue;
+      double v = (double)D.Ld[3 * (size_t)i];
+      if (v < wmin) wmin = v;
+      if (v > wmax) wmax = v;
+      nin++;
+    }
+    printf("   A1 РАВНОМЕРНЫЙ ВТОК (%s): L ∈ [%.9f, %.9f] при точном 1, "
+           "макс отклонение %.3e по %lld листьям\n",
+           dnm[t], wmin, wmax,
+           fabs(wmax - 1.0) > fabs(1.0 - wmin) ? fabs(wmax - 1.0) : fabs(1.0 - wmin),
+           (long long)nin);
+    /* --- A2. КАРАНДАШ: точный ответ — не расплывается --- */
+    memset(D.vis, 0, (size_t)T.n);
+    memset(D.Ld, 0, 3 * (size_t)T.n * sizeof *D.Ld);
+    int32_t c0[3];
+    for (int a = 0; a < 3; a++)
+      c0[a] = om[a] > 0.0 ? 0 : nb - 1;
+    for (int32_t i = 0; i < T.n; i++) {
+      if (T.nd[i].child0 >= 0) continue;
+      int on = 0;
+      for (int a = 0; a < 3; a++)
+        if (T.nd[i].lo[a] == c0[a]) on = 1;
+      if (on) D.vis[i] = 1u; /* граница втока: вносит ноль, а не выпадает из веса */
+    }
+    int32_t pc[3] = {nb / 2, nb / 2, nb / 2};
+    for (int a = 0; a < 3; a++)
+      pc[a] = om[a] > 0.0 ? 1 : nb - 2;
+    /* Карандаш ставится на оси коробки по тем осям, вдоль которых он идёт вглубь. */
+    int amaj = 0;
+    for (int a = 1; a < 3; a++)
+      if (fabs(om[a]) > fabs(om[amaj])) amaj = a;
+    for (int a = 0; a < 3; a++)
+      if (a != amaj) pc[a] = nb / 2;
+    int32_t pl = T.idx[hz_occ_index(nb, pc[0], pc[1], pc[2])];
+    D.vis[pl] = 1u;
+    for (int k = 0; k < 3; k++)
+      D.Ld[3 * (size_t)pl + (size_t)k] = 1.0f;
+    dsweep_rec(&T, &D, 0, om, 1.0, 0);
+    printf("   A2 КАРАНДАШ (%s): слой |  max L  | Σ L (поток) | разброс σ, ячеек\n", dnm[t]);
+    for (int32_t kk = 4; kk <= nb - 4; kk *= 2) {
+      double mx2 = 0.0, s0 = 0.0, s2 = 0.0;
+      for (int32_t i = 0; i < T.n; i++) {
+        if (T.nd[i].child0 >= 0) continue;
+        int32_t cm = T.nd[i].lo[amaj];
+        int32_t off = om[amaj] > 0.0 ? cm - pc[amaj] : pc[amaj] - cm;
+        if (off != kk) continue;
+        double v = (double)D.Ld[3 * (size_t)i];
+        if (v > mx2) mx2 = v;
+        s0 += v;
+        double dd = 0.0;
+        for (int a = 0; a < 3; a++) {
+          if (a == amaj) continue;
+          double ax2 = (double)T.nd[i].lo[a] - ((double)pc[a] + (double)kk * om[a] / om[amaj]);
+          dd += ax2 * ax2;
+        }
+        s2 += v * dd;
+      }
+      printf("      %4d  | %.6f | %.6f | %.3f\n", kk, mx2, s0, s0 > 0.0 ? sqrt(s2 / s0) : 0.0);
+    }
+  }
+  if (corridor) {
+    /* --- B. КОРИДОР: стены поглощают, поток обязан дойти целиком --- */
+    int d = dax;
+    double om[3] = {DR.ox[d], DR.oy[d], DR.oz[d]};
+    int amaj = 0;
+    for (int a = 1; a < 3; a++)
+      if (fabs(om[a]) > fabs(om[amaj])) amaj = a;
+    printf("   B КОРИДОР (%s, ось %d): ширина | доля дошедшего потока на длине %d\n", dnm[0], amaj,
+           nb - 8);
+    for (int W = 4; W <= 16; W *= 2) {
+      memset(D.srf, 0, (size_t)T.n);
+      memset(D.vis, 0, (size_t)T.n);
+      memset(D.Ld, 0, 3 * (size_t)T.n * sizeof *D.Ld);
+      for (int32_t i = 0; i < T.n; i++) {
+        if (T.nd[i].child0 >= 0) continue;
+        int wall = 0;
+        for (int a = 0; a < 3; a++) {
+          if (a == amaj) continue;
+          if (labs((long)T.nd[i].lo[a] - (long)(nb / 2)) > W / 2) wall = 1;
+        }
+        if (wall) D.srf[i] = 2u; /* ЧЁРНАЯ стена: гасит, не светит */
+      }
+      /* РАЗМЕТКА ВТОКА. Первая редакция метила посчитанным всё, у чего ХОТЬ ОДНА
+       * координата не дошла до плоскости источника, — то есть почти всю
+       * коробку, и свип не делал ничего (все три ширины дали ровно ноль).
+       * Верно так: посчитанными метятся ТОЛЬКО грани втока (по каждой оси — та,
+       * с которой приходит свет), а источник — плоскость `lo[amaj] == c1`
+       * внутри коридора. */
+      int32_t c1 = om[amaj] > 0.0 ? 2 : nb - 3;
+      int64_t nsrc = 0;
+      for (int32_t i = 0; i < T.n; i++) {
+        if (T.nd[i].child0 >= 0) continue;
+        int on = 0;
+        for (int a = 0; a < 3; a++) {
+          int32_t c = T.nd[i].lo[a];
+          if (om[a] > 0.0 ? (c == 0) : (c == nb - 1)) on = 1;
+        }
+        if (on) D.vis[i] = 1u;
+      }
+      for (int32_t i = 0; i < T.n; i++) {
+        if (T.nd[i].child0 >= 0 || D.srf[i] != 0) continue;
+        if (T.nd[i].lo[amaj] != c1) continue;
+        D.vis[i] = 1u;
+        for (int k = 0; k < 3; k++)
+          D.Ld[3 * (size_t)i + (size_t)k] = 1.0f;
+        nsrc++;
+      }
+      dsweep_rec(&T, &D, 0, om, 1.0, 0);
+      int32_t c2 = om[amaj] > 0.0 ? nb - 6 : 5;
+      double sin2 = (double)nsrc, sout = 0.0;
+      for (int32_t i = 0; i < T.n; i++) {
+        if (T.nd[i].child0 >= 0 || D.srf[i] != 0) continue;
+        if (T.nd[i].lo[amaj] != c2) continue;
+        sout += (double)D.Ld[3 * (size_t)i];
+      }
+      printf("      %4d  | %.4f  (втекло по %lld ячейкам)\n", W, sin2 > 0.0 ? sout / sin2 : 0.0,
+             (long long)nsrc);
+    }
+  }
+  free(D.Ld);
+  free(D.Bs);
+  free(D.Bn);
+  free(D.Bsp);
+  free(D.Bwi);
+  free(D.Bns);
+  free(D.Ap);
+  free(D.srf);
+  free(D.vis);
+  free(D.cstart);
+  tr3_dirs_free(&DR);
+  stree_free(&T);
+  opyr_free(&P);
 }
 
 static void tsweep_rec(stree *T, const opyr *P, int lev, int drop, const double sc[3], int32_t ni) {
@@ -3556,6 +3814,9 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "ffull") == 0) g_ffull = 1;
     if (strcmp(argv[i], "fzero") == 0) g_fzero = 1;
     if (strcmp(argv[i], "fnotrans") == 0) g_fnotrans = 1;
+    /* Ф12. (§549): стенд на диффузию правила переноса. */
+    if (strncmp(argv[i], "diffbench=", 10) == 0) g_diffbench = (int)strtol(argv[i] + 10, NULL, 10);
+    if (strcmp(argv[i], "onenb") == 0) g_onenb = 1;
     /* НЕГАТИВНЫЙ КОНТРОЛЬ §541: прежняя ТОЧЕЧНАЯ формула. Закон обязан пасть. */
     if (strcmp(argv[i], "ptlight") == 0) g_ptlight = 1;
     if (strncmp(argv[i], "dns=", 4) == 0) g_dns = strtod(argv[i] + 4, NULL);
@@ -3669,6 +3930,10 @@ int main(int argc, char **argv) {
    * И всё же ДО всякого счёта: смысл исполнителя в том, чтобы негодная модель
    * света не доживала до первого замера. */
   alight_selftest();
+  if (g_diffbench > 0) {
+    diffbench(g_diffbench, 1);
+    return 0;
+  }
   if (lev < 1 || lev > HZ_DC_MAX_LOG2SIZE) {
     fprintf(stderr, "lev вне разрядного предела (1..%d)\n", HZ_DC_MAX_LOG2SIZE);
     return 2;

@@ -2275,6 +2275,10 @@ static int g_render = 0;
 /* §567: потолок LOD по угловому размеру ячейки, пикселей. По умолчанию равен
  * порогу невязки — иначе правка вводила бы ДВА новых числа сразу. */
 static double g_lodceil = 1.0;
+/* §572: размер таблицы гаммы (`HZ_GAMN` объявлен у растеризатора; здесь стоит то
+ * же число, потому что макрос определён ниже по файлу). Негативный контроль
+ * `gam16` ломает её нарочно — картинка обязана пойти полосами. */
+static int g_gamn = 4096;
 /* Секундомеры сводки: заполняются рабочими стадиями по ходу. */
 static double g_t0 = 0.0, g_t_frame = 0.0, g_t_fslice = 0.0, g_t_fdir = 0.0, g_t_fras = 0.0,
               g_t_bounce = 0.0;
@@ -3790,6 +3794,11 @@ typedef struct {
   double white;
   int nocull;           /* НЕГАТИВНЫЙ КОНТРОЛЬ: отсечение выключено */
   int64_t nseen, ncull; /* сколько многоугольников пришло и сколько отброшено */
+  /* Р3 (§572): буфер отложенного затенения — радианс на пиксель, три канала.
+   * `nfrag` — сколько фрагментов прошло z; отношение к числу закрытых пикселей
+   * есть ГЛУБИНА ПЕРЕКРЫТИЯ, и от неё прямо зависит выигрыш Р3. */
+  float *defcol;
+  int64_t nfrag;
 } litctx;
 
 static int lit_find(const litctx *L, const hz_dcref *r) {
@@ -3844,24 +3853,58 @@ static void lit_tri(litctx *L, const double p[3][3], const double col[3][3]) {
   double d31x = sx[2] - sx[0], d31y = sy[2] - sy[0];
   double det = d21x * d31y - d21y * d31x;
   if (!(fabs(det) > 0.0)) return;
+  /* Р1 (§572): `1/det` ВЫНЕСЕНО. Прежде на каждый пиксель ограничивающей
+   * коробки — включая отвергнутые — приходилось ДВА деления; теперь два
+   * умножения. */
+  double inv = 1.0 / det;
+  double dz1 = sz[1] - sz[0], dz2 = sz[2] - sz[0];
   for (int py = iy0; py <= iy1; py++)
     for (int px = ix0; px <= ix1; px++) {
       double qx = (double)px + 0.5 - sx[0], qy = (double)py + 0.5 - sy[0];
-      double u = (qx * d31y - qy * d31x) / det, v = (qy * d21x - qx * d21y) / det;
+      double u = (qx * d31y - qy * d31x) * inv, v = (qy * d21x - qx * d21y) * inv;
       if (u < 0.0 || v < 0.0 || u + v > 1.0) continue;
-      double zz = sz[0] + u * (sz[1] - sz[0]) + v * (sz[2] - sz[0]);
+      double zz = sz[0] + u * dz1 + v * dz2;
       size_t k = (size_t)py * (size_t)L->w + (size_t)px;
       if (zz >= L->z[k]) continue;
       L->z[k] = zz;
-      for (int c = 0; c < 3; c++) {
-        double e = col[0][c] + u * (col[1][c] - col[0][c]) + v * (col[2][c] - col[0][c]);
-        double t = e / L->white;
-        if (t < 0.0) t = 0.0;
-        if (t > 1.0) t = 1.0;
-        double g = pow(t, 1.0 / 2.2);
-        L->rgb[3 * k + (size_t)c] = (unsigned char)(g * 255.0 + 0.5);
-      }
+      L->nfrag++;
+      /* Р3 (§572): ОТЛОЖЕННОЕ ЗАТЕНЕНИЕ. Здесь только запоминается, ЧЕМ пиксель
+       * закрыт; цвет и гамма считаются ОДИН раз на видимый пиксель после
+       * обхода. Прежде гамма платилась за каждый прошедший z фрагмент, а
+       * большая часть их затиралась следующими треугольниками — то есть работа
+       * делалась и выбрасывалась. */
+      for (int c = 0; c < 3; c++)
+        L->defcol[3 * k + (size_t)c] =
+            (float)(col[0][c] + u * (col[1][c] - col[0][c]) + v * (col[2][c] - col[0][c]));
     }
+}
+
+/* Р2 (§572): ГАММА ТАБЛИЦЕЙ. Выход всё равно байт, поэтому `4096` шагов дают
+ * ошибку ниже половины кванта ПО ПОСТРОЕНИЮ, а не по замеру. `pow` при этом
+ * зовётся `4096` раз на кадр вместо трёх раз на фрагмент.
+ * `HZ_GAMN` — размер таблицы, а не порог: он назван здесь, потому что от него
+ * зависит точность, и негативный контроль (`gam16`) её ломает нарочно. */
+#define HZ_GAMN 4096
+static void lit_resolve(litctx *L, int gamn) {
+  unsigned char *lut = malloc((size_t)gamn);
+  if (lut == NULL) exit(1);
+  for (int i = 0; i < gamn; i++) {
+    double t = ((double)i + 0.5) / (double)gamn;
+    lut[i] = (unsigned char)(pow(t, 1.0 / 2.2) * 255.0 + 0.5);
+  }
+  size_t np = (size_t)L->w * (size_t)L->h;
+  for (size_t k = 0; k < np; k++) {
+    if (L->z[k] >= 1e299) continue; /* пиксель не закрыт ничем */
+    for (int c = 0; c < 3; c++) {
+      double t = (double)L->defcol[3 * k + (size_t)c] / L->white;
+      if (t < 0.0) t = 0.0;
+      if (t > 1.0) t = 1.0;
+      int ix = (int)(t * (double)gamn);
+      if (ix >= gamn) ix = gamn - 1;
+      L->rgb[3 * k + (size_t)c] = lut[ix];
+    }
+  }
+  free(lut);
 }
 
 /* ОТСЕЧЕНИЕ ДО ПРОЕКЦИИ (Ш5в). Срез строится на ПОЛНЫЙ ШАР — так и задумано
@@ -3890,6 +3933,16 @@ static int lit_cull(const litctx *L, const double w[4][3], int nv) {
     if (uu > zz * cm->tany) out_t++;
   }
   return out_near == nv || out_l == nv || out_r == nv || out_b == nv || out_t == nv;
+}
+
+/* §573: пустой обработчик — им меряется цена САМОГО обхода дерева и критерия
+ * LOD, отдельно от растеризации. */
+static int lit_none(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv) {
+  (void)ctx;
+  (void)ref;
+  (void)v;
+  (void)nv;
+  return 0;
 }
 
 static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv) {
@@ -4034,6 +4087,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "ceil=", 5) == 0) g_lodceil = strtod(argv[i] + 5, NULL);
     /* §570: СОЛНЦЕ — направленный источник для наружной сцены. */
     if (strcmp(argv[i], "sun") == 0) g_sun = 1;
+    if (strcmp(argv[i], "gam16") == 0) g_gamn = 16;
     if (strncmp(argv[i], "sun=", 4) == 0) {
       const char *sp = argv[i] + 4;
       char *se = NULL;
@@ -7367,7 +7421,7 @@ int main(int argc, char **argv) {
       if (w995 > 0.0) white = w995;
       free(tmpw);
     }
-    litctx LC = {&S, key, ord, irr, &fr, NULL, NULL, 0, 0, NULL, white, nocull, 0, 0};
+    litctx LC = {&S, key, ord, irr, &fr, NULL, NULL, 0, 0, NULL, white, nocull, 0, 0, NULL, 0};
     tr3_camera cam;
     if (tr3_camera_look(&cam, eyec, atc, upc, HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0, res,
                         res) == 0) {
@@ -7382,9 +7436,31 @@ int main(int argc, char **argv) {
       LC.rgb = rgb;
       LC.w = res;
       LC.h = res;
+      LC.defcol = calloc(np * 3, sizeof *LC.defcol);
+      if (LC.defcol == NULL) exit(1);
+      ta = now_s();
+      /* §573: РАЗДЕЛЕНИЕ ОБХОДА И РАСТЕРИЗАЦИИ. «УБИВАЕТ» §572 сработало
+       * (126 мс против порога 100), и условие требует профилировать, а не
+       * догадываться. Здесь тот же обход гоняется с ПУСТЫМ обработчиком: его
+       * время есть цена обхода дерева и критерия LOD, а разность — цена самой
+       * растеризации. */
+      double ta_w = now_s();
+      int wrc0 = hz_dc_walk(&T, lod_stop, &LL, lit_none, &LC);
+      double t_walk = now_s() - ta_w;
       ta = now_s();
       int wrc = hz_dc_walk(&T, lod_stop, &LL, lit_poly, &LC);
+      lit_resolve(&LC, g_gamn);
+      printf("      §573 ПРОФИЛЬ РАСТРА: обход дерева с ПУСТЫМ обработчиком %.1f мс (код %d), "
+             "обход+растр %.1f мс — значит сама растеризация %.1f мс\n",
+             t_walk * 1e3, wrc0, (now_s() - ta) * 1e3, (now_s() - ta - t_walk) * 1e3);
       double t_rast = now_s() - ta;
+      int64_t ncov = 0;
+      for (size_t i2 = 0; i2 < np; i2++)
+        if (zb[i2] < 1e299) ncov++;
+      printf("      §572 РАСТР: фрагментов прошло z %lld на %lld закрытых пикселей, ГЛУБИНА "
+             "ПЕРЕКРЫТИЯ %.2f; таблица гаммы %d входов\n",
+             (long long)LC.nfrag, (long long)ncov, (double)LC.nfrag / (double)(ncov ? ncov : 1),
+             g_gamn);
       char path[256];
       /* Ш18 (§494): СГЛАЖИВАНИЕ. Растр идёт в `res`, а на диск пишется вдвое
        * меньше со свёрткой коробкой 2×2 — четыре пробы на пиксель. Это НЕ
@@ -7423,6 +7499,7 @@ int main(int argc, char **argv) {
       g_t_frame = t_slice + t_dir + t_rast;
       free(zb);
       free(rgb);
+      free(LC.defcol);
     }
     free(key);
     free(ord);

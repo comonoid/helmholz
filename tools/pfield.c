@@ -38,6 +38,7 @@
 #include "transport/mesh3.h"
 #include "transport/sweep3.h"
 #include <math.h>
+#include <omp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -202,6 +203,10 @@ static int u_occ(void *ctx, const int32_t lo[3], int32_t size) {
  * Лечится ЕДИНСТВЕННЫМ местом — положением рамы (`hz_gridalign` ниже).
  * Ключ `gridalign` возвращает прежнюю раму: это НЕГАТИВНЫЙ КОНТРОЛЬ, и отношение
  * площади обязано вернуться к `1.5000` ТОЧНО. */
+/* НЕГАТИВНЫЙ КОНТРОЛЬ §581: один поток принудительно — все времена обязаны
+ * вернуться к однопоточным. Объявлен рано, потому что читается прагмами. */
+static int g_omp1 = 0;
+
 static int hz_gridalign = 0;
 /* НЕГАТИВНЫЙ КОНТРОЛЬ §463 (`flipall`): обратить порядок вершин У ВСЕХ выданных
  * треугольников. Доля вывернутых и по числу, и ПО ПЛОЩАДИ обязана стать почти
@@ -1946,6 +1951,10 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
       su[a * HZ_LIGHT_NS + b] = lsamp(a);
       sv[a * HZ_LIGHT_NS + b] = lsamp(b);
     }
+  /* Р1 (§581): ДЕЛЕНИЕ ПО ПРИЁМНИКАМ. Записи независимы (`irr[i]`), чтения
+   * общие и неизменные, порядок сложения ВНУТРИ приёмника не меняется — значит
+   * ответ побитово тот же, и это проверяется приёмкой, а не предполагается. */
+#pragma omp parallel for schedule(dynamic, 256) if (!g_omp1)
   for (int32_t i = 0; i < S->n; i++) {
     double p[3], n[3];
     hz_slice_vertex(S, i, p);
@@ -3829,6 +3838,15 @@ static void alight_selftest(void) {
  * правило, что в `hz_ppm_write`: одиночный яркий блик не должен утопить кадр).
  * Гамма `1/2.2`. Ложноцветной палитры здесь нет: она годится полю интенсивности,
  * а на геометрии делает картинку нечитаемой. */
+struct littri {
+  double p[3][3], col[3][3], uv[3][2];
+  int mat;
+  /* Габарит по строкам, посчитанный ОДИН раз при сборе: без него каждая полоса
+   * перепроецировала бы все треугольники заново, и деление на потоки не давало
+   * ничего (замерено: 218 -> 234 мс, то есть хуже). */
+  int iy0, iy1;
+};
+
 typedef struct {
   const hz_dcslice *S;
   const uint64_t *key;
@@ -3874,6 +3892,11 @@ typedef struct {
    * есть ГЛУБИНА ПЕРЕКРЫТИЯ, и от неё прямо зависит выигрыш Р3. */
   float *defcol;
   int64_t nfrag;
+  /* Р3 (§581): СБОР ТРЕУГОЛЬНИКОВ, потом отрисовка по полосам. Обход остаётся
+   * однопоточным (у него общий выход), а рисование делится: каждый поток берёт
+   * свою полосу строк и трогает только свои пиксели. */
+  struct littri *tris;
+  int64_t ntris, captris;
 } litctx;
 
 static int lit_find(const litctx *L, const hz_dcref *r) {
@@ -3897,8 +3920,12 @@ static int lit_find(const litctx *L, const hz_dcref *r) {
   return -1;
 }
 
+/* Р3 (§581): `by0..by1` — ПОЛОСА ЭКРАНА, за которую отвечает поток; `by0 > by1`
+ * значит без ограничения. Пиксель принадлежит РОВНО ОДНОЙ полосе, поэтому
+ * z-буфер идёт без гонок и без атомарных операций, а порядок детерминирован —
+ * это и даёт побитовость. */
 static void lit_tri(litctx *L, const double p[3][3], const double col[3][3], const double uv[3][2],
-                    int mat) {
+                    int mat, int by0, int by1) {
   const tr3_camera *cm = L->cam;
   double sx[3], sy[3], sz[3];
   for (int k = 0; k < 3; k++) {
@@ -3925,6 +3952,11 @@ static void lit_tri(litctx *L, const double p[3][3], const double col[3][3], con
   if (iy0 < 0) iy0 = 0;
   if (ix1 >= L->w) ix1 = L->w - 1;
   if (iy1 >= L->h) iy1 = L->h - 1;
+  if (by0 <= by1) {
+    if (iy0 < by0) iy0 = by0;
+    if (iy1 > by1) iy1 = by1;
+    if (iy0 > iy1) return;
+  }
   double d21x = sx[1] - sx[0], d21y = sy[1] - sy[0];
   double d31x = sx[2] - sx[0], d31y = sy[2] - sy[0];
   double det = d21x * d31y - d21y * d31x;
@@ -4236,7 +4268,42 @@ static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv
       u3[1][c] = uvv[i][c];
       u3[2][c] = uvv[i + 1][c];
     }
-    lit_tri(L, p3, c3, u3, matp);
+    if (L->tris != NULL) {
+      if (L->ntris >= L->captris) {
+        int64_t nc2 = L->captris > 0 ? L->captris * 2 : 65536;
+        struct littri *nt = realloc(L->tris, (size_t)nc2 * sizeof *nt);
+        if (nt == NULL) exit(1);
+        L->tris = nt;
+        L->captris = nc2;
+      }
+      struct littri *dst = &L->tris[L->ntris++];
+      memcpy(dst->p, p3, sizeof p3);
+      memcpy(dst->col, c3, sizeof c3);
+      memcpy(dst->uv, u3, sizeof u3);
+      dst->mat = matp;
+      {
+        const tr3_camera *cm3 = L->cam;
+        double y0f = 1e300, y1f = -1e300;
+        int okp = 1;
+        for (int q3 = 0; q3 < 3; q3++) {
+          double d3[3];
+          for (int c3i = 0; c3i < 3; c3i++)
+            d3[c3i] = p3[q3][c3i] - cm3->eye[c3i];
+          double zz3 = d3[0] * cm3->fwd[0] + d3[1] * cm3->fwd[1] + d3[2] * cm3->fwd[2];
+          if (!(zz3 > 1e-6)) {
+            okp = 0;
+            break;
+          }
+          double uu3 = d3[0] * cm3->up[0] + d3[1] * cm3->up[1] + d3[2] * cm3->up[2];
+          double sy3 = (1.0 - uu3 / (zz3 * cm3->tany)) * 0.5 * (double)cm3->h;
+          if (sy3 < y0f) y0f = sy3;
+          if (sy3 > y1f) y1f = sy3;
+        }
+        dst->iy0 = okp ? (int)floor(y0f) : 0;
+        dst->iy1 = okp ? (int)ceil(y1f) : L->h - 1;
+      }
+    } else
+      lit_tri(L, p3, c3, u3, matp, 0, -1);
   }
   return 0;
 }
@@ -4358,6 +4425,7 @@ int main(int argc, char **argv) {
      * вернуться, и расхождение с передискретизованным эталоном вырасти. */
     if (strcmp(argv[i], "texnomip") == 0) g_texnomip = 1;
     if (strcmp(argv[i], "nofrustum") == 0) g_nofrustum = 1;
+    if (strcmp(argv[i], "omp1") == 0) g_omp1 = 1;
     if (strcmp(argv[i], "texflat") == 0) g_texflat = 1;
     if (strncmp(argv[i], "sun=", 4) == 0) {
       const char *sp = argv[i] + 4;
@@ -7539,7 +7607,21 @@ int main(int argc, char **argv) {
       tb2 = now_s();
       int64_t nlink = 0;
       double sthru2 = 0.0, sall2 = 0.0;
+      /* Р2 (§581): ДЕЛЕНИЕ ПО ПРИЁМНИКАМ — самое большое число в системе
+       * (`16.8` с). Каждый приёмник пишет свой `ind[i]`, дерево излучателей
+       * читается всеми и не меняется. Порядок сложения ВНУТРИ приёмника не
+       * меняется, значит ответ побитово тот же.
+       * СЧЁТЧИКИ — ПО ПОТОКАМ, А СВОДЯТСЯ В ФИКСИРОВАННОМ ПОРЯДКЕ: редукция
+       * OpenMP отдала бы порядок планировщику, и число поехало бы от запуска к
+       * запуску. Здесь оно воспроизводимо. */
+      int nth = g_omp1 ? 1 : omp_get_max_threads();
+      int64_t *plink = calloc((size_t)nth, sizeof *plink);
+      double *pthru = calloc((size_t)nth, sizeof *pthru);
+      double *pall = calloc((size_t)nth, sizeof *pall);
+      if (plink == NULL || pthru == NULL || pall == NULL) exit(1);
+#pragma omp parallel for schedule(dynamic, 64) if (!g_omp1)
       for (int32_t i = 0; i < S.n; i++) {
+        int th = g_omp1 ? 0 : omp_get_thread_num();
         double pi[3], nn2[3], acc2[3] = {0, 0, 0};
         hz_slice_vertex(&S, i, pi);
         for (int k = 0; k < 3; k++)
@@ -7547,11 +7629,19 @@ int main(int argc, char **argv) {
         hz_slice_normal(&S, i, nn2);
         double rrecv = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
         for (int q2 = 0; q2 < 6; q2++)
-          hgather_rec(&ET, 0, q2, pi, nn2, g_hgather, rrecv, &P, &fr, indvis, acc2, &nlink, &sthru2,
-                      &sall2);
+          hgather_rec(&ET, 0, q2, pi, nn2, g_hgather, rrecv, &P, &fr, indvis, acc2, &plink[th],
+                      &pthru[th], &pall[th]);
         for (int k = 0; k < 3; k++)
           ind[3 * (size_t)i + (size_t)k] = (float)(acc2[k] * (alb0 ? 0.0 : alb(&m, S.c[i].mat, k)));
       }
+      for (int t4 = 0; t4 < nth; t4++) {
+        nlink += plink[t4];
+        sthru2 += pthru[t4];
+        sall2 += pall[t4];
+      }
+      free(plink);
+      free(pthru);
+      free(pall);
       double t_g2 = now_s() - tb2;
       double sd2 = 0.0, si2 = 0.0;
       for (int32_t i = 0; i < S.n; i++)
@@ -7986,7 +8076,33 @@ int main(int argc, char **argv) {
       int wrc0 = hz_dc_walk(&T, lod_stop, &LLc, lit_none, &LC);
       double t_walk = now_s() - ta_w;
       ta = now_s();
+      /* Р3 (§581): обход СОБИРАЕТ, отрисовка идёт ПО ПОЛОСАМ параллельно. */
+      if (!g_omp1) {
+        LC.captris = 65536;
+        LC.tris = malloc((size_t)LC.captris * sizeof *LC.tris);
+        if (LC.tris == NULL) exit(1);
+      }
       int wrc = hz_dc_walk(&T, lod_stop, &LLc, lit_poly, &LC);
+      if (LC.tris != NULL) {
+        int nb2 = omp_get_max_threads();
+        int bh = (res + nb2 - 1) / nb2;
+#pragma omp parallel for schedule(static)
+        for (int b2 = 0; b2 < nb2; b2++) {
+          int y0b = b2 * bh, y1b = y0b + bh - 1;
+          if (y1b >= res) y1b = res - 1;
+          for (int64_t t5 = 0; t5 < LC.ntris; t5++) {
+            /* Отсев по предвычисленному габариту строк — два сравнения вместо
+             * повторного проецирования трёх вершин. Без него деление на полосы
+             * не давало ничего: замерено `218 → 234` мс, то есть ХУЖЕ
+             * однопоточного, потому что каждая полоса перепроецировала все
+             * треугольники заново. */
+            if (LC.tris[t5].iy1 < y0b || LC.tris[t5].iy0 > y1b) continue;
+            lit_tri(&LC, LC.tris[t5].p, LC.tris[t5].col, LC.tris[t5].uv, LC.tris[t5].mat, y0b, y1b);
+          }
+        }
+        free(LC.tris);
+        LC.tris = NULL;
+      }
       lit_resolve(&LC, g_gamn);
       printf("      §573 ПРОФИЛЬ РАСТРА: обход дерева с ПУСТЫМ обработчиком %.1f мс (код %d), "
              "обход+растр %.1f мс — значит сама растеризация %.1f мс\n",

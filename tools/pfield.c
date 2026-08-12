@@ -2281,7 +2281,7 @@ static double g_lodceil = 1.0;
 static int g_gamn = 4096;
 /* НЕГАТИВНЫЙ КОНТРОЛЬ §575: вернуть постоянное альбедо вместо выборки. Картинка
  * обязана вернуться к СЕРОЙ побитово. */
-static int g_texflat = 0;
+static int g_texflat = 0, g_texnomip = 0;
 /* Секундомеры сводки: заполняются рабочими стадиями по ходу. */
 static double g_t0 = 0.0, g_t_frame = 0.0, g_t_fslice = 0.0, g_t_fdir = 0.0, g_t_fras = 0.0,
               g_t_bounce = 0.0;
@@ -3801,8 +3801,16 @@ typedef struct {
    * отложенный буфер вместе с цветом и выбираются ОДИН раз на видимый пиксель.
    * Т1: альбедо применяется при ЧТЕНИИ поля, поэтому в перенос текстура не
    * входит вовсе — и цветного непрямого света от неё не будет (§575). */
-  unsigned char **texrgb;
-  int *texw, *texh;
+  /* Ш8б (08-12): МИП-ПИРАМИДА на материал. Точечная выборка рябила на листве и
+   * дальних поверхностях; уровень выбирается по следу пикселя в текселях, а
+   * внутри уровня и между уровнями идёт линейная интерполяция (трилинейная).
+   * Память растёт на треть (сумма 1+1/4+1/16+… = 4/3) — это цена, названная
+   * до кода. */
+  unsigned char **texrgb; /* [материал][уровень] */
+  int *texw, *texh;       /* размеры УРОВНЯ 0 */
+  unsigned char ***texmip;
+  int **mipw, **miph;
+  int *nmip;
   const float *uvs;
   float *defuv;
   unsigned char *defmat;
@@ -3814,6 +3822,8 @@ typedef struct {
   celltris *ct;
   int nmtl;
   int64_t nsurfuv;
+  double pxrad; /* радиан на пиксель — нужен для выбора уровня пирамиды */
+  int nomip;    /* НК: точечная выборка нулевого уровня */
   /* Р3 (§572): буфер отложенного затенения — радианс на пиксель, три канала.
    * `nfrag` — сколько фрагментов прошло z; отношение к числу закрытых пикселей
    * есть ГЛУБИНА ПЕРЕКРЫТИЯ, и от неё прямо зависит выигрыш Р3. */
@@ -3951,6 +3961,7 @@ static void lit_resolve(litctx *L, int gamn) {
       if (L->z[k] >= 1e299) continue;
       int mt = L->defmat[k];
       double uu = (double)L->defuv[2 * k + 0], vv0 = (double)L->defuv[2 * k + 1];
+      double uvdens = 0.0;
       /* КООРДИНАТА БЕРЁТСЯ С САМОЙ ПОВЕРХНОСТИ, А НЕ С НАШЕГО МНОГОУГОЛЬНИКА
        * (замечание пользователя 08-12). Прежде `uv` считалось ОДНОЙ точкой на
        * ячейку среза и интерполировалось по DC-многоугольнику; соседние ячейки
@@ -4022,23 +4033,62 @@ static void lit_resolve(litctx *L, int gamn) {
                 bv * (L->mesh->vt[2 * (size_t)q2 + 1] - L->mesh->vt[2 * (size_t)q0 + 1]);
           mt = L->mesh->fm != NULL ? L->mesh->fm[ls3[t3]] : mt;
           if (mt < 0 || mt >= L->nmtl) mt = L->defmat[k];
+          /* ПЛОТНОСТЬ ТЕКСЕЛЕЙ НА МЕТР — у ТОГО ЖЕ треугольника: отношение
+           * площади в координатах текстуры к площади в мире. Отсюда след
+           * пикселя в текселях, отсюда уровень пирамиды. Ни одного подобранного
+           * числа: `z·pxrad` есть ширина пикселя на этой глубине по построению
+           * камеры. */
+          double au = L->mesh->vt[2 * (size_t)q1 + 0] - L->mesh->vt[2 * (size_t)q0 + 0];
+          double av = L->mesh->vt[2 * (size_t)q1 + 1] - L->mesh->vt[2 * (size_t)q0 + 1];
+          double bu2 = L->mesh->vt[2 * (size_t)q2 + 0] - L->mesh->vt[2 * (size_t)q0 + 0];
+          double bv2 = L->mesh->vt[2 * (size_t)q2 + 1] - L->mesh->vt[2 * (size_t)q0 + 1];
+          double auv = fabs(au * bv2 - av * bu2);       /* площадь в uv (×2) */
+          double aw3 = sqrt(d11 * d22 - d12 * d12);     /* площадь в мире (×2) */
+          uvdens = (aw3 > 0.0) ? sqrt(auv / aw3) : 0.0; /* текселей(долей) на метр */
         }
         if (bestd3 < 1e299) L->nsurfuv++;
       }
-      const unsigned char *tx = L->texrgb[mt];
-      if (tx == NULL) continue;
-      int tw = L->texw[mt], th = L->texh[mt];
+      if (L->texrgb[mt] == NULL) continue;
       double vv = 1.0 - vv0;
-      uu -= floor(uu);
-      vv -= floor(vv);
-      int ix = (int)(uu * (double)tw), iy = (int)(vv * (double)th);
-      if (ix < 0) ix = 0;
-      if (iy < 0) iy = 0;
-      if (ix >= tw) ix = tw - 1;
-      if (iy >= th) iy = th - 1;
-      const unsigned char *px = tx + 3 * ((size_t)iy * (size_t)tw + (size_t)ix);
+      /* УРОВЕНЬ ПИРАМИДЫ по следу пикселя в текселях. Ширина пикселя на глубине
+       * `z` есть `z·pxrad`; умноженная на плотность текселей и на размер
+       * текстуры, она даёт след. `log2` от него — уровень. */
+      double lodf = 0.0;
+      if (!L->nomip && uvdens > 0.0 && L->pxrad > 0.0) {
+        double foot = L->z[k] * L->pxrad * uvdens * (double)L->texw[mt];
+        if (foot > 1.0) lodf = log2(foot);
+      }
+      int nl4 = L->nmip[mt] > 0 ? L->nmip[mt] : 1;
+      if (lodf > (double)(nl4 - 1)) lodf = (double)(nl4 - 1);
+      int l0 = (int)lodf, l1 = l0 + 1 < nl4 ? l0 + 1 : l0;
+      double fl = lodf - (double)l0;
+      /* ТРИЛИНЕЙНО: билинейно внутри двух уровней и линейно между ними. Без
+       * межуровневой части на границах уровней видны ступени. */
+      double acc3[3] = {0.0, 0.0, 0.0};
+      for (int s6 = 0; s6 < 2; s6++) {
+        int lv = s6 ? l1 : l0;
+        double wl = s6 ? fl : 1.0 - fl;
+        if (!(wl > 0.0)) continue;
+        const unsigned char *tx = L->texmip[mt][lv];
+        int tw = L->mipw[mt][lv], th = L->miph[mt][lv];
+        double fu = uu - floor(uu), fv = vv - floor(vv);
+        double gx = fu * (double)tw - 0.5, gy = fv * (double)th - 0.5;
+        int x0 = (int)floor(gx), y0 = (int)floor(gy);
+        double tx0 = gx - (double)x0, ty0 = gy - (double)y0;
+        for (int dy = 0; dy < 2; dy++)
+          for (int dx = 0; dx < 2; dx++) {
+            int xx = x0 + dx, yy = y0 + dy;
+            /* Повтор по краю: текстуры сцены тайловые, обрезка дала бы шов. */
+            xx = ((xx % tw) + tw) % tw;
+            yy = ((yy % th) + th) % th;
+            double wq = (dx ? tx0 : 1.0 - tx0) * (dy ? ty0 : 1.0 - ty0) * wl;
+            const unsigned char *px = tx + 3 * ((size_t)yy * (size_t)tw + (size_t)xx);
+            for (int c = 0; c < 3; c++)
+              acc3[c] += wq * (double)px[c];
+          }
+      }
       for (int c = 0; c < 3; c++)
-        L->defcol[3 * k + (size_t)c] *= (float)((double)px[c] / 255.0);
+        L->defcol[3 * k + (size_t)c] *= (float)(acc3[c] / 255.0);
       L->ntexpx++;
     }
   }
@@ -4259,6 +4309,9 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "sun") == 0) g_sun = 1;
     if (strcmp(argv[i], "gam16") == 0) g_gamn = 16;
     if (strcmp(argv[i], "texflat") == 0) g_texflat = 1;
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ: точечная выборка без пирамиды — рябь обязана
+     * вернуться, и расхождение с передискретизованным эталоном вырасти. */
+    if (strcmp(argv[i], "texnomip") == 0) g_texnomip = 1;
     if (strcmp(argv[i], "texflat") == 0) g_texflat = 1;
     if (strncmp(argv[i], "sun=", 4) == 0) {
       const char *sp = argv[i] + 4;
@@ -7757,6 +7810,8 @@ int main(int argc, char **argv) {
     LC.mesh = &m;
     LC.ct = &CT;
     LC.nmtl = m.nmtl;
+    LC.pxrad = LL.pxrad;
+    LC.nomip = g_texnomip;
     tr3_camera cam;
     if (tr3_camera_look(&cam, eyec, atc, upc, HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0, res,
                         res) == 0) {
@@ -7783,6 +7838,11 @@ int main(int argc, char **argv) {
         LC.texh = calloc((size_t)m.nmtl, sizeof *LC.texh);
         LC.defuv = calloc(np * 2, sizeof *LC.defuv);
         LC.defmat = calloc(np, 1);
+        LC.texmip = calloc((size_t)m.nmtl, sizeof *LC.texmip);
+        LC.mipw = calloc((size_t)m.nmtl, sizeof *LC.mipw);
+        LC.miph = calloc((size_t)m.nmtl, sizeof *LC.miph);
+        LC.nmip = calloc((size_t)m.nmtl, sizeof *LC.nmip);
+        if (LC.texmip == NULL || LC.mipw == NULL || LC.miph == NULL || LC.nmip == NULL) exit(1);
         if (LC.texrgb == NULL || LC.texw == NULL || LC.texh == NULL || LC.defuv == NULL ||
             LC.defmat == NULL)
           exit(1);
@@ -7814,6 +7874,48 @@ int main(int argc, char **argv) {
           if (hz_ppm_read(path2, &LC.texrgb[mi2], &LC.texw[mi2], &LC.texh[mi2]) == 0) {
             nload++;
             tbytes += (int64_t)LC.texw[mi2] * LC.texh[mi2] * 3;
+            /* МИП-ПИРАМИДА строится сразу: коробка 2×2 на уровень, пока сторона
+             * не станет единицей. Коробка, а не что-то умнее, — потому что
+             * уровень всё равно интерполируется линейно, и лишняя точность
+             * ниже кванта байта. */
+            int lv2 = 1, w2 = LC.texw[mi2], h2 = LC.texh[mi2];
+            while (w2 > 1 || h2 > 1) {
+              w2 = w2 > 1 ? w2 / 2 : 1;
+              h2 = h2 > 1 ? h2 / 2 : 1;
+              lv2++;
+            }
+            LC.nmip[mi2] = lv2;
+            LC.texmip[mi2] = calloc((size_t)lv2, sizeof *LC.texmip[mi2]);
+            LC.mipw[mi2] = calloc((size_t)lv2, sizeof *LC.mipw[mi2]);
+            LC.miph[mi2] = calloc((size_t)lv2, sizeof *LC.miph[mi2]);
+            if (LC.texmip[mi2] == NULL || LC.mipw[mi2] == NULL || LC.miph[mi2] == NULL) exit(1);
+            LC.texmip[mi2][0] = LC.texrgb[mi2];
+            LC.mipw[mi2][0] = LC.texw[mi2];
+            LC.miph[mi2][0] = LC.texh[mi2];
+            for (int l2 = 1; l2 < lv2; l2++) {
+              int pw = LC.mipw[mi2][l2 - 1], ph = LC.miph[mi2][l2 - 1];
+              int cw = pw > 1 ? pw / 2 : 1, ch = ph > 1 ? ph / 2 : 1;
+              unsigned char *dst = malloc((size_t)cw * (size_t)ch * 3);
+              if (dst == NULL) exit(1);
+              const unsigned char *src = LC.texmip[mi2][l2 - 1];
+              for (int y2 = 0; y2 < ch; y2++)
+                for (int x2 = 0; x2 < cw; x2++)
+                  for (int c2 = 0; c2 < 3; c2++) {
+                    int sx0 = (pw > 1) ? 2 * x2 : 0, sy0 = (ph > 1) ? 2 * y2 : 0;
+                    int sx1 = (pw > 1) ? sx0 + 1 : sx0, sy1 = (ph > 1) ? sy0 + 1 : sy0;
+                    size_t o0 = 3 * ((size_t)sy0 * (size_t)pw + (size_t)sx0) + (size_t)c2;
+                    size_t o1 = 3 * ((size_t)sy0 * (size_t)pw + (size_t)sx1) + (size_t)c2;
+                    size_t o2 = 3 * ((size_t)sy1 * (size_t)pw + (size_t)sx0) + (size_t)c2;
+                    size_t o3 = 3 * ((size_t)sy1 * (size_t)pw + (size_t)sx1) + (size_t)c2;
+                    unsigned s5 = (unsigned)src[o0] + src[o1] + src[o2] + src[o3];
+                    dst[3 * ((size_t)y2 * (size_t)cw + (size_t)x2) + (size_t)c2] =
+                        (unsigned char)(s5 / 4);
+                  }
+              LC.texmip[mi2][l2] = dst;
+              LC.mipw[mi2][l2] = cw;
+              LC.miph[mi2][l2] = ch;
+              tbytes += (int64_t)cw * ch * 3;
+            }
           } else
             nmiss++;
         }

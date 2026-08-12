@@ -3807,6 +3807,13 @@ typedef struct {
   float *defuv;
   unsigned char *defmat;
   int64_t ntexpx;
+  /* Замечание пользователя 08-12: координата берётся С ПОВЕРХНОСТИ, а не с
+   * нашего многоугольника. Для этого нужны сама сетка и указатель ячейка ->
+   * треугольники; `nsurfuv` считает, скольким пикселям это удалось. */
+  const hz_objmesh *mesh;
+  celltris *ct;
+  int nmtl;
+  int64_t nsurfuv;
   /* Р3 (§572): буфер отложенного затенения — радианс на пиксель, три канала.
    * `nfrag` — сколько фрагментов прошло z; отношение к числу закрытых пикселей
    * есть ГЛУБИНА ПЕРЕКРЫТИЯ, и от неё прямо зависит выигрыш Р3. */
@@ -3943,10 +3950,85 @@ static void lit_resolve(litctx *L, int gamn) {
     for (size_t k = 0; k < npx; k++) {
       if (L->z[k] >= 1e299) continue;
       int mt = L->defmat[k];
+      double uu = (double)L->defuv[2 * k + 0], vv0 = (double)L->defuv[2 * k + 1];
+      /* КООРДИНАТА БЕРЁТСЯ С САМОЙ ПОВЕРХНОСТИ, А НЕ С НАШЕГО МНОГОУГОЛЬНИКА
+       * (замечание пользователя 08-12). Прежде `uv` считалось ОДНОЙ точкой на
+       * ячейку среза и интерполировалось по DC-многоугольнику; соседние ячейки
+       * берут координату с РАЗНЫХ исходных треугольников, и на швах выходил
+       * мусор. Здесь по глубине восстанавливается мировая точка пикселя, по ней
+       * находится ЯЧЕЙКА ПОЛЯ и её список треугольников, а координата берётся
+       * барицентрикой у ТОГО треугольника, к плоскости которого точка ближе
+       * всего. Это и есть «накладывать на поверхность»: DC-представление в
+       * выборку не входит вовсе. */
+      if (L->mesh != NULL && L->ct != NULL) {
+        int px2 = (int)(k % (size_t)L->w), py2 = (int)(k / (size_t)L->w);
+        const tr3_camera *cm2 = L->cam;
+        double ax = ((double)px2 + 0.5) / (double)L->w * 2.0 - 1.0;
+        double ay = 1.0 - ((double)py2 + 0.5) / (double)L->h * 2.0;
+        double dr[3], wp[3];
+        for (int c = 0; c < 3; c++)
+          dr[c] = cm2->fwd[c] + cm2->right[c] * ax * cm2->tanx + cm2->up[c] * ay * cm2->tany;
+        for (int c = 0; c < 3; c++)
+          wp[c] = cm2->eye[c] + dr[c] * L->z[k];
+        int32_t cl3[3];
+        int ok3 = 1;
+        for (int c = 0; c < 3; c++) {
+          double f3 = floor((wp[c] - L->fr->org[c]) / L->fr->h);
+          if (!(f3 >= 0.0) || !(f3 < (double)L->fr->n)) ok3 = 0;
+          cl3[c] = ok3 ? (int32_t)f3 : 0;
+        }
+        const int32_t *ls3 = NULL;
+        int32_t nls = ok3 ? ct_list(L->ct, cl3, &ls3) : 0;
+        double bestd3 = 1e300;
+        for (int32_t t3 = 0; t3 < nls; t3++) {
+          const double *A3, *B3, *C3;
+          tri_verts(L->mesh, ls3[t3], &A3, &B3, &C3);
+          double e1[3], e2[3], nn3[3];
+          for (int c = 0; c < 3; c++) {
+            e1[c] = B3[c] - A3[c];
+            e2[c] = C3[c] - A3[c];
+          }
+          nn3[0] = e1[1] * e2[2] - e1[2] * e2[1];
+          nn3[1] = e1[2] * e2[0] - e1[0] * e2[2];
+          nn3[2] = e1[0] * e2[1] - e1[1] * e2[0];
+          double nl3 = sqrt(nn3[0] * nn3[0] + nn3[1] * nn3[1] + nn3[2] * nn3[2]);
+          if (!(nl3 > 0.0)) continue;
+          double dd3 =
+              fabs((wp[0] - A3[0]) * nn3[0] + (wp[1] - A3[1]) * nn3[1] + (wp[2] - A3[2]) * nn3[2]) /
+              nl3;
+          if (dd3 >= bestd3) continue;
+          const int32_t *ft3 = L->mesh->ft;
+          if (ft3 == NULL) continue;
+          int32_t q0 = ft3[3 * (size_t)ls3[t3] + 0], q1 = ft3[3 * (size_t)ls3[t3] + 1],
+                  q2 = ft3[3 * (size_t)ls3[t3] + 2];
+          if (q0 < 0 || q1 < 0 || q2 < 0) continue;
+          double d11 = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
+          double d12 = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
+          double d22 = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
+          double vp[3];
+          for (int c = 0; c < 3; c++)
+            vp[c] = wp[c] - A3[c];
+          double dp1 = vp[0] * e1[0] + vp[1] * e1[1] + vp[2] * e1[2];
+          double dp2 = vp[0] * e2[0] + vp[1] * e2[1] + vp[2] * e2[2];
+          double dn3 = d11 * d22 - d12 * d12;
+          if (!(fabs(dn3) > 0.0)) continue;
+          double bu = (d22 * dp1 - d12 * dp2) / dn3, bv = (d11 * dp2 - d12 * dp1) / dn3;
+          bestd3 = dd3;
+          uu = L->mesh->vt[2 * (size_t)q0 + 0] +
+               bu * (L->mesh->vt[2 * (size_t)q1 + 0] - L->mesh->vt[2 * (size_t)q0 + 0]) +
+               bv * (L->mesh->vt[2 * (size_t)q2 + 0] - L->mesh->vt[2 * (size_t)q0 + 0]);
+          vv0 = L->mesh->vt[2 * (size_t)q0 + 1] +
+                bu * (L->mesh->vt[2 * (size_t)q1 + 1] - L->mesh->vt[2 * (size_t)q0 + 1]) +
+                bv * (L->mesh->vt[2 * (size_t)q2 + 1] - L->mesh->vt[2 * (size_t)q0 + 1]);
+          mt = L->mesh->fm != NULL ? L->mesh->fm[ls3[t3]] : mt;
+          if (mt < 0 || mt >= L->nmtl) mt = L->defmat[k];
+        }
+        if (bestd3 < 1e299) L->nsurfuv++;
+      }
       const unsigned char *tx = L->texrgb[mt];
       if (tx == NULL) continue;
       int tw = L->texw[mt], th = L->texh[mt];
-      double uu = (double)L->defuv[2 * k + 0], vv = 1.0 - (double)L->defuv[2 * k + 1];
+      double vv = 1.0 - vv0;
       uu -= floor(uu);
       vv -= floor(vv);
       int ix = (int)(uu * (double)tw), iy = (int)(vv * (double)th);
@@ -7672,6 +7754,9 @@ int main(int argc, char **argv) {
     LC.white = white;
     LC.nocull = nocull;
     LC.uvs = uvs;
+    LC.mesh = &m;
+    LC.ct = &CT;
+    LC.nmtl = m.nmtl;
     tr3_camera cam;
     if (tr3_camera_look(&cam, eyec, atc, upc, HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0, res,
                         res) == 0) {
@@ -7755,9 +7840,10 @@ int main(int argc, char **argv) {
       for (size_t i2 = 0; i2 < np; i2++)
         if (zb[i2] < 1e299) ncov++;
       printf("      §572 РАСТР: фрагментов прошло z %lld на %lld закрытых пикселей, ГЛУБИНА "
-             "ПЕРЕКРЫТИЯ %.2f; таблица гаммы %d входов\n",
+             "ПЕРЕКРЫТИЯ %.2f; таблица гаммы %d входов; КООРДИНАТА С ПОВЕРХНОСТИ у %lld "
+             "пикселей (%.1f %%)\n",
              (long long)LC.nfrag, (long long)ncov, (double)LC.nfrag / (double)(ncov ? ncov : 1),
-             g_gamn);
+             g_gamn, (long long)LC.nsurfuv, 100.0 * (double)LC.nsurfuv / (double)(ncov ? ncov : 1));
       char path[256];
       /* Ш18 (§494): СГЛАЖИВАНИЕ. Растр идёт в `res`, а на диск пишется вдвое
        * меньше со свёрткой коробкой 2×2 — четыре пробы на пиксель. Это НЕ

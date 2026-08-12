@@ -2172,6 +2172,11 @@ static double g_hgather = 0.0;
  * матрицы нет, есть ещё один проход); `dirsall` — НЕГАТИВНЫЙ КОНТРОЛЬ, излучать
  * во все стороны вместо наружной полусферы. */
 static int g_dsweep = 0, g_dnmu = 2, g_dnphi = 2, g_dpass = 1, g_dirsall = 0, g_dblkopen = 0;
+/* Ф9. (§536): замер границы узости доли; `dlobeflat` — негативный контроль. */
+static int g_lobetest = 0, g_dlobeflat = 0;
+/* Перебивка узости и зеркальной доли для СВИПА без правки сцены; -1 у `dks` —
+ * «не перебивать», брать из материала. */
+static double g_dns = 0.0, g_dks = -1.0;
 /* Ф8'-0 (§524, А921): доля затронутых листьев печатается как ФУНКЦИЯ допуска, а
  * не при одном пороге — иначе порог был бы магическим. Пять уровней, первый
  * (0.0) есть точное неравенство, то есть отсутствие порога вовсе. */
@@ -2480,9 +2485,16 @@ static void stree_links(stree *T, int32_t gn) {
  *     лист занят, но `Bs` нет — ЧЁРНАЯ стена: гасит, но не светит.
  * Второе физически честнее дыры и печатается счётчиком (А891). */
 typedef struct {
-  float *Ld;          /* 3 на УЗЕЛ: радианс текущего направления */
-  float *Bs;          /* 3 на УЗЕЛ: исходящая радиосити поверхности */
-  float *Bn;          /* 3 на УЗЕЛ: нормаль поверхности */
+  float *Ld; /* 3 на УЗЕЛ: радианс текущего направления */
+  float *Bs; /* 3 на УЗЕЛ: исходящая радиосити поверхности */
+  float *Bn; /* 3 на УЗЕЛ: нормаль поверхности */
+  /* Ф9. (§536): УЗКАЯ ЧАСТЬ ИЗЛУЧЕНИЯ. Диффузная часть `Bs` изотропна и хранится
+   * одним числом; узкая зависит от направления и потому хранится ТРЕМЯ вещами:
+   * амплитудой `Bsp` (= rho_s * E_dir), направлением ПРИХОДА света `Bwi` и
+   * показателем `Bns`. Это ОДНА доля на лист, а не распределение по ND, и
+   * оговорка записана: первый отскок несёт узость честно, второй и дальше —
+   * только диффузно (§538). */
+  float *Bsp, *Bwi, *Bns;
   unsigned char *srf; /* 1 — есть Bs; 2 — занят без Bs (чёрная стена) */
   /* Лист уже посчитан в этом направлении. Ровно та же оговорка, что у
    * открытости (`open < 0` — «ещё не посчитан, не наш порядок»): у
@@ -2501,6 +2513,33 @@ typedef struct {
    * стену. Истина между, и замер обязан дать обе стороны, а не одну. */
   int blkopen;
 } dfield;
+
+/* --- Ф9' (§536): ШИРИНА ДОЛИ РАССЕЯНИЯ ИЗ МАТЕРИАЛА ------------------------ */
+
+/* ЧТО ЗАДАЁТСЯ ОДНИМ ЧИСЛОМ. `f_r = ρ_d/π + ρ_s·(s+2)/(2π)·cos^s α`, где `α` —
+ * угол между исходящим направлением и зеркальным отражением входящего
+ * относительно нормали ЯЧЕЙКИ. При `s = 0` доля обращается в `1/π`, то есть в
+ * диффузную: диапазон «диффузное … зеркало» непрерывен по построению, и
+ * отдельного переключателя между режимами нет.
+ *
+ * КРИВЫЕ ЗЕРКАЛА ЛОЖАТСЯ САМИ: нормаль берётся у ячейки среза (DC), то есть у
+ * поверхности, а не у ординаты, — кривизна несётся сеткой.
+ *
+ * ЗЕРКАЛЬНЫЙ ВЕКТОР НЕ СТРОИТСЯ. `cos α = ω_e·ω_d − 2(ω_d·n)(ω_e·n)` —
+ * тождество, а не приближение: подставить `mirror(ω_d) = ω_d − 2(ω_d·n)n` в
+ * `ω_e·mirror(ω_d)` и раскрыть. Два скалярных произведения вместо вектора.
+ *
+ * ГДЕ ГРАНИЦА, СКАЗАНО ДО КОДА (К3/К5/К56): отражённого направления в наборе
+ * ординат нет, интерполировать между ними нельзя, поэтому доля у́же шага
+ * `2π/ND` ложится на сетку — ЭНЕРГИЯ верна, ОБРАЗ разрешается лишь до шага.
+ * Обе половины границы меряются порознь (А947): `A` — энергетическая, угловая
+ * ошибка пика — образная. */
+static double lobe(double cosa, double ns) {
+  if (g_dlobeflat) return 1.0 / (2.0 * 3.14159265358979323846);
+  if (!(cosa > 0.0)) return 0.0;
+  if (!(ns > 0.0)) return 1.0 / 3.14159265358979323846;
+  return (ns + 2.0) / (2.0 * 3.14159265358979323846) * pow(cosa, ns);
+}
 
 /* Один лист: посчитать входящий радианс, собрать его в приёмники, выставить
  * исходящий. Порядок именно такой — сбор читает ВХОДЯЩЕЕ, иначе ячейка собирала
@@ -2551,11 +2590,27 @@ static void dsweep_leaf(const stree *T, dfield *D, int32_t ni, const double om[3
    * приходящее с изнанки; чёрная стена гасит всё. `dirsall` — негативный
    * контроль: излучать во все стороны, игнорируя нормаль. */
   if (D->srf[ni] == 1) {
-    double dn = om[0] * (double)D->Bn[3 * (size_t)ni] + om[1] * (double)D->Bn[3 * (size_t)ni + 1] +
-                om[2] * (double)D->Bn[3 * (size_t)ni + 2];
+    double nn[3] = {(double)D->Bn[3 * (size_t)ni], (double)D->Bn[3 * (size_t)ni + 1],
+                    (double)D->Bn[3 * (size_t)ni + 2]};
+    double dn = om[0] * nn[0] + om[1] * nn[1] + om[2] * nn[2];
     int out = dirsall || dn > 0.0;
+    /* УЗКАЯ ЧАСТЬ. Зеркальный вектор не строится: `cos α = ω_e·ω_in −
+     * 2(ω_in·n)(ω_e·n)` — тождество. Кривизна входит через `n`, взятую у ЯЧЕЙКИ
+     * СРЕЗА, поэтому произвольная кривая зеркальная поверхность работает без
+     * отдельной машинерии. */
+    double lv = 0.0;
+    if (out && D->Bns != NULL && (double)D->Bns[ni] > 0.0) {
+      double wi[3] = {(double)D->Bwi[3 * (size_t)ni], (double)D->Bwi[3 * (size_t)ni + 1],
+                      (double)D->Bwi[3 * (size_t)ni + 2]};
+      double wn = wi[0] * nn[0] + wi[1] * nn[1] + wi[2] * nn[2];
+      double ca = om[0] * wi[0] + om[1] * wi[1] + om[2] * wi[2] - 2.0 * wn * dn;
+      lv = lobe(ca, (double)D->Bns[ni]);
+    }
     for (int k = 0; k < 3; k++)
-      D->Ld[3 * (size_t)ni + (size_t)k] = out ? D->Bs[3 * (size_t)ni + (size_t)k] : 0.0f;
+      D->Ld[3 * (size_t)ni + (size_t)k] =
+          out ? (float)((double)D->Bs[3 * (size_t)ni + (size_t)k] +
+                        lv * (double)D->Bsp[3 * (size_t)ni + (size_t)k])
+              : 0.0f;
   } else if (D->srf[ni] == 2 && !D->blkopen) {
     for (int k = 0; k < 3; k++)
       D->Ld[3 * (size_t)ni + (size_t)k] = 0.0f;
@@ -3288,7 +3343,18 @@ int main(int argc, char **argv) {
     /* Ф8'-0 (§524): доля листьев свипа, затронутых ударом. `hitr=` — радиус
      * сферы (негативный контроль — `hitr=2.0`, доля обязана уйти в десятки
      * процентов); `hitnoocc` — проверка на ложный ноль, занятость не правится. */
-    /* Ф8' (§532): отскок направленным свипом по дереву. */
+    /* Ф9. (§536): граница узости доли рассеяния — замер без переноса. */
+    if (strcmp(argv[i], "lobetest") == 0) {
+      g_lobetest = 1;
+      lit = 1;
+    }
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ §536: доля с той же энергией, но БЕЗ зависимости от
+     * угла. Отклонение A обязано стать ничтожным при любом s, то есть граница
+     * исчезнуть. Не исчезнет — значит меряется не доля, а машинерия. */
+    if (strcmp(argv[i], "dlobeflat") == 0) g_dlobeflat = 1;
+    if (strncmp(argv[i], "dns=", 4) == 0) g_dns = strtod(argv[i] + 4, NULL);
+    if (strncmp(argv[i], "dks=", 4) == 0) g_dks = strtod(argv[i] + 4, NULL);
+    /* Ф8. (§532): отскок направленным свипом по дереву. */
     if (strcmp(argv[i], "dsweep") == 0) {
       g_dsweep = 1;
       lit = 1;
@@ -5647,6 +5713,111 @@ int main(int argc, char **argv) {
      * обосновывающий свип, а не попытка уложиться в бюджет. */
     float *ind = calloc(3 * (size_t)S.n, sizeof *ind);
     if (ind == NULL) exit(1);
+    /* ---- Ф9' (§536): САМАЯ УЗКАЯ ДОЛЯ, КОТОРУЮ НЕСЁТ ДАННОЕ ND ---- */
+    /* ЗАМЕР БЕЗ ПЕРЕНОСА, И ЭТО СОЗНАТЕЛЬНО. Граница «до какой узости ординаты
+     * несут отражение» есть свойство НАБОРА ОРДИНАТ и геометрии, а не света:
+     * ни источника, ни камеры в ней нет. Значит мерить её надо отдельно от
+     * транспорта, иначе три разные ошибки сложатся в одно число (А934).
+     *
+     * ДВЕ ПОЛОВИНЫ ГРАНИЦЫ МЕРЯЮТСЯ ПОРОЗНЬ (А947), потому что К56 говорит
+     * ровно о том, что они РАЗНЫЕ:
+     *   A — квадратурное альбедо доли `Σ_e w_e f_r cos θ_e`. Это ЭНЕРГИЯ.
+     *       Сравнивается не с `ρ_s` (нормировка Фонга точна лишь при нормальном
+     *       падении и спутала бы свою погрешность с квадратурной), а с ТЕМ ЖЕ
+     *       интегралом на заведомо избыточном наборе.
+     *   УГОЛ ПИКА — на какую ординату легла вершина доли против истинного
+     *       зеркального направления. Это ОБРАЗ, и просил пользователь именно
+     *       его. `A` к нему слепа: интеграл сходится и тогда, когда пик уехал.
+     *
+     * НОРМАЛИ БЕРУТСЯ ИЗ СЦЕНЫ, А НЕ ПРИДУМЫВАЮТСЯ: выборка по срезу с шагом,
+     * число печатается. */
+    if (g_lobetest) {
+      static const double SS[] = {0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0, 30.0, 50.0, 200.0};
+      static const int NMU[] = {1, 2, 2, 4}, NPHI[] = {1, 2, 4, 4};
+      tr3_dirs RF;
+      /* ЭТАЛОННЫЙ НАБОР — тот же механизм, вчетверо гуще самого густого из
+       * испытуемых по каждой оси. Своей аналитики здесь нет намеренно: она
+       * внесла бы вторую формулу, и замер мерил бы разницу формул. */
+      if (tr3_dirs_product(&RF, 16, 16) != 0) exit(1);
+      int32_t nstep = S.n / 256 > 0 ? S.n / 256 : 1;
+      int64_t nsmp = 0;
+      for (int32_t i = 0; i < S.n; i += nstep)
+        nsmp++;
+      printf("   Ф9' ГРАНИЦА УЗОСТИ: нормалей из среза %lld (шаг %d из %d), эталон ND %d\n",
+             (long long)nsmp, nstep, S.n, RF.n);
+      printf("        ND  полуугол |  s  | ОТКЛОНЕНИЕ A, %% (p50/p90/max) | УГОЛ ПИКА, град "
+             "(p50/p90/max)\n");
+      for (int ci = 0; ci < 4; ci++) {
+        tr3_dirs DT;
+        if (tr3_dirs_product(&DT, NMU[ci], NPHI[ci]) != 0) exit(1);
+        double thnd = acos(1.0 - 2.0 / (double)DT.n) * 180.0 / 3.14159265358979323846;
+        for (size_t si = 0; si < sizeof SS / sizeof SS[0]; si++) {
+          double ns2 = SS[si];
+          double *ea = malloc((size_t)(nsmp * DT.n) * sizeof *ea);
+          double *pa = malloc((size_t)(nsmp * DT.n) * sizeof *pa);
+          if (ea == NULL || pa == NULL) exit(1);
+          int64_t ne = 0;
+          for (int32_t i = 0; i < S.n; i += nstep) {
+            double nn3[3];
+            hz_slice_normal(&S, i, nn3);
+            for (int d = 0; d < DT.n; d++) {
+              double od[3] = {DT.ox[d], DT.oy[d], DT.oz[d]};
+              double dn2 = od[0] * nn3[0] + od[1] * nn3[1] + od[2] * nn3[2];
+              if (!(dn2 < 0.0)) continue; /* не падает на эту сторону */
+              /* Испытуемый набор: альбедо доли и ординату пика. */
+              double at = 0.0, pk = -1.0;
+              int be = -1;
+              for (int e = 0; e < DT.n; e++) {
+                double oe[3] = {DT.ox[e], DT.oy[e], DT.oz[e]};
+                double en2 = oe[0] * nn3[0] + oe[1] * nn3[1] + oe[2] * nn3[2];
+                if (!(en2 > 0.0)) continue;
+                double ca = oe[0] * od[0] + oe[1] * od[1] + oe[2] * od[2] - 2.0 * dn2 * en2;
+                double fv = lobe(ca, ns2) * DT.w[e] * en2;
+                at += fv;
+                if (fv > pk) {
+                  pk = fv;
+                  be = e;
+                }
+              }
+              /* Эталон: тот же интеграл на избыточном наборе. */
+              double ar = 0.0;
+              for (int e = 0; e < RF.n; e++) {
+                double oe[3] = {RF.ox[e], RF.oy[e], RF.oz[e]};
+                double en2 = oe[0] * nn3[0] + oe[1] * nn3[1] + oe[2] * nn3[2];
+                if (!(en2 > 0.0)) continue;
+                double ca = oe[0] * od[0] + oe[1] * od[1] + oe[2] * od[2] - 2.0 * dn2 * en2;
+                ar += lobe(ca, ns2) * RF.w[e] * en2;
+              }
+              if (!(ar > 0.0)) continue;
+              ea[ne] = 100.0 * fabs(at - ar) / ar;
+              /* Угол между ординатой пика и ИСТИННЫМ зеркальным направлением. */
+              double mr[3] = {od[0] - 2.0 * dn2 * nn3[0], od[1] - 2.0 * dn2 * nn3[1],
+                              od[2] - 2.0 * dn2 * nn3[2]};
+              if (be >= 0) {
+                double cm = DT.ox[be] * mr[0] + DT.oy[be] * mr[1] + DT.oz[be] * mr[2];
+                if (cm > 1.0) cm = 1.0;
+                if (cm < -1.0) cm = -1.0;
+                pa[ne] = acos(cm) * 180.0 / 3.14159265358979323846;
+              } else
+                pa[ne] = 180.0;
+              ne++;
+            }
+          }
+          if (ne > 0) {
+            qsort(ea, (size_t)ne, sizeof *ea, cmp_d);
+            qsort(pa, (size_t)ne, sizeof *pa, cmp_d);
+            printf("       %4d  %6.1f°  |%5.0f| %8.2f %8.2f %8.2f      | %8.2f %8.2f %8.2f\n", DT.n,
+                   thnd, ns2, ea[ne / 2], ea[(ne * 9) / 10], ea[ne - 1], pa[ne / 2],
+                   pa[(ne * 9) / 10], pa[ne - 1]);
+          }
+          free(ea);
+          free(pa);
+        }
+        tr3_dirs_free(&DT);
+      }
+      tr3_dirs_free(&RF);
+    }
+
     /* ---- Ф8' (§532): ОТСКОК НАПРАВЛЕННЫМ СВИПОМ ПО ДЕРЕВУ ---- */
     if (g_dsweep) {
       tr3_dirs DR;
@@ -5666,6 +5837,9 @@ int main(int argc, char **argv) {
       D.Ld = calloc(3 * (size_t)TD.n, sizeof *D.Ld);
       D.Bs = calloc(3 * (size_t)TD.n, sizeof *D.Bs);
       D.Bn = calloc(3 * (size_t)TD.n, sizeof *D.Bn);
+      D.Bsp = calloc(3 * (size_t)TD.n, sizeof *D.Bsp);
+      D.Bwi = calloc(3 * (size_t)TD.n, sizeof *D.Bwi);
+      D.Bns = calloc((size_t)TD.n, sizeof *D.Bns);
       D.srf = calloc((size_t)TD.n, 1);
       D.vis = calloc((size_t)TD.n, 1);
       D.cstart = calloc((size_t)TD.n + 1, sizeof *D.cstart);
@@ -5677,9 +5851,10 @@ int main(int argc, char **argv) {
       double *sar = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *sar);
       int32_t *slf = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *slf);
       double *wchk = calloc((size_t)(S.n > 0 ? S.n : 1), sizeof *wchk);
-      if (D.Ld == NULL || D.Bs == NULL || D.Bn == NULL || D.srf == NULL || D.vis == NULL ||
-          D.cstart == NULL || D.clist == NULL || D.Eind == NULL || snx == NULL || sny == NULL ||
-          snz == NULL || sar == NULL || slf == NULL || wchk == NULL)
+      if (D.Ld == NULL || D.Bs == NULL || D.Bn == NULL || D.Bsp == NULL || D.Bwi == NULL ||
+          D.Bns == NULL || D.srf == NULL || D.vis == NULL || D.cstart == NULL || D.clist == NULL ||
+          D.Eind == NULL || snx == NULL || sny == NULL || snz == NULL || sar == NULL ||
+          slf == NULL || wchk == NULL)
         exit(1);
       D.snx = snx;
       D.sny = sny;
@@ -5733,14 +5908,46 @@ int main(int argc, char **argv) {
           int32_t l2 = slf[i];
           if (l2 < 0) continue;
           aw2[l2] += sar[i];
+          /* УЗОСТЬ И ЗЕРКАЛЬНАЯ ДОЛЯ ИЗ МАТЕРИАЛА (Ф9', §536). `Ns` и `Ks` уже
+           * разбираются `scene_obj.c` и до сих пор не читались никем; ключи
+           * `dns=`/`dks=` перебивают их глобально — для СВИПА по узости без
+           * правки сцены.
+           * `Ns = 0` ЧИТАЕТСЯ КАК «ДОЛИ НЕТ», а не как `s = 0` (А949): в `.mtl`
+           * ноль пишут и диффузным, и по умолчанию, и принять молчание формата
+           * за значение — та же ошибка, что А917.
+           * `E_dir` ВОССТАНАВЛИВАЕТСЯ ДЕЛЕНИЕМ на диффузное альбедо, потому что
+           * `irr` хранит уже `rho_d·E`. При `rho_d = 0` восстановить нечего, и
+           * узкая часть там просто не заводится — оговорка, а не молчание. */
+          double nsi = g_dns > 0.0
+                           ? g_dns
+                           : (m.mtl != NULL && S.c[i].mat < m.nmtl ? m.mtl[S.c[i].mat].ns : 0.0);
+          double wi2[3] = {0.0, 0.0, 0.0}, wl = 0.0;
+          for (int k = 0; k < 3; k++) {
+            double pw2[3];
+            hz_slice_vertex(&S, i, pw2);
+            wi2[k] = (fr.org[k] + pw2[k] * fr.h) - AL.c[k];
+            wl += wi2[k] * wi2[k];
+          }
+          wl = sqrt(wl);
           for (int k = 0; k < 3; k++) {
             D.Bs[3 * (size_t)l2 + (size_t)k] +=
                 (float)(sar[i] * (double)irr[3 * (size_t)i + (size_t)k]);
             D.Bn[3 * (size_t)l2 + (size_t)k] +=
                 (float)(sar[i] * (k == 0 ? snx[i] : (k == 1 ? sny[i] : snz[i])));
+            if (nsi > 0.0 && wl > 0.0) {
+              double rd = alb(&m, S.c[i].mat, k);
+              double rs =
+                  g_dks >= 0.0
+                      ? g_dks
+                      : (m.mtl != NULL && S.c[i].mat < m.nmtl ? m.mtl[S.c[i].mat].ks3[k] : 0.0);
+              double ed = rd > 1e-6 ? (double)irr[3 * (size_t)i + (size_t)k] / rd : 0.0;
+              D.Bsp[3 * (size_t)l2 + (size_t)k] += (float)(sar[i] * rs * ed);
+              D.Bwi[3 * (size_t)l2 + (size_t)k] += (float)(sar[i] * wi2[k] / wl);
+            }
           }
+          if (nsi > 0.0) D.Bns[l2] += (float)(sar[i] * nsi);
         }
-        int64_t nsrf = 0, nblk = 0;
+        int64_t nsrf = 0, nblk = 0, nglos = 0;
         for (int32_t l2 = 0; l2 < TD.n; l2++) {
           if (TD.nd[l2].child0 >= 0) continue;
           if (aw2[l2] > 0.0) {
@@ -5756,6 +5963,26 @@ int main(int argc, char **argv) {
               for (int k = 0; k < 3; k++)
                 D.Bn[3 * (size_t)l2 + (size_t)k] =
                     (float)((double)D.Bn[3 * (size_t)l2 + (size_t)k] / nl);
+            /* Узкая часть: амплитуда — среднее по площади (А936, тот же довод,
+             * что у диффузной); направление прихода нормируется; показатель —
+             * среднее по площади. Делить на `π` здесь НЕ надо: нормировка
+             * `(s+2)/2π` сидит в самой доле. */
+            {
+              double wl2 = 0.0;
+              for (int k = 0; k < 3; k++) {
+                D.Bsp[3 * (size_t)l2 + (size_t)k] =
+                    (float)((double)D.Bsp[3 * (size_t)l2 + (size_t)k] / aw2[l2]);
+                wl2 += (double)D.Bwi[3 * (size_t)l2 + (size_t)k] *
+                       (double)D.Bwi[3 * (size_t)l2 + (size_t)k];
+              }
+              wl2 = sqrt(wl2);
+              if (wl2 > 0.0)
+                for (int k = 0; k < 3; k++)
+                  D.Bwi[3 * (size_t)l2 + (size_t)k] =
+                      (float)((double)D.Bwi[3 * (size_t)l2 + (size_t)k] / wl2);
+              D.Bns[l2] = (float)((double)D.Bns[l2] / aw2[l2]);
+              if (D.Bns[l2] > 0.0f) nglos++;
+            }
             D.srf[l2] = 1;
             nsrf++;
           } else {
@@ -5772,8 +5999,8 @@ int main(int argc, char **argv) {
         }
         free(aw2);
         printf("   Ф8' ПОКРЫТИЕ: ячеек среза отображено %lld из %d; листьев-ИЗЛУЧАТЕЛЕЙ %lld, "
-               "листьев-ЗАСЛОНОВ без среза %lld, всего листьев %d\n",
-               (long long)nmap, S.n, (long long)nsrf, (long long)nblk, TD.nleaf);
+               "листьев-ЗАСЛОНОВ без среза %lld, всего листьев %d; из излучателей ГЛЯНЦЕВЫХ %lld\n",
+               (long long)nmap, S.n, (long long)nsrf, (long long)nblk, TD.nleaf, (long long)nglos);
       }
       double t_build3 = now_s() - tb3;
       /* ПРОХОДЫ ПО НАПРАВЛЕНИЯМ. Ld обнуляется на каждое направление: они
@@ -5856,6 +6083,9 @@ int main(int argc, char **argv) {
       free(D.Ld);
       free(D.Bs);
       free(D.Bn);
+      free(D.Bsp);
+      free(D.Bwi);
+      free(D.Bns);
       free(D.srf);
       free(D.vis);
       free(D.cstart);

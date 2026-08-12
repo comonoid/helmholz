@@ -757,6 +757,12 @@ typedef struct {
    * `0` выключает потолок и возвращает прежнее поведение (негативный контроль). */
   double thrcell;
   int64_t hist[HZ_DC_MAX_LOG2SIZE + 2];
+  /* §580: отсечение по пирамиде видимости ВО ВРЕМЯ СПУСКА. Ставится ТОЛЬКО на
+   * обход растеризатора: для переноса оно незаконно (свет приходит извне
+   * кадра), для кадра — законно по определению пикселя. */
+  int cull;
+  const tr3_camera *cam;
+  double org[3], h;
 } lodctx;
 
 static int lod_stop(void *ctx, const hz_dctree *t, const hz_dcref *r) {
@@ -771,6 +777,42 @@ static int lod_stop(void *ctx, const hz_dctree *t, const hz_dcref *r) {
     double lo = (double)r->lo[a], hi = lo + (double)r->size, e = L->eye[a];
     double dd = e < lo ? lo - e : (e > hi ? e - hi : 0.0);
     d2 += dd * dd;
+  }
+  /* ОТСЕЧЕНИЕ ПО ПИРАМИДЕ ВИДИМОСТИ ВО ВРЕМЯ СПУСКА (§580). Узел, целиком
+   * лежащий вне пирамиды, объявляется ЛИСТОМ — и всё его поддерево не
+   * обходится вовсе. «Пропустить поддерево» в контракте `hz_dc_walk` не
+   * предусмотрено, но «считать листом» даёт то же: лист выдаст пару полигонов,
+   * их отбросит `lit_cull`, а спуск на тысячи узлов не пойдёт.
+   *
+   * ЭТО ЗАКОННО ЗДЕСЬ И НЕЗАКОННО В ПЕРЕНОСЕ, И РАЗНИЦУ НАДО НАЗВАТЬ. Проект
+   * запрещает фрустумное отсечение для СВЕТА: он приходит извне кадра и от
+   * невидимых поверхностей (`CLAUDE.md`, «FRUSTUM/VISIBILITY CULLING IS STILL
+   * NOT AVAILABLE»). Здесь же делается КАДР, то есть пиксели: то, чего камера
+   * не видит, в пиксель не попадает по определению. Поэтому флаг ставится
+   * ТОЛЬКО на обход растеризатора, а срез для переноса строится тем же
+   * `lod_stop` с флагом выключенным.
+   *
+   * ЗАМЕРЕНО ДО ПРАВКИ: обход выдавал `252 955` многоугольников, из которых
+   * `181 626` (`71.8 %`) отбрасывались УЖЕ ПОСТРОЕННЫМИ. */
+  if (L->cull && L->cam != NULL) {
+    const tr3_camera *cm = L->cam;
+    int outn = 0, outl = 0, outr = 0, outb = 0, outt = 0;
+    for (int k = 0; k < 8; k++) {
+      double p[3], d[3];
+      for (int a = 0; a < 3; a++)
+        p[a] = ((double)r->lo[a] + ((k >> a) & 1 ? (double)r->size : 0.0)) * L->h + L->org[a];
+      for (int a = 0; a < 3; a++)
+        d[a] = p[a] - cm->eye[a];
+      double zz = d[0] * cm->fwd[0] + d[1] * cm->fwd[1] + d[2] * cm->fwd[2];
+      double rr = d[0] * cm->right[0] + d[1] * cm->right[1] + d[2] * cm->right[2];
+      double uu = d[0] * cm->up[0] + d[1] * cm->up[1] + d[2] * cm->up[2];
+      if (!(zz > 1e-6)) outn++;
+      if (rr < -zz * cm->tanx) outl++;
+      if (rr > zz * cm->tanx) outr++;
+      if (uu < -zz * cm->tany) outb++;
+      if (uu > zz * cm->tany) outt++;
+    }
+    if (outn == 8 || outl == 8 || outr == 8 || outb == 8 || outt == 8) return 1;
   }
   if (!(d2 > 0.0)) return 0;
   /* ПОТОЛОК ПО УГЛОВОМУ РАЗМЕРУ ЯЧЕЙКИ (§567, замечание пользователя 08-12).
@@ -2282,6 +2324,9 @@ static int g_gamn = 4096;
 /* НЕГАТИВНЫЙ КОНТРОЛЬ §575: вернуть постоянное альбедо вместо выборки. Картинка
  * обязана вернуться к СЕРОЙ побитово. */
 static int g_texflat = 0, g_texnomip = 0;
+/* НЕГАТИВНЫЙ КОНТРОЛЬ §580: отсечение по пирамиде выключено — обход и число
+ * отброшенных обязаны вернуться к прежним. */
+static int g_nofrustum = 0;
 /* Секундомеры сводки: заполняются рабочими стадиями по ходу. */
 static double g_t0 = 0.0, g_t_frame = 0.0, g_t_fslice = 0.0, g_t_fdir = 0.0, g_t_fras = 0.0,
               g_t_bounce = 0.0;
@@ -4312,6 +4357,7 @@ int main(int argc, char **argv) {
     /* НЕГАТИВНЫЙ КОНТРОЛЬ: точечная выборка без пирамиды — рябь обязана
      * вернуться, и расхождение с передискретизованным эталоном вырасти. */
     if (strcmp(argv[i], "texnomip") == 0) g_texnomip = 1;
+    if (strcmp(argv[i], "nofrustum") == 0) g_nofrustum = 1;
     if (strcmp(argv[i], "texflat") == 0) g_texflat = 1;
     if (strncmp(argv[i], "sun=", 4) == 0) {
       const char *sp = argv[i] + 4;
@@ -7928,11 +7974,19 @@ int main(int argc, char **argv) {
        * догадываться. Здесь тот же обход гоняется с ПУСТЫМ обработчиком: его
        * время есть цена обхода дерева и критерия LOD, а разность — цена самой
        * растеризации. */
+      /* §580: КОПИЯ КОНТЕКСТА С ОТСЕЧЕНИЕМ. Оригинал `LL` идёт в срез, который
+       * кормит ПЕРЕНОС, и там фрустумное отсечение запрещено. */
+      lodctx LLc = LL;
+      LLc.cull = !g_nofrustum;
+      LLc.cam = &cam;
+      LLc.h = fr.h;
+      for (int a = 0; a < 3; a++)
+        LLc.org[a] = fr.org[a];
       double ta_w = now_s();
-      int wrc0 = hz_dc_walk(&T, lod_stop, &LL, lit_none, &LC);
+      int wrc0 = hz_dc_walk(&T, lod_stop, &LLc, lit_none, &LC);
       double t_walk = now_s() - ta_w;
       ta = now_s();
-      int wrc = hz_dc_walk(&T, lod_stop, &LL, lit_poly, &LC);
+      int wrc = hz_dc_walk(&T, lod_stop, &LLc, lit_poly, &LC);
       lit_resolve(&LC, g_gamn);
       printf("      §573 ПРОФИЛЬ РАСТРА: обход дерева с ПУСТЫМ обработчиком %.1f мс (код %d), "
              "обход+растр %.1f мс — значит сама растеризация %.1f мс\n",

@@ -1857,6 +1857,16 @@ static double lsamp(int i) {
  * разошлись соглашения об альбедо в §531. Здесь им разойтись нечем. */
 static int g_ptlight = 0; /* НК §541: вернуть прежнюю точечную формулу */
 
+/* СОЛНЦЕ (§570): направленный источник вместо площадки. Наружной сцене площадка
+ * под «потолком полости» не годится по построению — у двора это правило дало
+ * светящийся потолок `465.7` м² размером с половину сцены, и `613.7` мс прямого
+ * света были ценой именно его, а не алгоритма.
+ * У направленного источника углового размера нет, поэтому проба ОДНА, а не
+ * `64`: облучённость есть `L_e·cos θ_r`, без `1/r²` и без площади. Тень —
+ * тот же марш, но к точке, отнесённой на габарит сцены. */
+static int g_sun = 0;
+static double g_sundir[3] = {-0.3, -1.0, -0.2}; /* §2: город, ω = normalize(−0.3,−1,−0.2) */
+
 static double alight_g(const arealight *L, const double w[3], double r2, double cosr) {
   if (g_ptlight) return cosr / r2 / (double)HZ_LIGHT_SAMPLES;
   double r = sqrt(r2);
@@ -1881,6 +1891,14 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
                          float *irr, double stepfrac, int hier, int64_t *nstep,
                          const hz_objmesh *A) {
   double su[HZ_LIGHT_SAMPLES], sv[HZ_LIGHT_SAMPLES];
+  /* СОЛНЦЕ: одна проба вместо `64`, и она не на площадке, а «за горизонтом» —
+   * точка, отнесённая вдоль `−ω` на габарит сцены. Заслон считается тем же
+   * маршем, что и у площадки, поэтому сравнение идёт схема в схему. */
+  int nsmp = g_sun ? 1 : HZ_LIGHT_SAMPLES;
+  double sunfar = 0.0;
+  for (int a = 0; a < 3; a++)
+    sunfar += (double)fr->n * fr->h * (double)fr->n * fr->h;
+  sunfar = sqrt(sunfar);
   for (int a = 0; a < HZ_LIGHT_NS; a++)
     for (int b = 0; b < HZ_LIGHT_NS; b++) {
       su[a * HZ_LIGHT_NS + b] = lsamp(a);
@@ -1893,10 +1911,10 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
       p[k] = fr->org[k] + p[k] * fr->h;
     hz_slice_normal(S, i, n);
     double acc[3] = {0, 0, 0};
-    for (int s = 0; s < HZ_LIGHT_SAMPLES; s++) {
+    for (int s = 0; s < nsmp; s++) {
       double q[3], w[3], r2 = 0.0;
       for (int k = 0; k < 3; k++) {
-        q[k] = L->c[k] + L->u[k] * su[s] + L->v[k] * sv[s];
+        q[k] = g_sun ? p[k] - g_sundir[k] * sunfar : L->c[k] + L->u[k] * su[s] + L->v[k] * sv[s];
         w[k] = q[k] - p[k];
         r2 += w[k] * w[k];
       }
@@ -1913,7 +1931,9 @@ static void front_direct(const hz_dcslice *S, const frame *fr, const opyr *P, co
         int sh = hier ? shadowed_h(P, fr, p, q, nstep) : shadowed(P, fr, p, q, stepfrac);
         if (sh) continue;
       }
-      double g = alight_g(L, w, r2, cosr);
+      /* У направленного источника ни площади, ни `1/r²`: облучённость есть
+       * `L_e·cos θ_r`, и это не упрощение, а определение. */
+      double g = g_sun ? cosr : alight_g(L, w, r2, cosr);
       for (int k = 0; k < 3; k++)
         acc[k] += L->rgb[k] * g * alb(A, S->c[i].mat, k);
     }
@@ -4012,6 +4032,23 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "fnoclamp") == 0) g_fnoclamp = 1;
     if (strcmp(argv[i], "camauto") == 0) g_camauto = 1;
     if (strncmp(argv[i], "ceil=", 5) == 0) g_lodceil = strtod(argv[i] + 5, NULL);
+    /* §570: СОЛНЦЕ — направленный источник для наружной сцены. */
+    if (strcmp(argv[i], "sun") == 0) g_sun = 1;
+    if (strncmp(argv[i], "sun=", 4) == 0) {
+      const char *sp = argv[i] + 4;
+      char *se = NULL;
+      double sl = 0.0;
+      for (int a = 0; a < 3; a++) {
+        g_sundir[a] = strtod(sp, &se);
+        sp = (*se == ',') ? se + 1 : se;
+        sl += g_sundir[a] * g_sundir[a];
+      }
+      sl = sqrt(sl);
+      if (sl > 0.0)
+        for (int a = 0; a < 3; a++)
+          g_sundir[a] /= sl;
+      g_sun = 1;
+    }
     if (strcmp(argv[i], "render") == 0) {
       g_render = 1;
       lit = 1;

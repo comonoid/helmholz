@@ -2287,7 +2287,7 @@ static double g_t0 = 0.0, g_t_frame = 0.0, g_t_fslice = 0.0, g_t_fdir = 0.0, g_t
  * шесть чисел явно; `camauto` ставит взгляд снаружи габарита — для предметов
  * (шары, дом), а для города и интерьера камеру надо задавать руками. */
 static double g_eye[3] = HZ_CFG_HALL_EYE, g_at[3] = HZ_CFG_HALL_AT;
-static int g_camauto = 0;
+static int g_camauto = 0, g_caminside = 0;
 /* А1001: прореживание излучателей гатера — ручкой, чтобы мерить ЕГО собственный
  * разброс тем же прибором. 0 — прежний автоматический выбор. */
 static int g_gstride = 0;
@@ -3886,6 +3886,32 @@ static void lit_tri(litctx *L, const double p[3][3], const double col[3][3]) {
  * зависит точность, и негативный контроль (`gam16`) её ломает нарочно. */
 #define HZ_GAMN 4096
 static void lit_resolve(litctx *L, int gamn) {
+  /* БЕЛАЯ ТОЧКА — СВОЙСТВО КАДРА, А НЕ СЦЕНЫ (08-12). Прежде она бралась
+   * перцентилем по ВСЕМ ячейкам среза, включая невидимые и залитые солнцем
+   * снаружи; при камере внутри двора это давило видимый интерьер в чёрное —
+   * замерено: кадр выходил сплошь тёмным при `E_ind/E_dir = 1.59`.
+   * С отложенным буфером (Р3) правильная величина под рукой: перцентиль по
+   * ЗАКРЫТЫМ пикселям. Перцентиль, а не максимум, — по той же причине, что и
+   * раньше: одиночный блик не должен утопить кадр. */
+  size_t npx = (size_t)L->w * (size_t)L->h;
+  {
+    float *v = malloc(npx * sizeof *v);
+    if (v == NULL) exit(1);
+    size_t nv = 0;
+    for (size_t k = 0; k < npx; k++) {
+      if (L->z[k] >= 1e299) continue;
+      float mx = L->defcol[3 * k];
+      for (int c = 1; c < 3; c++)
+        if (L->defcol[3 * k + (size_t)c] > mx) mx = L->defcol[3 * k + (size_t)c];
+      v[nv++] = mx;
+    }
+    if (nv > 0) {
+      qsort(v, nv, sizeof *v, cmp_f);
+      double w995 = (double)v[(size_t)((double)nv * 0.995)];
+      if (w995 > 0.0) L->white = w995;
+    }
+    free(v);
+  }
   unsigned char *lut = malloc((size_t)gamn);
   if (lut == NULL) exit(1);
   for (int i = 0; i < gamn; i++) {
@@ -4084,6 +4110,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "fnotrans") == 0) g_fnotrans = 1;
     if (strcmp(argv[i], "fnoclamp") == 0) g_fnoclamp = 1;
     if (strcmp(argv[i], "camauto") == 0) g_camauto = 1;
+    if (strcmp(argv[i], "caminside") == 0) g_caminside = 1;
     if (strncmp(argv[i], "ceil=", 5) == 0) g_lodceil = strtod(argv[i] + 5, NULL);
     /* §570: СОЛНЦЕ — направленный источник для наружной сцены. */
     if (strcmp(argv[i], "sun") == 0) g_sun = 1;
@@ -4323,8 +4350,6 @@ int main(int argc, char **argv) {
       g_eye[a] = c2[a] + dv[a] / dl2 * dg * 0.75;
     }
   }
-  printf("   КАМЕРА: глаз (%.2f %.2f %.2f) -> (%.2f %.2f %.2f)%s\n", g_eye[0], g_eye[1], g_eye[2],
-         g_at[0], g_at[1], g_at[2], g_camauto ? "  [camauto]" : "");
 
   /* ---- 1. занятость ---- */
   double t0 = now_s();
@@ -4425,6 +4450,112 @@ int main(int argc, char **argv) {
     int wrc = hz_occ_write(occdump, lev, fr.n, P.b[lev]);
     printf("   ДАМП ЗАНЯТОСТИ -> %s (код %d)\n", occdump, wrc);
   }
+
+  if (g_caminside) {
+    /* КАМЕРА ВНУТРИ (08-12, указание пользователя). `camauto` ставит взгляд
+     * СНАРУЖИ габарита — годится предмету, но не двору и не улице: там видна
+     * только крыша. Здесь точка ищется ПО ЗАНЯТОСТИ, а не подбирается руками,
+     * чтобы правило работало и на других сценах.
+     * ПРАВИЛО: в слое на высоте глаза над низом сцены взять ПУСТУЮ ячейку,
+     * наиболее удалённую от занятых, среди лежащих в центральной половине
+     * плана. Центральная половина — чтобы не уйти в чистое поле за зданием:
+     * самая открытая точка сцены обычно снаружи, а нужен внутренний двор.
+     * Высота глаза `1.6` м — не подгонка, а рост человека; это единственное
+     * число здесь, и оно названо. */
+    const double EYEH = 1.6;
+    /* Высота отсчитывается от НИЗА СЦЕНЫ, а не от начала рамы: рама шире сцены,
+     * и `EYEH/h` дало бы ячейку под нею (замерено: до ближайшей занятой вышло
+     * 69.32 м, то есть камера стояла в пустоте вне здания). */
+    int32_t yc = (int32_t)((lo[1] + EYEH - fr.org[1]) / fr.h);
+    if (yc < 0) yc = 0;
+    if (yc >= fr.n) yc = fr.n - 1;
+    int32_t bx0 = (int32_t)((lo[0] + 0.25 * (hi[0] - lo[0]) - fr.org[0]) / fr.h);
+    int32_t bx1 = (int32_t)((lo[0] + 0.75 * (hi[0] - lo[0]) - fr.org[0]) / fr.h);
+    int32_t bz0 = (int32_t)((lo[2] + 0.25 * (hi[2] - lo[2]) - fr.org[2]) / fr.h);
+    int32_t bz1 = (int32_t)((lo[2] + 0.75 * (hi[2] - lo[2]) - fr.org[2]) / fr.h);
+    int32_t best[2] = {(bx0 + bx1) / 2, (bz0 + bz1) / 2};
+    double bestd = -1.0;
+    /* Расстояние до ближайшей занятой — поиском по расширяющемуся квадрату с
+     * ранним выходом: как только квадрат превысил лучшее, дальше не смотрим. */
+    for (int32_t z = bz0; z <= bz1; z++)
+      for (int32_t x = bx0; x <= bx1; x++) {
+        if (x < 0 || z < 0 || x >= fr.n || z >= fr.n) continue;
+        if (hz_occ_get(P.b[lev], hz_occ_index(fr.n, x, yc, z))) continue;
+        int32_t rad = 0;
+        for (rad = 1; rad < fr.n; rad++) {
+          if ((double)rad <= bestd) break; /* хуже найденного — бросаем */
+          int hitocc = 0;
+          for (int32_t d = -rad; d <= rad && !hitocc; d++) {
+            int32_t qs[4][2] = {
+                {x + d, z - rad}, {x + d, z + rad}, {x - rad, z + d}, {x + rad, z + d}};
+            for (int q = 0; q < 4 && !hitocc; q++) {
+              if (qs[q][0] < 0 || qs[q][1] < 0 || qs[q][0] >= fr.n || qs[q][1] >= fr.n) continue;
+              if (hz_occ_get(P.b[lev], hz_occ_index(fr.n, qs[q][0], yc, qs[q][1]))) hitocc = 1;
+            }
+          }
+          if (hitocc) break;
+        }
+        if ((double)rad > bestd) {
+          bestd = (double)rad;
+          best[0] = x;
+          best[1] = z;
+        }
+      }
+    g_eye[0] = fr.org[0] + ((double)best[0] + 0.5) * fr.h;
+    g_eye[1] = fr.org[1] + ((double)yc + 0.5) * fr.h;
+    g_eye[2] = fr.org[2] + ((double)best[1] + 0.5) * fr.h;
+    /* НАПРАВЛЕНИЕ ВЗГЛЯДА ТОЖЕ ИЩЕТСЯ, А НЕ НАЗНАЧАЕТСЯ. Первая редакция
+     * смотрела «в дальнюю половину сцены» — и упёрлась в стену: кадр вышел
+     * одной плоскостью во весь экран. Здесь пробуется `16` азимутов, и берётся
+     * тот, где свободный ход дальше всего: во дворе это ось двора или аркада, в
+     * коридоре — вдоль коридора. Порога нет, число азимутов — разрешение
+     * перебора, а не допуск. */
+    double bestlen = -1.0;
+    for (int az = 0; az < 16; az++) {
+      double ang = 2.0 * 3.14159265358979323846 * (double)az / 16.0;
+      double dx = cos(ang), dz = sin(ang), len = 0.0;
+      for (double s = fr.h; s < 200.0; s += fr.h) {
+        int32_t qx = (int32_t)((g_eye[0] + dx * s - fr.org[0]) / fr.h);
+        int32_t qz = (int32_t)((g_eye[2] + dz * s - fr.org[2]) / fr.h);
+        if (qx < 0 || qz < 0 || qx >= fr.n || qz >= fr.n) break;
+        if (hz_occ_get(P.b[lev], hz_occ_index(fr.n, qx, yc, qz))) break;
+        len = s;
+      }
+      if (len > bestlen) {
+        bestlen = len;
+        g_at[0] = g_eye[0] + dx * len;
+        g_at[2] = g_eye[2] + dz * len;
+      }
+    }
+    g_at[1] = g_eye[1];
+    printf("   ВЗГЛЯД: выбран азимут со свободным ходом %.2f м из 16 пробных\n", bestlen);
+    printf("   КАМЕРА ВНУТРИ: самая открытая точка центральной половины на высоте %.2f м, "
+           "до ближайшей занятой %.2f м\n",
+           EYEH, bestd * fr.h);
+    /* КАРТА СЛОЯ — чтобы точка выбиралась не вслепую. Печатается один раз и
+     * стоит 64×64 запроса бита; без неё 'камера внутри' не отличить от
+     * 'камера в чулане', а это и случилось при первой редакции. */
+    {
+      printf("   КАРТА ЗАНЯТОСТИ на высоте глаза (# занято, . пусто), X вправо, Z вниз:\n");
+      int32_t gx0 = (int32_t)((lo[0] - fr.org[0]) / fr.h),
+              gx1 = (int32_t)((hi[0] - fr.org[0]) / fr.h);
+      int32_t gz0 = (int32_t)((lo[2] - fr.org[2]) / fr.h),
+              gz1 = (int32_t)((hi[2] - fr.org[2]) / fr.h);
+      for (int r2 = 0; r2 < 32; r2++) {
+        printf("     ");
+        for (int c2 = 0; c2 < 64; c2++) {
+          int32_t x = gx0 + (gx1 - gx0) * c2 / 64, z = gz0 + (gz1 - gz0) * r2 / 32;
+          int oc = (x >= 0 && z >= 0 && x < fr.n && z < fr.n) &&
+                   hz_occ_get(P.b[lev], hz_occ_index(fr.n, x, yc, z));
+          putchar(oc ? '#' : (x == best[0] && z == best[1] ? 'E' : '.'));
+        }
+        putchar('\n');
+      }
+    }
+  }
+  printf("   КАМЕРА: глаз (%.2f %.2f %.2f) -> (%.2f %.2f %.2f)%s%s\n", g_eye[0], g_eye[1], g_eye[2],
+         g_at[0], g_at[1], g_at[2], g_camauto ? "  [camauto]" : "",
+         g_caminside ? "  [caminside]" : "");
 
   /* ---- 2. эрмитовы рёбра: сцена строит и отдаёт ---- */
   hz_htab ht;

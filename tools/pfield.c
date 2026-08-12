@@ -2167,6 +2167,11 @@ static int g_treesweep = 0;
 static double g_sweepthr = 0.0, g_sweeppx = 1.0, g_sweepeye[3] = {0, 0, 0};
 /* Ф6. (§516): угловой порог иерархического отскока; 0 — прежний гатер N². */
 static double g_hgather = 0.0;
+/* Ф8' (§532): отскок направленным свипом. `nmu,nphi` — набор §2 (1,1 / 2,2 /
+ * 2,4 / 4,4 даёт ND = 8, 32, 64, 128); `dpass` — число отскоков (довод №3 §523:
+ * матрицы нет, есть ещё один проход); `dirsall` — НЕГАТИВНЫЙ КОНТРОЛЬ, излучать
+ * во все стороны вместо наружной полусферы. */
+static int g_dsweep = 0, g_dnmu = 2, g_dnphi = 2, g_dpass = 1, g_dirsall = 0, g_dblkopen = 0;
 /* Ф8'-0 (§524, А921): доля затронутых листьев печатается как ФУНКЦИЯ допуска, а
  * не при одном пороге — иначе порог был бы магическим. Пять уровней, первый
  * (0.0) есть точное неравенство, то есть отсутствие порога вовсе. */
@@ -2404,7 +2409,14 @@ static void stree_links(stree *T, int32_t gn) {
       /* Перебор ячеек грани в МЕЛКОЙ сетке; одинаковые соседи схлопываются.
        * Площадь считается в мелких ячейках, доля — от площади грани листа. */
       double tot = (double)s->size * (double)s->size;
-      int32_t seen = -1;
+      /* ДЛИННАЯ СЕРИЯ ОДНОГО СОСЕДА СХЛОПЫВАЕТСЯ ПО ПОИСКУ, НО НЕ ПО ПЛОЩАДИ
+       * (А942). Прежняя редакция писала `if (nj == seen) continue;` и тем
+       * ВЫБРАСЫВАЛА площадь всех повторов: крупный сосед получал вес одной
+       * мелкой клетки вместо своей доли, и суммы весов выходили много меньше
+       * единицы. Найдено первым же потребителем этих списков (Ф8', §534);
+       * до него их не читал никто, поэтому ошибка и жила. Здесь повтор
+       * по-прежнему не ищется заново — но вес ему добавляется. */
+      int32_t seen = -1, seent = -1;
       for (int32_t a = 0; a < s->size; a++)
         for (int32_t b = 0; b < s->size; b++) {
           int32_t q[3];
@@ -2412,12 +2424,16 @@ static void stree_links(stree *T, int32_t gn) {
           q[u] = s->lo[u] + a;
           q[v] = s->lo[v] + b;
           int32_t nj = T->idx[hz_occ_index(gn, q[0], q[1], q[2])];
-          if (nj == seen) continue; /* дёшево ловит длинные серии одного соседа */
+          if (nj == seen && seent >= 0) {
+            T->nbw[seent] += 1.0f / (float)tot;
+            continue;
+          }
           int found = 0;
           for (int32_t t = T->nbstart[(size_t)i * 6 + (size_t)f]; t < cnt; t++)
             if (T->nblist[t] == nj) {
               T->nbw[t] += 1.0f / (float)tot;
               found = 1;
+              seent = t;
               break;
             }
           if (!found) {
@@ -2432,6 +2448,7 @@ static void stree_links(stree *T, int32_t gn) {
             }
             T->nblist[cnt] = nj;
             T->nbw[cnt] = 1.0f / (float)tot;
+            seent = cnt;
             cnt++;
           }
           seen = nj;
@@ -2439,6 +2456,132 @@ static void stree_links(stree *T, int32_t gn) {
     }
   T->nbstart[(size_t)T->n * 6] = cnt;
   T->nnb = cnt;
+}
+
+/* --- Ф8' (§532): РАДИАНС ПО НАПРАВЛЕНИЯМ НА ТОМ ЖЕ ДЕРЕВЕ ------------------ */
+
+/* ЧТО ЗДЕСЬ НОВОГО И ЧТО СТАРОГО. Правило переноса ТО ЖЕ, что у открытости:
+ * взвешенное среднее по трём ВХОДНЫМ граням, вес оси `|ω_a|`, внутри грани —
+ * доли площади из готового CSR (§514). Новая только НЕИЗВЕСТНАЯ: вместо доли
+ * видимости несётся радианс, и на поверхности вместо булева заслона стоит
+ * граничное условие.
+ *
+ * ND-СОСТОЯНИЯ В ОБЪЁМЕ НЕТ (§530, возражение пользователя «узел вырастет
+ * ойойойййй»). Свип идёт ПО ОДНОМУ НАПРАВЛЕНИЮ ЗА РАЗ, поэтому узел несёт три
+ * float, а не `ND × 3`: при `ND = 128` это 12 Б против 1 536 Б, то есть разница
+ * между 1.8 МБ и 65 МБ на дерево. Собранная облучённость копится ПО ХОДУ
+ * прохода — радианс аддитивен, это довод №3 самого §523.
+ *
+ * ПОВЕРХНОСТЬ — ЭТО ЛЮБОЙ ЗАНЯТЫЙ ЛИСТ, А НЕ ТОЛЬКО ТОТ, КУДА ПОПАЛА ЯЧЕЙКА
+ * СРЕЗА (А935). Срез огрублён по камере, и дальняя стена представлена немногими
+ * крупными ячейками; считай поверхностью только их — и свет пошёл бы сквозь
+ * стену там, где срез редок. Здесь два класса врозь и оба считаются:
+ *     лист с `Bs` — светит наружу своей радиосити;
+ *     лист занят, но `Bs` нет — ЧЁРНАЯ стена: гасит, но не светит.
+ * Второе физически честнее дыры и печатается счётчиком (А891). */
+typedef struct {
+  float *Ld;          /* 3 на УЗЕЛ: радианс текущего направления */
+  float *Bs;          /* 3 на УЗЕЛ: исходящая радиосити поверхности */
+  float *Bn;          /* 3 на УЗЕЛ: нормаль поверхности */
+  unsigned char *srf; /* 1 — есть Bs; 2 — занят без Bs (чёрная стена) */
+  /* Лист уже посчитан в этом направлении. Ровно та же оговорка, что у
+   * открытости (`open < 0` — «ещё не посчитан, не наш порядок»): у
+   * градуированного дерева сосед через грань может лежать ниже по потоку, и
+   * читать его нельзя. Такой сосед ИСКЛЮЧАЕТСЯ ИЗ ВЕСА, а не берётся нулём —
+   * иначе схема теряла бы энергию на каждом перепаде уровня. */
+  unsigned char *vis;
+  int32_t *cstart, *clist;       /* CSR: лист -> ячейки среза */
+  double *Eind;                  /* 3 на ячейку среза, копится по ходу */
+  const double *snx, *sny, *snz; /* нормали ячеек среза */
+  int32_t nsl;
+  /* ВИЛКА ВМЕСТО ОДНОГО ЧИСЛА (§534). Занятый лист без ячейки среза — это
+   * поверхность, которую камера не разрешила: радиосити ей взять НЕОТКУДА, и
+   * обе крайности неверны. Гасить (по умолчанию) — НИЖНЯЯ граница: такой лист
+   * поглощает и не светит. Пропускать (`dblkopen`) — ВЕРХНЯЯ: свет идёт сквозь
+   * стену. Истина между, и замер обязан дать обе стороны, а не одну. */
+  int blkopen;
+} dfield;
+
+/* Один лист: посчитать входящий радианс, собрать его в приёмники, выставить
+ * исходящий. Порядок именно такой — сбор читает ВХОДЯЩЕЕ, иначе ячейка собирала
+ * бы собственное излучение. */
+static void dsweep_leaf(const stree *T, dfield *D, int32_t ni, const double om[3], double wd,
+                        int dirsall) {
+  double lin[3] = {0.0, 0.0, 0.0}, wsum = 0.0;
+  for (int a = 0; a < 3; a++) {
+    double w = fabs(om[a]);
+    if (!(w > 0.0)) continue;
+    /* Входная грань по оси `a`: свет идёт в сторону `sign(om[a])`, значит
+     * входит через грань с противоположной стороны. */
+    int f = 2 * a + (om[a] > 0.0 ? 0 : 1);
+    int32_t b0 = T->nbstart[(size_t)ni * 6 + (size_t)f];
+    int32_t b1 = T->nbstart[(size_t)ni * 6 + (size_t)f + 1];
+    double acc[3] = {0.0, 0.0, 0.0}, aw = 0.0;
+    for (int32_t t = b0; t < b1; t++) {
+      int32_t nj = T->nblist[t];
+      if (nj < 0) continue;
+      if (!D->vis[nj]) continue; /* ещё не посчитан — не наш порядок */
+      double fw = (double)T->nbw[t];
+      aw += fw;
+      for (int k = 0; k < 3; k++)
+        acc[k] += fw * (double)D->Ld[3 * (size_t)nj + (size_t)k];
+    }
+    if (!(aw > 0.0)) continue; /* грань наружу сетки: тьма, вклада нет */
+    /* ДЕЛИТЬ НА `aw` ОБЯЗАТЕЛЬНО. Доли площади `nbw` суммируются в единицу лишь
+     * когда ВСЕ соседи грани уже посчитаны; на перепаде уровня часть их лежит
+     * ниже по потоку и исключается. Без деления недостача уходила бы прямо в
+     * потерю энергии, и она уходила: первая редакция дала отношение `0.0059`
+     * вместо ожидавшихся десятых долей (§534). */
+    for (int k = 0; k < 3; k++)
+      lin[k] += w * acc[k] / aw;
+    wsum += w;
+  }
+  if (wsum > 0.0)
+    for (int k = 0; k < 3; k++)
+      lin[k] /= wsum;
+  /* СБОР ПО ХОДУ: приёмник берёт входящее с косинусом, вес квадратуры — `wd`. */
+  for (int32_t t = D->cstart[ni]; t < D->cstart[ni + 1]; t++) {
+    int32_t i = D->clist[t];
+    double cs = -(om[0] * D->snx[i] + om[1] * D->sny[i] + om[2] * D->snz[i]);
+    if (!(cs > 0.0)) continue;
+    for (int k = 0; k < 3; k++)
+      D->Eind[3 * (size_t)i + (size_t)k] += wd * cs * lin[k];
+  }
+  /* ИСХОДЯЩЕЕ. Поверхность с радиосити светит в НАРУЖНУЮ полусферу и гасит
+   * приходящее с изнанки; чёрная стена гасит всё. `dirsall` — негативный
+   * контроль: излучать во все стороны, игнорируя нормаль. */
+  if (D->srf[ni] == 1) {
+    double dn = om[0] * (double)D->Bn[3 * (size_t)ni] + om[1] * (double)D->Bn[3 * (size_t)ni + 1] +
+                om[2] * (double)D->Bn[3 * (size_t)ni + 2];
+    int out = dirsall || dn > 0.0;
+    for (int k = 0; k < 3; k++)
+      D->Ld[3 * (size_t)ni + (size_t)k] = out ? D->Bs[3 * (size_t)ni + (size_t)k] : 0.0f;
+  } else if (D->srf[ni] == 2 && !D->blkopen) {
+    for (int k = 0; k < 3; k++)
+      D->Ld[3 * (size_t)ni + (size_t)k] = 0.0f;
+  } else {
+    for (int k = 0; k < 3; k++)
+      D->Ld[3 * (size_t)ni + (size_t)k] = (float)lin[k];
+  }
+  D->vis[ni] = 1u;
+}
+
+/* Обход в октантном порядке ДЛЯ НАПРАВЛЕНИЯ: по оси `a` свет идёт в сторону
+ * `sign(om[a])`, значит первым обходится ребёнок с той стороны, ОТКУДА свет
+ * приходит. Условие свипа тогда выполняется по построению — как и у открытости,
+ * сортировать нечего. */
+static void dsweep_rec(const stree *T, dfield *D, int32_t ni, const double om[3], double wd,
+                       int dirsall) {
+  const snode *nd = &T->nd[ni];
+  if (nd->child0 >= 0) {
+    int bx = om[0] > 0.0 ? 0 : 1, by = om[1] > 0.0 ? 0 : 1, bz = om[2] > 0.0 ? 0 : 1;
+    for (int i = 0; i < 8; i++) {
+      int kx = (i & 1) ? 1 - bx : bx, ky = (i & 2) ? 1 - by : by, kz = (i & 4) ? 1 - bz : bz;
+      dsweep_rec(T, D, nd->child0 + (kx | (ky << 1) | (kz << 2)), om, wd, dirsall);
+    }
+    return;
+  }
+  dsweep_leaf(T, D, ni, om, wd, dirsall);
 }
 
 static void tsweep_rec(stree *T, const opyr *P, int lev, int drop, const double sc[3], int32_t ni) {
@@ -3145,6 +3288,35 @@ int main(int argc, char **argv) {
     /* Ф8'-0 (§524): доля листьев свипа, затронутых ударом. `hitr=` — радиус
      * сферы (негативный контроль — `hitr=2.0`, доля обязана уйти в десятки
      * процентов); `hitnoocc` — проверка на ложный ноль, занятость не правится. */
+    /* Ф8' (§532): отскок направленным свипом по дереву. */
+    if (strcmp(argv[i], "dsweep") == 0) {
+      g_dsweep = 1;
+      lit = 1;
+    }
+    if (strncmp(argv[i], "dnmu=", 5) == 0) {
+      g_dnmu = (int)strtol(argv[i] + 5, NULL, 10);
+      g_dsweep = 1;
+      lit = 1;
+    }
+    if (strncmp(argv[i], "dnphi=", 6) == 0) {
+      g_dnphi = (int)strtol(argv[i] + 6, NULL, 10);
+      g_dsweep = 1;
+      lit = 1;
+    }
+    if (strncmp(argv[i], "dpass=", 6) == 0) g_dpass = (int)strtol(argv[i] + 6, NULL, 10);
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ §532: излучать во ВСЕ направления, игнорируя нормаль
+     * поверхности. Свет пойдёт с изнанки и сквозь тонкую геометрию, и отношение
+     * обязано вырасти не менее чем в 1.4 раза. */
+    if (strcmp(argv[i], "dblkopen") == 0) {
+      g_dblkopen = 1;
+      g_dsweep = 1;
+      lit = 1;
+    }
+    if (strcmp(argv[i], "dirsall") == 0) {
+      g_dirsall = 1;
+      g_dsweep = 1;
+      lit = 1;
+    }
     /* §529: `albone` — все альбедо единица (фальсификатор разбора). */
     if (strcmp(argv[i], "albone") == 0) g_albone = 1;
     /* §531: `emitalb2` — вернуть ПРЕЖНЕЕ неверное поведение (альбедо излучателя
@@ -5475,6 +5647,229 @@ int main(int argc, char **argv) {
      * обосновывающий свип, а не попытка уложиться в бюджет. */
     float *ind = calloc(3 * (size_t)S.n, sizeof *ind);
     if (ind == NULL) exit(1);
+    /* ---- Ф8' (§532): ОТСКОК НАПРАВЛЕННЫМ СВИПОМ ПО ДЕРЕВУ ---- */
+    if (g_dsweep) {
+      tr3_dirs DR;
+      if (tr3_dirs_product(&DR, g_dnmu, g_dnphi) != 0) exit(1);
+      stree TD;
+      double tb3 = now_s();
+      double eyes2[3];
+      for (int a = 0; a < 3; a++)
+        eyes2[a] = LL.eye[a] / (double)((int32_t)1 << HZ_SWEEP_DROP);
+      int32_t gn2 = (int32_t)1 << (fr.lev - HZ_SWEEP_DROP);
+      stree_build(&TD, &P, fr.lev, HZ_SWEEP_DROP, gn2, eyes2, g_sweeppx, g_sweepthr);
+      stree_links(&TD, gn2);
+      dfield D;
+      memset(&D, 0, sizeof D);
+      D.nsl = S.n;
+      D.blkopen = g_dblkopen;
+      D.Ld = calloc(3 * (size_t)TD.n, sizeof *D.Ld);
+      D.Bs = calloc(3 * (size_t)TD.n, sizeof *D.Bs);
+      D.Bn = calloc(3 * (size_t)TD.n, sizeof *D.Bn);
+      D.srf = calloc((size_t)TD.n, 1);
+      D.vis = calloc((size_t)TD.n, 1);
+      D.cstart = calloc((size_t)TD.n + 1, sizeof *D.cstart);
+      D.clist = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *D.clist);
+      D.Eind = calloc(3 * (size_t)S.n, sizeof *D.Eind);
+      double *snx = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *snx);
+      double *sny = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *sny);
+      double *snz = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *snz);
+      double *sar = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *sar);
+      int32_t *slf = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *slf);
+      double *wchk = calloc((size_t)(S.n > 0 ? S.n : 1), sizeof *wchk);
+      if (D.Ld == NULL || D.Bs == NULL || D.Bn == NULL || D.srf == NULL || D.vis == NULL ||
+          D.cstart == NULL || D.clist == NULL || D.Eind == NULL || snx == NULL || sny == NULL ||
+          snz == NULL || sar == NULL || slf == NULL || wchk == NULL)
+        exit(1);
+      D.snx = snx;
+      D.sny = sny;
+      D.snz = snz;
+      /* ОТОБРАЖЕНИЕ «ЯЧЕЙКА СРЕЗА -> ЛИСТ» тем же правилом, что у `sweep_vis`:
+       * иначе перенос и сбор читали бы разные ячейки. */
+      double cwid = fr.h * (double)((int32_t)1 << HZ_SWEEP_DROP);
+      int64_t nmap = 0;
+      for (int32_t i = 0; i < S.n; i++) {
+        double p2[3], n2[3];
+        hz_slice_vertex(&S, i, p2);
+        for (int k = 0; k < 3; k++)
+          p2[k] = fr.org[k] + p2[k] * fr.h;
+        hz_slice_normal(&S, i, n2);
+        snx[i] = n2[0];
+        sny[i] = n2[1];
+        snz[i] = n2[2];
+        double cs4 = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
+        sar[i] = cs4 * cs4;
+        int32_t cc2[3];
+        int ok3 = 1;
+        for (int k = 0; k < 3; k++) {
+          double f3 = floor((p2[k] - fr.org[k]) / cwid);
+          if (!(f3 >= 0.0) || !(f3 < (double)gn2)) ok3 = 0;
+          cc2[k] = ok3 ? (int32_t)f3 : 0;
+        }
+        slf[i] = ok3 ? TD.idx[hz_occ_index(gn2, cc2[0], cc2[1], cc2[2])] : -1;
+        if (slf[i] >= 0) {
+          nmap++;
+          D.cstart[slf[i] + 1]++;
+        }
+      }
+      for (int32_t i = 0; i < TD.n; i++)
+        D.cstart[i + 1] += D.cstart[i];
+      {
+        int32_t *cur = malloc((size_t)TD.n * sizeof *cur);
+        if (cur == NULL) exit(1);
+        memcpy(cur, D.cstart, (size_t)TD.n * sizeof *cur);
+        for (int32_t i = 0; i < S.n; i++)
+          if (slf[i] >= 0) D.clist[cur[slf[i]]++] = i;
+        free(cur);
+      }
+      /* РАДИОСИТИ ЛИСТА — СРЕДНЕЕ ПО ПЛОЩАДИ, А НЕ СУММА (А936): радианс есть
+       * величина УДЕЛЬНАЯ, и две ячейки среза в одном листе не светят вдвое
+       * ярче. Делится на `π`, потому что диффузная поверхность с радиосити `B`
+       * имеет радианс `B/π`. */
+      {
+        double *aw2 = calloc((size_t)TD.n, sizeof *aw2);
+        if (aw2 == NULL) exit(1);
+        for (int32_t i = 0; i < S.n; i++) {
+          int32_t l2 = slf[i];
+          if (l2 < 0) continue;
+          aw2[l2] += sar[i];
+          for (int k = 0; k < 3; k++) {
+            D.Bs[3 * (size_t)l2 + (size_t)k] +=
+                (float)(sar[i] * (double)irr[3 * (size_t)i + (size_t)k]);
+            D.Bn[3 * (size_t)l2 + (size_t)k] +=
+                (float)(sar[i] * (k == 0 ? snx[i] : (k == 1 ? sny[i] : snz[i])));
+          }
+        }
+        int64_t nsrf = 0, nblk = 0;
+        for (int32_t l2 = 0; l2 < TD.n; l2++) {
+          if (TD.nd[l2].child0 >= 0) continue;
+          if (aw2[l2] > 0.0) {
+            double nl = 0.0;
+            for (int k = 0; k < 3; k++) {
+              D.Bs[3 * (size_t)l2 + (size_t)k] = (float)((double)D.Bs[3 * (size_t)l2 + (size_t)k] /
+                                                         aw2[l2] / 3.14159265358979323846);
+              nl += (double)D.Bn[3 * (size_t)l2 + (size_t)k] *
+                    (double)D.Bn[3 * (size_t)l2 + (size_t)k];
+            }
+            nl = sqrt(nl);
+            if (nl > 0.0)
+              for (int k = 0; k < 3; k++)
+                D.Bn[3 * (size_t)l2 + (size_t)k] =
+                    (float)((double)D.Bn[3 * (size_t)l2 + (size_t)k] / nl);
+            D.srf[l2] = 1;
+            nsrf++;
+          } else {
+            /* А935: ЛЮБОЙ занятый лист заслоняет, даже если среза в нём нет —
+             * иначе там, где срез огрублён, свет пошёл бы сквозь стену. Такой
+             * лист есть ЧЁРНАЯ стена: гасит, но не светит. */
+            int32_t lof[3] = {TD.nd[l2].lo[0] << HZ_SWEEP_DROP, TD.nd[l2].lo[1] << HZ_SWEEP_DROP,
+                              TD.nd[l2].lo[2] << HZ_SWEEP_DROP};
+            if (u_occ(&P, lof, TD.nd[l2].size << HZ_SWEEP_DROP)) {
+              D.srf[l2] = 2;
+              nblk++;
+            }
+          }
+        }
+        free(aw2);
+        printf("   Ф8' ПОКРЫТИЕ: ячеек среза отображено %lld из %d; листьев-ИЗЛУЧАТЕЛЕЙ %lld, "
+               "листьев-ЗАСЛОНОВ без среза %lld, всего листьев %d\n",
+               (long long)nmap, S.n, (long long)nsrf, (long long)nblk, TD.nleaf);
+      }
+      double t_build3 = now_s() - tb3;
+      /* ПРОХОДЫ ПО НАПРАВЛЕНИЯМ. Ld обнуляется на каждое направление: они
+       * независимы, и `vis` метит уже посчитанные — как `open < 0` у открытости. */
+      double si3 = 0.0, sd3 = 0.0;
+      double t_pass = 0.0;
+      for (int pass = 0; pass < g_dpass; pass++) {
+        for (int32_t i = 0; i < 3 * S.n; i++)
+          D.Eind[i] = 0.0;
+        for (int32_t i = 0; i < S.n; i++)
+          wchk[i] = 0.0;
+        double tp = now_s();
+        for (int d = 0; d < DR.n; d++) {
+          double om[3] = {DR.ox[d], DR.oy[d], DR.oz[d]};
+          memset(D.Ld, 0, 3 * (size_t)TD.n * sizeof *D.Ld);
+          memset(D.vis, 0, (size_t)TD.n);
+          dsweep_rec(&TD, &D, 0, om, DR.w[d], g_dirsall);
+          /* А937: ПРОВЕРКА НОРМИРОВКИ ЗАКОНОМ. `Σ_d w_d max(0, −ω·n)` обязана
+           * быть `π` — иначе ошибка множителя смешается с физикой и проживёт,
+           * как прожила ошибка §531. */
+          for (int32_t i = 0; i < S.n; i++) {
+            double cs = -(om[0] * snx[i] + om[1] * sny[i] + om[2] * snz[i]);
+            if (cs > 0.0) wchk[i] += DR.w[d] * cs;
+          }
+        }
+        t_pass = now_s() - tp;
+        si3 = sd3 = 0.0;
+        for (int32_t i = 0; i < S.n; i++)
+          for (int k = 0; k < 3; k++) {
+            double e3 = D.Eind[3 * (size_t)i + (size_t)k] * (alb0 ? 0.0 : alb(&m, S.c[i].mat, k));
+            if (pass + 1 == g_dpass) ind[3 * (size_t)i + (size_t)k] = (float)e3;
+            si3 += e3;
+            sd3 += (double)irr[3 * (size_t)i + (size_t)k];
+          }
+        double wmn = 1e300, wmx = -1e300, wav = 0.0;
+        for (int32_t i = 0; i < S.n; i++) {
+          if (wchk[i] < wmn) wmn = wchk[i];
+          if (wchk[i] > wmx) wmx = wchk[i];
+          wav += wchk[i];
+        }
+        wav /= (double)(S.n ? S.n : 1);
+        printf("   Ф8' СВИП ПО НАПРАВЛЕНИЯМ: ND %d (nmu %d, nphi %d), отскок %d; дерево+раскладка "
+               "%.1f мс, проход %.1f мс (%.0f нс на лист-направление); СУММА косвенного / прямого "
+               "= %.4f%s\n",
+               DR.n, g_dnmu, g_dnphi, pass + 1, t_build3 * 1e3, t_pass * 1e3,
+               t_pass * 1e9 / ((double)DR.n * (double)(TD.nleaf ? TD.nleaf : 1)),
+               si3 / (sd3 > 0.0 ? sd3 : 1.0),
+               g_dirsall ? "  [НК dirsall]"
+                         : (g_dblkopen ? "  [ВЕРХНЯЯ граница: заслоны без среза ПРОЗРАЧНЫ]" : ""));
+        printf("      А937 НОРМИРОВКА: Σ w·max(0,−ω·n) = %.5f…%.5f, среднее %.5f (обязана быть "
+               "π = %.5f, отклонение среднего %.2f %%)\n",
+               wmn, wmx, wav, 3.14159265358979323846,
+               100.0 * (wav - 3.14159265358979323846) / 3.14159265358979323846);
+        /* МНОГОКРАТНЫЕ ОТРАЖЕНИЯ БЕЗ МАТРИЦЫ (довод №3 §523): следующая
+         * радиосити есть собранная облучённость на альбедо. Матрицы нет, есть
+         * ещё один проход по тем же направлениям. */
+        if (pass + 1 < g_dpass) {
+          double *aw3 = calloc((size_t)TD.n, sizeof *aw3);
+          if (aw3 == NULL) exit(1);
+          memset(D.Bs, 0, 3 * (size_t)TD.n * sizeof *D.Bs);
+          for (int32_t i = 0; i < S.n; i++) {
+            int32_t l2 = slf[i];
+            if (l2 < 0) continue;
+            aw3[l2] += sar[i];
+            for (int k = 0; k < 3; k++)
+              D.Bs[3 * (size_t)l2 + (size_t)k] +=
+                  (float)(sar[i] * D.Eind[3 * (size_t)i + (size_t)k] * alb(&m, S.c[i].mat, k));
+          }
+          for (int32_t l2 = 0; l2 < TD.n; l2++)
+            if (D.srf[l2] == 1 && aw3[l2] > 0.0)
+              for (int k = 0; k < 3; k++)
+                D.Bs[3 * (size_t)l2 + (size_t)k] =
+                    (float)((double)D.Bs[3 * (size_t)l2 + (size_t)k] / aw3[l2] /
+                            3.14159265358979323846);
+          free(aw3);
+        }
+      }
+      for (int32_t i = 0; i < 3 * S.n; i++)
+        irr[i] += ind[i];
+      free(D.Ld);
+      free(D.Bs);
+      free(D.Bn);
+      free(D.srf);
+      free(D.vis);
+      free(D.cstart);
+      free(D.clist);
+      free(D.Eind);
+      free(snx);
+      free(sny);
+      free(snz);
+      free(sar);
+      free(slf);
+      free(wchk);
+      stree_free(&TD);
+      tr3_dirs_free(&DR);
+    }
     if (g_hgather > 0.0) {
       /* Ф6. (§516): ОТСКОК ПО ИЕРАРХИИ ИЗЛУЧАТЕЛЕЙ. */
       etree ET;

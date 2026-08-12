@@ -2229,6 +2229,13 @@ static int g_diffbench = 0, g_onenb = 0, g_schar = 0, g_scharax = 0;
 /* Ф14. (§557): поячеечное сличение свипа с гатером; `cmpself` — подсунуть один
  * и тот же массив дважды (проверка на ложный ноль, А1002). */
 static int g_cmpcell = 0, g_cmpself = 0, g_fnoclamp = 0;
+/* РЕЖИМ ТОЛЬКО РЕНДЕРА (08-12, выбор пользователя): пропустить диагностические
+ * проходы, СОХРАНИВ все тайминги рабочих стадий. Прибор не должен мешать
+ * измерять то, ради чего он заведён. */
+static int g_render = 0;
+/* Секундомеры сводки: заполняются рабочими стадиями по ходу. */
+static double g_t0 = 0.0, g_t_frame = 0.0, g_t_fslice = 0.0, g_t_fdir = 0.0, g_t_fras = 0.0,
+              g_t_bounce = 0.0;
 /* КАМЕРА ДЛЯ ЛЮБОЙ СЦЕНЫ (08-12). Прежде все восемь мест читали `HZ_CFG_HALL_EYE`
  * напрямую, и никакая сцена кроме комнаты не рендерилась вовсе. `cam=` задаёт
  * шесть чисел явно; `camauto` ставит взгляд снаружи габарита — для предметов
@@ -3596,7 +3603,9 @@ static double alight_sum(const arealight *L, const double p[3], const double nr[
   double acc = 0.0;
   for (int a = 0; a < HZ_LIGHT_NS; a++)
     for (int b = 0; b < HZ_LIGHT_NS; b++) {
-      double q[3], w[3], r2 = 0.0;
+      /* Явный ноль — не перестраховка: gcc-analyzer не доказывает, что цикл ниже
+       * заполняет все три компоненты, и без инициализации гейт краснеет. */
+      double q[3] = {0.0, 0.0, 0.0}, w[3] = {0.0, 0.0, 0.0}, r2 = 0.0;
       for (int k = 0; k < 3; k++) {
         q[k] = L->c[k] + L->u[k] * lsamp(a) + L->v[k] * lsamp(b);
         w[k] = q[k] - p[k];
@@ -3980,6 +3989,10 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "fnotrans") == 0) g_fnotrans = 1;
     if (strcmp(argv[i], "fnoclamp") == 0) g_fnoclamp = 1;
     if (strcmp(argv[i], "camauto") == 0) g_camauto = 1;
+    if (strcmp(argv[i], "render") == 0) {
+      g_render = 1;
+      lit = 1;
+    }
     if (strncmp(argv[i], "cam=", 4) == 0) {
       const char *cp = argv[i] + 4;
       char *ep = NULL;
@@ -4125,6 +4138,7 @@ int main(int argc, char **argv) {
    * которого не доходит правка, не контроль.
    * И всё же ДО всякого счёта: смысл исполнителя в том, чтобы негодная модель
    * света не доживала до первого замера. */
+  g_t0 = now_s();
   alight_selftest();
   emitbudget_selftest();
   if (g_diffbench > 0) {
@@ -4211,7 +4225,10 @@ int main(int argc, char **argv) {
       "   занятость за %.2f с: занятых ячеек %lld (%.3f %%), пирамида %.1f МБ\n", t_occ,
       (long long)nocc, 100.0 * (double)nocc / (double)((size_t)fr.n * (size_t)fr.n * (size_t)fr.n),
       (double)hz_occ_bytes((size_t)fr.n * (size_t)fr.n * (size_t)fr.n) * (8.0 / 7.0) / 1048576.0);
-  {
+  /* РЕЖИМ `render` (08-12): диагностические проходы пропускаются целиком. На
+   * доме они стоили `> 600` с против `33` с сборки — то есть прибор мешал
+   * измерять то, ради чего заведён. Тайминги РАБОЧИХ стадий остаются все. */
+  if (!g_render) {
     /* СКОЛЬКО СЕТКИ МОЖНО ПРОПУСТИТЬ: доля ЗАНЯТЫХ ячеек по уровням пирамиды.
      * Если на грубых уровнях занято единицы процентов, то свип, умеющий
      * перепрыгивать пустой узел, платит по ПОВЕРХНОСТИ, а не по объёму. */
@@ -4461,6 +4478,7 @@ int main(int argc, char **argv) {
   printf("   ДЕРЕВО: спуск %.2f с (узлов %d), маски %.2f с (крупный лист с маской %d — обязан "
          "быть 0), формы %.2f с (код %d; ЗАГНАНО %d)\n",
          t_shape, T.n, t_masks, T.nbigmask, t_dc, rc, T.nclamped);
+  double t_tree = t_shape + t_masks + t_dc;
   int64_t nv = 0;
   int32_t zero[3] = {0, 0, 0};
   int64_t nvl = 0;
@@ -4833,9 +4851,9 @@ int main(int argc, char **argv) {
 
   /* ---- 4. приёмка: потеря поля (популяция — ВХОД) ---- */
   celltris CT;
-  ct_build(&CT, &m, &fr, P.b[lev], nocc);
-  surf_err(&T, &fr, &m, ct_list, &CT, "");
-  {
+  ct_build(&CT, &m, &fr, P.b[lev], nocc); /* нужен дальше материалам среза */
+  if (!g_render) surf_err(&T, &fr, &m, ct_list, &CT, "");
+  if (!g_render) {
     covstat st;
     occ_cover(&T, &fr, P.b[lev], &ht, &st);
     printf("   ПОТЕРЯНО ПОЛЕМ: занятых ячеек %lld; ОКНО 27 — %lld (%.2f %%); ОКНО 1 — %lld "
@@ -4892,7 +4910,7 @@ int main(int argc, char **argv) {
   }
 
   /* ---- 4б. СРЕЗ (Ш2): построение, замер обхода, сверка вершин ---- */
-  {
+  if (!g_render) {
     hz_dcslice S;
     if (hz_slice_init(&S, lev) != HZ_DC_OK) exit(1);
     if (vq1) S.vbits = 1; /* НЕГАТИВНЫЙ КОНТРОЛЬ §397: вершина в один бит на ось */
@@ -5006,7 +5024,7 @@ int main(int argc, char **argv) {
 
   /* ---- 4в. АДАПТИВНЫЙ СРЕЗ (Ш3): критерий, ошибка ДО ВЫДАННОЙ ПОВЕРХНОСТИ,
    *      ориентация на перепаде уровней, доля среза за кадр ---- */
-  {
+  if (!g_render) {
     lodctx L;
     memset(&L, 0, sizeof L);
     {
@@ -6981,6 +6999,7 @@ int main(int argc, char **argv) {
              g_hgather, ET.n, (long long)nlink, (long long)S.n * (long long)S.n,
              (double)((long long)S.n * (long long)S.n) / (double)(nlink ? nlink : 1), t_build * 1e3,
              t_g2 * 1e3, si2 / (sd2 > 0.0 ? sd2 : 1.0), indvis ? " [С ЗАСЛОНАМИ]" : "");
+      g_t_bounce = t_build + t_g2;
       if (indmeas || indvis)
         printf("      §474 СКВОЗЬ ЗАСЛОНЫ: %.2f %%\n",
                100.0 * sthru2 / (sall2 > 0.0 ? sall2 : 1.0));
@@ -7308,6 +7327,10 @@ int main(int argc, char **argv) {
              "ячейку), растеризация %.1f мс (код %d), ВСЕГО %.1f мс -> %s (код %d)\n",
              res, t_slice * 1e3, S.n, t_dir * 1e3, t_dir * 1e9 / (double)(S.n ? S.n : 1),
              t_rast * 1e3, wrc, (t_slice + t_dir + t_rast) * 1e3, path, prc);
+      g_t_fslice = t_slice;
+      g_t_fdir = t_dir;
+      g_t_fras = t_rast;
+      g_t_frame = t_slice + t_dir + t_rast;
       free(zb);
       free(rgb);
     }
@@ -7316,6 +7339,25 @@ int main(int argc, char **argv) {
     free(irr2);
     free(irr);
     hz_slice_free(&S);
+  }
+  /* СВОДКА ПО СТАДИЯМ (08-12, требование пользователя «тайминги считать надо»).
+   * Печатается ВСЕГДА, а не только в режиме `render`: до неё числа лежали
+   * россыпью по два десятка строк, и сложить их глазом было нельзя.
+   * ЧТО ЗДЕСЬ ЕСТЬ И ЧЕГО НЕТ. `ПОСТРОЙКА` — разовая работа над сценой
+   * (занятость, рёбра, дерево); `КАДР` — то, что платится КАЖДЫЙ раз. Смешивать
+   * их — то же, что смешивать холодный старт с установившимся, а это запрещено
+   * прямо (`CLAUDE.md`). Отскок стоит отдельной строкой: он платится за кадр
+   * только у динамического света. */
+  {
+    double t_build_all = t_occ + t_edges + t_tree;
+    printf("== СВОДКА ВРЕМЕНИ (%s%s)\n"
+           "   ПОСТРОЙКА СЦЕНЫ: занятость %.2f с + рёбра %.2f с + дерево %.2f с = %.2f с\n"
+           "   ЗА КАДР: %.1f мс (срез %.1f + прямой свет %.1f + растеризация %.1f)\n"
+           "   ОТСКОК:  %.1f мс (за кадр только при динамическом свете)\n"
+           "   ВСЕГО ОТ ЗАПУСКА ДО КАДРА: %.2f с\n",
+           g_render ? "режим render" : "полный, с диагностикой", nonrm ? ", НОРМАЛИ ОСЕВЫЕ" : "",
+           t_occ, t_edges, t_tree, t_build_all, g_t_frame * 1e3, g_t_fslice * 1e3, g_t_fdir * 1e3,
+           g_t_fras * 1e3, g_t_bounce * 1e3, now_s() - g_t0);
   }
   ct_free(&CT);
   hz_dc_free(&T);

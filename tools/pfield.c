@@ -2222,6 +2222,8 @@ static double g_hgather = 0.0;
 static int g_dsweep = 0, g_dnmu = 2, g_dnphi = 2, g_dpass = 1, g_dirsall = 0, g_dblkopen = 0;
 /* Ф9. (§536): замер границы узости доли; `dlobeflat` — негативный контроль. */
 static int g_lobetest = 0, g_dlobeflat = 0;
+/* Ф11. (§545): `ffull` — вернуть булев заслон (сведение); `fzero` — НК. */
+static int g_ffull = 0, g_fzero = 0, g_fnotrans = 0;
 /* Перебивка узости и зеркальной доли для СВИПА без правки сцены; -1 у `dks` —
  * «не перебивать», брать из материала. */
 static double g_dns = 0.0, g_dks = -1.0;
@@ -2229,6 +2231,9 @@ static double g_dns = 0.0, g_dks = -1.0;
  * не при одном пороге — иначе порог был бы магическим. Пять уровней, первый
  * (0.0) есть точное неравенство, то есть отсутствие порога вовсе. */
 #define HZ_HS_NTOL 5
+/* Ф11. (§545): сколько значений `f` держать для распределения. Степень двойки —
+ * чтобы выборка бралась маской, а не делением; это не порог, а размер буфера. */
+#define HZ_FSTAT_CAP 65536
 /* НЕГАТИВНЫЙ КОНТРОЛЬ §520: все нормали в ОДНУ корзину — то есть усреднение
  * через складку, как было до §519. Энергия обязана уехать вдвое. */
 
@@ -2560,6 +2565,14 @@ typedef struct {
    * поглощает и не светит. Пропускать (`dblkopen`) — ВЕРХНЯЯ: свет идёт сквозь
    * стену. Истина между, и замер обязан дать обе стороны, а не одну. */
   int blkopen;
+  /* Ф11. (§545): доля перекрытия. `Ap` — площадь площадки в листе, `cw` —
+   * сторона ячейки сетки свипа в метрах; `fone`/`fzero` — сведение к прежнему
+   * правилу и негативный контроль; `fstat` — выборка `f` для распределения. */
+  float *Ap;
+  double cw;
+  int fone, fzero, fnotrans;
+  double *fstat;
+  int64_t nfstat, nfone;
 } dfield;
 
 /* --- Ф9' (§536): ШИРИНА ДОЛИ РАССЕЯНИЯ ИЗ МАТЕРИАЛА ------------------------ */
@@ -2642,6 +2655,33 @@ static void dsweep_leaf(const stree *T, dfield *D, int32_t ni, const double om[3
                     (double)D->Bn[3 * (size_t)ni + 2]};
     double dn = om[0] * nn[0] + om[1] * nn[1] + om[2] * nn[2];
     int out = dirsall || dn > 0.0;
+    /* ДОЛЯ ПЕРЕКРЫТИЯ (Ф11', §545). Прежде лист гасил направление ЦЕЛИКОМ, хотя
+     * поверхность занимает в нём не весь объём: заслон выходил толщиной в лист
+     * (`0.066` м) вместо толщины поверхности, и луч, проходящий в двух
+     * сантиметрах от стены, гиб. Здесь считается отношение ПАРАЛЛЕЛЬНЫХ
+     * ПРОЕКЦИЙ на плоскость ⊥ω:
+     *     площадка   `A_p·|ω·n|`
+     *     сам лист   `h²·(|ω_x| + |ω_y| + |ω_z|)`
+     * то есть доля лучей пучка, встречающих площадку. При `f = 1` правило
+     * тождественно прежнему, и это проверяется приёмкой.
+     * ОГОВОРКИ НАЗВАНЫ И ИЗМЕРЕНЫ ОТДЕЛЬНО: `A_p` есть сумма площадей ГРАНЕЙ
+     * ячеек среза, а не наклонённой поверхности (А969, занижает `f`); проекции
+     * нескольких площадок в одном листе могут перекрываться (А970, завышает);
+     * нормаль усреднена и на складке не значит направления (А971). */
+    double f = 1.0;
+    if (!D->fone) {
+      double sab = fabs(om[0]) + fabs(om[1]) + fabs(om[2]);
+      double h = (double)T->nd[ni].size * D->cw;
+      double cell = h * h * sab;
+      f = cell > 0.0 ? (double)D->Ap[ni] * fabs(dn) / cell : 1.0;
+      if (f > 1.0) f = 1.0;
+      if (D->fzero) f = 0.0;
+      if (D->fstat != NULL) {
+        D->fstat[D->nfstat & (HZ_FSTAT_CAP - 1)] = f;
+        D->nfstat++;
+        if (f >= 1.0) D->nfone++;
+      }
+    }
     /* УЗКАЯ ЧАСТЬ. Зеркальный вектор не строится: `cos α = ω_e·ω_in −
      * 2(ω_in·n)(ω_e·n)` — тождество. Кривизна входит через `n`, взятую у ЯЧЕЙКИ
      * СРЕЗА, поэтому произвольная кривая зеркальная поверхность работает без
@@ -2654,11 +2694,20 @@ static void dsweep_leaf(const stree *T, dfield *D, int32_t ni, const double om[3
       double ca = om[0] * wi[0] + om[1] * wi[1] + om[2] * wi[2] - 2.0 * wn * dn;
       lv = lobe(ca, (double)D->Bns[ni]);
     }
-    for (int k = 0; k < 3; k++)
+    /* ВЫПУКЛАЯ КОМБИНАЦИЯ, а не сумма (А973): перекрытая доля потока заменяется
+     * излучением поверхности, неперекрытая проходит насквозь. Энергия не
+     * рождается — значение лежит между `B_out` и `L_in`. */
+    for (int k = 0; k < 3; k++) {
+      double bo = out ? (double)D->Bs[3 * (size_t)ni + (size_t)k] +
+                            lv * (double)D->Bsp[3 * (size_t)ni + (size_t)k]
+                      : 0.0;
+      /* РАЗДЕЛЕНИЕ ДВУХ ПОЛОВИН ПРАВИЛА (§547). `f` меняет СРАЗУ ДВЕ вещи:
+       * ослабляет излучение (перекрыта лишь доля сечения) и пропускает остаток
+       * насквозь. Чтобы сказать, какая половина что делает, `fnotrans`
+       * оставляет первую и выключает вторую. */
       D->Ld[3 * (size_t)ni + (size_t)k] =
-          out ? (float)((double)D->Bs[3 * (size_t)ni + (size_t)k] +
-                        lv * (double)D->Bsp[3 * (size_t)ni + (size_t)k])
-              : 0.0f;
+          (float)(f * bo + (D->fnotrans ? 0.0 : (1.0 - f) * lin[k]));
+    }
   } else if (D->srf[ni] == 2 && !D->blkopen) {
     for (int k = 0; k < 3; k++)
       D->Ld[3 * (size_t)ni + (size_t)k] = 0.0f;
@@ -3502,6 +3551,11 @@ int main(int argc, char **argv) {
      * угла. Отклонение A обязано стать ничтожным при любом s, то есть граница
      * исчезнуть. Не исчезнет — значит меряется не доля, а машинерия. */
     if (strcmp(argv[i], "dlobeflat") == 0) g_dlobeflat = 1;
+    /* Ф11. (§545): `ffull` — прежний булев заслон, приёмка сведения;
+     * `fzero` — НЕГАТИВНЫЙ КОНТРОЛЬ, поверхности не заслоняют вовсе. */
+    if (strcmp(argv[i], "ffull") == 0) g_ffull = 1;
+    if (strcmp(argv[i], "fzero") == 0) g_fzero = 1;
+    if (strcmp(argv[i], "fnotrans") == 0) g_fnotrans = 1;
     /* НЕГАТИВНЫЙ КОНТРОЛЬ §541: прежняя ТОЧЕЧНАЯ формула. Закон обязан пасть. */
     if (strcmp(argv[i], "ptlight") == 0) g_ptlight = 1;
     if (strncmp(argv[i], "dns=", 4) == 0) g_dns = strtod(argv[i] + 4, NULL);
@@ -6037,6 +6091,13 @@ int main(int argc, char **argv) {
       memset(&D, 0, sizeof D);
       D.nsl = S.n;
       D.blkopen = g_dblkopen;
+      D.fone = g_ffull;
+      D.fzero = g_fzero;
+      D.fnotrans = g_fnotrans;
+      D.cw = fr.h * (double)((int32_t)1 << HZ_SWEEP_DROP);
+      D.Ap = calloc((size_t)TD.n, sizeof *D.Ap);
+      D.fstat = malloc((size_t)HZ_FSTAT_CAP * sizeof *D.fstat);
+      if (D.Ap == NULL || D.fstat == NULL) exit(1);
       D.Ld = calloc(3 * (size_t)TD.n, sizeof *D.Ld);
       D.Bs = calloc(3 * (size_t)TD.n, sizeof *D.Bs);
       D.Bn = calloc(3 * (size_t)TD.n, sizeof *D.Bn);
@@ -6150,7 +6211,9 @@ int main(int argc, char **argv) {
           }
           if (nsi > 0.0) D.Bns[l2] += (float)(sar[i] * nsi);
         }
-        int64_t nsrf = 0, nblk = 0, nglos = 0;
+        int64_t nsrf = 0, nblk = 0, nglos = 0, nfold = 0, nmulti = 0;
+        double *foldv = malloc((size_t)HZ_FSTAT_CAP * sizeof *foldv);
+        if (foldv == NULL) exit(1);
         for (int32_t l2 = 0; l2 < TD.n; l2++) {
           if (TD.nd[l2].child0 >= 0) continue;
           if (aw2[l2] > 0.0) {
@@ -6186,6 +6249,12 @@ int main(int argc, char **argv) {
               D.Bns[l2] = (float)((double)D.Bns[l2] / aw2[l2]);
               if (D.Bns[l2] > 0.0f) nglos++;
             }
+            D.Ap[l2] = (float)aw2[l2];
+            /* А971: СКЛАДЧАТОСТЬ ЛИСТА `1 − |Σ A_i n_i| / Σ A_i`. У плоской
+             * площадки ноль, у угла — заметно больше нуля, и тогда усреднённая
+             * нормаль не значит направления поверхности (§518/§519). Печатается,
+             * чтобы оговорка была числом, а не словом. */
+            if (nfold < (int64_t)HZ_FSTAT_CAP) foldv[nfold++] = 1.0 - nl / aw2[l2];
             D.srf[l2] = 1;
             nsrf++;
           } else {
@@ -6200,6 +6269,18 @@ int main(int argc, char **argv) {
             }
           }
         }
+        /* А970: сколько листьев несут ДВЕ и более ячейки среза — там проекции
+         * площадок могут перекрываться, и `f` завышена. */
+        for (int32_t l2 = 0; l2 < TD.n; l2++)
+          if (D.srf[l2] == 1 && D.cstart[l2 + 1] - D.cstart[l2] >= 2) nmulti++;
+        if (nfold > 0) {
+          qsort(foldv, (size_t)nfold, sizeof *foldv, cmp_d);
+          printf("      А971 СКЛАДЧАТОСТЬ ЛИСТА (1 − |ΣAn|/ΣA): p50 %.4f, p90 %.4f, max %.4f по "
+                 "%lld листьям; А970 листьев с 2+ ячейками среза %lld (%.1f %%)\n",
+                 foldv[nfold / 2], foldv[(nfold * 9) / 10], foldv[nfold - 1], (long long)nfold,
+                 (long long)nmulti, 100.0 * (double)nmulti / (double)(nsrf ? nsrf : 1));
+        }
+        free(foldv);
         free(aw2);
         printf("   Ф8' ПОКРЫТИЕ: ячеек среза отображено %lld из %d; листьев-ИЗЛУЧАТЕЛЕЙ %lld, "
                "листьев-ЗАСЛОНОВ без среза %lld, всего листьев %d; из излучателей ГЛЯНЦЕВЫХ %lld\n",
@@ -6257,6 +6338,23 @@ int main(int argc, char **argv) {
                "π = %.5f, отклонение среднего %.2f %%)\n",
                wmn, wmx, wav, 3.14159265358979323846,
                100.0 * (wav - 3.14159265358979323846) / 3.14159265358979323846);
+        /* Ф11' (§545): РАСПРЕДЕЛЕНИЕ ДОЛИ ПЕРЕКРЫТИЯ. Без него «правило
+         * изменило ответ» не отличить от «правило почти не сработало». */
+        if (D.nfstat > 0) {
+          int64_t nf = D.nfstat < (int64_t)HZ_FSTAT_CAP ? D.nfstat : (int64_t)HZ_FSTAT_CAP;
+          double *fc = malloc((size_t)nf * sizeof *fc);
+          if (fc == NULL) exit(1);
+          memcpy(fc, D.fstat, (size_t)nf * sizeof *fc);
+          qsort(fc, (size_t)nf, sizeof *fc, cmp_d);
+          printf("      Ф11' ДОЛЯ ПЕРЕКРЫТИЯ f: p10 %.4f, p50 %.4f, p90 %.4f; в единицу упёрлось "
+                 "%.2f %% случаев (выборка %lld из %lld)\n",
+                 fc[nf / 10], fc[nf / 2], fc[(nf * 9) / 10],
+                 100.0 * (double)D.nfone / (double)(D.nfstat ? D.nfstat : 1), (long long)nf,
+                 (long long)D.nfstat);
+          free(fc);
+        }
+        D.nfstat = 0;
+        D.nfone = 0;
         /* МНОГОКРАТНЫЕ ОТРАЖЕНИЯ БЕЗ МАТРИЦЫ (довод №3 §523): следующая
          * радиосити есть собранная облучённость на альбедо. Матрицы нет, есть
          * ещё один проход по тем же направлениям. */
@@ -6289,6 +6387,8 @@ int main(int argc, char **argv) {
       free(D.Bsp);
       free(D.Bwi);
       free(D.Bns);
+      free(D.Ap);
+      free(D.fstat);
       free(D.srf);
       free(D.vis);
       free(D.cstart);

@@ -844,11 +844,108 @@ typedef struct {
   void *pctx;
   int rc;
   int32_t nskip; /* пропущено полигонов у неманифолдных ячеек — СЧИТАЕТСЯ (§377) */
+  /* ПАМЯТЬ ОТВЕТА КРИТЕРИЯ СРЕЗА, по байту на узел (§585). NULL = считать
+   * каждый раз, как было. Живёт ровно один вызов обхода. */
+  unsigned char *memo;
 } walkctx;
 
+/* --- память ответа критерия среза (§585) ----------------------------------
+ *
+ * ЗАЧЕМ. `leafish` есть функция ОДНОГО аргумента — индекса узла: коробка
+ * `(lo, size)` у узла единственная (арена, один родитель на блок из восьми,
+ * индексы строго вперёд — `dc_alloc8`), а контекст среза на время обхода
+ * неподвижен. Схема же `cellProc/faceProc/edgeProc` спрашивает про один и тот
+ * же узел много раз: как про ячейку, как про обе стороны каждой его грани и как
+ * про каждый из четырёх углов каждого его ребра, и заново на каждом уровне
+ * спуска. ЗАМЕРЕНО (§585, Bistro, poly=8): `16 037 694` вызова `lod_stop` при
+ * не более чем `276 904` внутренних узлах — кратность `57.9`.
+ *
+ * ПОЧЕМУ ЭТО НЕ МЕНЯЕТ ВЫХОД. Значение то же самое; меняется только число его
+ * вычислений. Побитовость картинки — не надежда, а следствие, и проверяется она
+ * прогоном с `HZ_DC_MEMO_OFF`.
+ *
+ * ПЕРЕКЛЮЧАТЕЛЬ — ПРИБОР, А НЕ ЧАСТЬ ДОГОВОРА. Он нужен ровно затем, чтобы
+ * негативные контроли §585 существовали: без `OFF` нечем показать, что выигрыш
+ * пришёл отсюда, а без `SCRAMBLE` нечем показать, что побитовое сличение вообще
+ * что-нибудь заметило бы. Обход однопоточный, поэтому файловая статика здесь не
+ * создаёт вопроса о потоках. */
+static int g_memo_mode = HZ_DC_MEMO_ON;
+/* ДВА СЧЁТЧИКА, А НЕ ОДИН, И РАЗНИЦА НЕ КОСМЕТИЧЕСКАЯ. Первая редакция считала
+ * одним, и он вышел `351 113` при `276 904` внутренних узлах — то есть считал
+ * ЛЮБЫЕ узлы, включая листья, а сверялся с числом ВНУТРЕННИХ. Ровно подмена
+ * величины, против которой стоит §4. `evals` — сколько РАЗЛИЧНЫХ узлов вообще
+ * тронул обход; `stops` — у скольких из них критерий среза вычислен полностью,
+ * и только это число сравнимо с прежними `16 037 694` вызовами. */
+static long long g_memo_evals, g_memo_stops, g_memo_flips;
+
+/* Шаг порчи для `HZ_DC_MEMO_SCRAMBLE`. Простое число, и это не украшение:
+ * дети выделяются блоками ПО ВОСЕМЬ, поэтому любой шаг, кратный восьми, попадал
+ * бы всегда в один и тот же угол блока. Первая редакция плана портила ответ у
+ * соседнего ребёнка (`ni ^ 1`), и аудит А1014 её отверг: у детей одного родителя
+ * дальность и невязка близки, ответ у них чаще всего ОДИН И ТОТ ЖЕ, и порча
+ * оказалась бы незаметной — то есть контроль был бы слеп ровно к тому, ради чего
+ * поставлен (узор К13/К40/К94).
+ *
+ * КОРЕНЬ ИСКЛЮЧЁН, И ЭТО ВТОРАЯ ПРАВКА КОНТРОЛЯ, СДЕЛАННАЯ ПО ЕГО ЖЕ ПРОГОНУ
+ * (А1022). `0 % 997 == 0`, поэтому первая редакция переворачивала ответ У КОРНЯ:
+ * обход объявлял корень листом и кончался немедленно — `1` тронутый узел,
+ * `0` многоугольников, растеризация `4.6` мс. Картинка, конечно, разошлась, но
+ * доказано этим было лишь «если убить корень, кадра не будет», а проверить надо
+ * другое: заметит ли побитовое сличение ЛОКАЛЬНУЮ порчу в глубине дерева. */
+#define HZ_DC_MEMO_SCRAMBLE_STRIDE 997
+
+void hz_dc_walk_memo(int mode) {
+  g_memo_mode = mode;
+}
+long long hz_dc_walk_memo_evals(void) {
+  return g_memo_evals;
+}
+long long hz_dc_walk_memo_stops(void) {
+  return g_memo_stops;
+}
+long long hz_dc_walk_memo_flips(void) {
+  return g_memo_flips;
+}
+
+/* СЧЁТЧИКИ ОБХОДА — ТОЛЬКО ПОД `-DHZ_DC_COUNT`, В РАБОЧЕЙ СБОРКЕ ИХ НЕТ.
+ * Заведены, чтобы не гадать, где именно стоит обход: §573 уже поймал проект на
+ * том, что «растеризация» оказалась спуском по дереву, а §580 — на том, что
+ * лишними были многоугольники, а не обход. Считать инкремент в горячем цикле
+ * рабочего пути нельзя, поэтому счёт живёт за флагом сборки. */
+#ifdef HZ_DC_COUNT
+long long hz_dc_n_cell, hz_dc_n_face, hz_dc_n_edge, hz_dc_n_leafish, hz_dc_n_stop, hz_dc_n_proc;
+#define HZ_CNT(x) ((x)++)
+#else
+#define HZ_CNT(x) ((void)0)
+#endif
+
 static int leafish(const walkctx *w, const hz_dcref *r) {
-  if (w->t->nd[r->ni].child0 < 0) return 1;
-  return w->stop != NULL && w->stop(w->sctx, w->t, r);
+  HZ_CNT(hz_dc_n_leafish);
+  if (w->memo != NULL) {
+    unsigned char m = w->memo[r->ni];
+    if (m != 0) return m == 1;
+  }
+  HZ_CNT(hz_dc_n_stop);
+  int haskids = w->t->nd[r->ni].child0 >= 0;
+  /* СЧЁТ ПОЛНЫХ ВЫЧИСЛЕНИЙ КРИТЕРИЯ ИДЁТ В ОБОИХ РЕЖИМАХ, И ЭТО НЕ МЕЛОЧЬ.
+   * Первая редакция считала его только при включённой памяти ответа — и тогда
+   * «было» и «стало» оказывались разными величинами, снятыми разными приборами
+   * (А1023). Сравнивать можно только это число с ним же. */
+  if (haskids) g_memo_stops++;
+  int lf = !haskids || (w->stop != NULL && w->stop(w->sctx, w->t, r));
+  if (w->memo != NULL) {
+    g_memo_evals++;
+    /* ПОРЧА ТОЛЬКО У УЗЛА С ДЕТЬМИ. У листа «не лист» означало бы спуск по
+     * `child0 = −1`, то есть чтение мимо массива: негативный контроль обязан
+     * ломать ОТВЕТ, а не память. У узла с детьми оба значения законны. */
+    if (g_memo_mode == HZ_DC_MEMO_SCRAMBLE && haskids && r->ni > 0 &&
+        (r->ni % HZ_DC_MEMO_SCRAMBLE_STRIDE) == 0) {
+      lf = !lf;
+      g_memo_flips++;
+    }
+    w->memo[r->ni] = (unsigned char)(lf ? 1 : 2);
+  }
+  return lf;
 }
 
 static void child_at2(const hz_dctree *t, const hz_dcref *r, const int32_t pt2[3], hz_dcref *o) {
@@ -902,6 +999,7 @@ static void edge_proc(walkctx *w, const hz_dcref q[4], int e, const int32_t qlo[
 /* Минимальное ребро достигнуто: все четыре ячейки — листья среза. */
 static void process_edge(walkctx *w, const hz_dcref q[4], int e, const int32_t qlo[3],
                          int32_t seg) {
+  HZ_CNT(hz_dc_n_proc);
   int u = (e + 1) % 3, v = (e + 2) % 3;
   int mi = 0;
   for (int k = 1; k < 4; k++)
@@ -980,11 +1078,18 @@ static void process_edge(walkctx *w, const hz_dcref q[4], int e, const int32_t q
 }
 
 static void edge_proc(walkctx *w, const hz_dcref q[4], int e, const int32_t qlo[3], int32_t seg) {
+  HZ_CNT(hz_dc_n_edge);
   if (w->rc != HZ_DC_OK) return;
   int u = (e + 1) % 3, v = (e + 2) % 3;
-  int all = 1;
-  for (int k = 0; k < 4; k++)
-    if (!leafish(w, &q[k])) all = 0;
+  /* Р2 (§585): ОТВЕТ ПО ЧЕТЫРЁМ ЯЧЕЙКАМ СЧИТАЕТСЯ ОДИН РАЗ. Прежде он считался
+   * здесь, а потом ЗАНОВО в цикле по половинам — до восьми лишних вызовов на
+   * каждый рекурсирующий `edge_proc`. Порядок обхода правка не трогает: те же
+   * циклы, та же рекурсия, то же условие. */
+  int lf[4], all = 1;
+  for (int k = 0; k < 4; k++) {
+    lf[k] = leafish(w, &q[k]);
+    if (!lf[k]) all = 0;
+  }
   if (all) {
     process_edge(w, q, e, qlo, seg);
     return;
@@ -996,7 +1101,7 @@ static void edge_proc(walkctx *w, const hz_dcref q[4], int e, const int32_t qlo[
     qlo2[e] += (int32_t)h * half;
     hz_dcref nq[4];
     for (int k = 0; k < 4; k++) {
-      if (leafish(w, &q[k])) {
+      if (lf[k]) {
         nq[k] = q[k];
         continue;
       }
@@ -1013,6 +1118,7 @@ static void edge_proc(walkctx *w, const hz_dcref q[4], int e, const int32_t qlo[
 
 static void face_proc(walkctx *w, const hz_dcref *r0, const hz_dcref *r1, int d,
                       const int32_t flo[3], int32_t rect) {
+  HZ_CNT(hz_dc_n_face);
   if (w->rc != HZ_DC_OK) return;
   int l0 = leafish(w, r0), l1 = leafish(w, r1);
   if (l0 && l1) return;
@@ -1074,6 +1180,7 @@ static void face_proc(walkctx *w, const hz_dcref *r0, const hz_dcref *r1, int d,
 }
 
 static void cell_proc(walkctx *w, const hz_dcref *r) {
+  HZ_CNT(hz_dc_n_cell);
   if (w->rc != HZ_DC_OK || leafish(w, r)) return;
   int32_t half = r->size / 2;
   hz_dcref c[8];
@@ -1123,11 +1230,26 @@ static void cell_proc(walkctx *w, const hz_dcref *r) {
   }
 }
 
+/* Выделение памяти ответа. `calloc` СТОИТ ЗДЕСЬ, А НЕ В ОБЁРТКЕ, сознательно:
+ * `CLAUDE.md` называет известный класс ложных срабатываний gcc-analyzer, при
+ * котором связь «ёмкость ↔ счёт» теряется через функцию-распределитель. Ноль
+ * значит «не считано», и это ЕДИНСТВЕННОЕ значение по умолчанию, которое здесь
+ * законно: «нет пометки» = «неизвестно», а не «лист» (А917).
+ * Нехватка памяти — не ошибка: NULL возвращает прежний путь слово в слово. */
+static unsigned char *memo_alloc(const hz_dctree *t) {
+  g_memo_evals = 0;
+  g_memo_stops = 0;
+  g_memo_flips = 0;
+  if (g_memo_mode == HZ_DC_MEMO_OFF || t->n <= 0) return NULL;
+  return calloc((size_t)t->n, 1);
+}
+
 int hz_dc_walk_stats(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_dc_poly emit, void *pctx,
                      int32_t *nskip) {
-  walkctx w = {t, stop, sctx, emit, pctx, HZ_DC_OK, 0};
+  walkctx w = {t, stop, sctx, emit, pctx, HZ_DC_OK, 0, memo_alloc(t)};
   hz_dcref root = {0, {0, 0, 0}, (int32_t)1 << t->log2size};
   cell_proc(&w, &root);
+  free(w.memo);
   if (nskip != NULL) *nskip = w.nskip;
   if (w.rc == HZ_DC_OK && w.nskip > 0) return HZ_DC_EMULTI;
   return w.rc;
@@ -1151,7 +1273,11 @@ static void locate(const walkctx *w, const int32_t cell[3], hz_dcref *out) {
 
 int hz_dc_walk_ref(const hz_dctree *t, const hz_htab *ht, hz_dc_stop stop, void *sctx,
                    hz_dc_poly emit, void *pctx) {
-  walkctx w = {t, stop, sctx, emit, pctx, HZ_DC_OK, 0};
+  /* Эталонный обход (Г42) получает ту же память ответа: он зовёт `leafish`
+   * через `locate`, и считать её двумя разными приборами значило бы сличать не
+   * то. Независимость эталона от этого не страдает — она в том, что он идёт ПО
+   * ТАБЛИЦЕ РЁБЕР, а не рекурсией (А1015). */
+  walkctx w = {t, stop, sctx, emit, pctx, HZ_DC_OK, 0, memo_alloc(t)};
   int32_t n = (int32_t)1 << t->log2size;
   for (int32_t i = 0; i < ht->n && w.rc == HZ_DC_OK; i++) {
     const hz_hedge *e = &ht->e[i];
@@ -1187,6 +1313,7 @@ int hz_dc_walk_ref(const hz_dctree *t, const hz_htab *ht, hz_dc_stop stop, void 
     }
     process_edge(&w, quad, e->axis, qlo, 1);
   }
+  free(w.memo);
   return w.rc;
 }
 

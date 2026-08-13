@@ -3880,6 +3880,7 @@ typedef struct {
   double white;
   int nocull;           /* НЕГАТИВНЫЙ КОНТРОЛЬ: отсечение выключено */
   int64_t nseen, ncull; /* сколько многоугольников пришло и сколько отброшено */
+  uint64_t polysum;     /* порядковая сумма потока многоугольников (А1013) */
   /* Ш8 (§575): текстуры. Таблица по МАТЕРИАЛУ; `uv` и материал кладутся в
    * отложенный буфер вместе с цветом и выбираются ОДИН раз на видимый пиксель.
    * Т1: альбедо применяется при ЧТЕНИИ поля, поэтому в перенос текстура не
@@ -4252,10 +4253,32 @@ static int lit_none(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv
   return 0;
 }
 
+/* КОНТРОЛЬНАЯ СУММА ПОТОКА МНОГОУГОЛЬНИКОВ (А1013). Картинка к ПОРЯДКУ выдачи
+ * слепа: треугольники собираются в массив и рисуются по полосам, а z-буфер
+ * порядок не различает, пока глубины не равны. Значит «картинка побитово та же»
+ * доказывает МЕНЬШЕ, чем кажется, — а правка Р2 §585 трогает как раз то место,
+ * где порядок мог бы поехать. Поэтому здесь считается ПОРЯДКОВАЯ сумма: FNV-1a
+ * по битовым образцам координат В ПОРЯДКЕ ВЫДАЧИ. Считается ДО отсечения — она
+ * должна отвечать за выход ОБХОДА, а не за работу растеризатора. */
+#define HZ_FNV_PRIME UINT64_C(1099511628211)
+#define HZ_FNV_BASIS UINT64_C(14695981039346656037)
+
+static void polysum_add(uint64_t *h, const double (*v)[3], int nv) {
+  unsigned char b[8];
+  *h = (*h ^ (uint64_t)nv) * HZ_FNV_PRIME;
+  for (int i = 0; i < nv; i++)
+    for (int c = 0; c < 3; c++) {
+      memcpy(b, &v[i][c], sizeof b);
+      for (int k = 0; k < 8; k++)
+        *h = (*h ^ (uint64_t)b[k]) * HZ_FNV_PRIME;
+    }
+}
+
 static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv) {
   litctx *L = (litctx *)ctx;
   double w[4][3], col[4][3];
 
+  polysum_add(&L->polysum, v, nv);
   for (int i = 0; i < nv; i++)
     for (int c = 0; c < 3; c++)
       w[i][c] = L->fr->org[c] + v[i][c] * L->fr->h;
@@ -4481,6 +4504,11 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "texnomip") == 0) g_texnomip = 1;
     if (strcmp(argv[i], "nofrustum") == 0) g_nofrustum = 1;
     if (strcmp(argv[i], "omp1") == 0) g_omp1 = 1;
+    /* §585, НК1 и НК2. Оба — ПРИБОР: без первого нечем показать, что выигрыш
+     * пришёл от памяти ответа, без второго — что побитовое сличение поломку
+     * вообще заметило бы. */
+    if (strcmp(argv[i], "nomemo") == 0) hz_dc_walk_memo(HZ_DC_MEMO_OFF);
+    if (strcmp(argv[i], "memoscramble") == 0) hz_dc_walk_memo(HZ_DC_MEMO_SCRAMBLE);
     if (strcmp(argv[i], "texflat") == 0) g_texflat = 1;
     if (strncmp(argv[i], "sun=", 4) == 0) {
       const char *sp = argv[i] + 4;
@@ -8031,6 +8059,7 @@ int main(int argc, char **argv) {
     }
     litctx LC;
     memset(&LC, 0, sizeof LC);
+    LC.polysum = HZ_FNV_BASIS; /* начальное значение FNV-1a */
     LC.S = &S;
     LC.key = key;
     LC.ord = ord;
@@ -8182,6 +8211,16 @@ int main(int argc, char **argv) {
       double ta_w = now_s();
       int wrc0 = hz_dc_walk(&T, lod_stop, &LLc, lit_none, &LC);
       double t_walk = now_s() - ta_w;
+#ifdef HZ_DC_COUNT
+      {
+        extern long long hz_dc_n_cell, hz_dc_n_face, hz_dc_n_edge, hz_dc_n_leafish, hz_dc_n_stop,
+            hz_dc_n_proc;
+        printf("      СЧЁТ ОБХОДА: cellProc %lld, faceProc %lld, edgeProc %lld, process_edge %lld; "
+               "leafish %lld (из них до lod_stop дошло %lld)\n",
+               hz_dc_n_cell, hz_dc_n_face, hz_dc_n_edge, hz_dc_n_proc, hz_dc_n_leafish,
+               hz_dc_n_stop);
+      }
+#endif
       ta = now_s();
       /* Р3 (§581): обход СОБИРАЕТ, отрисовка идёт ПО ПОЛОСАМ параллельно. */
       if (!g_omp1) {
@@ -8214,6 +8253,15 @@ int main(int argc, char **argv) {
       printf("      §573 ПРОФИЛЬ РАСТРА: обход дерева с ПУСТЫМ обработчиком %.1f мс (код %d), "
              "обход+растр %.1f мс — значит сама растеризация %.1f мс\n",
              t_walk * 1e3, wrc0, (now_s() - ta) * 1e3, (now_s() - ta - t_walk) * 1e3);
+      /* §585: механизм проверяется СЧЁТОМ, а выгода — временем, и путать их
+       * нельзя. `узлов посчитано` — это число РАЗЛИЧНЫХ узлов, у которых ответ
+       * критерия вычислен полностью; при `nomemo` считать нечем, и печатается
+       * ноль, а не подставленное число вызовов. */
+      printf("      §585 ПАМЯТЬ ОТВЕТА: КРИТЕРИЙ СЧИТАН ПОЛНОСТЬЮ %lld раз (различных узлов "
+             "тронуто %lld), перевёрнуто ответов %lld; ПОРЯДКОВАЯ СУММА ПОТОКА МНОГОУГОЛЬНИКОВ "
+             "%016llx\n",
+             hz_dc_walk_memo_stops(), hz_dc_walk_memo_evals(), hz_dc_walk_memo_flips(),
+             (unsigned long long)LC.polysum);
       double t_rast = now_s() - ta;
       int64_t ncov = 0;
       for (size_t i2 = 0; i2 < np; i2++)

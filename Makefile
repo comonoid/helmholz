@@ -391,6 +391,17 @@ build/pflow: tools/pflow.c $(PFULL) | build
 build/pfield: tools/pfield.c src/scene_obj.c src/pclip.c src/cut/dcslice.c src/cut/dc.c src/cut/qef.c src/cut/poly3.c src/cut/surf.c src/image.c src/transport/cam3.c src/transport/ray3.c src/transport/mesh3.c src/transport/sweep3.c src/transport/dirs3.c src/transport/cut3.c src/transport/quad.c src/transport/tet3.c src/octree.c | build
 	$(RUN) 'gcc $(CFLAGS) -I tools -o $@ tools/pfield.c src/scene_obj.c src/pclip.c src/cut/dcslice.c src/cut/dc.c src/cut/qef.c src/cut/poly3.c src/cut/surf.c src/image.c src/transport/cam3.c src/transport/ray3.c src/transport/mesh3.c src/transport/sweep3.c src/transport/dirs3.c src/transport/cut3.c src/transport/quad.c src/transport/tet3.c src/octree.c -lm'
 
+# pwalk — ТОТ ЖЕ `pfield`, но собранный с окном (SDL) и потому понимающий ключ
+# `walk` (§589): цикл кадров, камера с клавиатуры и мыши.
+#
+# ОТДЕЛЬНАЯ ЦЕЛЬ, А НЕ ФЛАГ ПО УМОЛЧАНИЮ, И ЭТО НЕ ВКУСОВЩИНА. `build/pfield` —
+# ЗАМЕРНЫЙ инструмент: на нём сняты все числа `PLAN_ELEMENTS.md`. Появись у него
+# внешняя зависимость — и условия прежних прогонов изменились бы задним числом,
+# а сравнивать стало бы не с чем. Исходник при этом ОДИН: растеризатор, срез и
+# прямой свет не копируются, окно живёт под `#ifdef HZ_SDL`.
+build/pwalk: tools/pfield.c src/scene_obj.c src/pclip.c src/cut/dcslice.c src/cut/dc.c src/cut/qef.c src/cut/poly3.c src/cut/surf.c src/image.c src/transport/cam3.c src/transport/ray3.c src/transport/mesh3.c src/transport/sweep3.c src/transport/dirs3.c src/transport/cut3.c src/transport/quad.c src/transport/tet3.c src/octree.c | build
+	nix-shell -p gcc SDL2 pkg-config --run 'gcc $(CFLAGS) -DHZ_SDL -I tools -o $@ tools/pfield.c src/scene_obj.c src/pclip.c src/cut/dcslice.c src/cut/dc.c src/cut/qef.c src/cut/poly3.c src/cut/surf.c src/image.c src/transport/cam3.c src/transport/ray3.c src/transport/mesh3.c src/transport/sweep3.c src/transport/dirs3.c src/transport/cut3.c src/transport/quad.c src/transport/tet3.c src/octree.c $(shell nix-shell -p SDL2 pkg-config --run "pkg-config --cflags --libs sdl2" 2>/dev/null) -lm'
+
 # poccref — ЭТАЛОН ЗАНЯТОСТИ (§385, шаг Ш0). Ни деревьев, ни ускорителей:
 # только меш и отсечение. Он обязан пережить удаление адаптера в Ш1б, поэтому и
 # стоит отдельным инструментом, а не ключом `pfield`.

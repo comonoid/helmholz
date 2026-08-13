@@ -2356,6 +2356,29 @@ static int g_texflat = 0, g_texnomip = 0;
 /* НЕГАТИВНЫЙ КОНТРОЛЬ §580: отсечение по пирамиде выключено — обход и число
  * отброшенных обязаны вернуться к прежним. */
 static int g_nofrustum = 0;
+
+/* ХОДЬБА ПО СЦЕНЕ (§589). Ключ `walk`: вместо одного кадра — цикл, камера
+ * правится с клавиатуры и мыши. Постройка сцены (`38` с) от этого не меняется:
+ * она разовая, и цикл начинается ПОСЛЕ неё.
+ *
+ * ПОЧЕМУ ЭТО ПРАВКА `pfield.c`, А НЕ НОВЫЙ ИНСТРУМЕНТ. Растеризатор, прямой
+ * свет, срез и таблица треугольников ячейки — статические функции ЭТОГО файла.
+ * Новый инструмент значил бы копию тысячи строк, а копия — это два места, где
+ * чинить один и тот же промах. */
+static int g_walk = 0;
+
+/* ТЕКСТУРЫ ЖИВУТ МЕЖДУ КАДРАМИ. Их загрузка — работа РАЗОВАЯ (`105` файлов,
+ * `24.5` МБ), и в цикле ходьбы она платилась бы каждый кадр. Поэтому массивы
+ * вынесены из кадрового контекста в файловые: `litctx` получает УКАЗАТЕЛИ на
+ * них, а владение остаётся здесь. Пиксельные поля (`defuv`, `defmat`) НЕ
+ * вынесены сознательно: они размером с кадр и к нему же относятся. */
+static unsigned char **g_texrgb;
+static int *g_texw, *g_texh;
+static unsigned char ***g_texmip;
+static int **g_mipw, **g_miph;
+static int *g_nmip;
+static int g_texloaded = 0;
+
 /* Секундомеры сводки: заполняются рабочими стадиями по ходу. */
 static double g_t0 = 0.0, g_t_frame = 0.0, g_t_fslice = 0.0, g_t_fdir = 0.0, g_t_fras = 0.0,
               g_t_bounce = 0.0;
@@ -4386,6 +4409,241 @@ static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv
 }
 /* --- 4. главная ------------------------------------------------------------ */
 
+/* ======================= ХОДЬБА ПО СЦЕНЕ (§589) =========================
+ *
+ * ОКНО И ВВОД ЖИВУТ ТОЛЬКО ПОД `-DHZ_SDL`, И ЭТО СОЗНАТЕЛЬНО. Рабочий
+ * `build/pfield` остаётся без единой внешней зависимости — он замерный
+ * инструмент, и тащить в него оконную библиотеку значит менять условия всех
+ * прежних прогонов. Ходилка собирается отдельной целью `build/pwalk` из ТОГО ЖЕ
+ * файла: одна реализация растеризатора, а не две.
+ *
+ * РАСКЛАДКА — DESCENT, шесть степеней свободы, как названо пользователем:
+ *     мышь        поворот: вправо/влево — рыскание, вверх/вниз — тангаж
+ *     W A S D     СКОЛЬЖЕНИЕ в плоскости вида: вверх, влево, вниз, вправо
+ *     пробел      тяга ВПЕРЁД
+ *     левый Shift тяга НАЗАД
+ *     Q E         КРЕН относительно вида
+ *     колесо      скорость (шаг вдвое), Tab — вернуть 6 м/с
+ *     Esc         выход, ` (тильда) — отпустить/схватить мышь
+ *
+ * ПОЧЕМУ БАЗИС ХРАНИТСЯ ЦЕЛИКОМ, А НЕ УГЛАМИ. При крене «верх мира» перестаёт
+ * быть верхом камеры, и пара (углы Эйлера + фиксированный up) шесть степеней
+ * свободы не выражает вовсе: у неё нет крена по построению. Поэтому хранится
+ * тройка ортонормированных векторов, повороты — их вращения, а ортогональность
+ * восстанавливается КАЖДЫЙ кадр (иначе накопление ошибки за тысячу кадров
+ * уводит базис, и это видно как медленный завал горизонта).
+ */
+#ifdef HZ_SDL
+#include <SDL2/SDL.h>
+
+static SDL_Window *g_win;
+static SDL_Renderer *g_ren;
+static SDL_Texture *g_tex;
+static int g_texres;
+/* Базис камеры. Заводится из `eyec/atc/upc` при первом кадре. */
+static double g_wpos[3], g_wfwd[3], g_wup[3], g_wright[3];
+static int g_winit;
+static double g_wspeed = 6.0; /* м/с; сцена Bistro 108 м поперёк — 18 с на проход */
+static int g_wgrab = 1;
+
+/* Скорость поворота мыши: радиан на пиксель. Число не магическое — это поле
+ * зрения, делённое на сторону окна, то есть «пиксель мыши = пиксель экрана». */
+#define HZ_WALK_MOUSE_RAD_PER_PX (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0 / 512.0)
+/* Крен клавишей: радиан в секунду. */
+#define HZ_WALK_ROLL_RAD_PER_S 1.5
+
+static void wnorm(double v[3]) {
+  double s = sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+  if (s > 0.0)
+    for (int a = 0; a < 3; a++)
+      v[a] /= s;
+}
+
+static void wcross(const double a[3], const double b[3], double o[3]) {
+  o[0] = a[1] * b[2] - a[2] * b[1];
+  o[1] = a[2] * b[0] - a[0] * b[2];
+  o[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+/* Поворот вектора `v` вокруг оси `k` (единичной) на угол `t` — формула Родрига.
+ * Одна формула на все три поворота; отдельных матриц для рыскания, тангажа и
+ * крена не заводится, потому что разница между ними только в оси. */
+static void wrot(double v[3], const double k[3], double t) {
+  double c = cos(t), s = sin(t), kv[3], d = 0.0;
+  wcross(k, v, kv);
+  for (int a = 0; a < 3; a++)
+    d += k[a] * v[a];
+  for (int a = 0; a < 3; a++)
+    v[a] = v[a] * c + kv[a] * s + k[a] * d * (1.0 - c);
+}
+
+static int walk_open(int res) {
+  if (SDL_Init(SDL_INIT_VIDEO) != 0) {
+    fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
+    return 0;
+  }
+  g_win = SDL_CreateWindow("helmholz — ходьба по сцене", SDL_WINDOWPOS_CENTERED,
+                           SDL_WINDOWPOS_CENTERED, res, res, SDL_WINDOW_SHOWN);
+  if (g_win == NULL) {
+    fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
+    return 0;
+  }
+  g_ren = SDL_CreateRenderer(g_win, -1, SDL_RENDERER_ACCELERATED);
+  if (g_ren == NULL) g_ren = SDL_CreateRenderer(g_win, -1, 0);
+  if (g_ren == NULL) {
+    fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError());
+    return 0;
+  }
+  g_tex = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, res, res);
+  if (g_tex == NULL) {
+    fprintf(stderr, "SDL_CreateTexture: %s\n", SDL_GetError());
+    return 0;
+  }
+  g_texres = res;
+  SDL_SetRelativeMouseMode(SDL_TRUE);
+  return 1;
+}
+
+static void walk_close(void) {
+  if (g_tex != NULL) SDL_DestroyTexture(g_tex);
+  if (g_ren != NULL) SDL_DestroyRenderer(g_ren);
+  if (g_win != NULL) SDL_DestroyWindow(g_win);
+  SDL_Quit();
+}
+
+/* Показать кадр и принять ввод. Возвращает 0, если пора выходить.
+ * `dt` — сколько заняло ПРЕДЫДУЩЕЕ построение кадра: движение считается по
+ * времени, а не по кадрам, иначе скорость ходьбы зависела бы от того, куда
+ * смотришь (у нас кадр от 0.15 до 0.9 с — разница втрое). */
+static int walk_present(const unsigned char *rgb, int res, double eyec[3], double atc[3],
+                        double upc[3], double dt) {
+  if (!g_winit) {
+    g_winit = 1;
+    for (int a = 0; a < 3; a++) {
+      g_wpos[a] = eyec[a];
+      g_wfwd[a] = atc[a] - eyec[a];
+      g_wup[a] = upc[a];
+    }
+    wnorm(g_wfwd);
+    wcross(g_wfwd, g_wup, g_wright);
+    wnorm(g_wright);
+    wcross(g_wright, g_wfwd, g_wup);
+    wnorm(g_wup);
+  }
+  if (res != g_texres) return 0;
+  SDL_UpdateTexture(g_tex, NULL, rgb, res * 3);
+  SDL_RenderClear(g_ren);
+  SDL_RenderCopy(g_ren, g_tex, NULL, NULL);
+  SDL_RenderPresent(g_ren);
+
+  SDL_Event e;
+  double dyaw = 0.0, dpitch = 0.0;
+  int nmot = 0;
+  while (SDL_PollEvent(&e)) {
+    if (e.type == SDL_QUIT) return 0;
+    if (e.type == SDL_MOUSEMOTION && g_wgrab) {
+      dyaw += (double)e.motion.xrel * HZ_WALK_MOUSE_RAD_PER_PX;
+      dpitch += (double)e.motion.yrel * HZ_WALK_MOUSE_RAD_PER_PX;
+      nmot++;
+    }
+    if (e.type == SDL_MOUSEWHEEL) {
+      if (e.wheel.y > 0) g_wspeed *= 2.0;
+      if (e.wheel.y < 0) g_wspeed *= 0.5;
+      printf("   скорость %.2f м/с\n", g_wspeed);
+      fflush(stdout);
+    }
+    if (e.type == SDL_KEYDOWN) {
+      if (e.key.keysym.sym == SDLK_ESCAPE) return 0;
+      if (e.key.keysym.sym == SDLK_TAB) g_wspeed = 6.0;
+      if (e.key.keysym.sym == SDLK_BACKQUOTE) {
+        g_wgrab = !g_wgrab;
+        SDL_SetRelativeMouseMode(g_wgrab ? SDL_TRUE : SDL_FALSE);
+      }
+    }
+  }
+
+  /* ПОВОРОТЫ. Рыскание — вокруг СОБСТВЕННОГО верха, а не вокруг верха мира:
+   * иначе при крене поворот мыши уводил бы взгляд вбок от того, что видно. */
+  /* Сравнений с нулём у плавучки здесь нет СОЗНАТЕЛЬНО (гейт `-Wfloat-equal`):
+   * «было ли движение» — это ЦЕЛЫЙ признак события, а не свойство числа. */
+  if (nmot > 0) {
+    wrot(g_wfwd, g_wup, -dyaw);
+    wrot(g_wright, g_wup, -dyaw);
+    wrot(g_wfwd, g_wright, -dpitch);
+    wrot(g_wup, g_wright, -dpitch);
+  }
+
+  const Uint8 *ks = SDL_GetKeyboardState(NULL);
+  int roll = 0;
+  if (ks[SDL_SCANCODE_Q]) roll += 1;
+  if (ks[SDL_SCANCODE_E]) roll -= 1;
+  if (roll != 0) {
+    double t = (double)roll * HZ_WALK_ROLL_RAD_PER_S * dt;
+    wrot(g_wup, g_wfwd, t);
+    wrot(g_wright, g_wfwd, t);
+  }
+
+  /* ОРТОГОНАЛИЗАЦИЯ КАЖДЫЙ КАДР — см. шапку: без неё базис уводит. */
+  wnorm(g_wfwd);
+  wcross(g_wfwd, g_wup, g_wright);
+  wnorm(g_wright);
+  wcross(g_wright, g_wfwd, g_wup);
+  wnorm(g_wup);
+
+  /* ТЯГА И СКОЛЬЖЕНИЕ. */
+  double step = g_wspeed * dt;
+  double mv[3] = {0.0, 0.0, 0.0};
+  if (ks[SDL_SCANCODE_SPACE])
+    for (int a = 0; a < 3; a++)
+      mv[a] += g_wfwd[a];
+  if (ks[SDL_SCANCODE_LSHIFT])
+    for (int a = 0; a < 3; a++)
+      mv[a] -= g_wfwd[a];
+  if (ks[SDL_SCANCODE_W])
+    for (int a = 0; a < 3; a++)
+      mv[a] += g_wup[a];
+  if (ks[SDL_SCANCODE_S])
+    for (int a = 0; a < 3; a++)
+      mv[a] -= g_wup[a];
+  if (ks[SDL_SCANCODE_D])
+    for (int a = 0; a < 3; a++)
+      mv[a] += g_wright[a];
+  if (ks[SDL_SCANCODE_A])
+    for (int a = 0; a < 3; a++)
+      mv[a] -= g_wright[a];
+  double ml = sqrt(mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2]);
+  if (ml > 0.0)
+    for (int a = 0; a < 3; a++)
+      g_wpos[a] += mv[a] / ml * step;
+
+  for (int a = 0; a < 3; a++) {
+    eyec[a] = g_wpos[a];
+    atc[a] = g_wpos[a] + g_wfwd[a];
+    upc[a] = g_wup[a];
+  }
+  return 1;
+}
+#else
+/* БЕЗ SDL ХОДЬБА НЕ МОЛЧИТ, А ОТКАЗЫВАЕТ. Тихо отрисовать один кадр вместо
+ * запрошенного цикла — худший вид отказа: выглядит как работа. */
+static int walk_open(int res) {
+  (void)res;
+  fprintf(stderr, "pfield: ключ `walk` требует сборки с SDL — собирайте `make build/pwalk`\n");
+  return 0;
+}
+static void walk_close(void) {}
+static int walk_present(const unsigned char *rgb, int res, double eyec[3], double atc[3],
+                        double upc[3], double dt) {
+  (void)rgb;
+  (void)res;
+  (void)eyec;
+  (void)atc;
+  (void)upc;
+  (void)dt;
+  return 0;
+}
+#endif
+
 int main(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr, "pfield ФАЙЛ.obj МАСШТАБ [lev=N] [nonrm] [occdump=ПУТЬ] [polydump=ПУТЬ]\n");
@@ -4507,6 +4765,13 @@ int main(int argc, char **argv) {
     /* §585, НК1 и НК2. Оба — ПРИБОР: без первого нечем показать, что выигрыш
      * пришёл от памяти ответа, без второго — что побитовое сличение поломку
      * вообще заметило бы. */
+    /* §589: ходьба подразумевает кадр со светом и режим `render` — иначе цикл
+     * тащил бы за собой замерную диагностику по нескольку секунд на кадр. */
+    if (strcmp(argv[i], "walk") == 0) {
+      g_walk = 1;
+      g_render = 1;
+      lit = 1;
+    }
     if (strcmp(argv[i], "nomemo") == 0) hz_dc_walk_memo(HZ_DC_MEMO_OFF);
     if (strcmp(argv[i], "memoscramble") == 0) hz_dc_walk_memo(HZ_DC_MEMO_SCRAMBLE);
     if (strcmp(argv[i], "texflat") == 0) g_texflat = 1;
@@ -6497,1840 +6762,1925 @@ int main(int argc, char **argv) {
     memset(&LL, 0, sizeof LL);
     double eyec[3] = {g_eye[0], g_eye[1], g_eye[2]}, atc[3] = {g_at[0], g_at[1], g_at[2]},
            upc[3] = HZ_CFG_UP;
-    for (int a = 0; a < 3; a++)
-      LL.eye[a] = (eyec[a] - fr.org[a]) / fr.h;
-    LL.pxrad = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / (double)res;
-    /* Ф5. (§514): камера дерева свипа — та же, что у среза, и в тех же единицах.
-     * Разные камеры у тени и у поверхности дали бы несогласованную подробность. */
-    for (int a = 0; a < 3; a++)
-      g_sweepeye[a] = LL.eye[a];
-    g_sweeppx = LL.pxrad;
-    LL.thr = lodthr;
+    /* ЦИКЛ ХОДЬБЫ (§589). Без ключа `walk` тело исполняется РОВНО ОДИН РАЗ и
+     * кончается `break` внизу — прежнее поведение слово в слово. С ключом камера
+     * правится в конце каждого прохода, и всё, что от неё зависит (срез, свет,
+     * растр), считается заново; всё, что не зависит (дерево, рёбра, текстуры,
+     * таблица треугольников ячейки), остаётся построенным. */
+    int walk_alive = 1;
+    if (g_walk && !walk_open(res)) return 2;
+    double t_prev = 1.0 / 30.0; /* первый шаг движения — как при 30 к/с */
+    for (;;) {
+      for (int a = 0; a < 3; a++)
+        LL.eye[a] = (eyec[a] - fr.org[a]) / fr.h;
+      LL.pxrad = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / (double)res;
+      /* Ф5. (§514): камера дерева свипа — та же, что у среза, и в тех же единицах.
+       * Разные камеры у тени и у поверхности дали бы несогласованную подробность. */
+      for (int a = 0; a < 3; a++)
+        g_sweepeye[a] = LL.eye[a];
+      g_sweeppx = LL.pxrad;
+      LL.thr = lodthr;
 
-    LL.thrcell = g_lodceil;
+      LL.thrcell = g_lodceil;
 
-    LL.thrpoly = g_lodpoly;
-    hz_dcslice S;
-    if (hz_slice_init(&S, lev) != HZ_DC_OK) exit(1);
-    double ta = now_s();
-    /* ПЕЧЬ СТРОИТСЯ НА ПОЛНУЮ ГЛУБИНУ, А НЕ ПО СРЕЗУ. Коробка вся ПЛОСКАЯ,
-     * невязка QEF на ней ноль, и критерий LOD законно огрубляет её до предела:
-     * при камере зала срез вышел в СЕМЬ ячеек, и печь мерила перенос между
-     * семью гигантскими площадками. Это был не отказ переноса, а отказ моего
-     * замера — величина считалась не на том. */
-    if (hz_slice_build(&S, &T, &ht, (oven > 0.0 || plates > 0.0) ? NULL : lod_stop, &LL) !=
-        HZ_DC_OK)
-      exit(1);
-    double t_slice = now_s() - ta;
+      LL.thrpoly = g_lodpoly;
+      hz_dcslice S;
+      if (hz_slice_init(&S, lev) != HZ_DC_OK) exit(1);
+      double ta = now_s();
+      /* ПЕЧЬ СТРОИТСЯ НА ПОЛНУЮ ГЛУБИНУ, А НЕ ПО СРЕЗУ. Коробка вся ПЛОСКАЯ,
+       * невязка QEF на ней ноль, и критерий LOD законно огрубляет её до предела:
+       * при камере зала срез вышел в СЕМЬ ячеек, и печь мерила перенос между
+       * семью гигантскими площадками. Это был не отказ переноса, а отказ моего
+       * замера — величина считалась не на том. */
+      if (hz_slice_build(&S, &T, &ht, (oven > 0.0 || plates > 0.0) ? NULL : lod_stop, &LL) !=
+          HZ_DC_OK)
+        exit(1);
+      double t_slice = now_s() - ta;
 
-    /* ИСТОЧНИК: площадка под потолком зала. Габарит сцены известен, потолок —
-     * его верх по оси Y; площадка ставится на 10 см ниже и в центре плана.
-     * Числа не магические: они выведены из ГАБАРИТА, а не подобраны на глаз.
-     * Правило вынесено в `hall_light` (§524): им же пользуется замер грязи. */
-    arealight AL;
-    hall_light(&AL, &P, &fr, lo, hi, LL.eye, 1);
+      /* ИСТОЧНИК: площадка под потолком зала. Габарит сцены известен, потолок —
+       * его верх по оси Y; площадка ставится на 10 см ниже и в центре плана.
+       * Числа не магические: они выведены из ГАБАРИТА, а не подобраны на глаз.
+       * Правило вынесено в `hall_light` (§524): им же пользуется замер грязи. */
+      arealight AL;
+      hall_light(&AL, &P, &fr, lo, hi, LL.eye, 1);
 
-    /* МАТЕРИАЛ ЯЧЕЙКИ СРЕЗА (Ш5б, §430). Байт `mat` перестаёт быть резервом:
-     * берётся материал первого треугольника в ячейке (`celltris` уже построен).
-     * Индекс, а не альбедо: в срезе лежит ИНДЕКС, полезная нагрузка — в таблице
-     * (Р4). Материалов на сцене десятки, таблица горяча в кэше.
-     * ЧЕГО ЭТО НЕ ДЕЛАЕТ: на границе двух материалов ячейка получает ОДИН из
-     * них, а не оба — граница пройдёт по ячейкам среза, то есть с точностью
-     * LOD. Для отскока это законно (энергия), для резкой границы текстуры —
-     * нет; текстур пока и нет. */
-    float *uvs = (m.vt != NULL && m.ft != NULL) ? calloc(2 * (size_t)S.n, sizeof *uvs) : NULL;
-    {
-      int64_t nmat = 0, nuv = 0;
-      for (int32_t i = 0; i < S.n; i++) {
-        /* ЧИТАТЬ ПО ВЕРШИНЕ, А НЕ ПО УГЛУ (найдено 08-11 картинкой с
-         * материалами). У крупной ячейки среза нижний угол лежит ГДЕ УГОДНО —
-         * внутри тела, в пустоте, на соседнем предмете, — и материал оттуда
-         * либо не находится вовсе, либо берётся чужой. Замерено: назначено
-         * `6 084` ячейкам из `19 345` (31 %), а большой шар вышел пятнистым,
-         * потому что часть его ячеек получила материал соседнего.
-         * ВЕРШИНА ЖЕ ЛЕЖИТ НА ПОВЕРХНОСТИ по построению DC, и её ячейка
-         * содержит ровно тот треугольник, который эту вершину и породил.
-         * Это тот же класс, что чтение радианса по углу (§486). */
-        double vw[3];
-        hz_slice_vertex(&S, i, vw);
-        int32_t cell[3];
-        for (int a = 0; a < 3; a++) {
-          double f = floor(vw[a]);
-          if (f < 0.0) f = 0.0;
-          if (f > (double)(fr.n - 1)) f = (double)(fr.n - 1);
-          cell[a] = (int32_t)f;
-        }
-        const int32_t *ls = NULL;
-        if (ct_list(&CT, cell, &ls) == 0) continue;
-        int32_t mi = m.fm != NULL ? m.fm[ls[0]] : 0;
-        if (mi < 0 || mi >= m.nmtl) mi = 0;
-        S.c[i].mat = (uint8_t)(mi < 255 ? mi : 255);
-        nmat++;
-        /* Ш8 (§575): КООРДИНАТА ТЕКСТУРЫ БЕРЁТСЯ ОТТУДА ЖЕ, ОТКУДА МАТЕРИАЛ —
-         * по ТОМУ ЖЕ треугольнику `ls[0]`, барицентрикой в точке вершины DC.
-         * Вершина лежит НА поверхности по построению, поэтому проекции не
-         * нужно; барицентрика считается в плоскости треугольника, и при выходе
-         * за него (вершина ячейки чуть в стороне) координаты не отбрасываются,
-         * а ЗАЖИМАЮТСЯ — иначе край поверхности остался бы без текстуры. */
-        if (uvs != NULL && m.ft != NULL && m.vt != NULL) {
-          const double *A2, *B2, *C2;
-          tri_verts(&m, ls[0], &A2, &B2, &C2);
-          double e1[3], e2[3], vp[3];
-          for (int k = 0; k < 3; k++) {
-            e1[k] = B2[k] - A2[k];
-            e2[k] = C2[k] - A2[k];
-            vp[k] = fr.org[k] + vw[k] * fr.h - A2[k];
-          }
-          double d11 = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
-          double d12 = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
-          double d22 = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
-          double dp1 = vp[0] * e1[0] + vp[1] * e1[1] + vp[2] * e1[2];
-          double dp2 = vp[0] * e2[0] + vp[1] * e2[1] + vp[2] * e2[2];
-          double dn = d11 * d22 - d12 * d12;
-          if (fabs(dn) > 0.0) {
-            double bu = (d22 * dp1 - d12 * dp2) / dn;
-            double bv = (d11 * dp2 - d12 * dp1) / dn;
-            if (bu < 0.0) bu = 0.0;
-            if (bv < 0.0) bv = 0.0;
-            if (bu + bv > 1.0) {
-              double s2 = bu + bv;
-              bu /= s2;
-              bv /= s2;
-            }
-            int32_t q0 = m.ft[3 * (size_t)ls[0] + 0], q1 = m.ft[3 * (size_t)ls[0] + 1],
-                    q2 = m.ft[3 * (size_t)ls[0] + 2];
-            if (q0 >= 0 && q1 >= 0 && q2 >= 0 && q0 < m.nvt && q1 < m.nvt && q2 < m.nvt) {
-              for (int k = 0; k < 2; k++)
-                uvs[2 * (size_t)i + (size_t)k] = (float)(m.vt[2 * (size_t)q0 + (size_t)k] +
-                                                         bu * (m.vt[2 * (size_t)q1 + (size_t)k] -
-                                                               m.vt[2 * (size_t)q0 + (size_t)k]) +
-                                                         bv * (m.vt[2 * (size_t)q2 + (size_t)k] -
-                                                               m.vt[2 * (size_t)q0 + (size_t)k]));
-              nuv++;
-            }
-          }
-        }
-      }
-      printf("   МАТЕРИАЛ В СРЕЗЕ: назначен %lld ячейкам из %d, материалов в сцене %d; "
-             "КООРДИНАТА ТЕКСТУРЫ у %lld (%.1f %%)\n",
-             (long long)nmat, S.n, m.nmtl, (long long)nuv,
-             100.0 * (double)nuv / (double)(S.n ? S.n : 1));
-    }
-
-    float *irr = malloc(3 * (size_t)S.n * sizeof *irr);
-    if (irr == NULL) exit(1);
-    ta = now_s();
-    /* РАБОЧИЙ ПУТЬ — С ПОДЪЁМОМ (§426): тот же предикат, вчетверо дешевле.
-     * Плоский марш остаётся АРБИТРОМ и зовётся ниже. */
-    int64_t nstep_w = 0;
-    front_direct(&S, &fr, &P, &AL, irr, 0.5, 1, &nstep_w, &m);
-    double t_dir = now_s() - ta;
-    /* РЕШЁТКА НА ПОТОЛКЕ — ЧИСЛОМ, А НЕ ГЛАЗОМ (§541; К19 запрещает мерить
-     * картинкой). Берутся ячейки среза с нормалью ВНИЗ и лежащие ПОД САМОЙ
-     * ПЛОЩАДКОЙ (А961): по всему потолку метрика смешала бы решётку с законным
-     * краевым спадом. `max/p50` при точечных источниках велик — каждая проба
-     * ставит пятно; у настоящей площадки потолок под ней не освещён вовсе
-     * (`cos θ_s = 0` у односторонней панели), и метрика вырождается. */
-    {
-      double sde = 0.0;
-      int64_t nlit = 0;
-      for (int32_t i = 0; i < S.n; i++) {
-        for (int k = 0; k < 3; k++)
-          sde += (double)irr[3 * (size_t)i + (size_t)k];
-        if (irr[3 * (size_t)i] > 0.0f) nlit++;
-      }
-      printf("   §541 ПРЯМОЙ СВЕТ АБСОЛЮТНО: Σ E_dir по срезу %.6e, освещённых ячеек %lld из %d\n",
-             sde, (long long)nlit, S.n);
-    }
-    {
-      double *ce = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *ce);
-      if (ce == NULL) exit(1);
-      int64_t nce = 0;
-      double au = sqrt(AL.u[0] * AL.u[0] + AL.u[1] * AL.u[1] + AL.u[2] * AL.u[2]);
-      double av = sqrt(AL.v[0] * AL.v[0] + AL.v[1] * AL.v[1] + AL.v[2] * AL.v[2]);
-      for (int32_t i = 0; i < S.n; i++) {
-        double nn4[3], pw4[3];
-        hz_slice_normal(&S, i, nn4);
-        if (!(nn4[1] < -0.9)) continue; /* нормаль вниз — это потолок */
-        hz_slice_vertex(&S, i, pw4);
-        for (int k = 0; k < 3; k++)
-          pw4[k] = fr.org[k] + pw4[k] * fr.h;
-        if (fabs(pw4[0] - AL.c[0]) > au || fabs(pw4[2] - AL.c[2]) > av) continue;
-        ce[nce++] = (double)irr[3 * (size_t)i];
-      }
-      if (nce > 0) {
-        qsort(ce, (size_t)nce, sizeof *ce, cmp_d);
-        double p50 = ce[nce / 2], mx = ce[nce - 1];
-        printf("   §541 РЕШЁТКА НА ПОТОЛКЕ ЧИСЛОМ: ячеек под площадкой %lld, E_dir p50 %.4e, "
-               "max %.4e, max/p50 = %.2f\n",
-               (long long)nce, p50, mx, mx / (p50 > 0.0 ? p50 : 1.0));
-      } else
-        printf("   §541 РЕШЁТКА НА ПОТОЛКЕ: ячеек под площадкой НЕТ — метрика не снята\n");
-      free(ce);
-    }
-    /* Ш15 (§484): КАРТИНКА ИЗ РАЗВЁРТКИ. Если сработал `xsweep`, облучённость
-     * берётся не маршем и не гатером, а ИСХОДЯЩИМ РАДИАНСОМ поверхностных
-     * элементов, посчитанным уравнением переноса. Заслоны там по построению —
-     * то, что маршем стоит 65 с (§474).
-     * СВЯЗЬ ЯЧЕЕК ПРЯМАЯ: и срез, и сетка переноса адресуются одной сеткой
-     * уровня `lev`, поэтому переклад — это чтение по координате, а не поиск. */
-    if (xrad != NULL) {
-      int64_t nfound = 0;
-      for (int32_t i = 0; i < S.n; i++) {
-        /* Ячейка читает СВОЙ уровень пирамиды, а не угол на самом мелком. НК
-         * `xcorner` возвращает прежнее чтение. */
-        int lv = xcorner ? lev : (int)S.c[i].lvl;
-        int32_t nl = (int32_t)1 << lv;
-        int sh = lev - lv;
-        size_t k = hz_occ_index(nl, S.c[i].lo[0] >> sh, S.c[i].lo[1] >> sh, S.c[i].lo[2] >> sh);
-        const float *src = xradlv != NULL ? xradlv[lv] : xrad;
-        for (int c = 0; c < 3; c++)
-          irr[3 * (size_t)i + (size_t)c] = src[3 * k + (size_t)c];
-        if (src[3 * k] > 0.0f) nfound++;
-      }
-      printf("   КАРТИНКА ИЗ РАЗВЁРТКИ: ячеек среза с радиансом %lld из %d (%.1f %%)\n",
-             (long long)nfound, S.n, 100.0 * (double)nfound / (double)(S.n ? S.n : 1));
-    }
-    /* А772/А775: ЭТАЛОН ПРОВЕРЯЕТСЯ САМ. Марш идёт шагом , и тонкий заслон
-     * он может проскочить. Пересчёт вдвое мельче: если множество затенённых
-     * почти не изменилось, эталон устойчив, и доли расхождения со свипом
-     * говорят про свип. Если изменилось — все эти доли наполовину про эталон. */
-    {
-      float *irrf = malloc(3 * (size_t)S.n * sizeof *irrf);
-      if (irrf == NULL) exit(1);
-      double tf = now_s();
-      front_direct(&S, &fr, &P, &AL, irrf, 0.25, 0, NULL, &m);
-      tf = now_s() - tf;
-      int64_t nd = 0, na = 0, nb = 0;
-      for (int32_t i = 0; i < S.n; i++) {
-        int a1 = irr[3 * (size_t)i] > 0.0f, b1 = irrf[3 * (size_t)i] > 0.0f;
-        na += a1;
-        nb += b1;
-        nd += (a1 != b1);
-      }
-      printf("   ЭТАЛОН ПРИ ПОЛОВИННОМ ШАГЕ (%.1f мс): освещённых h/2 %lld, h/4 %lld, "
-             "РАЗОШЛИСЬ %lld (%.3f %% от среза)\n",
-             tf * 1e3, (long long)na, (long long)nb, (long long)nd,
-             100.0 * (double)nd / (double)(S.n ? S.n : 1));
-      free(irrf);
-    }
-
-    /* ЭТАЛОН С ПОДЪЁМОМ (А784). Предикат тот же, значит множество затенённых
-     * обязано СОВПАСТЬ побитово; падают только шаги и время. */
-    {
-      float *irrh = malloc(3 * (size_t)S.n * sizeof *irrh);
-      if (irrh == NULL) exit(1);
-      int64_t nsteph = 0;
-      double th = now_s();
-      /* АРБИТР — ПЛОСКИЙ марш: рабочий путь стал иерархическим, и сравнивать
-       * его с самим собою значило бы печатать ложный ноль. */
-      front_direct(&S, &fr, &P, &AL, irrh, 0.5, 0, &nsteph, &m);
-      th = now_s() - th;
-      int64_t nd2 = 0;
-      for (int32_t i = 0; i < S.n; i++)
-        if ((irr[3 * (size_t)i] > 0.0f) != (irrh[3 * (size_t)i] > 0.0f)) nd2++;
-      printf("   АРБИТР (плоский марш): %.1f мс против %.1f мс рабочего с подъёмом (в %.2f "
-             "раза), шагов %lld (%.1f на луч); РАСХОЖДЕНИЕ %lld ячеек\n",
-             th * 1e3, t_dir * 1e3, t_dir / (th > 0.0 ? th : 1.0), (long long)nsteph,
-             (double)nsteph / (double)((int64_t)S.n * HZ_LIGHT_SAMPLES), (long long)nd2);
-      free(irrh);
-    }
-
-    /* СВИП — то, что Ш5 обязан измерить
-; луч выше остаётся ЭТАЛОНОМ (А763), и
-     * сверка идёт ПОЯЧЕЕЧНО, а не по картинке. */
-    float *irr2 = malloc(3 * (size_t)S.n * sizeof *irr2);
-    if (irr2 == NULL) exit(1);
-    double t_sw = 0.0, t_ga = 0.0;
-    /* Ф5. (§514): камера дерева свипа ставится ЗДЕСЬ, непосредственно перед
-     * прогоном. Прежде она ставилась в ветви `lit`, которая идёт ПОЗЖЕ, и
-     * дерево строилось с камерой в нуле — то есть порог не действовал вовсе.
-     * Замер это и показал: число листьев не менялось ни при каком пороге. */
-    for (int a2 = 0; a2 < 3; a2++)
-      g_sweepeye[a2] = LL.eye[a2];
-    g_sweeppx = LL.pxrad;
-    front_sweep(&S, &fr, &P, &AL, irr2, &m, &t_sw, &t_ga, sweepaxis, sweepfrac, sweepr01);
-    /* ДОЛЯ ОТКРЫТОСТИ, А НЕ ОБЛУЧЁННОСТЬ (§423, А781). Приёмка задана на долю,
-     * поэтому нужен знаменатель — облучённость БЕЗ всякого затенения. Считается
-     * третьим проходом, дешёвым (теста заслона в нём нет вовсе). */
-    float *irro = malloc(3 * (size_t)S.n * sizeof *irro);
-    if (irro == NULL) exit(1);
-    front_direct(&S, &fr, &P, &AL, irro, -1.0, 0, NULL, &m);
-    {
-      double *dv = malloc((size_t)S.n * sizeof *dv);
-      if (dv == NULL) exit(1);
-      int64_t nv2 = 0;
-      for (int32_t i = 0; i < S.n; i++) {
-        double den = (double)irro[3 * (size_t)i];
-        if (!(den > 0.0)) continue;
-        double a = (double)irr[3 * (size_t)i] / den, b = (double)irr2[3 * (size_t)i] / den;
-        dv[nv2++] = fabs(a - b);
-      }
-      double q90 = 0.0, q99 = 0.0, qmax = 0.0;
-      if (nv2 > 0) {
-        qsort(dv, (size_t)nv2, sizeof *dv, cmp_d);
-        q90 = dv[(nv2 * 9) / 10];
-        q99 = dv[(nv2 * 99) / 100];
-        qmax = dv[nv2 - 1];
-      }
+      /* МАТЕРИАЛ ЯЧЕЙКИ СРЕЗА (Ш5б, §430). Байт `mat` перестаёт быть резервом:
+       * берётся материал первого треугольника в ячейке (`celltris` уже построен).
+       * Индекс, а не альбедо: в срезе лежит ИНДЕКС, полезная нагрузка — в таблице
+       * (Р4). Материалов на сцене десятки, таблица горяча в кэше.
+       * ЧЕГО ЭТО НЕ ДЕЛАЕТ: на границе двух материалов ячейка получает ОДИН из
+       * них, а не оба — граница пройдёт по ячейкам среза, то есть с точностью
+       * LOD. Для отскока это законно (энергия), для резкой границы текстуры —
+       * нет; текстур пока и нет. */
+      float *uvs = (m.vt != NULL && m.ft != NULL) ? calloc(2 * (size_t)S.n, sizeof *uvs) : NULL;
       {
-        double ma = 0.0, mb = 0.0;
-        int64_t nm = 0;
+        int64_t nmat = 0, nuv = 0;
         for (int32_t i = 0; i < S.n; i++) {
-          double den = (double)irro[3 * (size_t)i];
-          if (!(den > 0.0)) continue;
-          ma += (double)irr[3 * (size_t)i] / den;
-          mb += (double)irr2[3 * (size_t)i] / den;
-          nm++;
+          /* ЧИТАТЬ ПО ВЕРШИНЕ, А НЕ ПО УГЛУ (найдено 08-11 картинкой с
+           * материалами). У крупной ячейки среза нижний угол лежит ГДЕ УГОДНО —
+           * внутри тела, в пустоте, на соседнем предмете, — и материал оттуда
+           * либо не находится вовсе, либо берётся чужой. Замерено: назначено
+           * `6 084` ячейкам из `19 345` (31 %), а большой шар вышел пятнистым,
+           * потому что часть его ячеек получила материал соседнего.
+           * ВЕРШИНА ЖЕ ЛЕЖИТ НА ПОВЕРХНОСТИ по построению DC, и её ячейка
+           * содержит ровно тот треугольник, который эту вершину и породил.
+           * Это тот же класс, что чтение радианса по углу (§486). */
+          double vw[3];
+          hz_slice_vertex(&S, i, vw);
+          int32_t cell[3];
+          for (int a = 0; a < 3; a++) {
+            double f = floor(vw[a]);
+            if (f < 0.0) f = 0.0;
+            if (f > (double)(fr.n - 1)) f = (double)(fr.n - 1);
+            cell[a] = (int32_t)f;
+          }
+          const int32_t *ls = NULL;
+          if (ct_list(&CT, cell, &ls) == 0) continue;
+          int32_t mi = m.fm != NULL ? m.fm[ls[0]] : 0;
+          if (mi < 0 || mi >= m.nmtl) mi = 0;
+          S.c[i].mat = (uint8_t)(mi < 255 ? mi : 255);
+          nmat++;
+          /* Ш8 (§575): КООРДИНАТА ТЕКСТУРЫ БЕРЁТСЯ ОТТУДА ЖЕ, ОТКУДА МАТЕРИАЛ —
+           * по ТОМУ ЖЕ треугольнику `ls[0]`, барицентрикой в точке вершины DC.
+           * Вершина лежит НА поверхности по построению, поэтому проекции не
+           * нужно; барицентрика считается в плоскости треугольника, и при выходе
+           * за него (вершина ячейки чуть в стороне) координаты не отбрасываются,
+           * а ЗАЖИМАЮТСЯ — иначе край поверхности остался бы без текстуры. */
+          if (uvs != NULL && m.ft != NULL && m.vt != NULL) {
+            const double *A2, *B2, *C2;
+            tri_verts(&m, ls[0], &A2, &B2, &C2);
+            double e1[3], e2[3], vp[3];
+            for (int k = 0; k < 3; k++) {
+              e1[k] = B2[k] - A2[k];
+              e2[k] = C2[k] - A2[k];
+              vp[k] = fr.org[k] + vw[k] * fr.h - A2[k];
+            }
+            double d11 = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
+            double d12 = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
+            double d22 = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
+            double dp1 = vp[0] * e1[0] + vp[1] * e1[1] + vp[2] * e1[2];
+            double dp2 = vp[0] * e2[0] + vp[1] * e2[1] + vp[2] * e2[2];
+            double dn = d11 * d22 - d12 * d12;
+            if (fabs(dn) > 0.0) {
+              double bu = (d22 * dp1 - d12 * dp2) / dn;
+              double bv = (d11 * dp2 - d12 * dp1) / dn;
+              if (bu < 0.0) bu = 0.0;
+              if (bv < 0.0) bv = 0.0;
+              if (bu + bv > 1.0) {
+                double s2 = bu + bv;
+                bu /= s2;
+                bv /= s2;
+              }
+              int32_t q0 = m.ft[3 * (size_t)ls[0] + 0], q1 = m.ft[3 * (size_t)ls[0] + 1],
+                      q2 = m.ft[3 * (size_t)ls[0] + 2];
+              if (q0 >= 0 && q1 >= 0 && q2 >= 0 && q0 < m.nvt && q1 < m.nvt && q2 < m.nvt) {
+                for (int k = 0; k < 2; k++)
+                  uvs[2 * (size_t)i + (size_t)k] = (float)(m.vt[2 * (size_t)q0 + (size_t)k] +
+                                                           bu * (m.vt[2 * (size_t)q1 + (size_t)k] -
+                                                                 m.vt[2 * (size_t)q0 + (size_t)k]) +
+                                                           bv * (m.vt[2 * (size_t)q2 + (size_t)k] -
+                                                                 m.vt[2 * (size_t)q0 + (size_t)k]));
+                nuv++;
+              }
+            }
+          }
         }
-        printf("   СРЕДНЯЯ ОТКРЫТОСТЬ: эталон %.4f, свип %.4f (по %lld ячейкам)\n",
-               ma / (double)(nm ? nm : 1), mb / (double)(nm ? nm : 1), (long long)nm);
+        printf("   МАТЕРИАЛ В СРЕЗЕ: назначен %lld ячейкам из %d, материалов в сцене %d; "
+               "КООРДИНАТА ТЕКСТУРЫ у %lld (%.1f %%)\n",
+               (long long)nmat, S.n, m.nmtl, (long long)nuv,
+               100.0 * (double)nuv / (double)(S.n ? S.n : 1));
       }
-      printf("   ПРИЁМКА Ш5а2 (доля открытости против эталона, популяция — ячейки среза с "
-             "ненулевым знаменателем %lld): p90 %.4f, p99 %.4f, макс %.4f\n",
-             (long long)nv2, q90, q99, qmax);
-      free(dv);
-    }
-    free(irro);
-    {
-      int64_t ndiff = 0, nlit_r = 0, nlit_s = 0, nsum_r = 0;
-      double emax = 0.0, sum_r = 0.0;
-      for (int32_t i = 0; i < S.n; i++) {
-        double a = irr[3 * (size_t)i], b = irr2[3 * (size_t)i];
-        if (a > 0.0) nlit_r++;
-        if (b > 0.0) nlit_s++;
-        if ((a > 0.0) != (b > 0.0)) ndiff++;
-        double d = fabs(a - b);
-        if (d > emax) emax = d;
-        /* §506: РАЗОШЛИСЬ ПО МНОЖЕСТВУ СЧИТАЕТСЯ ПО «> 0», А У ДИФФУЗНОЙ СХЕМЫ
-         * ХВОСТЫ НИКОГДА НЕ ДОХОДЯТ ДО НУЛЯ. Значит счётчик может мерить не
-         * обтекание заслона, а экспоненциально малый шум. Здесь то же множество
-         * считается по долям от СРЕДНЕЙ облучённости — порога нет, есть
-         * зависимость, и она сама скажет, шум это или свет. */
-        sum_r += a;
-        nsum_r++;
-      }
-      double mean_r = nsum_r > 0 ? sum_r / (double)nsum_r : 0.0;
-      int64_t ndf[3] = {0, 0, 0};
-      static const double frac3[3] = {0.01, 0.05, 0.20};
-      for (int32_t i = 0; i < S.n; i++) {
-        double a = irr[3 * (size_t)i], b = irr2[3 * (size_t)i];
-        for (int t2 = 0; t2 < 3; t2++) {
-          double th = frac3[t2] * mean_r;
-          if ((a > th) != (b > th)) ndf[t2]++;
-        }
-      }
-      printf("      §506 РАЗОШЛИСЬ ПО ПОРОГУ ОТ СРЕДНЕЙ: 1 %% — %lld (%.2f %%), 5 %% — %lld (%.2f "
-             "%%), 20 %% — %lld (%.2f %%)\n",
-             (long long)ndf[0], 100.0 * (double)ndf[0] / (double)(S.n ? S.n : 1), (long long)ndf[1],
-             100.0 * (double)ndf[1] / (double)(S.n ? S.n : 1), (long long)ndf[2],
-             100.0 * (double)ndf[2] / (double)(S.n ? S.n : 1));
-      printf("   СВИП: %.1f мс на %d образцов; сетка %d^3 = %lld ячеек, %.2f нс НА ЯЧЕЙКУ СЕТКИ; "
-             "%.0f нс на ячейку СРЕЗА (это цена для БЮДЖЕТА, а не цена обработки); сбор %.1f мс; "
-             "освещённых ячеек "
-             "луч %lld, свип %lld, РАЗОШЛИСЬ %lld (%.2f %%), макс расхождение %.3e\n",
-             t_sw * 1e3, HZ_LIGHT_SAMPLES, (int)1 << (lev - HZ_SWEEP_DROP),
-             (long long)((int64_t)1 << (3 * (lev - HZ_SWEEP_DROP))),
-             t_sw * 1e9 / (double)((int64_t)1 << (3 * (lev - HZ_SWEEP_DROP))) /
-                 (double)HZ_LIGHT_SAMPLES,
-             t_sw * 1e9 / (double)(S.n ? S.n : 1) / (double)HZ_LIGHT_SAMPLES, t_ga * 1e3,
-             (long long)nlit_r, (long long)nlit_s, (long long)ndiff,
-             100.0 * (double)ndiff / (double)(S.n ? S.n : 1), emax);
-    }
 
-    /* ---- ПЕЧЬ (Ш5б, §430): ЗАМКНУТАЯ ФОРМА ПРОТИВ ИТЕРАЦИИ ---- */
-    /* В замкнутой полости с ПОСТОЯННЫМ альбедо и постоянной эмиссией угловые
-     * коэффициенты каждой площадки суммируются в единицу, поэтому радиозность
-     * удовлетворяет `B = E + ρ·B`, то есть `B = E/(1−ρ)` ТОЧНО. Ответ не зависит
-     * ни от формы полости, ни от разбиения — потому это и приёмка: всякое
-     * отклонение есть УТЕЧКА (или приток) энергии в моём переносе, а не
-     * погрешность геометрии.
-     * ЗДЕСЬ ПРОВЕРЯЕТСЯ МОЙ ГАТЕР, А НЕ АРИФМЕТИКА: угловые коэффициенты
-     * считаются тем же кодом, что и отскок на сцене. */
-    /* ---- ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ (§446): ПЕРВОЕ ДЕЙСТВИЕ, НАЗНАЧЕННОЕ
-     * ЗАРАНЕЕ В §445. КЛЮЧ `area` — ЧТОБЫ ЗАМЕР ШЁЛ НА ЛЮБОЙ СЦЕНЕ (§450, П3а):
-     * величина `1.5` снята только на коробке, а правило А793 требует гонять
-     * эталон НА КАЖДОЙ НОВОЙ СЦЕНЕ. ---- */
-    if (oven > 0.0 || area) {
-      /* ИСТИНА БЕРЁТСЯ ИЗ САМОГО МЕША, А НЕ КОНСТАНТОЙ `6.0`. Тогда замер
-       * остаётся верным при любом масштабе — и негативный контроль НК-1
-       * (масштаб `2.0`) проверяет себя сам, а не сверяется с вписанным числом. */
-      double atrue = 0.0;
-      for (int32_t t3 = 0; t3 < m.nt; t3++) {
-        const double *p0 = m.v + 3 * (size_t)m.f[3 * (size_t)t3];
-        const double *p1 = m.v + 3 * (size_t)m.f[3 * (size_t)t3 + 1];
-        const double *p2 = m.v + 3 * (size_t)m.f[3 * (size_t)t3 + 2];
-        double nn[3];
-        atrue += tri_area2(p0, p1, p2, nn);
-      }
-      /* ТАБЛИЦА РЁБЕР ДО ВСЯКОГО ОБХОДА: сколько пересечений в каждом СЛОЕ и
-       * сколько из них сидят на КОНЦАХ ребра (`t` у нуля или у единицы). Обход и
-       * вершины стоят ниже по цепочке, и судить по ним о причине — та же ошибка,
-       * что А791 (искать вниз, когда надо вверх). */
-      {
-        int64_t *el = calloc(3 * (size_t)(fr.n + 1), sizeof *el);
-        if (el == NULL) exit(1);
-        int64_t nt0 = 0, nt1 = 0;
-        for (int32_t i = 0; i < ht.n; i++) {
-          int a = ht.e[i].axis;
-          int32_t p = ht.e[i].p[a];
-          if (p >= 0 && p <= fr.n) el[(size_t)a * (size_t)(fr.n + 1) + (size_t)p]++;
-          /* Порог — не магический: это шаг ребра в долях, при котором точка
-           * неотличима от конца в двойной точности на сетке в 2^lev ячеек. */
-          if (ht.e[i].t < 1e-12) nt0++;
-          if (ht.e[i].t > 1.0 - 1e-12) nt1++;
+      float *irr = malloc(3 * (size_t)S.n * sizeof *irr);
+      if (irr == NULL) exit(1);
+      ta = now_s();
+      /* РАБОЧИЙ ПУТЬ — С ПОДЪЁМОМ (§426): тот же предикат, вчетверо дешевле.
+       * Плоский марш остаётся АРБИТРОМ и зовётся ниже. */
+      int64_t nstep_w = 0;
+      front_direct(&S, &fr, &P, &AL, irr, 0.5, 1, &nstep_w, &m);
+      double t_dir = now_s() - ta;
+      /* ---- ДИАГНОСТИКА КАДРА: ВСЁ, ЧТО НИЖЕ, К КАРТИНКЕ НЕ ОТНОСИТСЯ (§589) ----
+       * Свип, арбитр-марш, эталоны, поячеечные сличения, иерархический отскок —
+       * это ЗАМЕРЫ, а не кадр. Одним прогоном они стоят секунды и потому в цикле
+       * ходьбы недопустимы: `walk` их выключает целиком.
+       * ЧТО ЭТО ЗНАЧИТ ЧЕСТНО: в ходьбе НЕТ КОСВЕННОГО СВЕТА. Виден прямой
+       * солнечный плюс тень; отскок (`3.4` с) в кадровый бюджет не входит и здесь
+       * не считается вовсе. Это не «упрощение ради скорости», а прямое следствие
+       * того, что отскок стоит втрое дороже секунды. */
+      float *irr2 = NULL;
+      if (!g_walk) {
+        /* РЕШЁТКА НА ПОТОЛКЕ — ЧИСЛОМ, А НЕ ГЛАЗОМ (§541; К19 запрещает мерить
+         * картинкой). Берутся ячейки среза с нормалью ВНИЗ и лежащие ПОД САМОЙ
+         * ПЛОЩАДКОЙ (А961): по всему потолку метрика смешала бы решётку с законным
+         * краевым спадом. `max/p50` при точечных источниках велик — каждая проба
+         * ставит пятно; у настоящей площадки потолок под ней не освещён вовсе
+         * (`cos θ_s = 0` у односторонней панели), и метрика вырождается. */
+        {
+          double sde = 0.0;
+          int64_t nlit = 0;
+          for (int32_t i = 0; i < S.n; i++) {
+            for (int k = 0; k < 3; k++)
+              sde += (double)irr[3 * (size_t)i + (size_t)k];
+            if (irr[3 * (size_t)i] > 0.0f) nlit++;
+          }
+          printf(
+              "   §541 ПРЯМОЙ СВЕТ АБСОЛЮТНО: Σ E_dir по срезу %.6e, освещённых ячеек %lld из %d\n",
+              sde, (long long)nlit, S.n);
         }
-        printf("   ТАБЛИЦА РЁБЕР: записей %d; `t` у НУЛЯ %lld, `t` у ЕДИНИЦЫ %lld "
-               "(поверхность на границе ячеек даёт и то и другое)\n",
-               ht.n, (long long)nt0, (long long)nt1);
-        for (int a = 0; a < 3; a++) {
-          int64_t tot = 0;
-          for (int32_t p = 0; p <= fr.n; p++)
-            tot += el[(size_t)a * (size_t)(fr.n + 1) + (size_t)p];
-          if (tot == 0) continue;
-          printf("   РЁБЕРА ПО СЛОЯМ ось %d (всего %lld):", a, (long long)tot);
-          for (int32_t p = 0; p <= fr.n; p++) {
-            int64_t c = el[(size_t)a * (size_t)(fr.n + 1) + (size_t)p];
-            if (c * 100 < tot) continue;
-            printf(" | слой %d: %lld", p, (long long)c);
+        {
+          double *ce = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *ce);
+          if (ce == NULL) exit(1);
+          int64_t nce = 0;
+          double au = sqrt(AL.u[0] * AL.u[0] + AL.u[1] * AL.u[1] + AL.u[2] * AL.u[2]);
+          double av = sqrt(AL.v[0] * AL.v[0] + AL.v[1] * AL.v[1] + AL.v[2] * AL.v[2]);
+          for (int32_t i = 0; i < S.n; i++) {
+            double nn4[3], pw4[3];
+            hz_slice_normal(&S, i, nn4);
+            if (!(nn4[1] < -0.9)) continue; /* нормаль вниз — это потолок */
+            hz_slice_vertex(&S, i, pw4);
+            for (int k = 0; k < 3; k++)
+              pw4[k] = fr.org[k] + pw4[k] * fr.h;
+            if (fabs(pw4[0] - AL.c[0]) > au || fabs(pw4[2] - AL.c[2]) > av) continue;
+            ce[nce++] = (double)irr[3 * (size_t)i];
+          }
+          if (nce > 0) {
+            qsort(ce, (size_t)nce, sizeof *ce, cmp_d);
+            double p50 = ce[nce / 2], mx = ce[nce - 1];
+            printf("   §541 РЕШЁТКА НА ПОТОЛКЕ ЧИСЛОМ: ячеек под площадкой %lld, E_dir p50 %.4e, "
+                   "max %.4e, max/p50 = %.2f\n",
+                   (long long)nce, p50, mx, mx / (p50 > 0.0 ? p50 : 1.0));
+          } else
+            printf("   §541 РЕШЁТКА НА ПОТОЛКЕ: ячеек под площадкой НЕТ — метрика не снята\n");
+          free(ce);
+        }
+        /* Ш15 (§484): КАРТИНКА ИЗ РАЗВЁРТКИ. Если сработал `xsweep`, облучённость
+         * берётся не маршем и не гатером, а ИСХОДЯЩИМ РАДИАНСОМ поверхностных
+         * элементов, посчитанным уравнением переноса. Заслоны там по построению —
+         * то, что маршем стоит 65 с (§474).
+         * СВЯЗЬ ЯЧЕЕК ПРЯМАЯ: и срез, и сетка переноса адресуются одной сеткой
+         * уровня `lev`, поэтому переклад — это чтение по координате, а не поиск. */
+        if (xrad != NULL) {
+          int64_t nfound = 0;
+          for (int32_t i = 0; i < S.n; i++) {
+            /* Ячейка читает СВОЙ уровень пирамиды, а не угол на самом мелком. НК
+             * `xcorner` возвращает прежнее чтение. */
+            int lv = xcorner ? lev : (int)S.c[i].lvl;
+            int32_t nl = (int32_t)1 << lv;
+            int sh = lev - lv;
+            size_t k = hz_occ_index(nl, S.c[i].lo[0] >> sh, S.c[i].lo[1] >> sh, S.c[i].lo[2] >> sh);
+            const float *src = xradlv != NULL ? xradlv[lv] : xrad;
+            for (int c = 0; c < 3; c++)
+              irr[3 * (size_t)i + (size_t)c] = src[3 * k + (size_t)c];
+            if (src[3 * k] > 0.0f) nfound++;
+          }
+          printf("   КАРТИНКА ИЗ РАЗВЁРТКИ: ячеек среза с радиансом %lld из %d (%.1f %%)\n",
+                 (long long)nfound, S.n, 100.0 * (double)nfound / (double)(S.n ? S.n : 1));
+        }
+        /* А772/А775: ЭТАЛОН ПРОВЕРЯЕТСЯ САМ. Марш идёт шагом , и тонкий заслон
+         * он может проскочить. Пересчёт вдвое мельче: если множество затенённых
+         * почти не изменилось, эталон устойчив, и доли расхождения со свипом
+         * говорят про свип. Если изменилось — все эти доли наполовину про эталон. */
+        {
+          float *irrf = malloc(3 * (size_t)S.n * sizeof *irrf);
+          if (irrf == NULL) exit(1);
+          double tf = now_s();
+          front_direct(&S, &fr, &P, &AL, irrf, 0.25, 0, NULL, &m);
+          tf = now_s() - tf;
+          int64_t nd = 0, na = 0, nb = 0;
+          for (int32_t i = 0; i < S.n; i++) {
+            int a1 = irr[3 * (size_t)i] > 0.0f, b1 = irrf[3 * (size_t)i] > 0.0f;
+            na += a1;
+            nb += b1;
+            nd += (a1 != b1);
+          }
+          printf("   ЭТАЛОН ПРИ ПОЛОВИННОМ ШАГЕ (%.1f мс): освещённых h/2 %lld, h/4 %lld, "
+                 "РАЗОШЛИСЬ %lld (%.3f %% от среза)\n",
+                 tf * 1e3, (long long)na, (long long)nb, (long long)nd,
+                 100.0 * (double)nd / (double)(S.n ? S.n : 1));
+          free(irrf);
+        }
+
+        /* ЭТАЛОН С ПОДЪЁМОМ (А784). Предикат тот же, значит множество затенённых
+         * обязано СОВПАСТЬ побитово; падают только шаги и время. */
+        {
+          float *irrh = malloc(3 * (size_t)S.n * sizeof *irrh);
+          if (irrh == NULL) exit(1);
+          int64_t nsteph = 0;
+          double th = now_s();
+          /* АРБИТР — ПЛОСКИЙ марш: рабочий путь стал иерархическим, и сравнивать
+           * его с самим собою значило бы печатать ложный ноль. */
+          front_direct(&S, &fr, &P, &AL, irrh, 0.5, 0, &nsteph, &m);
+          th = now_s() - th;
+          int64_t nd2 = 0;
+          for (int32_t i = 0; i < S.n; i++)
+            if ((irr[3 * (size_t)i] > 0.0f) != (irrh[3 * (size_t)i] > 0.0f)) nd2++;
+          printf("   АРБИТР (плоский марш): %.1f мс против %.1f мс рабочего с подъёмом (в %.2f "
+                 "раза), шагов %lld (%.1f на луч); РАСХОЖДЕНИЕ %lld ячеек\n",
+                 th * 1e3, t_dir * 1e3, t_dir / (th > 0.0 ? th : 1.0), (long long)nsteph,
+                 (double)nsteph / (double)((int64_t)S.n * HZ_LIGHT_SAMPLES), (long long)nd2);
+          free(irrh);
+        }
+
+        /* СВИП — то, что Ш5 обязан измерить
+    ; луч выше остаётся ЭТАЛОНОМ (А763), и
+         * сверка идёт ПОЯЧЕЕЧНО, а не по картинке. */
+        irr2 = malloc(3 * (size_t)S.n * sizeof *irr2);
+        if (irr2 == NULL) exit(1);
+        double t_sw = 0.0, t_ga = 0.0;
+        /* Ф5. (§514): камера дерева свипа ставится ЗДЕСЬ, непосредственно перед
+         * прогоном. Прежде она ставилась в ветви `lit`, которая идёт ПОЗЖЕ, и
+         * дерево строилось с камерой в нуле — то есть порог не действовал вовсе.
+         * Замер это и показал: число листьев не менялось ни при каком пороге. */
+        for (int a2 = 0; a2 < 3; a2++)
+          g_sweepeye[a2] = LL.eye[a2];
+        g_sweeppx = LL.pxrad;
+        front_sweep(&S, &fr, &P, &AL, irr2, &m, &t_sw, &t_ga, sweepaxis, sweepfrac, sweepr01);
+        /* ДОЛЯ ОТКРЫТОСТИ, А НЕ ОБЛУЧЁННОСТЬ (§423, А781). Приёмка задана на долю,
+         * поэтому нужен знаменатель — облучённость БЕЗ всякого затенения. Считается
+         * третьим проходом, дешёвым (теста заслона в нём нет вовсе). */
+        float *irro = malloc(3 * (size_t)S.n * sizeof *irro);
+        if (irro == NULL) exit(1);
+        front_direct(&S, &fr, &P, &AL, irro, -1.0, 0, NULL, &m);
+        {
+          double *dv = malloc((size_t)S.n * sizeof *dv);
+          if (dv == NULL) exit(1);
+          int64_t nv2 = 0;
+          for (int32_t i = 0; i < S.n; i++) {
+            double den = (double)irro[3 * (size_t)i];
+            if (!(den > 0.0)) continue;
+            double a = (double)irr[3 * (size_t)i] / den, b = (double)irr2[3 * (size_t)i] / den;
+            dv[nv2++] = fabs(a - b);
+          }
+          double q90 = 0.0, q99 = 0.0, qmax = 0.0;
+          if (nv2 > 0) {
+            qsort(dv, (size_t)nv2, sizeof *dv, cmp_d);
+            q90 = dv[(nv2 * 9) / 10];
+            q99 = dv[(nv2 * 99) / 100];
+            qmax = dv[nv2 - 1];
+          }
+          {
+            double ma = 0.0, mb = 0.0;
+            int64_t nm = 0;
+            for (int32_t i = 0; i < S.n; i++) {
+              double den = (double)irro[3 * (size_t)i];
+              if (!(den > 0.0)) continue;
+              ma += (double)irr[3 * (size_t)i] / den;
+              mb += (double)irr2[3 * (size_t)i] / den;
+              nm++;
+            }
+            printf("   СРЕДНЯЯ ОТКРЫТОСТЬ: эталон %.4f, свип %.4f (по %lld ячейкам)\n",
+                   ma / (double)(nm ? nm : 1), mb / (double)(nm ? nm : 1), (long long)nm);
+          }
+          printf("   ПРИЁМКА Ш5а2 (доля открытости против эталона, популяция — ячейки среза с "
+                 "ненулевым знаменателем %lld): p90 %.4f, p99 %.4f, макс %.4f\n",
+                 (long long)nv2, q90, q99, qmax);
+          free(dv);
+        }
+        free(irro);
+        {
+          int64_t ndiff = 0, nlit_r = 0, nlit_s = 0, nsum_r = 0;
+          double emax = 0.0, sum_r = 0.0;
+          for (int32_t i = 0; i < S.n; i++) {
+            double a = irr[3 * (size_t)i], b = irr2[3 * (size_t)i];
+            if (a > 0.0) nlit_r++;
+            if (b > 0.0) nlit_s++;
+            if ((a > 0.0) != (b > 0.0)) ndiff++;
+            double d = fabs(a - b);
+            if (d > emax) emax = d;
+            /* §506: РАЗОШЛИСЬ ПО МНОЖЕСТВУ СЧИТАЕТСЯ ПО «> 0», А У ДИФФУЗНОЙ СХЕМЫ
+             * ХВОСТЫ НИКОГДА НЕ ДОХОДЯТ ДО НУЛЯ. Значит счётчик может мерить не
+             * обтекание заслона, а экспоненциально малый шум. Здесь то же множество
+             * считается по долям от СРЕДНЕЙ облучённости — порога нет, есть
+             * зависимость, и она сама скажет, шум это или свет. */
+            sum_r += a;
+            nsum_r++;
+          }
+          double mean_r = nsum_r > 0 ? sum_r / (double)nsum_r : 0.0;
+          int64_t ndf[3] = {0, 0, 0};
+          static const double frac3[3] = {0.01, 0.05, 0.20};
+          for (int32_t i = 0; i < S.n; i++) {
+            double a = irr[3 * (size_t)i], b = irr2[3 * (size_t)i];
+            for (int t2 = 0; t2 < 3; t2++) {
+              double th = frac3[t2] * mean_r;
+              if ((a > th) != (b > th)) ndf[t2]++;
+            }
+          }
+          printf(
+              "      §506 РАЗОШЛИСЬ ПО ПОРОГУ ОТ СРЕДНЕЙ: 1 %% — %lld (%.2f %%), 5 %% — %lld (%.2f "
+              "%%), 20 %% — %lld (%.2f %%)\n",
+              (long long)ndf[0], 100.0 * (double)ndf[0] / (double)(S.n ? S.n : 1),
+              (long long)ndf[1], 100.0 * (double)ndf[1] / (double)(S.n ? S.n : 1),
+              (long long)ndf[2], 100.0 * (double)ndf[2] / (double)(S.n ? S.n : 1));
+          printf(
+              "   СВИП: %.1f мс на %d образцов; сетка %d^3 = %lld ячеек, %.2f нс НА ЯЧЕЙКУ СЕТКИ; "
+              "%.0f нс на ячейку СРЕЗА (это цена для БЮДЖЕТА, а не цена обработки); сбор %.1f мс; "
+              "освещённых ячеек "
+              "луч %lld, свип %lld, РАЗОШЛИСЬ %lld (%.2f %%), макс расхождение %.3e\n",
+              t_sw * 1e3, HZ_LIGHT_SAMPLES, (int)1 << (lev - HZ_SWEEP_DROP),
+              (long long)((int64_t)1 << (3 * (lev - HZ_SWEEP_DROP))),
+              t_sw * 1e9 / (double)((int64_t)1 << (3 * (lev - HZ_SWEEP_DROP))) /
+                  (double)HZ_LIGHT_SAMPLES,
+              t_sw * 1e9 / (double)(S.n ? S.n : 1) / (double)HZ_LIGHT_SAMPLES, t_ga * 1e3,
+              (long long)nlit_r, (long long)nlit_s, (long long)ndiff,
+              100.0 * (double)ndiff / (double)(S.n ? S.n : 1), emax);
+        }
+
+        /* ---- ПЕЧЬ (Ш5б, §430): ЗАМКНУТАЯ ФОРМА ПРОТИВ ИТЕРАЦИИ ---- */
+        /* В замкнутой полости с ПОСТОЯННЫМ альбедо и постоянной эмиссией угловые
+         * коэффициенты каждой площадки суммируются в единицу, поэтому радиозность
+         * удовлетворяет `B = E + ρ·B`, то есть `B = E/(1−ρ)` ТОЧНО. Ответ не зависит
+         * ни от формы полости, ни от разбиения — потому это и приёмка: всякое
+         * отклонение есть УТЕЧКА (или приток) энергии в моём переносе, а не
+         * погрешность геометрии.
+         * ЗДЕСЬ ПРОВЕРЯЕТСЯ МОЙ ГАТЕР, А НЕ АРИФМЕТИКА: угловые коэффициенты
+         * считаются тем же кодом, что и отскок на сцене. */
+        /* ---- ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ (§446): ПЕРВОЕ ДЕЙСТВИЕ, НАЗНАЧЕННОЕ
+         * ЗАРАНЕЕ В §445. КЛЮЧ `area` — ЧТОБЫ ЗАМЕР ШЁЛ НА ЛЮБОЙ СЦЕНЕ (§450, П3а):
+         * величина `1.5` снята только на коробке, а правило А793 требует гонять
+         * эталон НА КАЖДОЙ НОВОЙ СЦЕНЕ. ---- */
+        if (oven > 0.0 || area) {
+          /* ИСТИНА БЕРЁТСЯ ИЗ САМОГО МЕША, А НЕ КОНСТАНТОЙ `6.0`. Тогда замер
+           * остаётся верным при любом масштабе — и негативный контроль НК-1
+           * (масштаб `2.0`) проверяет себя сам, а не сверяется с вписанным числом. */
+          double atrue = 0.0;
+          for (int32_t t3 = 0; t3 < m.nt; t3++) {
+            const double *p0 = m.v + 3 * (size_t)m.f[3 * (size_t)t3];
+            const double *p1 = m.v + 3 * (size_t)m.f[3 * (size_t)t3 + 1];
+            const double *p2 = m.v + 3 * (size_t)m.f[3 * (size_t)t3 + 2];
+            double nn[3];
+            atrue += tri_area2(p0, p1, p2, nn);
+          }
+          /* ТАБЛИЦА РЁБЕР ДО ВСЯКОГО ОБХОДА: сколько пересечений в каждом СЛОЕ и
+           * сколько из них сидят на КОНЦАХ ребра (`t` у нуля или у единицы). Обход и
+           * вершины стоят ниже по цепочке, и судить по ним о причине — та же ошибка,
+           * что А791 (искать вниз, когда надо вверх). */
+          {
+            int64_t *el = calloc(3 * (size_t)(fr.n + 1), sizeof *el);
+            if (el == NULL) exit(1);
+            int64_t nt0 = 0, nt1 = 0;
+            for (int32_t i = 0; i < ht.n; i++) {
+              int a = ht.e[i].axis;
+              int32_t p = ht.e[i].p[a];
+              if (p >= 0 && p <= fr.n) el[(size_t)a * (size_t)(fr.n + 1) + (size_t)p]++;
+              /* Порог — не магический: это шаг ребра в долях, при котором точка
+               * неотличима от конца в двойной точности на сетке в 2^lev ячеек. */
+              if (ht.e[i].t < 1e-12) nt0++;
+              if (ht.e[i].t > 1.0 - 1e-12) nt1++;
+            }
+            printf("   ТАБЛИЦА РЁБЕР: записей %d; `t` у НУЛЯ %lld, `t` у ЕДИНИЦЫ %lld "
+                   "(поверхность на границе ячеек даёт и то и другое)\n",
+                   ht.n, (long long)nt0, (long long)nt1);
+            for (int a = 0; a < 3; a++) {
+              int64_t tot = 0;
+              for (int32_t p = 0; p <= fr.n; p++)
+                tot += el[(size_t)a * (size_t)(fr.n + 1) + (size_t)p];
+              if (tot == 0) continue;
+              printf("   РЁБЕРА ПО СЛОЯМ ось %d (всего %lld):", a, (long long)tot);
+              for (int32_t p = 0; p <= fr.n; p++) {
+                int64_t c = el[(size_t)a * (size_t)(fr.n + 1) + (size_t)p];
+                if (c * 100 < tot) continue;
+                printf(" | слой %d: %lld", p, (long long)c);
+              }
+              printf("\n");
+            }
+            free(el);
+          }
+
+          /* ДВА ОГРАНИЧИТЕЛЯ ПОРОЗНЬ (§450, П3.2): ПОЛНАЯ ГЛУБИНА и СРЕЗ. Площадь
+           * одной поверхности нельзя сравнивать с ячейками другой, а срез огрубляет
+           * — значит числа разные, и печатать их надо врозь, а не одно за оба. */
+          int32_t nbin = HZ_PLBIN * fr.n + 2;
+          for (int pass = 0; pass < 2; pass++) {
+            areacnt A;
+            memset(&A, 0, sizeof A);
+            A.nbin = nbin;
+            A.pl_area = calloc(3 * (size_t)nbin, sizeof *A.pl_area);
+            A.pl_cnt = calloc(3 * (size_t)nbin, sizeof *A.pl_cnt);
+            A.ncell = fr.n + 1;
+            A.cl_area = calloc(3 * (size_t)A.ncell, sizeof *A.cl_area);
+            A.cl_cnt = calloc(3 * (size_t)A.ncell, sizeof *A.cl_cnt);
+            if (A.pl_area == NULL || A.pl_cnt == NULL || A.cl_area == NULL || A.cl_cnt == NULL)
+              exit(1);
+            int32_t nskip = 0;
+            int wrca = pass == 0 ? hz_dc_walk_stats(&T, NULL, NULL, area_emit, &A, &nskip)
+                                 : hz_dc_walk_stats(&T, lod_stop, &LL, area_emit, &A, &nskip);
+            double h2 = fr.h * fr.h;
+            const char *tag = pass == 0 ? "ПОЛНАЯ ГЛУБИНА" : "СРЕЗ";
+            printf("   ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ [%s] (§446): веер от v0 %.5f м², от v1 %.5f м² "
+                   "(разность %.3e); ИСТИННАЯ по мешу %.5f м², отношение %.4f\n",
+                   tag, A.fan0 * h2, A.fan1 * h2, fabs(A.fan0 - A.fan1) * h2, atrue,
+                   A.fan0 * h2 / (atrue > 0.0 ? atrue : 1.0));
+            printf(
+                "   ПО ОСЯМ [%s] (главная ось нормали, БЕЗ знака): площадь %.5f / %.5f / %.5f м²; "
+                "многоугольников %lld / %lld / %lld\n",
+                tag, A.ax[0] * h2, A.ax[1] * h2, A.ax[2] * h2, (long long)A.px[0],
+                (long long)A.px[1], (long long)A.px[2]);
+            printf("   ОБХОД [%s]: многоугольников %lld, треугольников %lld, вырожденных %lld, "
+                   "неплоскостность макс %.3e ячейки, ПРОПУЩЕНО полигонов %lld (код %d)\n",
+                   tag, (long long)A.npoly, (long long)A.ntri, (long long)A.ndeg, A.flatmax,
+                   (long long)nskip, wrca);
+            /* ГИСТОГРАММА ПО ПЛОСКОСТЯМ (П2). Печатаются корзины, несущие не менее
+             * сотой доли площади своей оси: иначе список утонет в хвосте из
+             * единичных многоугольников на стыках стен. Отсечённая доля печатается,
+             * чтобы «показано не всё» не читалось как «больше ничего нет». */
+            for (int ax = 0; ax < 3; ax++) {
+              if (!(A.ax[ax] > 0.0)) continue;
+              printf("   ПЛОСКОСТИ [%s] ось %d (площадь оси %.5f м²):", tag, ax, A.ax[ax] * h2);
+              double shown = 0.0;
+              int nsh = 0;
+              for (int32_t b = 0; b < nbin; b++) {
+                double a = A.pl_area[(size_t)ax * (size_t)nbin + (size_t)b];
+                if (!(a > 0.01 * A.ax[ax])) continue;
+                printf(" | %.4f м: %.5f м² (%lld мн-ков)",
+                       fr.org[ax] + (double)b / (double)HZ_PLBIN * fr.h, a * h2,
+                       (long long)A.pl_cnt[(size_t)ax * (size_t)nbin + (size_t)b]);
+                shown += a;
+                nsh++;
+              }
+              printf(" || показано %d корзин, %.1f %% площади оси\n", nsh,
+                     100.0 * shown / A.ax[ax]);
+              printf("   СЛОИ ЯЧЕЕК [%s] ось %d:", tag, ax);
+              int nsh2 = 0;
+              double shown2 = 0.0;
+              for (int32_t c = 0; c < A.ncell; c++) {
+                double a = A.cl_area[(size_t)ax * (size_t)A.ncell + (size_t)c];
+                if (!(a > 0.01 * A.ax[ax])) continue;
+                printf(" | слой %d: %.5f м² (%lld мн-ков)", c, a * h2,
+                       (long long)A.cl_cnt[(size_t)ax * (size_t)A.ncell + (size_t)c]);
+                shown2 += a;
+                nsh2++;
+              }
+              printf(" || показано %d слоёв, %.1f %% площади оси\n", nsh2,
+                     100.0 * shown2 / A.ax[ax]);
+            }
+            if (pass == 0) {
+              /* ЭТАЛОННЫЙ ОБХОД ТОЛЬКО НА ПОЛНОЙ ГЛУБИНЕ: на срезе отображение
+               * «ребро -> полигон» у него отсутствует по построению (Г42). */
+              areacnt R;
+              memset(&R, 0, sizeof R);
+              int wrcr = hz_dc_walk_ref(&T, &ht, NULL, NULL, area_emit, &R);
+              printf("   ЭТАЛОННЫЙ ОБХОД (Г42, независимая реализация, код %d): %.5f м², "
+                     "многоугольников %lld; РАСХОЖДЕНИЕ с рабочим %.3e отн.\n",
+                     wrcr, R.fan0 * h2, (long long)R.npoly,
+                     fabs(R.fan0 - A.fan0) / (A.fan0 > 0.0 ? A.fan0 : 1.0));
+            }
+            free(A.pl_area);
+            free(A.pl_cnt);
+            free(A.cl_area);
+            free(A.cl_cnt);
+          }
+        }
+
+        if (oven > 0.0) {
+          double rho = oven, Le = 1.0;
+          float *B = malloc(3 * (size_t)S.n * sizeof *B);
+          float *Bn = malloc(3 * (size_t)S.n * sizeof *Bn);
+          if (B == NULL || Bn == NULL) exit(1);
+          for (int32_t i = 0; i < 3 * S.n; i++)
+            B[i] = (float)Le;
+          double exact = Le / (1.0 - rho);
+          /* ДВЕНАДЦАТИ ОТСКОКОВ МАЛО ПРИ ВЫСОКОМ АЛЬБЕДО, И ЭТО АРИФМЕТИКА, А НЕ
+           * догадка: невязка итерации есть `ρ^n`, то есть при `ρ = 0.7` и `n = 12`
+           * она `1.4 %` — сравнима с тем систематическим смещением, которое печь и
+           * должна измерять. Двадцать четыре дают `0.02 %` и разделяют их. */
+          const int OVEN_ITERS = 24;
+          for (int it = 1; it <= OVEN_ITERS; it++) {
+            for (int32_t i = 0; i < 3 * S.n; i++)
+              Bn[i] = (float)Le;
+            for (int32_t j = 0; j < S.n; j++) {
+              double pj[3], nj[3];
+              hz_slice_vertex(&S, j, pj);
+              for (int k = 0; k < 3; k++)
+                pj[k] = fr.org[k] + pj[k] * fr.h;
+              hz_slice_normal(&S, j, nj);
+              double cs = fr.h * (double)((int32_t)1 << (lev - (int)S.c[j].lvl));
+              double aj = cs * cs;
+              for (int32_t i = 0; i < S.n; i++) {
+                if (i == j) continue;
+                double pi[3], ni[3], w[3], r2 = 0.0;
+                hz_slice_vertex(&S, i, pi);
+                for (int k = 0; k < 3; k++)
+                  pi[k] = fr.org[k] + pi[k] * fr.h;
+                hz_slice_normal(&S, i, ni);
+                for (int k = 0; k < 3; k++) {
+                  w[k] = pj[k] - pi[k];
+                  r2 += w[k] * w[k];
+                }
+                if (!(r2 > 0.0)) continue;
+                double r = sqrt(r2);
+                double ci = (w[0] * ni[0] + w[1] * ni[1] + w[2] * ni[2]) / r;
+                double cj = -(w[0] * nj[0] + w[1] * nj[1] + w[2] * nj[2]) / r;
+                if (!(ci > 0.0) || !(cj > 0.0)) continue;
+                double ff = ci * cj * aj / (3.14159265358979323846 * r2);
+                for (int k = 0; k < 3; k++)
+                  Bn[3 * (size_t)i + (size_t)k] +=
+                      (float)(rho * (double)B[3 * (size_t)j + (size_t)k] * ff);
+              }
+            }
+            /* ДИАГНОЗ §435, ПУНКТ (а) и (б): сколько пар прошло оба `cos > 0` и
+             * чему равна сумма угловых коэффициентов ОДНОЙ площадки. В замкнутой
+             * полости вторая обязана быть `1`; отклонение и есть мера того,
+             * насколько гатер теряет энергию. */
+            if (it == 1) {
+              /* СУММА ПО ВСЕМ ПЛОЩАДКАМ, А НЕ ПО ОДНОЙ (А790). Площадка `0` —
+               * угловая, и она видит меньше типичной; одно число с неё мерой
+               * потери гатера не является. Здесь считается РАСПРЕДЕЛЕНИЕ. */
+              {
+                double *fs = malloc((size_t)S.n * sizeof *fs);
+                if (fs == NULL) exit(1);
+                for (int32_t jj = 0; jj < S.n; jj++) {
+                  double pa[3], na[3];
+                  hz_slice_vertex(&S, jj, pa);
+                  for (int k = 0; k < 3; k++)
+                    pa[k] = fr.org[k] + pa[k] * fr.h;
+                  hz_slice_normal(&S, jj, na);
+                  double acc2 = 0.0;
+                  for (int32_t ii = 0; ii < S.n; ii++) {
+                    if (ii == jj) continue;
+                    double pb[3], nb[3], ww[3], rr2 = 0.0;
+                    hz_slice_vertex(&S, ii, pb);
+                    for (int k = 0; k < 3; k++)
+                      pb[k] = fr.org[k] + pb[k] * fr.h;
+                    hz_slice_normal(&S, ii, nb);
+                    for (int k = 0; k < 3; k++) {
+                      ww[k] = pb[k] - pa[k];
+                      rr2 += ww[k] * ww[k];
+                    }
+                    if (!(rr2 > 0.0)) continue;
+                    double rr = sqrt(rr2);
+                    double caa = (ww[0] * na[0] + ww[1] * na[1] + ww[2] * na[2]) / rr;
+                    double cbb = -(ww[0] * nb[0] + ww[1] * nb[1] + ww[2] * nb[2]) / rr;
+                    if (!(caa > 0.0) || !(cbb > 0.0)) continue;
+                    double csb = fr.h * (double)((int32_t)1 << (lev - (int)S.c[ii].lvl));
+                    acc2 += caa * cbb * csb * csb / (3.14159265358979323846 * rr2);
+                  }
+                  fs[jj] = acc2;
+                }
+                qsort(fs, (size_t)S.n, sizeof *fs, cmp_d);
+                double mean = 0.0;
+                for (int32_t jj = 0; jj < S.n; jj++)
+                  mean += fs[jj];
+                mean /= (double)(S.n ? S.n : 1);
+                printf(
+                    "   СУММА УГЛОВЫХ КОЭФФИЦИЕНТОВ ПО ВСЕМ %d ПЛОЩАДКАМ: среднее %.4f, p10 %.4f, "
+                    "p50 %.4f, p90 %.4f (обязана быть 1)\n",
+                    S.n, mean, fs[S.n / 10], fs[S.n / 2], fs[(S.n * 9) / 10]);
+                free(fs);
+              }
+              int64_t npair = 0;
+              double ffsum = 0.0;
+              int32_t j0 = 0;
+              double pj0[3], nj0[3];
+              hz_slice_vertex(&S, j0, pj0);
+              for (int k = 0; k < 3; k++)
+                pj0[k] = fr.org[k] + pj0[k] * fr.h;
+              hz_slice_normal(&S, j0, nj0);
+              for (int32_t i = 0; i < S.n; i++) {
+                if (i == j0) continue;
+                double pi[3], ni[3], w[3], r2 = 0.0;
+                hz_slice_vertex(&S, i, pi);
+                for (int k = 0; k < 3; k++)
+                  pi[k] = fr.org[k] + pi[k] * fr.h;
+                hz_slice_normal(&S, i, ni);
+                for (int k = 0; k < 3; k++) {
+                  w[k] = pi[k] - pj0[k];
+                  r2 += w[k] * w[k];
+                }
+                if (!(r2 > 0.0)) continue;
+                double r = sqrt(r2);
+                double cj = (w[0] * nj0[0] + w[1] * nj0[1] + w[2] * nj0[2]) / r;
+                double ci = -(w[0] * ni[0] + w[1] * ni[1] + w[2] * ni[2]) / r;
+                if (!(ci > 0.0) || !(cj > 0.0)) continue;
+                double cs2 = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
+                npair++;
+                ffsum += ci * cj * cs2 * cs2 / (3.14159265358979323846 * r2);
+              }
+              {
+                double atot = 0.0;
+                for (int32_t i = 0; i < S.n; i++) {
+                  double cs3 = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
+                  atot += cs3 * cs3;
+                }
+                {
+                  /* СКОЛЬКО ЯЧЕЕК НА ГРАНЬ. У единичной коробки при lev=5 стена
+                   * занимает 30x30 = 900 клеток; если ячеек среза меньше, значит
+                   * вершина выдана не в каждой клетке стены — это и есть недосчёт
+                   * площади. Группировка по ГЛАВНОЙ оси нормали: шесть граней. */
+                  int64_t hg[6] = {0, 0, 0, 0, 0, 0};
+                  for (int32_t i = 0; i < S.n; i++) {
+                    double nn2[3];
+                    hz_slice_normal(&S, i, nn2);
+                    int ax = 0;
+                    for (int k = 1; k < 3; k++)
+                      if (fabs(nn2[k]) > fabs(nn2[ax])) ax = k;
+                    hg[2 * ax + (nn2[ax] > 0.0 ? 1 : 0)]++;
+                  }
+                  printf(
+                      "   ЯЧЕЕК НА ГРАНЬ (по главной оси нормали): %lld %lld %lld %lld %lld %lld "
+                      "против 900 клеток стены\n",
+                      (long long)hg[0], (long long)hg[1], (long long)hg[2], (long long)hg[3],
+                      (long long)hg[4], (long long)hg[5]);
+                }
+                printf("   ПЛОЩАДЬ СРЕЗА: %.5f м² против истинной 6.00000 м² у единичной коробки "
+                       "(отношение %.4f)\n",
+                       atot, atot / 6.0);
+              }
+              printf("   ДИАГНОЗ ПЕЧИ: у площадки 0 видимых партнёров %lld из %d; СУММА УГЛОВЫХ "
+                     "КОЭФФИЦИЕНТОВ %.5f (в замкнутой полости обязана быть 1)\n",
+                     (long long)npair, S.n - 1, ffsum);
+            }
+            double sum = 0.0;
+            for (int32_t i = 0; i < S.n; i++)
+              sum += (double)Bn[3 * (size_t)i];
+
+            double mean = sum / (double)(S.n ? S.n : 1);
+            printf("   ПЕЧЬ ρ=%.2f, отскок %2d: средняя B = %.5f против замкнутой формы %.5f "
+                   "(отклонение %.2f %%)\n",
+                   rho, it, mean, exact, 100.0 * (mean - exact) / exact);
+            for (int32_t i = 0; i < 3 * S.n; i++)
+              B[i] = Bn[i];
+          }
+          free(B);
+          free(Bn);
+        }
+
+        /* ---- ДВЕ ПЛАСТИНЫ: `E_ind = ρ·E_dir·F` (Ш5б, §430 П5б.2; §450 П6) ---- */
+        /* ПЕЧЬ ЛОВИТ СОХРАНЕНИЕ ЭНЕРГИИ, ЭТОТ СТЕНД — ЕЁ РАСПРЕДЕЛЕНИЕ. В замкнутой
+         * полости сумма угловых коэффициентов равна единице при ЛЮБОМ разумном ядре,
+         * лишь бы оно было симметрично и нормировано; отдельные коэффициенты она не
+         * проверяет. Два соосных квадрата проверяют именно их: `F` известен в
+         * замкнутой форме (каталог Хауэлла C-11), и косинусы с `1/r²` входят в него
+         * порознь.
+         * ЧЕГО ЭТОТ СТЕНД НЕ ПРОВЕРЯЕТ, И ЭТО СКАЗАНО ЗДЕСЬ, А НЕ В ДОКЛАДЕ: ЗАСЛОНЫ.
+         * Гатер незаслонённый (приближение (1) §432), значит требование А756 —
+         * «печь не ловит тени» — этим стендом ТОЖЕ не закрывается. Обе половины
+         * приёмки §430 меряют неэкранированный перенос, и тени остаются
+         * неизмеренными вовсе. */
+        if (plates > 0.0) {
+          double rho = plates;
+          /* Габарит пластин и зазор берутся ИЗ СЦЕНЫ, а не вписываются: стенд обязан
+           * оставаться верным, если пластины подвинут. */
+          double side_a = hi[0] - lo[0], gap = hi[1] - lo[1], mid = 0.5 * (lo[1] + hi[1]);
+          double X = side_a / gap;
+          double X2 = X * X, s = sqrt(1.0 + X2);
+          double F = (2.0 / (3.14159265358979323846 * X2)) *
+                     (0.5 * log((1.0 + X2) * (1.0 + X2) / (1.0 + 2.0 * X2)) +
+                      2.0 * X * s * atan(X / s) - 2.0 * X * atan(X));
+          double acc = 0.0;
+          int64_t nup = 0, nlo = 0;
+          for (int32_t i = 0; i < S.n; i++) {
+            double pi[3], ni[3];
+            hz_slice_vertex(&S, i, pi);
+            for (int k = 0; k < 3; k++)
+              pi[k] = fr.org[k] + pi[k] * fr.h;
+            if (pi[1] < mid) {
+              nlo++;
+              continue;
+            }
+            nup++;
+            hz_slice_normal(&S, i, ni);
+            double sum = 0.0;
+            for (int32_t j = 0; j < S.n; j++) {
+              double pj[3], nj[3], w[3], r2 = 0.0;
+              hz_slice_vertex(&S, j, pj);
+              for (int k = 0; k < 3; k++)
+                pj[k] = fr.org[k] + pj[k] * fr.h;
+              if (pj[1] >= mid) continue; /* излучает только НИЖНЯЯ пластина */
+              hz_slice_normal(&S, j, nj);
+              for (int k = 0; k < 3; k++) {
+                w[k] = pj[k] - pi[k];
+                r2 += w[k] * w[k];
+              }
+              if (!(r2 > 0.0)) continue;
+              double r = sqrt(r2);
+              double ci = (w[0] * ni[0] + w[1] * ni[1] + w[2] * ni[2]) / r;
+              double cj = -(w[0] * nj[0] + w[1] * nj[1] + w[2] * nj[2]) / r;
+              if (!(ci > 0.0) || !(cj > 0.0)) continue;
+              double cs = fr.h * (double)((int32_t)1 << (lev - (int)S.c[j].lvl));
+              sum += ci * cj * cs * cs / (3.14159265358979323846 * r2);
+            }
+            acc += sum;
+          }
+          double mean = acc / (double)(nup ? nup : 1);
+          printf("   ПЛАСТИНЫ: сторона %.4f м, зазор %.4f м, X = %.3f; ЯЧЕЕК верх %lld, низ %lld\n",
+                 side_a, gap, X, (long long)nup, (long long)nlo);
+          printf("   `E_ind = ρ·E_dir·F` при ρ=%.2f: замерено %.5f, замкнутая форма %.5f "
+                 "(F = %.5f), ОТКЛОНЕНИЕ %.2f %%\n",
+                 rho, rho * mean, rho * F, F, 100.0 * (mean - F) / F);
+        }
+
+        /* ---- ОДИН ОТСКОК (Ш5б, §430) ---- */
+        /* ПРИБЛИЖЕНИЯ НАЗЫВАЮТСЯ ЗДЕСЬ, А НЕ В ДОКЛАДЕ ЗАДНИМ ЧИСЛОМ.
+         *   (1) ВИДИМОСТИ МЕЖДУ ЯЧЕЙКАМИ НЕТ: перенос идёт по незаслонённому
+         *       угловому коэффициенту. Значит свет проходит сквозь стены, и на
+         *       сцене с комнатами это ВИДНО. Взято сознательно: с видимостью цена
+         *       умножается на марш (~4.8 шага), а замер физики от заслонов не
+         *       зависит — `E_ind = ρ·E_dir` проверяется на ПЛОСКОЙ стене, где
+         *       заслонов нет вовсе.
+         *   (2) ИЗЛУЧАТЕЛИ ПРОРЕЖЕНЫ шагом `stride`: берётся каждый `stride`-й, а
+         *       вклад умножается на `stride`. Это несмещённая оценка суммы, но с
+         *       разбросом; разброс НЕ ИЗМЕРЕН и в приёмку не входит.
+         *   (3) ПЛОЩАДЬ ЯЧЕЙКИ взята как площадь её грани `(h·2^(lev-lvl))²` —
+         *       поверхность внутри ячейки наклонена и её площадь больше; это
+         *       систематическая недооценка, названная и не исправленная.
+         * ЦЕНА ОЖИДАЕТСЯ ПЛОХОЙ И ПРЕДСКАЗАНА ДО ПРОГОНА (§430, П5б.3): это замер,
+         * обосновывающий свип, а не попытка уложиться в бюджет. */
+        float *ind = calloc(3 * (size_t)S.n, sizeof *ind);
+        float *indsw = NULL;
+        if (ind == NULL) exit(1);
+        /* ---- Ф9' (§536): САМАЯ УЗКАЯ ДОЛЯ, КОТОРУЮ НЕСЁТ ДАННОЕ ND ---- */
+        /* ЗАМЕР БЕЗ ПЕРЕНОСА, И ЭТО СОЗНАТЕЛЬНО. Граница «до какой узости ординаты
+         * несут отражение» есть свойство НАБОРА ОРДИНАТ и геометрии, а не света:
+         * ни источника, ни камеры в ней нет. Значит мерить её надо отдельно от
+         * транспорта, иначе три разные ошибки сложатся в одно число (А934).
+         *
+         * ДВЕ ПОЛОВИНЫ ГРАНИЦЫ МЕРЯЮТСЯ ПОРОЗНЬ (А947), потому что К56 говорит
+         * ровно о том, что они РАЗНЫЕ:
+         *   A — квадратурное альбедо доли `Σ_e w_e f_r cos θ_e`. Это ЭНЕРГИЯ.
+         *       Сравнивается не с `ρ_s` (нормировка Фонга точна лишь при нормальном
+         *       падении и спутала бы свою погрешность с квадратурной), а с ТЕМ ЖЕ
+         *       интегралом на заведомо избыточном наборе.
+         *   УГОЛ ПИКА — на какую ординату легла вершина доли против истинного
+         *       зеркального направления. Это ОБРАЗ, и просил пользователь именно
+         *       его. `A` к нему слепа: интеграл сходится и тогда, когда пик уехал.
+         *
+         * НОРМАЛИ БЕРУТСЯ ИЗ СЦЕНЫ, А НЕ ПРИДУМЫВАЮТСЯ: выборка по срезу с шагом,
+         * число печатается. */
+        if (g_lobetest) {
+          static const double SS[] = {0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0, 30.0, 50.0, 200.0};
+          static const int NMU[] = {1, 2, 2, 4}, NPHI[] = {1, 2, 4, 4};
+          tr3_dirs RF;
+          /* ЭТАЛОННЫЙ НАБОР — тот же механизм, вчетверо гуще самого густого из
+           * испытуемых по каждой оси. Своей аналитики здесь нет намеренно: она
+           * внесла бы вторую формулу, и замер мерил бы разницу формул. */
+          if (tr3_dirs_product(&RF, 16, 16) != 0) exit(1);
+          int32_t nstep = S.n / 256 > 0 ? S.n / 256 : 1;
+          int64_t nsmp = 0;
+          for (int32_t i = 0; i < S.n; i += nstep)
+            nsmp++;
+          printf("   Ф9' ГРАНИЦА УЗОСТИ: нормалей из среза %lld (шаг %d из %d), эталон ND %d\n",
+                 (long long)nsmp, nstep, S.n, RF.n);
+          printf("        ND  полуугол |  s  | ОТКЛОНЕНИЕ A, %% (p50/p90/max) | УГОЛ ПИКА, град "
+                 "(p50/p90/max)\n");
+          for (int ci = 0; ci < 4; ci++) {
+            tr3_dirs DT;
+            if (tr3_dirs_product(&DT, NMU[ci], NPHI[ci]) != 0) exit(1);
+            double thnd = acos(1.0 - 2.0 / (double)DT.n) * 180.0 / 3.14159265358979323846;
+            for (size_t si = 0; si < sizeof SS / sizeof SS[0]; si++) {
+              double ns2 = SS[si];
+              double *ea = malloc((size_t)(nsmp * DT.n) * sizeof *ea);
+              double *pa = malloc((size_t)(nsmp * DT.n) * sizeof *pa);
+              if (ea == NULL || pa == NULL) exit(1);
+              int64_t ne = 0;
+              for (int32_t i = 0; i < S.n; i += nstep) {
+                double nn3[3];
+                hz_slice_normal(&S, i, nn3);
+                for (int d = 0; d < DT.n; d++) {
+                  double od[3] = {DT.ox[d], DT.oy[d], DT.oz[d]};
+                  double dn2 = od[0] * nn3[0] + od[1] * nn3[1] + od[2] * nn3[2];
+                  if (!(dn2 < 0.0)) continue; /* не падает на эту сторону */
+                  /* Испытуемый набор: альбедо доли и ординату пика. */
+                  double at = 0.0, pk = -1.0;
+                  int be = -1;
+                  for (int e = 0; e < DT.n; e++) {
+                    double oe[3] = {DT.ox[e], DT.oy[e], DT.oz[e]};
+                    double en2 = oe[0] * nn3[0] + oe[1] * nn3[1] + oe[2] * nn3[2];
+                    if (!(en2 > 0.0)) continue;
+                    double ca = oe[0] * od[0] + oe[1] * od[1] + oe[2] * od[2] - 2.0 * dn2 * en2;
+                    double fv = lobe(ca, ns2) * DT.w[e] * en2;
+                    at += fv;
+                    if (fv > pk) {
+                      pk = fv;
+                      be = e;
+                    }
+                  }
+                  /* Эталон: тот же интеграл на избыточном наборе. */
+                  double ar = 0.0;
+                  for (int e = 0; e < RF.n; e++) {
+                    double oe[3] = {RF.ox[e], RF.oy[e], RF.oz[e]};
+                    double en2 = oe[0] * nn3[0] + oe[1] * nn3[1] + oe[2] * nn3[2];
+                    if (!(en2 > 0.0)) continue;
+                    double ca = oe[0] * od[0] + oe[1] * od[1] + oe[2] * od[2] - 2.0 * dn2 * en2;
+                    ar += lobe(ca, ns2) * RF.w[e] * en2;
+                  }
+                  if (!(ar > 0.0)) continue;
+                  ea[ne] = 100.0 * fabs(at - ar) / ar;
+                  /* Угол между ординатой пика и ИСТИННЫМ зеркальным направлением. */
+                  double mr[3] = {od[0] - 2.0 * dn2 * nn3[0], od[1] - 2.0 * dn2 * nn3[1],
+                                  od[2] - 2.0 * dn2 * nn3[2]};
+                  if (be >= 0) {
+                    double cm = DT.ox[be] * mr[0] + DT.oy[be] * mr[1] + DT.oz[be] * mr[2];
+                    if (cm > 1.0) cm = 1.0;
+                    if (cm < -1.0) cm = -1.0;
+                    pa[ne] = acos(cm) * 180.0 / 3.14159265358979323846;
+                  } else
+                    pa[ne] = 180.0;
+                  ne++;
+                }
+              }
+              if (ne > 0) {
+                qsort(ea, (size_t)ne, sizeof *ea, cmp_d);
+                qsort(pa, (size_t)ne, sizeof *pa, cmp_d);
+                printf("       %4d  %6.1f°  |%5.0f| %8.2f %8.2f %8.2f      | %8.2f %8.2f %8.2f\n",
+                       DT.n, thnd, ns2, ea[ne / 2], ea[(ne * 9) / 10], ea[ne - 1], pa[ne / 2],
+                       pa[(ne * 9) / 10], pa[ne - 1]);
+              }
+              free(ea);
+              free(pa);
+            }
+            tr3_dirs_free(&DT);
+          }
+          tr3_dirs_free(&RF);
+        }
+
+        /* ---- Ф8' (§532): ОТСКОК НАПРАВЛЕННЫМ СВИПОМ ПО ДЕРЕВУ ---- */
+        if (g_dsweep) {
+          tr3_dirs DR;
+          if (tr3_dirs_product(&DR, g_dnmu, g_dnphi) != 0) exit(1);
+          stree TD;
+          double tb3 = now_s();
+          double eyes2[3];
+          for (int a = 0; a < 3; a++)
+            eyes2[a] = LL.eye[a] / (double)((int32_t)1 << HZ_SWEEP_DROP);
+          int32_t gn2 = (int32_t)1 << (fr.lev - HZ_SWEEP_DROP);
+          stree_build(&TD, &P, fr.lev, HZ_SWEEP_DROP, gn2, eyes2, g_sweeppx, g_sweepthr);
+          stree_links(&TD, gn2);
+          dfield D;
+          memset(&D, 0, sizeof D);
+          D.nsl = S.n;
+          D.blkopen = g_dblkopen;
+          D.fone = g_ffull;
+          D.fzero = g_fzero;
+          D.fnotrans = g_fnotrans;
+          D.fnoclamp = g_fnoclamp;
+          double emact = 0.0, emcut = 0.0;
+          D.emitact = &emact;
+          D.emitcut = &emcut;
+          D.frawv = malloc((size_t)HZ_FSTAT_CAP * sizeof *D.frawv);
+          if (D.frawv == NULL) exit(1);
+          D.schar = g_schar;
+          D.scharax = g_scharax;
+          D.onenb = g_onenb;
+          D.cw = fr.h * (double)((int32_t)1 << HZ_SWEEP_DROP);
+          D.Ap = calloc((size_t)TD.n, sizeof *D.Ap);
+          D.fstat = malloc((size_t)HZ_FSTAT_CAP * sizeof *D.fstat);
+          if (D.Ap == NULL || D.fstat == NULL) exit(1);
+          D.Ld = calloc(3 * (size_t)TD.n, sizeof *D.Ld);
+          D.Bs = calloc(3 * (size_t)TD.n, sizeof *D.Bs);
+          D.Bn = calloc(3 * (size_t)TD.n, sizeof *D.Bn);
+          D.Bsp = calloc(3 * (size_t)TD.n, sizeof *D.Bsp);
+          D.Bwi = calloc(3 * (size_t)TD.n, sizeof *D.Bwi);
+          D.Bns = calloc((size_t)TD.n, sizeof *D.Bns);
+          D.srf = calloc((size_t)TD.n, 1);
+          D.vis = calloc((size_t)TD.n, 1);
+          D.cstart = calloc((size_t)TD.n + 1, sizeof *D.cstart);
+          D.clist = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *D.clist);
+          D.Eind = calloc(3 * (size_t)S.n, sizeof *D.Eind);
+          double *snx = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *snx);
+          double *sny = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *sny);
+          double *snz = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *snz);
+          double *sar = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *sar);
+          int32_t *slf = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *slf);
+          double *wchk = calloc((size_t)(S.n > 0 ? S.n : 1), sizeof *wchk);
+          if (D.Ld == NULL || D.Bs == NULL || D.Bn == NULL || D.Bsp == NULL || D.Bwi == NULL ||
+              D.Bns == NULL || D.srf == NULL || D.vis == NULL || D.cstart == NULL ||
+              D.clist == NULL || D.Eind == NULL || snx == NULL || sny == NULL || snz == NULL ||
+              sar == NULL || slf == NULL || wchk == NULL)
+            exit(1);
+          D.snx = snx;
+          D.sny = sny;
+          D.snz = snz;
+          /* ОТОБРАЖЕНИЕ «ЯЧЕЙКА СРЕЗА -> ЛИСТ» тем же правилом, что у `sweep_vis`:
+           * иначе перенос и сбор читали бы разные ячейки. */
+          double cwid = fr.h * (double)((int32_t)1 << HZ_SWEEP_DROP);
+          int64_t nmap = 0;
+          for (int32_t i = 0; i < S.n; i++) {
+            double p2[3], n2[3];
+            hz_slice_vertex(&S, i, p2);
+            for (int k = 0; k < 3; k++)
+              p2[k] = fr.org[k] + p2[k] * fr.h;
+            hz_slice_normal(&S, i, n2);
+            snx[i] = n2[0];
+            sny[i] = n2[1];
+            snz[i] = n2[2];
+            double cs4 = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
+            sar[i] = cs4 * cs4;
+            int32_t cc2[3];
+            int ok3 = 1;
+            for (int k = 0; k < 3; k++) {
+              double f3 = floor((p2[k] - fr.org[k]) / cwid);
+              if (!(f3 >= 0.0) || !(f3 < (double)gn2)) ok3 = 0;
+              cc2[k] = ok3 ? (int32_t)f3 : 0;
+            }
+            slf[i] = ok3 ? TD.idx[hz_occ_index(gn2, cc2[0], cc2[1], cc2[2])] : -1;
+            if (slf[i] >= 0) {
+              nmap++;
+              D.cstart[slf[i] + 1]++;
+            }
+          }
+          for (int32_t i = 0; i < TD.n; i++)
+            D.cstart[i + 1] += D.cstart[i];
+          {
+            int32_t *cur = malloc((size_t)TD.n * sizeof *cur);
+            if (cur == NULL) exit(1);
+            memcpy(cur, D.cstart, (size_t)TD.n * sizeof *cur);
+            for (int32_t i = 0; i < S.n; i++)
+              if (slf[i] >= 0) D.clist[cur[slf[i]]++] = i;
+            free(cur);
+          }
+          /* РАДИОСИТИ ЛИСТА — СРЕДНЕЕ ПО ПЛОЩАДИ, А НЕ СУММА (А936): радианс есть
+           * величина УДЕЛЬНАЯ, и две ячейки среза в одном листе не светят вдвое
+           * ярче. Делится на `π`, потому что диффузная поверхность с радиосити `B`
+           * имеет радианс `B/π`. */
+          {
+            double *aw2 = calloc((size_t)TD.n, sizeof *aw2);
+            if (aw2 == NULL) exit(1);
+            for (int32_t i = 0; i < S.n; i++) {
+              int32_t l2 = slf[i];
+              if (l2 < 0) continue;
+              aw2[l2] += sar[i];
+              /* УЗОСТЬ И ЗЕРКАЛЬНАЯ ДОЛЯ ИЗ МАТЕРИАЛА (Ф9', §536). `Ns` и `Ks` уже
+               * разбираются `scene_obj.c` и до сих пор не читались никем; ключи
+               * `dns=`/`dks=` перебивают их глобально — для СВИПА по узости без
+               * правки сцены.
+               * `Ns = 0` ЧИТАЕТСЯ КАК «ДОЛИ НЕТ», а не как `s = 0` (А949): в `.mtl`
+               * ноль пишут и диффузным, и по умолчанию, и принять молчание формата
+               * за значение — та же ошибка, что А917.
+               * `E_dir` ВОССТАНАВЛИВАЕТСЯ ДЕЛЕНИЕМ на диффузное альбедо, потому что
+               * `irr` хранит уже `rho_d·E`. При `rho_d = 0` восстановить нечего, и
+               * узкая часть там просто не заводится — оговорка, а не молчание. */
+              double nsi =
+                  g_dns > 0.0 ? g_dns
+                              : (m.mtl != NULL && S.c[i].mat < m.nmtl ? m.mtl[S.c[i].mat].ns : 0.0);
+              double wi2[3] = {0.0, 0.0, 0.0}, wl = 0.0;
+              for (int k = 0; k < 3; k++) {
+                double pw2[3];
+                hz_slice_vertex(&S, i, pw2);
+                wi2[k] = (fr.org[k] + pw2[k] * fr.h) - AL.c[k];
+                wl += wi2[k] * wi2[k];
+              }
+              wl = sqrt(wl);
+              for (int k = 0; k < 3; k++) {
+                D.Bs[3 * (size_t)l2 + (size_t)k] +=
+                    (float)(sar[i] * (double)irr[3 * (size_t)i + (size_t)k]);
+                D.Bn[3 * (size_t)l2 + (size_t)k] +=
+                    (float)(sar[i] * (k == 0 ? snx[i] : (k == 1 ? sny[i] : snz[i])));
+                if (nsi > 0.0 && wl > 0.0) {
+                  double rd = alb(&m, S.c[i].mat, k);
+                  double rs =
+                      g_dks >= 0.0
+                          ? g_dks
+                          : (m.mtl != NULL && S.c[i].mat < m.nmtl ? m.mtl[S.c[i].mat].ks3[k] : 0.0);
+                  double ed = rd > 1e-6 ? (double)irr[3 * (size_t)i + (size_t)k] / rd : 0.0;
+                  D.Bsp[3 * (size_t)l2 + (size_t)k] += (float)(sar[i] * rs * ed);
+                  D.Bwi[3 * (size_t)l2 + (size_t)k] += (float)(sar[i] * wi2[k] / wl);
+                }
+              }
+              if (nsi > 0.0) D.Bns[l2] += (float)(sar[i] * nsi);
+            }
+            int64_t nsrf = 0, nblk = 0, nglos = 0, nfold = 0, nmulti = 0;
+            double *foldv = malloc((size_t)HZ_FSTAT_CAP * sizeof *foldv);
+            if (foldv == NULL) exit(1);
+            for (int32_t l2 = 0; l2 < TD.n; l2++) {
+              if (TD.nd[l2].child0 >= 0) continue;
+              if (aw2[l2] > 0.0) {
+                double nl = 0.0;
+                for (int k = 0; k < 3; k++) {
+                  D.Bs[3 * (size_t)l2 + (size_t)k] =
+                      (float)((double)D.Bs[3 * (size_t)l2 + (size_t)k] / aw2[l2] /
+                              3.14159265358979323846);
+                  nl += (double)D.Bn[3 * (size_t)l2 + (size_t)k] *
+                        (double)D.Bn[3 * (size_t)l2 + (size_t)k];
+                }
+                nl = sqrt(nl);
+                if (nl > 0.0)
+                  for (int k = 0; k < 3; k++)
+                    D.Bn[3 * (size_t)l2 + (size_t)k] =
+                        (float)((double)D.Bn[3 * (size_t)l2 + (size_t)k] / nl);
+                /* Узкая часть: амплитуда — среднее по площади (А936, тот же довод,
+                 * что у диффузной); направление прихода нормируется; показатель —
+                 * среднее по площади. Делить на `π` здесь НЕ надо: нормировка
+                 * `(s+2)/2π` сидит в самой доле. */
+                {
+                  double wl2 = 0.0;
+                  for (int k = 0; k < 3; k++) {
+                    D.Bsp[3 * (size_t)l2 + (size_t)k] =
+                        (float)((double)D.Bsp[3 * (size_t)l2 + (size_t)k] / aw2[l2]);
+                    wl2 += (double)D.Bwi[3 * (size_t)l2 + (size_t)k] *
+                           (double)D.Bwi[3 * (size_t)l2 + (size_t)k];
+                  }
+                  wl2 = sqrt(wl2);
+                  if (wl2 > 0.0)
+                    for (int k = 0; k < 3; k++)
+                      D.Bwi[3 * (size_t)l2 + (size_t)k] =
+                          (float)((double)D.Bwi[3 * (size_t)l2 + (size_t)k] / wl2);
+                  D.Bns[l2] = (float)((double)D.Bns[l2] / aw2[l2]);
+                  if (D.Bns[l2] > 0.0f) nglos++;
+                }
+                D.Ap[l2] = (float)aw2[l2];
+                /* А971: СКЛАДЧАТОСТЬ ЛИСТА `1 − |Σ A_i n_i| / Σ A_i`. У плоской
+                 * площадки ноль, у угла — заметно больше нуля, и тогда усреднённая
+                 * нормаль не значит направления поверхности (§518/§519). Печатается,
+                 * чтобы оговорка была числом, а не словом. */
+                if (nfold < (int64_t)HZ_FSTAT_CAP) foldv[nfold++] = 1.0 - nl / aw2[l2];
+                D.srf[l2] = 1;
+                nsrf++;
+              } else {
+                /* А935: ЛЮБОЙ занятый лист заслоняет, даже если среза в нём нет —
+                 * иначе там, где срез огрублён, свет пошёл бы сквозь стену. Такой
+                 * лист есть ЧЁРНАЯ стена: гасит, но не светит. */
+                int32_t lof[3] = {TD.nd[l2].lo[0] << HZ_SWEEP_DROP,
+                                  TD.nd[l2].lo[1] << HZ_SWEEP_DROP,
+                                  TD.nd[l2].lo[2] << HZ_SWEEP_DROP};
+                if (u_occ(&P, lof, TD.nd[l2].size << HZ_SWEEP_DROP)) {
+                  D.srf[l2] = 2;
+                  nblk++;
+                }
+              }
+            }
+            /* А970: сколько листьев несут ДВЕ и более ячейки среза — там проекции
+             * площадок могут перекрываться, и `f` завышена. */
+            for (int32_t l2 = 0; l2 < TD.n; l2++)
+              if (D.srf[l2] == 1 && D.cstart[l2 + 1] - D.cstart[l2] >= 2) nmulti++;
+            if (nfold > 0) {
+              qsort(foldv, (size_t)nfold, sizeof *foldv, cmp_d);
+              printf(
+                  "      А971 СКЛАДЧАТОСТЬ ЛИСТА (1 − |ΣAn|/ΣA): p50 %.4f, p90 %.4f, max %.4f по "
+                  "%lld листьям; А970 листьев с 2+ ячейками среза %lld (%.1f %%)\n",
+                  foldv[nfold / 2], foldv[(nfold * 9) / 10], foldv[nfold - 1], (long long)nfold,
+                  (long long)nmulti, 100.0 * (double)nmulti / (double)(nsrf ? nsrf : 1));
+            }
+            free(foldv);
+            free(aw2);
+            printf("   Ф8' ПОКРЫТИЕ: ячеек среза отображено %lld из %d; листьев-ИЗЛУЧАТЕЛЕЙ %lld, "
+                   "листьев-ЗАСЛОНОВ без среза %lld, всего листьев %d; из излучателей ГЛЯНЦЕВЫХ "
+                   "%lld\n",
+                   (long long)nmap, S.n, (long long)nsrf, (long long)nblk, TD.nleaf,
+                   (long long)nglos);
+          }
+          double t_build3 = now_s() - tb3;
+          /* ПРОХОДЫ ПО НАПРАВЛЕНИЯМ. Ld обнуляется на каждое направление: они
+           * независимы, и `vis` метит уже посчитанные — как `open < 0` у открытости. */
+          double si3 = 0.0, sd3 = 0.0;
+          double t_pass = 0.0;
+          for (int pass = 0; pass < g_dpass; pass++) {
+            for (int32_t i = 0; i < 3 * S.n; i++)
+              D.Eind[i] = 0.0;
+            for (int32_t i = 0; i < S.n; i++)
+              wchk[i] = 0.0;
+            double tp = now_s();
+            for (int d = 0; d < DR.n; d++) {
+              double om[3] = {DR.ox[d], DR.oy[d], DR.oz[d]};
+              memset(D.Ld, 0, 3 * (size_t)TD.n * sizeof *D.Ld);
+              memset(D.vis, 0, (size_t)TD.n);
+              dsweep_rec(&TD, &D, 0, om, DR.w[d], g_dirsall);
+              /* А937: ПРОВЕРКА НОРМИРОВКИ ЗАКОНОМ. `Σ_d w_d max(0, −ω·n)` обязана
+               * быть `π` — иначе ошибка множителя смешается с физикой и проживёт,
+               * как прожила ошибка §531. */
+              for (int32_t i = 0; i < S.n; i++) {
+                double cs = -(om[0] * snx[i] + om[1] * sny[i] + om[2] * snz[i]);
+                if (cs > 0.0) wchk[i] += DR.w[d] * cs;
+              }
+            }
+            t_pass = now_s() - tp;
+            si3 = sd3 = 0.0;
+            for (int32_t i = 0; i < S.n; i++)
+              for (int k = 0; k < 3; k++) {
+                double e3 =
+                    D.Eind[3 * (size_t)i + (size_t)k] * (alb0 ? 0.0 : alb(&m, S.c[i].mat, k));
+                if (pass + 1 == g_dpass) ind[3 * (size_t)i + (size_t)k] = (float)e3;
+                si3 += e3;
+                sd3 += (double)irr[3 * (size_t)i + (size_t)k];
+              }
+            double wmn = 1e300, wmx = -1e300, wav = 0.0;
+            for (int32_t i = 0; i < S.n; i++) {
+              if (wchk[i] < wmn) wmn = wchk[i];
+              if (wchk[i] > wmx) wmx = wchk[i];
+              wav += wchk[i];
+            }
+            wav /= (double)(S.n ? S.n : 1);
+            printf(
+                "   Ф8' СВИП ПО НАПРАВЛЕНИЯМ: ND %d (nmu %d, nphi %d), отскок %d; дерево+раскладка "
+                "%.1f мс, проход %.1f мс (%.0f нс на лист-направление); СУММА косвенного / прямого "
+                "= %.4f%s\n",
+                DR.n, g_dnmu, g_dnphi, pass + 1, t_build3 * 1e3, t_pass * 1e3,
+                t_pass * 1e9 / ((double)DR.n * (double)(TD.nleaf ? TD.nleaf : 1)),
+                si3 / (sd3 > 0.0 ? sd3 : 1.0),
+                g_dirsall ? "  [НК dirsall]"
+                          : (g_dblkopen ? "  [ВЕРХНЯЯ граница: заслоны без среза ПРОЗРАЧНЫ]" : ""));
+            printf("      А937 НОРМИРОВКА: Σ w·max(0,−ω·n) = %.5f…%.5f, среднее %.5f (обязана быть "
+                   "π = %.5f, отклонение среднего %.2f %%)\n",
+                   wmn, wmx, wav, 3.14159265358979323846,
+                   100.0 * (wav - 3.14159265358979323846) / 3.14159265358979323846);
+            /* Ф11' (§545): РАСПРЕДЕЛЕНИЕ ДОЛИ ПЕРЕКРЫТИЯ. Без него «правило
+             * изменило ответ» не отличить от «правило почти не сработало». */
+            if (D.nfstat > 0) {
+              int64_t nf = D.nfstat < (int64_t)HZ_FSTAT_CAP ? D.nfstat : (int64_t)HZ_FSTAT_CAP;
+              double *fc = malloc((size_t)nf * sizeof *fc);
+              if (fc == NULL) exit(1);
+              memcpy(fc, D.fstat, (size_t)nf * sizeof *fc);
+              qsort(fc, (size_t)nf, sizeof *fc, cmp_d);
+              printf(
+                  "      Ф11' ДОЛЯ ПЕРЕКРЫТИЯ f: p10 %.4f, p50 %.4f, p90 %.4f; в единицу упёрлось "
+                  "%.2f %% случаев (выборка %lld из %lld)\n",
+                  fc[nf / 10], fc[nf / 2], fc[(nf * 9) / 10],
+                  100.0 * (double)D.nfone / (double)(D.nfstat ? D.nfstat : 1), (long long)nf,
+                  (long long)D.nfstat);
+              free(fc);
+            }
+            /* Ф15' (§561): БЮДЖЕТ ИЗЛУЧЕНИЯ. `Φ_аналит` — сколько поверхность
+             * обязана излучить в полусферу (`Σ A_i·irr_i`); `Φ_факт` — сколько
+             * излучено; `Φ_обрезано` — съеденное обрезкой `min(1, f)`.
+             * ПЕРЕКОС РАСКЛАДКИ (А1009) считается ОТДЕЛЬНО: `Σ max(0, A_p − h²)` —
+             * сколько площади лежит в листьях сверх их собственного сечения. Это и
+             * есть болезнь; обрезка — лишь её следствие. */
+            {
+              double phan = 0.0, over = 0.0, atot2 = 0.0;
+              for (int32_t i = 0; i < S.n; i++)
+                for (int k = 0; k < 3; k++)
+                  phan += sar[i] * (double)irr[3 * (size_t)i + (size_t)k];
+              for (int32_t l3 = 0; l3 < TD.n; l3++) {
+                if (TD.nd[l3].child0 >= 0 || D.srf[l3] != 1) continue;
+                double hl = (double)TD.nd[l3].size * D.cw;
+                atot2 += (double)D.Ap[l3];
+                if ((double)D.Ap[l3] > hl * hl) over += (double)D.Ap[l3] - hl * hl;
+              }
+              printf("      Ф15' БЮДЖЕТ ИЗЛУЧЕНИЯ: Φ_аналит %.4e, Φ_факт %.4e, Φ_обрезано %.4e; "
+                     "невязка %.2f %%%s\n",
+                     phan, emact * 3.0, emcut * 3.0,
+                     100.0 * (phan - emact * 3.0 - emcut * 3.0) / (phan > 0.0 ? phan : 1.0),
+                     g_fnoclamp ? "  [fnoclamp: обрезка СНЯТА]" : "");
+              printf("      Ф15' ПЕРЕКОС РАСКЛАДКИ (А1009): площади сверх сечения листа %.4e из "
+                     "%.4e (%.1f %%)\n",
+                     over, atot2, 100.0 * over / (atot2 > 0.0 ? atot2 : 1.0));
+              if (D.nfraw > 0) {
+                qsort(D.frawv, (size_t)D.nfraw, sizeof *D.frawv, cmp_d);
+                printf("      Ф15' СЫРОЕ f СРЕДИ УПЁРШИХСЯ: p50 %.3f, p90 %.3f, max %.3f по %lld "
+                       "случаям\n",
+                       D.frawv[D.nfraw / 2], D.frawv[(D.nfraw * 9) / 10], D.frawv[D.nfraw - 1],
+                       (long long)D.nfraw);
+              }
+              emact = emcut = 0.0;
+              D.nfraw = 0;
+            }
+            D.nfstat = 0;
+            D.nfone = 0;
+            /* МНОГОКРАТНЫЕ ОТРАЖЕНИЯ БЕЗ МАТРИЦЫ (довод №3 §523): следующая
+             * радиосити есть собранная облучённость на альбедо. Матрицы нет, есть
+             * ещё один проход по тем же направлениям. */
+            if (pass + 1 < g_dpass) {
+              double *aw3 = calloc((size_t)TD.n, sizeof *aw3);
+              if (aw3 == NULL) exit(1);
+              memset(D.Bs, 0, 3 * (size_t)TD.n * sizeof *D.Bs);
+              for (int32_t i = 0; i < S.n; i++) {
+                int32_t l2 = slf[i];
+                if (l2 < 0) continue;
+                aw3[l2] += sar[i];
+                for (int k = 0; k < 3; k++)
+                  D.Bs[3 * (size_t)l2 + (size_t)k] +=
+                      (float)(sar[i] * D.Eind[3 * (size_t)i + (size_t)k] * alb(&m, S.c[i].mat, k));
+              }
+              for (int32_t l2 = 0; l2 < TD.n; l2++)
+                if (D.srf[l2] == 1 && aw3[l2] > 0.0)
+                  for (int k = 0; k < 3; k++)
+                    D.Bs[3 * (size_t)l2 + (size_t)k] =
+                        (float)((double)D.Bs[3 * (size_t)l2 + (size_t)k] / aw3[l2] /
+                                3.14159265358979323846);
+              free(aw3);
+            }
+          }
+          /* Ф14. (§557): при сличении свип не вливается в `irr` — иначе гатер, идущий
+           * следом, считал бы отскок от уже подсвеченной поверхности. */
+          if (g_cmpcell) {
+            indsw = malloc(3 * (size_t)S.n * sizeof *indsw);
+            if (indsw == NULL) exit(1);
+            memcpy(indsw, ind, 3 * (size_t)S.n * sizeof *indsw);
+            memset(ind, 0, 3 * (size_t)S.n * sizeof *ind);
+          } else
+            for (int32_t i = 0; i < 3 * S.n; i++)
+              irr[i] += ind[i];
+          free(D.Ld);
+          free(D.Bs);
+          free(D.Bn);
+          free(D.Bsp);
+          free(D.Bwi);
+          free(D.Bns);
+          free(D.Ap);
+          free(D.fstat);
+          free(D.frawv);
+          free(D.srf);
+          free(D.vis);
+          free(D.cstart);
+          free(D.clist);
+          free(D.Eind);
+          free(snx);
+          free(sny);
+          free(snz);
+          free(sar);
+          free(slf);
+          free(wchk);
+          stree_free(&TD);
+          tr3_dirs_free(&DR);
+        }
+        if (g_hgather > 0.0) {
+          /* Ф6. (§516): ОТСКОК ПО ИЕРАРХИИ ИЗЛУЧАТЕЛЕЙ. */
+          etree ET;
+          memset(&ET, 0, sizeof ET);
+          double tb2 = now_s();
+          etree_build(&ET, &S, &fr, irr, &m, 0, S.n, 0, lev);
+          double t_build = now_s() - tb2;
+          tb2 = now_s();
+          int64_t nlink = 0;
+          double sthru2 = 0.0, sall2 = 0.0;
+          /* Р2 (§581): ДЕЛЕНИЕ ПО ПРИЁМНИКАМ — самое большое число в системе
+           * (`16.8` с). Каждый приёмник пишет свой `ind[i]`, дерево излучателей
+           * читается всеми и не меняется. Порядок сложения ВНУТРИ приёмника не
+           * меняется, значит ответ побитово тот же.
+           * СЧЁТЧИКИ — ПО ПОТОКАМ, А СВОДЯТСЯ В ФИКСИРОВАННОМ ПОРЯДКЕ: редукция
+           * OpenMP отдала бы порядок планировщику, и число поехало бы от запуска к
+           * запуску. Здесь оно воспроизводимо. */
+          int nth = g_omp1 ? 1 : omp_get_max_threads();
+          int64_t *plink = calloc((size_t)nth, sizeof *plink);
+          double *pthru = calloc((size_t)nth, sizeof *pthru);
+          double *pall = calloc((size_t)nth, sizeof *pall);
+          if (plink == NULL || pthru == NULL || pall == NULL) exit(1);
+#pragma omp parallel for schedule(dynamic, 64) if (!g_omp1)
+          for (int32_t i = 0; i < S.n; i++) {
+            int th = g_omp1 ? 0 : omp_get_thread_num();
+            double pi[3], nn2[3], acc2[3] = {0, 0, 0};
+            hz_slice_vertex(&S, i, pi);
+            for (int k = 0; k < 3; k++)
+              pi[k] = fr.org[k] + pi[k] * fr.h;
+            hz_slice_normal(&S, i, nn2);
+            double rrecv = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
+            for (int q2 = 0; q2 < 6; q2++)
+              hgather_rec(&ET, 0, q2, pi, nn2, g_hgather, rrecv, &P, &fr, indvis, acc2, &plink[th],
+                          &pthru[th], &pall[th]);
+            for (int k = 0; k < 3; k++)
+              ind[3 * (size_t)i + (size_t)k] =
+                  (float)(acc2[k] * (alb0 ? 0.0 : alb(&m, S.c[i].mat, k)));
+          }
+          for (int t4 = 0; t4 < nth; t4++) {
+            nlink += plink[t4];
+            sthru2 += pthru[t4];
+            sall2 += pall[t4];
+          }
+          free(plink);
+          free(pthru);
+          free(pall);
+          double t_g2 = now_s() - tb2;
+          double sd2 = 0.0, si2 = 0.0;
+          for (int32_t i = 0; i < S.n; i++)
+            for (int k = 0; k < 3; k++) {
+              sd2 += (double)irr[3 * (size_t)i + (size_t)k];
+              si2 += (double)ind[3 * (size_t)i + (size_t)k];
+            }
+          printf(
+              "   Ф6. ИЕРАРХИЧЕСКИЙ ОТСКОК: eps %.3f, узлов дерева %d, СВЯЗЕЙ %lld против %lld пар "
+              "(в %.0f раз меньше); дерево %.1f мс, сбор %.1f мс; СУММА косвенного / прямого = "
+              "%.4f%s\n",
+              g_hgather, ET.n, (long long)nlink, (long long)S.n * (long long)S.n,
+              (double)((long long)S.n * (long long)S.n) / (double)(nlink ? nlink : 1),
+              t_build * 1e3, t_g2 * 1e3, si2 / (sd2 > 0.0 ? sd2 : 1.0),
+              indvis ? " [С ЗАСЛОНАМИ]" : "");
+          g_t_bounce = t_build + t_g2;
+          if (indmeas || indvis)
+            printf("      §474 СКВОЗЬ ЗАСЛОНЫ: %.2f %%\n",
+                   100.0 * sthru2 / (sall2 > 0.0 ? sall2 : 1.0));
+          for (int32_t i = 0; i < 3 * S.n; i++)
+            irr[i] += ind[i];
+          etree_free(&ET);
+        } else {
+          /* Ф3. (§510): ИЗЛУЧАТЕЛИ С ОГРУБЛЁННОГО СРЕЗА. Приёмнику нужна
+           * подробность, излучателю — нет: дальняя стена светит как ОДНА площадка
+           * со своей средней яркостью. Второй срез того же дерева с бо́льшим порогом
+           * и есть эта огрублённая раздача; прямой свет на нём считается тем же
+           * `front_direct` (ячеек мало, цена ничтожна). */
+          hz_dcslice SE;
+          float *irre = irr;
+          const hz_dcslice *SRC2 = &S;
+          if (g_emitthr > 0.0) {
+            lodctx LE = LL;
+            LE.thr = g_emitthr;
+            if (hz_slice_init(&SE, lev) != HZ_DC_OK) exit(1);
+            if (hz_slice_build(&SE, &T, &ht, lod_stop, &LE) != HZ_DC_OK) exit(1);
+            for (int32_t i2 = 0; i2 < SE.n; i2++) {
+              double vw2[3];
+              hz_slice_vertex(&SE, i2, vw2);
+              int32_t cl2[3];
+              for (int a2 = 0; a2 < 3; a2++) {
+                double f2 = floor(vw2[a2]);
+                if (f2 < 0.0) f2 = 0.0;
+                if (f2 > (double)(fr.n - 1)) f2 = (double)(fr.n - 1);
+                cl2[a2] = (int32_t)f2;
+              }
+              const int32_t *ls2 = NULL;
+              if (ct_list(&CT, cl2, &ls2) == 0) continue;
+              int32_t mi2 = m.fm != NULL ? m.fm[ls2[0]] : 0;
+              SE.c[i2].mat = (uint8_t)(mi2 < 255 ? mi2 : 255);
+            }
+            irre = malloc(3 * (size_t)SE.n * sizeof *irre);
+            if (irre == NULL) exit(1);
+            front_direct(&SE, &fr, &P, &AL, irre, 0.5, 1, NULL, &m);
+            SRC2 = &SE;
+            printf("   Ф3' ОГРУБЛЁННЫЕ ИЗЛУЧАТЕЛИ: порог %.2f, ячеек %d против %d приёмников\n",
+                   g_emitthr, SE.n, S.n);
+          }
+          int32_t stride = 1;
+          while ((int64_t)(SRC2->n / (stride > 0 ? stride : 1)) * (int64_t)S.n > 200000000LL)
+            stride *= 2;
+          if (g_gstride > 0) stride = g_gstride;
+          double tb = now_s();
+          int64_t nemit = 0;
+          double sthru = 0.0, sall = 0.0;
+          double walb = 0.0, wtot = 0.0;
+          for (int32_t j = 0; j < SRC2->n; j += stride) {
+            double ej[3] = {(double)irre[3 * (size_t)j], (double)irre[3 * (size_t)j + 1],
+                            (double)irre[3 * (size_t)j + 2]};
+            if (!(ej[0] + ej[1] + ej[2] > 0.0)) continue;
+            nemit++;
+            /* §529: средневзвешенное альбедо ИЗЛУЧАТЕЛЕЙ, взвешенное их же потоком.
+             * Печатается затем, что предсказание П1 сделано именно через него: если
+             * второй множитель лишний, отношение обязано вырасти ровно в `1/⟨ρ⟩`. */
+            for (int k = 0; k < 3; k++) {
+              wtot += ej[k];
+              walb += ej[k] * alb(&m, S.c[j].mat, k);
+            }
+            double pj[3], nj[3];
+            hz_slice_vertex(&S, j, pj);
+            for (int k = 0; k < 3; k++)
+              pj[k] = fr.org[k] + pj[k] * fr.h;
+            hz_slice_normal(&S, j, nj);
+            double cside = fr.h * (double)((int32_t)1 << (lev - (int)SRC2->c[j].lvl));
+            double aj = cside * cside * (double)stride;
+            for (int32_t i = 0; i < S.n; i++) {
+              if (i == j) continue;
+              double pi[3], ni[3], w[3], r2 = 0.0;
+              hz_slice_vertex(&S, i, pi);
+              for (int k = 0; k < 3; k++)
+                pi[k] = fr.org[k] + pi[k] * fr.h;
+              hz_slice_normal(&S, i, ni);
+              for (int k = 0; k < 3; k++) {
+                w[k] = pj[k] - pi[k];
+                r2 += w[k] * w[k];
+              }
+              if (!(r2 > 0.0)) continue;
+              double r = sqrt(r2);
+              double ci = (w[0] * ni[0] + w[1] * ni[1] + w[2] * ni[2]) / r;
+              double cj = -(w[0] * nj[0] + w[1] * nj[1] + w[2] * nj[2]) / r;
+              if (!(ci > 0.0) || !(cj > 0.0)) continue;
+              /* §474: СКОЛЬКО КОСВЕННОГО ПРИХОДИТ СКВОЗЬ СТЕНЫ. Приближение (1)
+               * названо в коде с самого начала, но НЕ ИЗМЕРЕНО ни разу; в закрытой
+               * комнате оно перестаёт быть безобидным — наружная сторона стены
+               * светит внутрь. Здесь тем же маршем, что у прямого света, считается
+               * доля энергии, чей путь пересекает занятую ячейку. Ключ `indvis`
+               * её ЗАСЛОНЯЕТ, `indmeas` — только считает. */
+              double ff = ci * cj * aj / (3.14159265358979323846 * r2);
+              int blocked = 0;
+              if (indmeas) blocked = shadowed(&P, &fr, pi, pj, 0.5);
+              for (int k = 0; k < 3; k++) {
+                double e = ej[k] * (alb0 ? 0.0 : (g_emitalb2 ? alb(&m, S.c[j].mat, k) : 1.0)) * ff *
+                           alb(&m, S.c[i].mat, k);
+                if (indmeas) {
+                  sall += e;
+                  if (blocked) sthru += e;
+                }
+                if (blocked && indvis) continue;
+                ind[3 * (size_t)i + (size_t)k] += (float)e;
+              }
+            }
+          }
+          tb = now_s() - tb;
+          /* ПРИЁМКА: отношение косвенного к прямому обязано быть порядка альбедо. */
+          double sd = 0.0, si = 0.0;
+          for (int32_t i = 0; i < S.n; i++)
+            for (int k = 0; k < 3; k++) {
+              sd += (double)irr[3 * (size_t)i + (size_t)k];
+              si += (double)ind[3 * (size_t)i + (size_t)k];
+            }
+          printf("   ОТСКОК: %.1f с (в %.0f раз дороже прямого света), излучателей %lld из %d "
+                 "(прореживание %d); СУММА косвенного / прямого = %.4f\n",
+                 tb, tb / (t_dir > 0.0 ? t_dir : 1.0), (long long)nemit, S.n, stride,
+                 si / (sd > 0.0 ? sd : 1.0));
+          printf("      §529 АЛЬБЕДО ИЗЛУЧАТЕЛЕЙ, взвешенное потоком: %.4f%s\n",
+                 walb / (wtot > 0.0 ? wtot : 1.0),
+                 g_emitalb2 ? "; ВТОРОЙ множитель ВОЗВРАЩЁН (emitalb2, СТАРОЕ НЕВЕРНОЕ)" : "");
+          if (indmeas)
+            printf("      §474 СКВОЗЬ ЗАСЛОНЫ: %.2f %% энергии отскока идёт путём, пересекающим "
+                   "занятую ячейку%s\n",
+                   100.0 * sthru / (sall > 0.0 ? sall : 1.0), indvis ? " (и ОТБРОШЕНА)" : "");
+          /* ---- Ф14' (§557): ПОЯЧЕЕЧНОЕ СЛИЧЕНИЕ СВИПА С ГАТЕРОМ ---- */
+          /* СУММАРНОЕ ЧИСЛО НЕ РАЗЛИЧАЕТ ДВЕ БОЛЕЗНИ: постоянный множитель (тогда
+           * это ошибка нормировки, и схема ни при чём) и потерю с расстоянием
+           * (тогда виноват перенос). Спутать их — потерять целый шаг на постройку
+           * схемы, которая не нужна; в проекте так уже выходило трижды (А933,
+           * А955, А994).
+           * ОТНОШЕНИЕ С НУЛЯМИ — НЕ ВЕЛИЧИНА (А999): берутся ячейки, где ГАТЕР выше
+           * порога от собственной медианы, а выброшенное считается тремя
+           * счётчиками, а не прячется.
+           * ГАТЕР — НЕ ИСТИНА, А ВТОРАЯ СХЕМА (А1001): его собственный разброс
+           * меряется тем же прибором через `hgather=` и `stride`. */
+          if (g_cmpcell && indsw != NULL) {
+            const float *A1 = indsw, *B1 = g_cmpself ? indsw : ind;
+            double *gv = malloc((size_t)S.n * sizeof *gv);
+            double *rt = malloc((size_t)S.n * sizeof *rt);
+            if (gv == NULL || rt == NULL) exit(1);
+            int64_t ng = 0;
+            for (int32_t i = 0; i < S.n; i++) {
+              double b = 0.0;
+              for (int k = 0; k < 3; k++)
+                b += (double)B1[3 * (size_t)i + (size_t)k];
+              if (b > 0.0) gv[ng++] = b;
+            }
+            double gmed = 0.0;
+            if (ng > 0) {
+              qsort(gv, (size_t)ng, sizeof *gv, cmp_d);
+              gmed = gv[ng / 2];
+            }
+            /* Порог назван ОТ ДАННЫХ, а не с потолка: тысячная медианы гатера. */
+            double thr2 = 1e-3 * gmed;
+            int64_t nboth0 = 0, ngz = 0, nsz = 0, nuse = 0;
+            /* Корзины по расстоянию ДО БЛИЖАЙШЕГО ИЗЛУЧАТЕЛЯ ПО ПРЯМОЙ. Величина
+             * названа честно (А1000): за стеной она даёт НИЖНЮЮ оценку длины пути,
+             * и если зависимость на такой оси найдётся — вывод тем крепче. */
+            static const double DB[4] = {0.5, 1.5, 3.0, 1e9};
+            double bs[4] = {0, 0, 0, 0}, bn[4] = {0, 0, 0, 0};
+            for (int32_t i = 0; i < S.n; i++) {
+              double a = 0.0, b = 0.0;
+              for (int k = 0; k < 3; k++) {
+                a += (double)A1[3 * (size_t)i + (size_t)k];
+                b += (double)B1[3 * (size_t)i + (size_t)k];
+              }
+              if (!(a > 0.0) && !(b > 0.0)) {
+                nboth0++;
+                continue;
+              }
+              if (!(b > thr2)) {
+                if (a > 0.0) ngz++;
+                continue;
+              }
+              if (!(a > 0.0)) nsz++;
+              rt[nuse++] = a / b;
+              double pw[3];
+              hz_slice_vertex(&S, i, pw);
+              for (int k = 0; k < 3; k++)
+                pw[k] = fr.org[k] + pw[k] * fr.h;
+              double dmin = 1e300;
+              for (int32_t j = 0; j < S.n; j += 16) {
+                if (!(irr[3 * (size_t)j] > 0.0f)) continue;
+                double pj2[3], d2 = 0.0;
+                hz_slice_vertex(&S, j, pj2);
+                for (int k = 0; k < 3; k++) {
+                  double dd = fr.org[k] + pj2[k] * fr.h - pw[k];
+                  d2 += dd * dd;
+                }
+                if (d2 < dmin) dmin = d2;
+              }
+              dmin = sqrt(dmin);
+              for (int bq = 0; bq < 4; bq++)
+                if (dmin < DB[bq]) {
+                  bs[bq] += a / b;
+                  bn[bq] += 1.0;
+                  break;
+                }
+            }
+            if (nuse > 0) {
+              qsort(rt, (size_t)nuse, sizeof *rt, cmp_d);
+              double p10 = rt[nuse / 10], p50 = rt[nuse / 2], p90 = rt[(nuse * 9) / 10];
+              printf("   Ф14' СВИП / ГАТЕР ПОЯЧЕЕЧНО%s: p10 %.4f, p50 %.4f, p90 %.4f, "
+                     "p90/p10 = %.2f по %lld ячейкам\n",
+                     g_cmpself ? " [cmpself: обязано быть 1.0000]" : "", p10, p50, p90,
+                     p10 > 0.0 ? p90 / p10 : 0.0, (long long)nuse);
+              printf("      ВЫБРОШЕНО: обе нули %lld, гатер ниже порога при ненулевом свипе %lld, "
+                     "свип ноль при живом гатере %lld (порог %.3e = 1e-3 медианы)\n",
+                     (long long)nboth0, (long long)ngz, (long long)nsz, thr2);
+              printf("      ПО РАССТОЯНИЮ ДО БЛИЖАЙШЕГО ИЗЛУЧАТЕЛЯ (по прямой, НИЖНЯЯ оценка "
+                     "пути):\n");
+              static const char *DN[4] = {"< 0.5 м", "0.5…1.5 м", "1.5…3 м", "> 3 м"};
+              for (int bq = 0; bq < 4; bq++)
+                printf("         %-10s среднее отношение %.4f по %.0f ячейкам\n", DN[bq],
+                       bn[bq] > 0.0 ? bs[bq] / bn[bq] : 0.0, bn[bq]);
+            }
+            free(gv);
+            free(rt);
+          }
+          for (int32_t i = 0; i < 3 * S.n; i++)
+            irr[i] += ind[i];
+          if (indsw != NULL) {
+            for (int32_t i = 0; i < 3 * S.n; i++)
+              irr[i] += indsw[i];
+            free(indsw);
+            indsw = NULL;
+          }
+          if (g_emitthr > 0.0) {
+            free(irre);
+            hz_slice_free(&SE);
+          }
+        }
+        free(ind);
+      } /* конец диагностики кадра (§589) */
+
+      /* ЦВЕТ ЯЧЕЙКИ КЛАДЁТСЯ В ИНДЕКС ПО КЛЮЧУ, чтобы растеризатор мог его взять
+       * по ячейке многоугольника. Индекс ПЛОСКИЙ (отсортированные ключи +
+       * двоичный поиск), а не дерево: у него нет ни спуска, ни владения. */
+      uint64_t *key = malloc((size_t)S.n * sizeof *key);
+      int32_t *ord = malloc((size_t)S.n * sizeof *ord);
+      if (key == NULL || ord == NULL) exit(1);
+      for (int32_t i = 0; i < S.n; i++) {
+        key[i] = cellkey(&S.c[i]);
+        ord[i] = i;
+      }
+      /* Срез уже в мортоновом порядке; ключ (lvl, lo) монотонен по нему не всегда,
+       * поэтому сортируется явно. */
+      for (int32_t i = 1; i < S.n; i++) {
+        uint64_t k = key[i];
+        int32_t o = ord[i];
+        int32_t j = i - 1;
+        while (j >= 0 && key[j] > k) {
+          key[j + 1] = key[j];
+          ord[j + 1] = ord[j];
+          j--;
+        }
+        key[j + 1] = k;
+        ord[j + 1] = o;
+      }
+
+      /* БЕЛАЯ ТОЧКА: перцентиль 99.5 по ЯЧЕЙКАМ СРЕЗА — то же правило, что в
+       * hz_ppm_write, но применённое к населению, у которого оно осмысленно. */
+      double white = 1.0;
+      {
+        float *tmpw = malloc((size_t)S.n * sizeof *tmpw);
+        if (tmpw == NULL) exit(1);
+        for (int32_t i = 0; i < S.n; i++) {
+          float mx = irr[3 * (size_t)i];
+          if (irr[3 * (size_t)i + 1] > mx) mx = irr[3 * (size_t)i + 1];
+          if (irr[3 * (size_t)i + 2] > mx) mx = irr[3 * (size_t)i + 2];
+          tmpw[i] = mx;
+        }
+        qsort(tmpw, (size_t)S.n, sizeof *tmpw, cmp_f);
+        double w995 = (double)tmpw[(size_t)((double)S.n * 0.995)];
+        if (w995 > 0.0) white = w995;
+        free(tmpw);
+      }
+      litctx LC;
+      memset(&LC, 0, sizeof LC);
+      LC.polysum = HZ_FNV_BASIS; /* начальное значение FNV-1a */
+      LC.S = &S;
+      LC.key = key;
+      LC.ord = ord;
+      LC.irr = irr;
+      LC.fr = &fr;
+      LC.white = white;
+      LC.nocull = nocull;
+      LC.uvs = uvs;
+      LC.mesh = &m;
+      LC.ct = &CT;
+      LC.nmtl = m.nmtl;
+      LC.pxrad = LL.pxrad;
+      LC.nomip = g_texnomip;
+      tr3_camera cam;
+      if (tr3_camera_look(&cam, eyec, atc, upc, HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0,
+                          res, res) == 0) {
+        size_t np = (size_t)res * (size_t)res;
+        double *zb = malloc(np * sizeof *zb);
+        unsigned char *rgb = calloc(np * 3, 1);
+        if (zb == NULL || rgb == NULL) exit(1);
+        for (size_t i = 0; i < np; i++)
+          zb[i] = 1e300;
+        LC.cam = &cam;
+        LC.z = zb;
+        LC.rgb = rgb;
+        LC.w = res;
+        LC.h = res;
+        int64_t ahist[10] = {0};
+        double apix[10] = {0};
+        LC.areahist = ahist;
+        LC.areapix = apix;
+        LC.defcol = calloc(np * 3, sizeof *LC.defcol);
+        if (LC.defcol == NULL) exit(1);
+        /* Ш8 (§575): ЗАГРУЗКА ТЕКСТУР. Имя из `map_Kd`, каталог — `ppm256` рядом
+         * с текстурами сцены (готовит `scripts/tex_prep.sh`). Отсутствующая
+         * текстура НЕ ошибка: материал остаётся одноцветным, и число таких
+         * ПЕЧАТАЕТСЯ, а не замалчивается (А891). */
+        if (uvs != NULL && !g_texflat) {
+          /* ПОЛЯ РАЗМЕРОМ С КАДР — КАЖДЫЙ КАДР. Они и есть кадр, а не сцена. */
+          LC.defuv = calloc(np * 2, sizeof *LC.defuv);
+          LC.defmat = calloc(np, 1);
+          if (LC.defuv == NULL || LC.defmat == NULL) exit(1);
+        }
+        /* А ЗАГРУЗКА ТЕКСТУР — ОДИН РАЗ ЗА ЗАПУСК (§589). В цикле ходьбы иначе
+         * платились бы `105` файлов на кадр. */
+        if (uvs != NULL && !g_texflat && !g_texloaded) {
+          g_texloaded = 1;
+          g_texrgb = calloc((size_t)m.nmtl, sizeof *g_texrgb);
+          g_texw = calloc((size_t)m.nmtl, sizeof *g_texw);
+          g_texh = calloc((size_t)m.nmtl, sizeof *g_texh);
+          g_texmip = calloc((size_t)m.nmtl, sizeof *g_texmip);
+          g_mipw = calloc((size_t)m.nmtl, sizeof *g_mipw);
+          g_miph = calloc((size_t)m.nmtl, sizeof *g_miph);
+          g_nmip = calloc((size_t)m.nmtl, sizeof *g_nmip);
+          if (g_texmip == NULL || g_mipw == NULL || g_miph == NULL || g_nmip == NULL) exit(1);
+          if (g_texrgb == NULL || g_texw == NULL || g_texh == NULL) exit(1);
+          char dir[512];
+          snprintf(dir, sizeof dir, "%s", argv[1]);
+          char *sl = strrchr(dir, '/');
+          if (sl != NULL)
+            *sl = '\0';
+          else
+            dir[0] = '\0';
+          int64_t nload = 0, nmiss = 0, tbytes = 0;
+          double tt0 = now_s();
+          for (int32_t mi2 = 0; mi2 < m.nmtl; mi2++) {
+            if (m.mtl[mi2].tex[0] == '\0') continue;
+            /* ПУТЬ В `map_Kd` ОТБРАСЫВАЕТСЯ, И РАЗДЕЛИТЕЛЬ ТАМ ОБРАТНЫЙ. У
+             * Сан-Мигеля стоит `textures\individual_b.png` — экспортёр писал под
+             * Windows. Берём только имя файла: каталог у нас свой (`ppm256`), и
+             * доверять пути из чужого файла на недоверенном входе нельзя тем
+             * более. Замерено: без этого нашлось `0` текстур из `271`. */
+            const char *nm2 = m.mtl[mi2].tex;
+            for (const char *s2 = nm2; *s2 != '\0'; s2++)
+              if (*s2 == '/' || *s2 == '\\') nm2 = s2 + 1;
+            char base[160];
+            snprintf(base, sizeof base, "%s", nm2);
+            char *dot = strrchr(base, '.');
+            if (dot != NULL) *dot = '\0';
+            /* ДВА МЕСТА ПОИСКА, И ЭТО НЕ ПЕРЕСТРАХОВКА. У Сан-Мигеля текстуры
+             * лежат в `textures/`, у Bistro — в нескольких каталогах рядом со
+             * сценой (`BuildingTextures`, `Street`, `Natural`…), и `map_Kd` там
+             * ссылается через `..\`. Мы кладём переведённые в ОДИН плоский
+             * `ppm256` у сцены, поэтому ищем по имени файла в обоих местах. */
+            char path2[900];
+            snprintf(path2, sizeof path2, "%s/textures/ppm256/%s.ppm", dir, base);
+            if (hz_ppm_read(path2, &g_texrgb[mi2], &g_texw[mi2], &g_texh[mi2]) != 0)
+              snprintf(path2, sizeof path2, "%s/ppm256/%s.ppm", dir, base);
+            if (hz_ppm_read(path2, &g_texrgb[mi2], &g_texw[mi2], &g_texh[mi2]) == 0) {
+              nload++;
+              tbytes += (int64_t)g_texw[mi2] * g_texh[mi2] * 3;
+              /* МИП-ПИРАМИДА строится сразу: коробка 2×2 на уровень, пока сторона
+               * не станет единицей. Коробка, а не что-то умнее, — потому что
+               * уровень всё равно интерполируется линейно, и лишняя точность
+               * ниже кванта байта. */
+              int lv2 = 1, w2 = g_texw[mi2], h2 = g_texh[mi2];
+              while (w2 > 1 || h2 > 1) {
+                w2 = w2 > 1 ? w2 / 2 : 1;
+                h2 = h2 > 1 ? h2 / 2 : 1;
+                lv2++;
+              }
+              g_nmip[mi2] = lv2;
+              g_texmip[mi2] = calloc((size_t)lv2, sizeof *g_texmip[mi2]);
+              g_mipw[mi2] = calloc((size_t)lv2, sizeof *g_mipw[mi2]);
+              g_miph[mi2] = calloc((size_t)lv2, sizeof *g_miph[mi2]);
+              if (g_texmip[mi2] == NULL || g_mipw[mi2] == NULL || g_miph[mi2] == NULL) exit(1);
+              g_texmip[mi2][0] = g_texrgb[mi2];
+              g_mipw[mi2][0] = g_texw[mi2];
+              g_miph[mi2][0] = g_texh[mi2];
+              for (int l2 = 1; l2 < lv2; l2++) {
+                int pw = g_mipw[mi2][l2 - 1], ph = g_miph[mi2][l2 - 1];
+                int cw = pw > 1 ? pw / 2 : 1, ch = ph > 1 ? ph / 2 : 1;
+                unsigned char *dst = malloc((size_t)cw * (size_t)ch * 3);
+                if (dst == NULL) exit(1);
+                const unsigned char *src = g_texmip[mi2][l2 - 1];
+                for (int y2 = 0; y2 < ch; y2++)
+                  for (int x2 = 0; x2 < cw; x2++)
+                    for (int c2 = 0; c2 < 3; c2++) {
+                      int sx0 = (pw > 1) ? 2 * x2 : 0, sy0 = (ph > 1) ? 2 * y2 : 0;
+                      int sx1 = (pw > 1) ? sx0 + 1 : sx0, sy1 = (ph > 1) ? sy0 + 1 : sy0;
+                      size_t o0 = 3 * ((size_t)sy0 * (size_t)pw + (size_t)sx0) + (size_t)c2;
+                      size_t o1 = 3 * ((size_t)sy0 * (size_t)pw + (size_t)sx1) + (size_t)c2;
+                      size_t o2 = 3 * ((size_t)sy1 * (size_t)pw + (size_t)sx0) + (size_t)c2;
+                      size_t o3 = 3 * ((size_t)sy1 * (size_t)pw + (size_t)sx1) + (size_t)c2;
+                      unsigned s5 = (unsigned)src[o0] + src[o1] + src[o2] + src[o3];
+                      dst[3 * ((size_t)y2 * (size_t)cw + (size_t)x2) + (size_t)c2] =
+                          (unsigned char)(s5 / 4);
+                    }
+                g_texmip[mi2][l2] = dst;
+                g_mipw[mi2][l2] = cw;
+                g_miph[mi2][l2] = ch;
+                tbytes += (int64_t)cw * ch * 3;
+              }
+            } else
+              nmiss++;
+          }
+          printf("   Ш8 ТЕКСТУРЫ: загружено %lld, не найдено %lld, память %.1f МБ, за %.2f с\n",
+                 (long long)nload, (long long)nmiss, (double)tbytes / 1048576.0, now_s() - tt0);
+        }
+        /* Кадровый контекст получает УКАЗАТЕЛИ на разово загруженное. Владения он
+         * не берёт: освобождать их в конце кадра значило бы грузить их заново. */
+        if (uvs != NULL && !g_texflat) {
+          LC.texrgb = g_texrgb;
+          LC.texw = g_texw;
+          LC.texh = g_texh;
+          LC.texmip = g_texmip;
+          LC.mipw = g_mipw;
+          LC.miph = g_miph;
+          LC.nmip = g_nmip;
+        }
+        ta = now_s();
+        /* §573: РАЗДЕЛЕНИЕ ОБХОДА И РАСТЕРИЗАЦИИ. «УБИВАЕТ» §572 сработало
+         * (126 мс против порога 100), и условие требует профилировать, а не
+         * догадываться. Здесь тот же обход гоняется с ПУСТЫМ обработчиком: его
+         * время есть цена обхода дерева и критерия LOD, а разность — цена самой
+         * растеризации. */
+        /* §580: КОПИЯ КОНТЕКСТА С ОТСЕЧЕНИЕМ. Оригинал `LL` идёт в срез, который
+         * кормит ПЕРЕНОС, и там фрустумное отсечение запрещено. */
+        lodctx LLc = LL;
+        LLc.cull = !g_nofrustum;
+        LLc.cam = &cam;
+        LLc.h = fr.h;
+        for (int a = 0; a < 3; a++)
+          LLc.org[a] = fr.org[a];
+        double ta_w = now_s();
+        int wrc0 = hz_dc_walk(&T, lod_stop, &LLc, lit_none, &LC);
+        double t_walk = now_s() - ta_w;
+#ifdef HZ_DC_COUNT
+        {
+          extern long long hz_dc_n_cell, hz_dc_n_face, hz_dc_n_edge, hz_dc_n_leafish, hz_dc_n_stop,
+              hz_dc_n_proc;
+          printf(
+              "      СЧЁТ ОБХОДА: cellProc %lld, faceProc %lld, edgeProc %lld, process_edge %lld; "
+              "leafish %lld (из них до lod_stop дошло %lld)\n",
+              hz_dc_n_cell, hz_dc_n_face, hz_dc_n_edge, hz_dc_n_proc, hz_dc_n_leafish,
+              hz_dc_n_stop);
+        }
+#endif
+        ta = now_s();
+        /* Р3 (§581): обход СОБИРАЕТ, отрисовка идёт ПО ПОЛОСАМ параллельно. */
+        if (!g_omp1) {
+          LC.captris = 65536;
+          LC.tris = malloc((size_t)LC.captris * sizeof *LC.tris);
+          if (LC.tris == NULL) exit(1);
+        }
+        int wrc = hz_dc_walk(&T, lod_stop, &LLc, lit_poly, &LC);
+        if (LC.tris != NULL) {
+          int nb2 = omp_get_max_threads();
+          int bh = (res + nb2 - 1) / nb2;
+#pragma omp parallel for schedule(static)
+          for (int b2 = 0; b2 < nb2; b2++) {
+            int y0b = b2 * bh, y1b = y0b + bh - 1;
+            if (y1b >= res) y1b = res - 1;
+            for (int64_t t5 = 0; t5 < LC.ntris; t5++) {
+              /* Отсев по предвычисленному габариту строк — два сравнения вместо
+               * повторного проецирования трёх вершин. Без него деление на полосы
+               * не давало ничего: замерено `218 → 234` мс, то есть ХУЖЕ
+               * однопоточного, потому что каждая полоса перепроецировала все
+               * треугольники заново. */
+              if (LC.tris[t5].iy1 < y0b || LC.tris[t5].iy0 > y1b) continue;
+              lit_tri(&LC, LC.tris[t5].p, LC.tris[t5].col, LC.tris[t5].uv, LC.tris[t5].mat, y0b,
+                      y1b);
+            }
+          }
+          free(LC.tris);
+          LC.tris = NULL;
+        }
+        lit_resolve(&LC, g_gamn);
+        printf("      §573 ПРОФИЛЬ РАСТРА: обход дерева с ПУСТЫМ обработчиком %.1f мс (код %d), "
+               "обход+растр %.1f мс — значит сама растеризация %.1f мс\n",
+               t_walk * 1e3, wrc0, (now_s() - ta) * 1e3, (now_s() - ta - t_walk) * 1e3);
+        /* §585: механизм проверяется СЧЁТОМ, а выгода — временем, и путать их
+         * нельзя. `узлов посчитано` — это число РАЗЛИЧНЫХ узлов, у которых ответ
+         * критерия вычислен полностью; при `nomemo` считать нечем, и печатается
+         * ноль, а не подставленное число вызовов. */
+        printf("      §585 ПАМЯТЬ ОТВЕТА: КРИТЕРИЙ СЧИТАН ПОЛНОСТЬЮ %lld раз (различных узлов "
+               "тронуто %lld), перевёрнуто ответов %lld; ПОРЯДКОВАЯ СУММА ПОТОКА МНОГОУГОЛЬНИКОВ "
+               "%016llx\n",
+               hz_dc_walk_memo_stops(), hz_dc_walk_memo_evals(), hz_dc_walk_memo_flips(),
+               (unsigned long long)LC.polysum);
+        double t_rast = now_s() - ta;
+        int64_t ncov = 0;
+        for (size_t i2 = 0; i2 < np; i2++)
+          if (zb[i2] < 1e299) ncov++;
+        printf("      §572 РАСТР: фрагментов прошло z %lld на %lld закрытых пикселей, ГЛУБИНА "
+               "ПЕРЕКРЫТИЯ %.2f; таблица гаммы %d входов; КООРДИНАТА С ПОВЕРХНОСТИ у %lld "
+               "пикселей (%.1f %%)\n",
+               (long long)LC.nfrag, (long long)ncov, (double)LC.nfrag / (double)(ncov ? ncov : 1),
+               g_gamn, (long long)LC.nsurfuv,
+               100.0 * (double)LC.nsurfuv / (double)(ncov ? ncov : 1));
+        {
+          double tot4 = 0.0;
+          for (int b5 = 0; b5 < 10; b5++)
+            tot4 += apix[b5];
+          printf("      РАЗМЕР ПОЛИГОНА НА ЭКРАНЕ (площадь в пикселях -> сколько их, и какую долю "
+                 "экрана они кроют):\n        ");
+          int lo4 = 1;
+          for (int b5 = 0; b5 < 10; b5++) {
+            if (ahist[b5] > 0)
+              printf("%d..%d: %lld шт / %.0f %%   ", lo4, lo4 * 4 - 1, (long long)ahist[b5],
+                     100.0 * apix[b5] / (tot4 > 0.0 ? tot4 : 1.0));
+            lo4 *= 4;
           }
           printf("\n");
         }
-        free(el);
-      }
-
-      /* ДВА ОГРАНИЧИТЕЛЯ ПОРОЗНЬ (§450, П3.2): ПОЛНАЯ ГЛУБИНА и СРЕЗ. Площадь
-       * одной поверхности нельзя сравнивать с ячейками другой, а срез огрубляет
-       * — значит числа разные, и печатать их надо врозь, а не одно за оба. */
-      int32_t nbin = HZ_PLBIN * fr.n + 2;
-      for (int pass = 0; pass < 2; pass++) {
-        areacnt A;
-        memset(&A, 0, sizeof A);
-        A.nbin = nbin;
-        A.pl_area = calloc(3 * (size_t)nbin, sizeof *A.pl_area);
-        A.pl_cnt = calloc(3 * (size_t)nbin, sizeof *A.pl_cnt);
-        A.ncell = fr.n + 1;
-        A.cl_area = calloc(3 * (size_t)A.ncell, sizeof *A.cl_area);
-        A.cl_cnt = calloc(3 * (size_t)A.ncell, sizeof *A.cl_cnt);
-        if (A.pl_area == NULL || A.pl_cnt == NULL || A.cl_area == NULL || A.cl_cnt == NULL) exit(1);
-        int32_t nskip = 0;
-        int wrca = pass == 0 ? hz_dc_walk_stats(&T, NULL, NULL, area_emit, &A, &nskip)
-                             : hz_dc_walk_stats(&T, lod_stop, &LL, area_emit, &A, &nskip);
-        double h2 = fr.h * fr.h;
-        const char *tag = pass == 0 ? "ПОЛНАЯ ГЛУБИНА" : "СРЕЗ";
-        printf("   ПЛОЩАДЬ ВЫДАННОЙ ПОВЕРХНОСТИ [%s] (§446): веер от v0 %.5f м², от v1 %.5f м² "
-               "(разность %.3e); ИСТИННАЯ по мешу %.5f м², отношение %.4f\n",
-               tag, A.fan0 * h2, A.fan1 * h2, fabs(A.fan0 - A.fan1) * h2, atrue,
-               A.fan0 * h2 / (atrue > 0.0 ? atrue : 1.0));
-        printf("   ПО ОСЯМ [%s] (главная ось нормали, БЕЗ знака): площадь %.5f / %.5f / %.5f м²; "
-               "многоугольников %lld / %lld / %lld\n",
-               tag, A.ax[0] * h2, A.ax[1] * h2, A.ax[2] * h2, (long long)A.px[0],
-               (long long)A.px[1], (long long)A.px[2]);
-        printf("   ОБХОД [%s]: многоугольников %lld, треугольников %lld, вырожденных %lld, "
-               "неплоскостность макс %.3e ячейки, ПРОПУЩЕНО полигонов %lld (код %d)\n",
-               tag, (long long)A.npoly, (long long)A.ntri, (long long)A.ndeg, A.flatmax,
-               (long long)nskip, wrca);
-        /* ГИСТОГРАММА ПО ПЛОСКОСТЯМ (П2). Печатаются корзины, несущие не менее
-         * сотой доли площади своей оси: иначе список утонет в хвосте из
-         * единичных многоугольников на стыках стен. Отсечённая доля печатается,
-         * чтобы «показано не всё» не читалось как «больше ничего нет». */
-        for (int ax = 0; ax < 3; ax++) {
-          if (!(A.ax[ax] > 0.0)) continue;
-          printf("   ПЛОСКОСТИ [%s] ось %d (площадь оси %.5f м²):", tag, ax, A.ax[ax] * h2);
-          double shown = 0.0;
-          int nsh = 0;
-          for (int32_t b = 0; b < nbin; b++) {
-            double a = A.pl_area[(size_t)ax * (size_t)nbin + (size_t)b];
-            if (!(a > 0.01 * A.ax[ax])) continue;
-            printf(" | %.4f м: %.5f м² (%lld мн-ков)",
-                   fr.org[ax] + (double)b / (double)HZ_PLBIN * fr.h, a * h2,
-                   (long long)A.pl_cnt[(size_t)ax * (size_t)nbin + (size_t)b]);
-            shown += a;
-            nsh++;
-          }
-          printf(" || показано %d корзин, %.1f %% площади оси\n", nsh, 100.0 * shown / A.ax[ax]);
-          printf("   СЛОИ ЯЧЕЕК [%s] ось %d:", tag, ax);
-          int nsh2 = 0;
-          double shown2 = 0.0;
-          for (int32_t c = 0; c < A.ncell; c++) {
-            double a = A.cl_area[(size_t)ax * (size_t)A.ncell + (size_t)c];
-            if (!(a > 0.01 * A.ax[ax])) continue;
-            printf(" | слой %d: %.5f м² (%lld мн-ков)", c, a * h2,
-                   (long long)A.cl_cnt[(size_t)ax * (size_t)A.ncell + (size_t)c]);
-            shown2 += a;
-            nsh2++;
-          }
-          printf(" || показано %d слоёв, %.1f %% площади оси\n", nsh2, 100.0 * shown2 / A.ax[ax]);
-        }
-        if (pass == 0) {
-          /* ЭТАЛОННЫЙ ОБХОД ТОЛЬКО НА ПОЛНОЙ ГЛУБИНЕ: на срезе отображение
-           * «ребро -> полигон» у него отсутствует по построению (Г42). */
-          areacnt R;
-          memset(&R, 0, sizeof R);
-          int wrcr = hz_dc_walk_ref(&T, &ht, NULL, NULL, area_emit, &R);
-          printf("   ЭТАЛОННЫЙ ОБХОД (Г42, независимая реализация, код %d): %.5f м², "
-                 "многоугольников %lld; РАСХОЖДЕНИЕ с рабочим %.3e отн.\n",
-                 wrcr, R.fan0 * h2, (long long)R.npoly,
-                 fabs(R.fan0 - A.fan0) / (A.fan0 > 0.0 ? A.fan0 : 1.0));
-        }
-        free(A.pl_area);
-        free(A.pl_cnt);
-        free(A.cl_area);
-        free(A.cl_cnt);
-      }
-    }
-
-    if (oven > 0.0) {
-      double rho = oven, Le = 1.0;
-      float *B = malloc(3 * (size_t)S.n * sizeof *B);
-      float *Bn = malloc(3 * (size_t)S.n * sizeof *Bn);
-      if (B == NULL || Bn == NULL) exit(1);
-      for (int32_t i = 0; i < 3 * S.n; i++)
-        B[i] = (float)Le;
-      double exact = Le / (1.0 - rho);
-      /* ДВЕНАДЦАТИ ОТСКОКОВ МАЛО ПРИ ВЫСОКОМ АЛЬБЕДО, И ЭТО АРИФМЕТИКА, А НЕ
-       * догадка: невязка итерации есть `ρ^n`, то есть при `ρ = 0.7` и `n = 12`
-       * она `1.4 %` — сравнима с тем систематическим смещением, которое печь и
-       * должна измерять. Двадцать четыре дают `0.02 %` и разделяют их. */
-      const int OVEN_ITERS = 24;
-      for (int it = 1; it <= OVEN_ITERS; it++) {
-        for (int32_t i = 0; i < 3 * S.n; i++)
-          Bn[i] = (float)Le;
-        for (int32_t j = 0; j < S.n; j++) {
-          double pj[3], nj[3];
-          hz_slice_vertex(&S, j, pj);
-          for (int k = 0; k < 3; k++)
-            pj[k] = fr.org[k] + pj[k] * fr.h;
-          hz_slice_normal(&S, j, nj);
-          double cs = fr.h * (double)((int32_t)1 << (lev - (int)S.c[j].lvl));
-          double aj = cs * cs;
-          for (int32_t i = 0; i < S.n; i++) {
-            if (i == j) continue;
-            double pi[3], ni[3], w[3], r2 = 0.0;
-            hz_slice_vertex(&S, i, pi);
-            for (int k = 0; k < 3; k++)
-              pi[k] = fr.org[k] + pi[k] * fr.h;
-            hz_slice_normal(&S, i, ni);
-            for (int k = 0; k < 3; k++) {
-              w[k] = pj[k] - pi[k];
-              r2 += w[k] * w[k];
-            }
-            if (!(r2 > 0.0)) continue;
-            double r = sqrt(r2);
-            double ci = (w[0] * ni[0] + w[1] * ni[1] + w[2] * ni[2]) / r;
-            double cj = -(w[0] * nj[0] + w[1] * nj[1] + w[2] * nj[2]) / r;
-            if (!(ci > 0.0) || !(cj > 0.0)) continue;
-            double ff = ci * cj * aj / (3.14159265358979323846 * r2);
-            for (int k = 0; k < 3; k++)
-              Bn[3 * (size_t)i + (size_t)k] +=
-                  (float)(rho * (double)B[3 * (size_t)j + (size_t)k] * ff);
-          }
-        }
-        /* ДИАГНОЗ §435, ПУНКТ (а) и (б): сколько пар прошло оба `cos > 0` и
-         * чему равна сумма угловых коэффициентов ОДНОЙ площадки. В замкнутой
-         * полости вторая обязана быть `1`; отклонение и есть мера того,
-         * насколько гатер теряет энергию. */
-        if (it == 1) {
-          /* СУММА ПО ВСЕМ ПЛОЩАДКАМ, А НЕ ПО ОДНОЙ (А790). Площадка `0` —
-           * угловая, и она видит меньше типичной; одно число с неё мерой
-           * потери гатера не является. Здесь считается РАСПРЕДЕЛЕНИЕ. */
-          {
-            double *fs = malloc((size_t)S.n * sizeof *fs);
-            if (fs == NULL) exit(1);
-            for (int32_t jj = 0; jj < S.n; jj++) {
-              double pa[3], na[3];
-              hz_slice_vertex(&S, jj, pa);
-              for (int k = 0; k < 3; k++)
-                pa[k] = fr.org[k] + pa[k] * fr.h;
-              hz_slice_normal(&S, jj, na);
-              double acc2 = 0.0;
-              for (int32_t ii = 0; ii < S.n; ii++) {
-                if (ii == jj) continue;
-                double pb[3], nb[3], ww[3], rr2 = 0.0;
-                hz_slice_vertex(&S, ii, pb);
-                for (int k = 0; k < 3; k++)
-                  pb[k] = fr.org[k] + pb[k] * fr.h;
-                hz_slice_normal(&S, ii, nb);
-                for (int k = 0; k < 3; k++) {
-                  ww[k] = pb[k] - pa[k];
-                  rr2 += ww[k] * ww[k];
-                }
-                if (!(rr2 > 0.0)) continue;
-                double rr = sqrt(rr2);
-                double caa = (ww[0] * na[0] + ww[1] * na[1] + ww[2] * na[2]) / rr;
-                double cbb = -(ww[0] * nb[0] + ww[1] * nb[1] + ww[2] * nb[2]) / rr;
-                if (!(caa > 0.0) || !(cbb > 0.0)) continue;
-                double csb = fr.h * (double)((int32_t)1 << (lev - (int)S.c[ii].lvl));
-                acc2 += caa * cbb * csb * csb / (3.14159265358979323846 * rr2);
+        char path[256];
+        /* Ш18 (§494): СГЛАЖИВАНИЕ. Растр идёт в `res`, а на диск пишется вдвое
+         * меньше со свёрткой коробкой 2×2 — четыре пробы на пиксель. Это НЕ
+         * полноценное сглаживание: края ГЕОМЕТРИИ остаются ступенчатыми на уровне
+         * ячейки, сглаживается только край многоугольника. Так и называется. */
+        int outres = ss2 ? res / 2 : res;
+        unsigned char *outrgb = rgb;
+        if (ss2) {
+          outrgb = malloc((size_t)outres * (size_t)outres * 3);
+          if (outrgb == NULL) exit(1);
+          for (int y = 0; y < outres; y++)
+            for (int x = 0; x < outres; x++)
+              for (int c = 0; c < 3; c++) {
+                unsigned s4 = 0;
+                for (int dy = 0; dy < 2; dy++)
+                  for (int dx = 0; dx < 2; dx++)
+                    s4 += rgb[3 * ((size_t)(2 * y + dy) * (size_t)res + (size_t)(2 * x + dx)) +
+                              (size_t)c];
+                outrgb[3 * ((size_t)y * (size_t)outres + (size_t)x) + (size_t)c] =
+                    (unsigned char)((s4 + 2u) / 4u);
               }
-              fs[jj] = acc2;
-            }
-            qsort(fs, (size_t)S.n, sizeof *fs, cmp_d);
-            double mean = 0.0;
-            for (int32_t jj = 0; jj < S.n; jj++)
-              mean += fs[jj];
-            mean /= (double)(S.n ? S.n : 1);
-            printf("   СУММА УГЛОВЫХ КОЭФФИЦИЕНТОВ ПО ВСЕМ %d ПЛОЩАДКАМ: среднее %.4f, p10 %.4f, "
-                   "p50 %.4f, p90 %.4f (обязана быть 1)\n",
-                   S.n, mean, fs[S.n / 10], fs[S.n / 2], fs[(S.n * 9) / 10]);
-            free(fs);
-          }
-          int64_t npair = 0;
-          double ffsum = 0.0;
-          int32_t j0 = 0;
-          double pj0[3], nj0[3];
-          hz_slice_vertex(&S, j0, pj0);
-          for (int k = 0; k < 3; k++)
-            pj0[k] = fr.org[k] + pj0[k] * fr.h;
-          hz_slice_normal(&S, j0, nj0);
-          for (int32_t i = 0; i < S.n; i++) {
-            if (i == j0) continue;
-            double pi[3], ni[3], w[3], r2 = 0.0;
-            hz_slice_vertex(&S, i, pi);
-            for (int k = 0; k < 3; k++)
-              pi[k] = fr.org[k] + pi[k] * fr.h;
-            hz_slice_normal(&S, i, ni);
-            for (int k = 0; k < 3; k++) {
-              w[k] = pi[k] - pj0[k];
-              r2 += w[k] * w[k];
-            }
-            if (!(r2 > 0.0)) continue;
-            double r = sqrt(r2);
-            double cj = (w[0] * nj0[0] + w[1] * nj0[1] + w[2] * nj0[2]) / r;
-            double ci = -(w[0] * ni[0] + w[1] * ni[1] + w[2] * ni[2]) / r;
-            if (!(ci > 0.0) || !(cj > 0.0)) continue;
-            double cs2 = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
-            npair++;
-            ffsum += ci * cj * cs2 * cs2 / (3.14159265358979323846 * r2);
-          }
-          {
-            double atot = 0.0;
-            for (int32_t i = 0; i < S.n; i++) {
-              double cs3 = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
-              atot += cs3 * cs3;
-            }
-            {
-              /* СКОЛЬКО ЯЧЕЕК НА ГРАНЬ. У единичной коробки при lev=5 стена
-               * занимает 30x30 = 900 клеток; если ячеек среза меньше, значит
-               * вершина выдана не в каждой клетке стены — это и есть недосчёт
-               * площади. Группировка по ГЛАВНОЙ оси нормали: шесть граней. */
-              int64_t hg[6] = {0, 0, 0, 0, 0, 0};
-              for (int32_t i = 0; i < S.n; i++) {
-                double nn2[3];
-                hz_slice_normal(&S, i, nn2);
-                int ax = 0;
-                for (int k = 1; k < 3; k++)
-                  if (fabs(nn2[k]) > fabs(nn2[ax])) ax = k;
-                hg[2 * ax + (nn2[ax] > 0.0 ? 1 : 0)]++;
-              }
-              printf("   ЯЧЕЕК НА ГРАНЬ (по главной оси нормали): %lld %lld %lld %lld %lld %lld "
-                     "против 900 клеток стены\n",
-                     (long long)hg[0], (long long)hg[1], (long long)hg[2], (long long)hg[3],
-                     (long long)hg[4], (long long)hg[5]);
-            }
-            printf("   ПЛОЩАДЬ СРЕЗА: %.5f м² против истинной 6.00000 м² у единичной коробки "
-                   "(отношение %.4f)\n",
-                   atot, atot / 6.0);
-          }
-          printf("   ДИАГНОЗ ПЕЧИ: у площадки 0 видимых партнёров %lld из %d; СУММА УГЛОВЫХ "
-                 "КОЭФФИЦИЕНТОВ %.5f (в замкнутой полости обязана быть 1)\n",
-                 (long long)npair, S.n - 1, ffsum);
         }
-        double sum = 0.0;
-        for (int32_t i = 0; i < S.n; i++)
-          sum += (double)Bn[3 * (size_t)i];
-
-        double mean = sum / (double)(S.n ? S.n : 1);
-        printf("   ПЕЧЬ ρ=%.2f, отскок %2d: средняя B = %.5f против замкнутой формы %.5f "
-               "(отклонение %.2f %%)\n",
-               rho, it, mean, exact, 100.0 * (mean - exact) / exact);
-        for (int32_t i = 0; i < 3 * S.n; i++)
-          B[i] = Bn[i];
+        snprintf(path, sizeof path, "img/pfield_lit_L%d_%d.ppm", lev, outres);
+        /* В ХОДЬБЕ КАДР НЕ ПИШЕТСЯ НА ДИСК: `786` КБ на кадр — это и лишняя
+         * работа, и мусор в `img/`. Снимок делает отдельный запуск без `walk`. */
+        int prc = g_walk ? 0 : hz_ppm_write_rgb(path, outrgb, outres, outres);
+        if (g_walk) {
+          double tf = t_slice + t_dir + t_rast;
+          /* ПОЛОЖЕНИЕ ПЕЧАТАЕТСЯ, А НЕ ПОДРАЗУМЕВАЕТСЯ: без него «управление не
+           * работает» и «работает, но смотрю в стену» неотличимы, а проверять
+           * придётся первым делом. */
+          printf("   кадр %6.1f мс (%.2f к/с): срез %.1f + свет %.1f + растр %.1f; ячеек %d, "
+                 "многоугольников %lld; глаз (%.2f %.2f %.2f) взгляд (%.2f %.2f %.2f)\n",
+                 tf * 1e3, 1.0 / (tf > 0.0 ? tf : 1.0), t_slice * 1e3, t_dir * 1e3, t_rast * 1e3,
+                 S.n, (long long)LC.nseen, eyec[0], eyec[1], eyec[2], atc[0] - eyec[0],
+                 atc[1] - eyec[1], atc[2] - eyec[2]);
+          fflush(stdout);
+          walk_alive = walk_present(outrgb, outres, eyec, atc, upc, t_prev);
+          t_prev = tf;
+        }
+        if (ss2) free(outrgb);
+        if (!g_walk) {
+          printf("   ОТСЕЧЕНИЕ: пришло %lld многоугольников, отброшено %lld (%.1f %%)\n",
+                 (long long)LC.nseen, (long long)LC.ncull,
+                 100.0 * (double)LC.ncull / (double)(LC.nseen ? LC.nseen : 1));
+          printf("   КАДР СО СВЕТОМ %d²: срез %.1f мс (ячеек %d), ПРЯМОЙ СВЕТ %.1f мс (%.0f нс на "
+                 "ячейку), растеризация %.1f мс (код %d), ВСЕГО %.1f мс -> %s (код %d)\n",
+                 res, t_slice * 1e3, S.n, t_dir * 1e3, t_dir * 1e9 / (double)(S.n ? S.n : 1),
+                 t_rast * 1e3, wrc, (t_slice + t_dir + t_rast) * 1e3, path, prc);
+        }
+        g_t_fslice = t_slice;
+        g_t_fdir = t_dir;
+        g_t_fras = t_rast;
+        g_t_frame = t_slice + t_dir + t_rast;
+        free(zb);
+        free(rgb);
+        free(LC.defcol);
       }
-      free(B);
-      free(Bn);
+      free(key);
+      free(ord);
+      free(irr2);
+      free(irr);
+      free(uvs);
+      hz_slice_free(&S);
+      /* ХВОСТ ЦИКЛА. Всё кадровое освобождено ВЫШЕ — иначе тысяча кадров съела бы
+       * память срезом по `460` тыс. ячеек на каждый. `uvs` добавлен сюда же: в
+       * однократном прогоне он не освобождался вовсе, и это была утечка, безвредная
+       * ровно потому, что программа тут же кончалась (§589, А1029). */
+      if (!g_walk || !walk_alive) break;
     }
-
-    /* ---- ДВЕ ПЛАСТИНЫ: `E_ind = ρ·E_dir·F` (Ш5б, §430 П5б.2; §450 П6) ---- */
-    /* ПЕЧЬ ЛОВИТ СОХРАНЕНИЕ ЭНЕРГИИ, ЭТОТ СТЕНД — ЕЁ РАСПРЕДЕЛЕНИЕ. В замкнутой
-     * полости сумма угловых коэффициентов равна единице при ЛЮБОМ разумном ядре,
-     * лишь бы оно было симметрично и нормировано; отдельные коэффициенты она не
-     * проверяет. Два соосных квадрата проверяют именно их: `F` известен в
-     * замкнутой форме (каталог Хауэлла C-11), и косинусы с `1/r²` входят в него
-     * порознь.
-     * ЧЕГО ЭТОТ СТЕНД НЕ ПРОВЕРЯЕТ, И ЭТО СКАЗАНО ЗДЕСЬ, А НЕ В ДОКЛАДЕ: ЗАСЛОНЫ.
-     * Гатер незаслонённый (приближение (1) §432), значит требование А756 —
-     * «печь не ловит тени» — этим стендом ТОЖЕ не закрывается. Обе половины
-     * приёмки §430 меряют неэкранированный перенос, и тени остаются
-     * неизмеренными вовсе. */
-    if (plates > 0.0) {
-      double rho = plates;
-      /* Габарит пластин и зазор берутся ИЗ СЦЕНЫ, а не вписываются: стенд обязан
-       * оставаться верным, если пластины подвинут. */
-      double side_a = hi[0] - lo[0], gap = hi[1] - lo[1], mid = 0.5 * (lo[1] + hi[1]);
-      double X = side_a / gap;
-      double X2 = X * X, s = sqrt(1.0 + X2);
-      double F = (2.0 / (3.14159265358979323846 * X2)) *
-                 (0.5 * log((1.0 + X2) * (1.0 + X2) / (1.0 + 2.0 * X2)) +
-                  2.0 * X * s * atan(X / s) - 2.0 * X * atan(X));
-      double acc = 0.0;
-      int64_t nup = 0, nlo = 0;
-      for (int32_t i = 0; i < S.n; i++) {
-        double pi[3], ni[3];
-        hz_slice_vertex(&S, i, pi);
-        for (int k = 0; k < 3; k++)
-          pi[k] = fr.org[k] + pi[k] * fr.h;
-        if (pi[1] < mid) {
-          nlo++;
-          continue;
-        }
-        nup++;
-        hz_slice_normal(&S, i, ni);
-        double sum = 0.0;
-        for (int32_t j = 0; j < S.n; j++) {
-          double pj[3], nj[3], w[3], r2 = 0.0;
-          hz_slice_vertex(&S, j, pj);
-          for (int k = 0; k < 3; k++)
-            pj[k] = fr.org[k] + pj[k] * fr.h;
-          if (pj[1] >= mid) continue; /* излучает только НИЖНЯЯ пластина */
-          hz_slice_normal(&S, j, nj);
-          for (int k = 0; k < 3; k++) {
-            w[k] = pj[k] - pi[k];
-            r2 += w[k] * w[k];
-          }
-          if (!(r2 > 0.0)) continue;
-          double r = sqrt(r2);
-          double ci = (w[0] * ni[0] + w[1] * ni[1] + w[2] * ni[2]) / r;
-          double cj = -(w[0] * nj[0] + w[1] * nj[1] + w[2] * nj[2]) / r;
-          if (!(ci > 0.0) || !(cj > 0.0)) continue;
-          double cs = fr.h * (double)((int32_t)1 << (lev - (int)S.c[j].lvl));
-          sum += ci * cj * cs * cs / (3.14159265358979323846 * r2);
-        }
-        acc += sum;
-      }
-      double mean = acc / (double)(nup ? nup : 1);
-      printf("   ПЛАСТИНЫ: сторона %.4f м, зазор %.4f м, X = %.3f; ЯЧЕЕК верх %lld, низ %lld\n",
-             side_a, gap, X, (long long)nup, (long long)nlo);
-      printf("   `E_ind = ρ·E_dir·F` при ρ=%.2f: замерено %.5f, замкнутая форма %.5f "
-             "(F = %.5f), ОТКЛОНЕНИЕ %.2f %%\n",
-             rho, rho * mean, rho * F, F, 100.0 * (mean - F) / F);
-    }
-
-    /* ---- ОДИН ОТСКОК (Ш5б, §430) ---- */
-    /* ПРИБЛИЖЕНИЯ НАЗЫВАЮТСЯ ЗДЕСЬ, А НЕ В ДОКЛАДЕ ЗАДНИМ ЧИСЛОМ.
-     *   (1) ВИДИМОСТИ МЕЖДУ ЯЧЕЙКАМИ НЕТ: перенос идёт по незаслонённому
-     *       угловому коэффициенту. Значит свет проходит сквозь стены, и на
-     *       сцене с комнатами это ВИДНО. Взято сознательно: с видимостью цена
-     *       умножается на марш (~4.8 шага), а замер физики от заслонов не
-     *       зависит — `E_ind = ρ·E_dir` проверяется на ПЛОСКОЙ стене, где
-     *       заслонов нет вовсе.
-     *   (2) ИЗЛУЧАТЕЛИ ПРОРЕЖЕНЫ шагом `stride`: берётся каждый `stride`-й, а
-     *       вклад умножается на `stride`. Это несмещённая оценка суммы, но с
-     *       разбросом; разброс НЕ ИЗМЕРЕН и в приёмку не входит.
-     *   (3) ПЛОЩАДЬ ЯЧЕЙКИ взята как площадь её грани `(h·2^(lev-lvl))²` —
-     *       поверхность внутри ячейки наклонена и её площадь больше; это
-     *       систематическая недооценка, названная и не исправленная.
-     * ЦЕНА ОЖИДАЕТСЯ ПЛОХОЙ И ПРЕДСКАЗАНА ДО ПРОГОНА (§430, П5б.3): это замер,
-     * обосновывающий свип, а не попытка уложиться в бюджет. */
-    float *ind = calloc(3 * (size_t)S.n, sizeof *ind);
-    float *indsw = NULL;
-    if (ind == NULL) exit(1);
-    /* ---- Ф9' (§536): САМАЯ УЗКАЯ ДОЛЯ, КОТОРУЮ НЕСЁТ ДАННОЕ ND ---- */
-    /* ЗАМЕР БЕЗ ПЕРЕНОСА, И ЭТО СОЗНАТЕЛЬНО. Граница «до какой узости ординаты
-     * несут отражение» есть свойство НАБОРА ОРДИНАТ и геометрии, а не света:
-     * ни источника, ни камеры в ней нет. Значит мерить её надо отдельно от
-     * транспорта, иначе три разные ошибки сложатся в одно число (А934).
-     *
-     * ДВЕ ПОЛОВИНЫ ГРАНИЦЫ МЕРЯЮТСЯ ПОРОЗНЬ (А947), потому что К56 говорит
-     * ровно о том, что они РАЗНЫЕ:
-     *   A — квадратурное альбедо доли `Σ_e w_e f_r cos θ_e`. Это ЭНЕРГИЯ.
-     *       Сравнивается не с `ρ_s` (нормировка Фонга точна лишь при нормальном
-     *       падении и спутала бы свою погрешность с квадратурной), а с ТЕМ ЖЕ
-     *       интегралом на заведомо избыточном наборе.
-     *   УГОЛ ПИКА — на какую ординату легла вершина доли против истинного
-     *       зеркального направления. Это ОБРАЗ, и просил пользователь именно
-     *       его. `A` к нему слепа: интеграл сходится и тогда, когда пик уехал.
-     *
-     * НОРМАЛИ БЕРУТСЯ ИЗ СЦЕНЫ, А НЕ ПРИДУМЫВАЮТСЯ: выборка по срезу с шагом,
-     * число печатается. */
-    if (g_lobetest) {
-      static const double SS[] = {0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0, 30.0, 50.0, 200.0};
-      static const int NMU[] = {1, 2, 2, 4}, NPHI[] = {1, 2, 4, 4};
-      tr3_dirs RF;
-      /* ЭТАЛОННЫЙ НАБОР — тот же механизм, вчетверо гуще самого густого из
-       * испытуемых по каждой оси. Своей аналитики здесь нет намеренно: она
-       * внесла бы вторую формулу, и замер мерил бы разницу формул. */
-      if (tr3_dirs_product(&RF, 16, 16) != 0) exit(1);
-      int32_t nstep = S.n / 256 > 0 ? S.n / 256 : 1;
-      int64_t nsmp = 0;
-      for (int32_t i = 0; i < S.n; i += nstep)
-        nsmp++;
-      printf("   Ф9' ГРАНИЦА УЗОСТИ: нормалей из среза %lld (шаг %d из %d), эталон ND %d\n",
-             (long long)nsmp, nstep, S.n, RF.n);
-      printf("        ND  полуугол |  s  | ОТКЛОНЕНИЕ A, %% (p50/p90/max) | УГОЛ ПИКА, град "
-             "(p50/p90/max)\n");
-      for (int ci = 0; ci < 4; ci++) {
-        tr3_dirs DT;
-        if (tr3_dirs_product(&DT, NMU[ci], NPHI[ci]) != 0) exit(1);
-        double thnd = acos(1.0 - 2.0 / (double)DT.n) * 180.0 / 3.14159265358979323846;
-        for (size_t si = 0; si < sizeof SS / sizeof SS[0]; si++) {
-          double ns2 = SS[si];
-          double *ea = malloc((size_t)(nsmp * DT.n) * sizeof *ea);
-          double *pa = malloc((size_t)(nsmp * DT.n) * sizeof *pa);
-          if (ea == NULL || pa == NULL) exit(1);
-          int64_t ne = 0;
-          for (int32_t i = 0; i < S.n; i += nstep) {
-            double nn3[3];
-            hz_slice_normal(&S, i, nn3);
-            for (int d = 0; d < DT.n; d++) {
-              double od[3] = {DT.ox[d], DT.oy[d], DT.oz[d]};
-              double dn2 = od[0] * nn3[0] + od[1] * nn3[1] + od[2] * nn3[2];
-              if (!(dn2 < 0.0)) continue; /* не падает на эту сторону */
-              /* Испытуемый набор: альбедо доли и ординату пика. */
-              double at = 0.0, pk = -1.0;
-              int be = -1;
-              for (int e = 0; e < DT.n; e++) {
-                double oe[3] = {DT.ox[e], DT.oy[e], DT.oz[e]};
-                double en2 = oe[0] * nn3[0] + oe[1] * nn3[1] + oe[2] * nn3[2];
-                if (!(en2 > 0.0)) continue;
-                double ca = oe[0] * od[0] + oe[1] * od[1] + oe[2] * od[2] - 2.0 * dn2 * en2;
-                double fv = lobe(ca, ns2) * DT.w[e] * en2;
-                at += fv;
-                if (fv > pk) {
-                  pk = fv;
-                  be = e;
-                }
-              }
-              /* Эталон: тот же интеграл на избыточном наборе. */
-              double ar = 0.0;
-              for (int e = 0; e < RF.n; e++) {
-                double oe[3] = {RF.ox[e], RF.oy[e], RF.oz[e]};
-                double en2 = oe[0] * nn3[0] + oe[1] * nn3[1] + oe[2] * nn3[2];
-                if (!(en2 > 0.0)) continue;
-                double ca = oe[0] * od[0] + oe[1] * od[1] + oe[2] * od[2] - 2.0 * dn2 * en2;
-                ar += lobe(ca, ns2) * RF.w[e] * en2;
-              }
-              if (!(ar > 0.0)) continue;
-              ea[ne] = 100.0 * fabs(at - ar) / ar;
-              /* Угол между ординатой пика и ИСТИННЫМ зеркальным направлением. */
-              double mr[3] = {od[0] - 2.0 * dn2 * nn3[0], od[1] - 2.0 * dn2 * nn3[1],
-                              od[2] - 2.0 * dn2 * nn3[2]};
-              if (be >= 0) {
-                double cm = DT.ox[be] * mr[0] + DT.oy[be] * mr[1] + DT.oz[be] * mr[2];
-                if (cm > 1.0) cm = 1.0;
-                if (cm < -1.0) cm = -1.0;
-                pa[ne] = acos(cm) * 180.0 / 3.14159265358979323846;
-              } else
-                pa[ne] = 180.0;
-              ne++;
-            }
-          }
-          if (ne > 0) {
-            qsort(ea, (size_t)ne, sizeof *ea, cmp_d);
-            qsort(pa, (size_t)ne, sizeof *pa, cmp_d);
-            printf("       %4d  %6.1f°  |%5.0f| %8.2f %8.2f %8.2f      | %8.2f %8.2f %8.2f\n", DT.n,
-                   thnd, ns2, ea[ne / 2], ea[(ne * 9) / 10], ea[ne - 1], pa[ne / 2],
-                   pa[(ne * 9) / 10], pa[ne - 1]);
-          }
-          free(ea);
-          free(pa);
-        }
-        tr3_dirs_free(&DT);
-      }
-      tr3_dirs_free(&RF);
-    }
-
-    /* ---- Ф8' (§532): ОТСКОК НАПРАВЛЕННЫМ СВИПОМ ПО ДЕРЕВУ ---- */
-    if (g_dsweep) {
-      tr3_dirs DR;
-      if (tr3_dirs_product(&DR, g_dnmu, g_dnphi) != 0) exit(1);
-      stree TD;
-      double tb3 = now_s();
-      double eyes2[3];
-      for (int a = 0; a < 3; a++)
-        eyes2[a] = LL.eye[a] / (double)((int32_t)1 << HZ_SWEEP_DROP);
-      int32_t gn2 = (int32_t)1 << (fr.lev - HZ_SWEEP_DROP);
-      stree_build(&TD, &P, fr.lev, HZ_SWEEP_DROP, gn2, eyes2, g_sweeppx, g_sweepthr);
-      stree_links(&TD, gn2);
-      dfield D;
-      memset(&D, 0, sizeof D);
-      D.nsl = S.n;
-      D.blkopen = g_dblkopen;
-      D.fone = g_ffull;
-      D.fzero = g_fzero;
-      D.fnotrans = g_fnotrans;
-      D.fnoclamp = g_fnoclamp;
-      double emact = 0.0, emcut = 0.0;
-      D.emitact = &emact;
-      D.emitcut = &emcut;
-      D.frawv = malloc((size_t)HZ_FSTAT_CAP * sizeof *D.frawv);
-      if (D.frawv == NULL) exit(1);
-      D.schar = g_schar;
-      D.scharax = g_scharax;
-      D.onenb = g_onenb;
-      D.cw = fr.h * (double)((int32_t)1 << HZ_SWEEP_DROP);
-      D.Ap = calloc((size_t)TD.n, sizeof *D.Ap);
-      D.fstat = malloc((size_t)HZ_FSTAT_CAP * sizeof *D.fstat);
-      if (D.Ap == NULL || D.fstat == NULL) exit(1);
-      D.Ld = calloc(3 * (size_t)TD.n, sizeof *D.Ld);
-      D.Bs = calloc(3 * (size_t)TD.n, sizeof *D.Bs);
-      D.Bn = calloc(3 * (size_t)TD.n, sizeof *D.Bn);
-      D.Bsp = calloc(3 * (size_t)TD.n, sizeof *D.Bsp);
-      D.Bwi = calloc(3 * (size_t)TD.n, sizeof *D.Bwi);
-      D.Bns = calloc((size_t)TD.n, sizeof *D.Bns);
-      D.srf = calloc((size_t)TD.n, 1);
-      D.vis = calloc((size_t)TD.n, 1);
-      D.cstart = calloc((size_t)TD.n + 1, sizeof *D.cstart);
-      D.clist = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *D.clist);
-      D.Eind = calloc(3 * (size_t)S.n, sizeof *D.Eind);
-      double *snx = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *snx);
-      double *sny = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *sny);
-      double *snz = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *snz);
-      double *sar = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *sar);
-      int32_t *slf = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *slf);
-      double *wchk = calloc((size_t)(S.n > 0 ? S.n : 1), sizeof *wchk);
-      if (D.Ld == NULL || D.Bs == NULL || D.Bn == NULL || D.Bsp == NULL || D.Bwi == NULL ||
-          D.Bns == NULL || D.srf == NULL || D.vis == NULL || D.cstart == NULL || D.clist == NULL ||
-          D.Eind == NULL || snx == NULL || sny == NULL || snz == NULL || sar == NULL ||
-          slf == NULL || wchk == NULL)
-        exit(1);
-      D.snx = snx;
-      D.sny = sny;
-      D.snz = snz;
-      /* ОТОБРАЖЕНИЕ «ЯЧЕЙКА СРЕЗА -> ЛИСТ» тем же правилом, что у `sweep_vis`:
-       * иначе перенос и сбор читали бы разные ячейки. */
-      double cwid = fr.h * (double)((int32_t)1 << HZ_SWEEP_DROP);
-      int64_t nmap = 0;
-      for (int32_t i = 0; i < S.n; i++) {
-        double p2[3], n2[3];
-        hz_slice_vertex(&S, i, p2);
-        for (int k = 0; k < 3; k++)
-          p2[k] = fr.org[k] + p2[k] * fr.h;
-        hz_slice_normal(&S, i, n2);
-        snx[i] = n2[0];
-        sny[i] = n2[1];
-        snz[i] = n2[2];
-        double cs4 = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
-        sar[i] = cs4 * cs4;
-        int32_t cc2[3];
-        int ok3 = 1;
-        for (int k = 0; k < 3; k++) {
-          double f3 = floor((p2[k] - fr.org[k]) / cwid);
-          if (!(f3 >= 0.0) || !(f3 < (double)gn2)) ok3 = 0;
-          cc2[k] = ok3 ? (int32_t)f3 : 0;
-        }
-        slf[i] = ok3 ? TD.idx[hz_occ_index(gn2, cc2[0], cc2[1], cc2[2])] : -1;
-        if (slf[i] >= 0) {
-          nmap++;
-          D.cstart[slf[i] + 1]++;
-        }
-      }
-      for (int32_t i = 0; i < TD.n; i++)
-        D.cstart[i + 1] += D.cstart[i];
-      {
-        int32_t *cur = malloc((size_t)TD.n * sizeof *cur);
-        if (cur == NULL) exit(1);
-        memcpy(cur, D.cstart, (size_t)TD.n * sizeof *cur);
-        for (int32_t i = 0; i < S.n; i++)
-          if (slf[i] >= 0) D.clist[cur[slf[i]]++] = i;
-        free(cur);
-      }
-      /* РАДИОСИТИ ЛИСТА — СРЕДНЕЕ ПО ПЛОЩАДИ, А НЕ СУММА (А936): радианс есть
-       * величина УДЕЛЬНАЯ, и две ячейки среза в одном листе не светят вдвое
-       * ярче. Делится на `π`, потому что диффузная поверхность с радиосити `B`
-       * имеет радианс `B/π`. */
-      {
-        double *aw2 = calloc((size_t)TD.n, sizeof *aw2);
-        if (aw2 == NULL) exit(1);
-        for (int32_t i = 0; i < S.n; i++) {
-          int32_t l2 = slf[i];
-          if (l2 < 0) continue;
-          aw2[l2] += sar[i];
-          /* УЗОСТЬ И ЗЕРКАЛЬНАЯ ДОЛЯ ИЗ МАТЕРИАЛА (Ф9', §536). `Ns` и `Ks` уже
-           * разбираются `scene_obj.c` и до сих пор не читались никем; ключи
-           * `dns=`/`dks=` перебивают их глобально — для СВИПА по узости без
-           * правки сцены.
-           * `Ns = 0` ЧИТАЕТСЯ КАК «ДОЛИ НЕТ», а не как `s = 0` (А949): в `.mtl`
-           * ноль пишут и диффузным, и по умолчанию, и принять молчание формата
-           * за значение — та же ошибка, что А917.
-           * `E_dir` ВОССТАНАВЛИВАЕТСЯ ДЕЛЕНИЕМ на диффузное альбедо, потому что
-           * `irr` хранит уже `rho_d·E`. При `rho_d = 0` восстановить нечего, и
-           * узкая часть там просто не заводится — оговорка, а не молчание. */
-          double nsi = g_dns > 0.0
-                           ? g_dns
-                           : (m.mtl != NULL && S.c[i].mat < m.nmtl ? m.mtl[S.c[i].mat].ns : 0.0);
-          double wi2[3] = {0.0, 0.0, 0.0}, wl = 0.0;
-          for (int k = 0; k < 3; k++) {
-            double pw2[3];
-            hz_slice_vertex(&S, i, pw2);
-            wi2[k] = (fr.org[k] + pw2[k] * fr.h) - AL.c[k];
-            wl += wi2[k] * wi2[k];
-          }
-          wl = sqrt(wl);
-          for (int k = 0; k < 3; k++) {
-            D.Bs[3 * (size_t)l2 + (size_t)k] +=
-                (float)(sar[i] * (double)irr[3 * (size_t)i + (size_t)k]);
-            D.Bn[3 * (size_t)l2 + (size_t)k] +=
-                (float)(sar[i] * (k == 0 ? snx[i] : (k == 1 ? sny[i] : snz[i])));
-            if (nsi > 0.0 && wl > 0.0) {
-              double rd = alb(&m, S.c[i].mat, k);
-              double rs =
-                  g_dks >= 0.0
-                      ? g_dks
-                      : (m.mtl != NULL && S.c[i].mat < m.nmtl ? m.mtl[S.c[i].mat].ks3[k] : 0.0);
-              double ed = rd > 1e-6 ? (double)irr[3 * (size_t)i + (size_t)k] / rd : 0.0;
-              D.Bsp[3 * (size_t)l2 + (size_t)k] += (float)(sar[i] * rs * ed);
-              D.Bwi[3 * (size_t)l2 + (size_t)k] += (float)(sar[i] * wi2[k] / wl);
-            }
-          }
-          if (nsi > 0.0) D.Bns[l2] += (float)(sar[i] * nsi);
-        }
-        int64_t nsrf = 0, nblk = 0, nglos = 0, nfold = 0, nmulti = 0;
-        double *foldv = malloc((size_t)HZ_FSTAT_CAP * sizeof *foldv);
-        if (foldv == NULL) exit(1);
-        for (int32_t l2 = 0; l2 < TD.n; l2++) {
-          if (TD.nd[l2].child0 >= 0) continue;
-          if (aw2[l2] > 0.0) {
-            double nl = 0.0;
-            for (int k = 0; k < 3; k++) {
-              D.Bs[3 * (size_t)l2 + (size_t)k] = (float)((double)D.Bs[3 * (size_t)l2 + (size_t)k] /
-                                                         aw2[l2] / 3.14159265358979323846);
-              nl += (double)D.Bn[3 * (size_t)l2 + (size_t)k] *
-                    (double)D.Bn[3 * (size_t)l2 + (size_t)k];
-            }
-            nl = sqrt(nl);
-            if (nl > 0.0)
-              for (int k = 0; k < 3; k++)
-                D.Bn[3 * (size_t)l2 + (size_t)k] =
-                    (float)((double)D.Bn[3 * (size_t)l2 + (size_t)k] / nl);
-            /* Узкая часть: амплитуда — среднее по площади (А936, тот же довод,
-             * что у диффузной); направление прихода нормируется; показатель —
-             * среднее по площади. Делить на `π` здесь НЕ надо: нормировка
-             * `(s+2)/2π` сидит в самой доле. */
-            {
-              double wl2 = 0.0;
-              for (int k = 0; k < 3; k++) {
-                D.Bsp[3 * (size_t)l2 + (size_t)k] =
-                    (float)((double)D.Bsp[3 * (size_t)l2 + (size_t)k] / aw2[l2]);
-                wl2 += (double)D.Bwi[3 * (size_t)l2 + (size_t)k] *
-                       (double)D.Bwi[3 * (size_t)l2 + (size_t)k];
-              }
-              wl2 = sqrt(wl2);
-              if (wl2 > 0.0)
-                for (int k = 0; k < 3; k++)
-                  D.Bwi[3 * (size_t)l2 + (size_t)k] =
-                      (float)((double)D.Bwi[3 * (size_t)l2 + (size_t)k] / wl2);
-              D.Bns[l2] = (float)((double)D.Bns[l2] / aw2[l2]);
-              if (D.Bns[l2] > 0.0f) nglos++;
-            }
-            D.Ap[l2] = (float)aw2[l2];
-            /* А971: СКЛАДЧАТОСТЬ ЛИСТА `1 − |Σ A_i n_i| / Σ A_i`. У плоской
-             * площадки ноль, у угла — заметно больше нуля, и тогда усреднённая
-             * нормаль не значит направления поверхности (§518/§519). Печатается,
-             * чтобы оговорка была числом, а не словом. */
-            if (nfold < (int64_t)HZ_FSTAT_CAP) foldv[nfold++] = 1.0 - nl / aw2[l2];
-            D.srf[l2] = 1;
-            nsrf++;
-          } else {
-            /* А935: ЛЮБОЙ занятый лист заслоняет, даже если среза в нём нет —
-             * иначе там, где срез огрублён, свет пошёл бы сквозь стену. Такой
-             * лист есть ЧЁРНАЯ стена: гасит, но не светит. */
-            int32_t lof[3] = {TD.nd[l2].lo[0] << HZ_SWEEP_DROP, TD.nd[l2].lo[1] << HZ_SWEEP_DROP,
-                              TD.nd[l2].lo[2] << HZ_SWEEP_DROP};
-            if (u_occ(&P, lof, TD.nd[l2].size << HZ_SWEEP_DROP)) {
-              D.srf[l2] = 2;
-              nblk++;
-            }
-          }
-        }
-        /* А970: сколько листьев несут ДВЕ и более ячейки среза — там проекции
-         * площадок могут перекрываться, и `f` завышена. */
-        for (int32_t l2 = 0; l2 < TD.n; l2++)
-          if (D.srf[l2] == 1 && D.cstart[l2 + 1] - D.cstart[l2] >= 2) nmulti++;
-        if (nfold > 0) {
-          qsort(foldv, (size_t)nfold, sizeof *foldv, cmp_d);
-          printf("      А971 СКЛАДЧАТОСТЬ ЛИСТА (1 − |ΣAn|/ΣA): p50 %.4f, p90 %.4f, max %.4f по "
-                 "%lld листьям; А970 листьев с 2+ ячейками среза %lld (%.1f %%)\n",
-                 foldv[nfold / 2], foldv[(nfold * 9) / 10], foldv[nfold - 1], (long long)nfold,
-                 (long long)nmulti, 100.0 * (double)nmulti / (double)(nsrf ? nsrf : 1));
-        }
-        free(foldv);
-        free(aw2);
-        printf("   Ф8' ПОКРЫТИЕ: ячеек среза отображено %lld из %d; листьев-ИЗЛУЧАТЕЛЕЙ %lld, "
-               "листьев-ЗАСЛОНОВ без среза %lld, всего листьев %d; из излучателей ГЛЯНЦЕВЫХ %lld\n",
-               (long long)nmap, S.n, (long long)nsrf, (long long)nblk, TD.nleaf, (long long)nglos);
-      }
-      double t_build3 = now_s() - tb3;
-      /* ПРОХОДЫ ПО НАПРАВЛЕНИЯМ. Ld обнуляется на каждое направление: они
-       * независимы, и `vis` метит уже посчитанные — как `open < 0` у открытости. */
-      double si3 = 0.0, sd3 = 0.0;
-      double t_pass = 0.0;
-      for (int pass = 0; pass < g_dpass; pass++) {
-        for (int32_t i = 0; i < 3 * S.n; i++)
-          D.Eind[i] = 0.0;
-        for (int32_t i = 0; i < S.n; i++)
-          wchk[i] = 0.0;
-        double tp = now_s();
-        for (int d = 0; d < DR.n; d++) {
-          double om[3] = {DR.ox[d], DR.oy[d], DR.oz[d]};
-          memset(D.Ld, 0, 3 * (size_t)TD.n * sizeof *D.Ld);
-          memset(D.vis, 0, (size_t)TD.n);
-          dsweep_rec(&TD, &D, 0, om, DR.w[d], g_dirsall);
-          /* А937: ПРОВЕРКА НОРМИРОВКИ ЗАКОНОМ. `Σ_d w_d max(0, −ω·n)` обязана
-           * быть `π` — иначе ошибка множителя смешается с физикой и проживёт,
-           * как прожила ошибка §531. */
-          for (int32_t i = 0; i < S.n; i++) {
-            double cs = -(om[0] * snx[i] + om[1] * sny[i] + om[2] * snz[i]);
-            if (cs > 0.0) wchk[i] += DR.w[d] * cs;
-          }
-        }
-        t_pass = now_s() - tp;
-        si3 = sd3 = 0.0;
-        for (int32_t i = 0; i < S.n; i++)
-          for (int k = 0; k < 3; k++) {
-            double e3 = D.Eind[3 * (size_t)i + (size_t)k] * (alb0 ? 0.0 : alb(&m, S.c[i].mat, k));
-            if (pass + 1 == g_dpass) ind[3 * (size_t)i + (size_t)k] = (float)e3;
-            si3 += e3;
-            sd3 += (double)irr[3 * (size_t)i + (size_t)k];
-          }
-        double wmn = 1e300, wmx = -1e300, wav = 0.0;
-        for (int32_t i = 0; i < S.n; i++) {
-          if (wchk[i] < wmn) wmn = wchk[i];
-          if (wchk[i] > wmx) wmx = wchk[i];
-          wav += wchk[i];
-        }
-        wav /= (double)(S.n ? S.n : 1);
-        printf("   Ф8' СВИП ПО НАПРАВЛЕНИЯМ: ND %d (nmu %d, nphi %d), отскок %d; дерево+раскладка "
-               "%.1f мс, проход %.1f мс (%.0f нс на лист-направление); СУММА косвенного / прямого "
-               "= %.4f%s\n",
-               DR.n, g_dnmu, g_dnphi, pass + 1, t_build3 * 1e3, t_pass * 1e3,
-               t_pass * 1e9 / ((double)DR.n * (double)(TD.nleaf ? TD.nleaf : 1)),
-               si3 / (sd3 > 0.0 ? sd3 : 1.0),
-               g_dirsall ? "  [НК dirsall]"
-                         : (g_dblkopen ? "  [ВЕРХНЯЯ граница: заслоны без среза ПРОЗРАЧНЫ]" : ""));
-        printf("      А937 НОРМИРОВКА: Σ w·max(0,−ω·n) = %.5f…%.5f, среднее %.5f (обязана быть "
-               "π = %.5f, отклонение среднего %.2f %%)\n",
-               wmn, wmx, wav, 3.14159265358979323846,
-               100.0 * (wav - 3.14159265358979323846) / 3.14159265358979323846);
-        /* Ф11' (§545): РАСПРЕДЕЛЕНИЕ ДОЛИ ПЕРЕКРЫТИЯ. Без него «правило
-         * изменило ответ» не отличить от «правило почти не сработало». */
-        if (D.nfstat > 0) {
-          int64_t nf = D.nfstat < (int64_t)HZ_FSTAT_CAP ? D.nfstat : (int64_t)HZ_FSTAT_CAP;
-          double *fc = malloc((size_t)nf * sizeof *fc);
-          if (fc == NULL) exit(1);
-          memcpy(fc, D.fstat, (size_t)nf * sizeof *fc);
-          qsort(fc, (size_t)nf, sizeof *fc, cmp_d);
-          printf("      Ф11' ДОЛЯ ПЕРЕКРЫТИЯ f: p10 %.4f, p50 %.4f, p90 %.4f; в единицу упёрлось "
-                 "%.2f %% случаев (выборка %lld из %lld)\n",
-                 fc[nf / 10], fc[nf / 2], fc[(nf * 9) / 10],
-                 100.0 * (double)D.nfone / (double)(D.nfstat ? D.nfstat : 1), (long long)nf,
-                 (long long)D.nfstat);
-          free(fc);
-        }
-        /* Ф15' (§561): БЮДЖЕТ ИЗЛУЧЕНИЯ. `Φ_аналит` — сколько поверхность
-         * обязана излучить в полусферу (`Σ A_i·irr_i`); `Φ_факт` — сколько
-         * излучено; `Φ_обрезано` — съеденное обрезкой `min(1, f)`.
-         * ПЕРЕКОС РАСКЛАДКИ (А1009) считается ОТДЕЛЬНО: `Σ max(0, A_p − h²)` —
-         * сколько площади лежит в листьях сверх их собственного сечения. Это и
-         * есть болезнь; обрезка — лишь её следствие. */
-        {
-          double phan = 0.0, over = 0.0, atot2 = 0.0;
-          for (int32_t i = 0; i < S.n; i++)
-            for (int k = 0; k < 3; k++)
-              phan += sar[i] * (double)irr[3 * (size_t)i + (size_t)k];
-          for (int32_t l3 = 0; l3 < TD.n; l3++) {
-            if (TD.nd[l3].child0 >= 0 || D.srf[l3] != 1) continue;
-            double hl = (double)TD.nd[l3].size * D.cw;
-            atot2 += (double)D.Ap[l3];
-            if ((double)D.Ap[l3] > hl * hl) over += (double)D.Ap[l3] - hl * hl;
-          }
-          printf("      Ф15' БЮДЖЕТ ИЗЛУЧЕНИЯ: Φ_аналит %.4e, Φ_факт %.4e, Φ_обрезано %.4e; "
-                 "невязка %.2f %%%s\n",
-                 phan, emact * 3.0, emcut * 3.0,
-                 100.0 * (phan - emact * 3.0 - emcut * 3.0) / (phan > 0.0 ? phan : 1.0),
-                 g_fnoclamp ? "  [fnoclamp: обрезка СНЯТА]" : "");
-          printf("      Ф15' ПЕРЕКОС РАСКЛАДКИ (А1009): площади сверх сечения листа %.4e из "
-                 "%.4e (%.1f %%)\n",
-                 over, atot2, 100.0 * over / (atot2 > 0.0 ? atot2 : 1.0));
-          if (D.nfraw > 0) {
-            qsort(D.frawv, (size_t)D.nfraw, sizeof *D.frawv, cmp_d);
-            printf("      Ф15' СЫРОЕ f СРЕДИ УПЁРШИХСЯ: p50 %.3f, p90 %.3f, max %.3f по %lld "
-                   "случаям\n",
-                   D.frawv[D.nfraw / 2], D.frawv[(D.nfraw * 9) / 10], D.frawv[D.nfraw - 1],
-                   (long long)D.nfraw);
-          }
-          emact = emcut = 0.0;
-          D.nfraw = 0;
-        }
-        D.nfstat = 0;
-        D.nfone = 0;
-        /* МНОГОКРАТНЫЕ ОТРАЖЕНИЯ БЕЗ МАТРИЦЫ (довод №3 §523): следующая
-         * радиосити есть собранная облучённость на альбедо. Матрицы нет, есть
-         * ещё один проход по тем же направлениям. */
-        if (pass + 1 < g_dpass) {
-          double *aw3 = calloc((size_t)TD.n, sizeof *aw3);
-          if (aw3 == NULL) exit(1);
-          memset(D.Bs, 0, 3 * (size_t)TD.n * sizeof *D.Bs);
-          for (int32_t i = 0; i < S.n; i++) {
-            int32_t l2 = slf[i];
-            if (l2 < 0) continue;
-            aw3[l2] += sar[i];
-            for (int k = 0; k < 3; k++)
-              D.Bs[3 * (size_t)l2 + (size_t)k] +=
-                  (float)(sar[i] * D.Eind[3 * (size_t)i + (size_t)k] * alb(&m, S.c[i].mat, k));
-          }
-          for (int32_t l2 = 0; l2 < TD.n; l2++)
-            if (D.srf[l2] == 1 && aw3[l2] > 0.0)
-              for (int k = 0; k < 3; k++)
-                D.Bs[3 * (size_t)l2 + (size_t)k] =
-                    (float)((double)D.Bs[3 * (size_t)l2 + (size_t)k] / aw3[l2] /
-                            3.14159265358979323846);
-          free(aw3);
-        }
-      }
-      /* Ф14. (§557): при сличении свип не вливается в `irr` — иначе гатер, идущий
-       * следом, считал бы отскок от уже подсвеченной поверхности. */
-      if (g_cmpcell) {
-        indsw = malloc(3 * (size_t)S.n * sizeof *indsw);
-        if (indsw == NULL) exit(1);
-        memcpy(indsw, ind, 3 * (size_t)S.n * sizeof *indsw);
-        memset(ind, 0, 3 * (size_t)S.n * sizeof *ind);
-      } else
-        for (int32_t i = 0; i < 3 * S.n; i++)
-          irr[i] += ind[i];
-      free(D.Ld);
-      free(D.Bs);
-      free(D.Bn);
-      free(D.Bsp);
-      free(D.Bwi);
-      free(D.Bns);
-      free(D.Ap);
-      free(D.fstat);
-      free(D.frawv);
-      free(D.srf);
-      free(D.vis);
-      free(D.cstart);
-      free(D.clist);
-      free(D.Eind);
-      free(snx);
-      free(sny);
-      free(snz);
-      free(sar);
-      free(slf);
-      free(wchk);
-      stree_free(&TD);
-      tr3_dirs_free(&DR);
-    }
-    if (g_hgather > 0.0) {
-      /* Ф6. (§516): ОТСКОК ПО ИЕРАРХИИ ИЗЛУЧАТЕЛЕЙ. */
-      etree ET;
-      memset(&ET, 0, sizeof ET);
-      double tb2 = now_s();
-      etree_build(&ET, &S, &fr, irr, &m, 0, S.n, 0, lev);
-      double t_build = now_s() - tb2;
-      tb2 = now_s();
-      int64_t nlink = 0;
-      double sthru2 = 0.0, sall2 = 0.0;
-      /* Р2 (§581): ДЕЛЕНИЕ ПО ПРИЁМНИКАМ — самое большое число в системе
-       * (`16.8` с). Каждый приёмник пишет свой `ind[i]`, дерево излучателей
-       * читается всеми и не меняется. Порядок сложения ВНУТРИ приёмника не
-       * меняется, значит ответ побитово тот же.
-       * СЧЁТЧИКИ — ПО ПОТОКАМ, А СВОДЯТСЯ В ФИКСИРОВАННОМ ПОРЯДКЕ: редукция
-       * OpenMP отдала бы порядок планировщику, и число поехало бы от запуска к
-       * запуску. Здесь оно воспроизводимо. */
-      int nth = g_omp1 ? 1 : omp_get_max_threads();
-      int64_t *plink = calloc((size_t)nth, sizeof *plink);
-      double *pthru = calloc((size_t)nth, sizeof *pthru);
-      double *pall = calloc((size_t)nth, sizeof *pall);
-      if (plink == NULL || pthru == NULL || pall == NULL) exit(1);
-#pragma omp parallel for schedule(dynamic, 64) if (!g_omp1)
-      for (int32_t i = 0; i < S.n; i++) {
-        int th = g_omp1 ? 0 : omp_get_thread_num();
-        double pi[3], nn2[3], acc2[3] = {0, 0, 0};
-        hz_slice_vertex(&S, i, pi);
-        for (int k = 0; k < 3; k++)
-          pi[k] = fr.org[k] + pi[k] * fr.h;
-        hz_slice_normal(&S, i, nn2);
-        double rrecv = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
-        for (int q2 = 0; q2 < 6; q2++)
-          hgather_rec(&ET, 0, q2, pi, nn2, g_hgather, rrecv, &P, &fr, indvis, acc2, &plink[th],
-                      &pthru[th], &pall[th]);
-        for (int k = 0; k < 3; k++)
-          ind[3 * (size_t)i + (size_t)k] = (float)(acc2[k] * (alb0 ? 0.0 : alb(&m, S.c[i].mat, k)));
-      }
-      for (int t4 = 0; t4 < nth; t4++) {
-        nlink += plink[t4];
-        sthru2 += pthru[t4];
-        sall2 += pall[t4];
-      }
-      free(plink);
-      free(pthru);
-      free(pall);
-      double t_g2 = now_s() - tb2;
-      double sd2 = 0.0, si2 = 0.0;
-      for (int32_t i = 0; i < S.n; i++)
-        for (int k = 0; k < 3; k++) {
-          sd2 += (double)irr[3 * (size_t)i + (size_t)k];
-          si2 += (double)ind[3 * (size_t)i + (size_t)k];
-        }
-      printf("   Ф6. ИЕРАРХИЧЕСКИЙ ОТСКОК: eps %.3f, узлов дерева %d, СВЯЗЕЙ %lld против %lld пар "
-             "(в %.0f раз меньше); дерево %.1f мс, сбор %.1f мс; СУММА косвенного / прямого = "
-             "%.4f%s\n",
-             g_hgather, ET.n, (long long)nlink, (long long)S.n * (long long)S.n,
-             (double)((long long)S.n * (long long)S.n) / (double)(nlink ? nlink : 1), t_build * 1e3,
-             t_g2 * 1e3, si2 / (sd2 > 0.0 ? sd2 : 1.0), indvis ? " [С ЗАСЛОНАМИ]" : "");
-      g_t_bounce = t_build + t_g2;
-      if (indmeas || indvis)
-        printf("      §474 СКВОЗЬ ЗАСЛОНЫ: %.2f %%\n",
-               100.0 * sthru2 / (sall2 > 0.0 ? sall2 : 1.0));
-      for (int32_t i = 0; i < 3 * S.n; i++)
-        irr[i] += ind[i];
-      etree_free(&ET);
-    } else {
-      /* Ф3. (§510): ИЗЛУЧАТЕЛИ С ОГРУБЛЁННОГО СРЕЗА. Приёмнику нужна
-       * подробность, излучателю — нет: дальняя стена светит как ОДНА площадка
-       * со своей средней яркостью. Второй срез того же дерева с бо́льшим порогом
-       * и есть эта огрублённая раздача; прямой свет на нём считается тем же
-       * `front_direct` (ячеек мало, цена ничтожна). */
-      hz_dcslice SE;
-      float *irre = irr;
-      const hz_dcslice *SRC2 = &S;
-      if (g_emitthr > 0.0) {
-        lodctx LE = LL;
-        LE.thr = g_emitthr;
-        if (hz_slice_init(&SE, lev) != HZ_DC_OK) exit(1);
-        if (hz_slice_build(&SE, &T, &ht, lod_stop, &LE) != HZ_DC_OK) exit(1);
-        for (int32_t i2 = 0; i2 < SE.n; i2++) {
-          double vw2[3];
-          hz_slice_vertex(&SE, i2, vw2);
-          int32_t cl2[3];
-          for (int a2 = 0; a2 < 3; a2++) {
-            double f2 = floor(vw2[a2]);
-            if (f2 < 0.0) f2 = 0.0;
-            if (f2 > (double)(fr.n - 1)) f2 = (double)(fr.n - 1);
-            cl2[a2] = (int32_t)f2;
-          }
-          const int32_t *ls2 = NULL;
-          if (ct_list(&CT, cl2, &ls2) == 0) continue;
-          int32_t mi2 = m.fm != NULL ? m.fm[ls2[0]] : 0;
-          SE.c[i2].mat = (uint8_t)(mi2 < 255 ? mi2 : 255);
-        }
-        irre = malloc(3 * (size_t)SE.n * sizeof *irre);
-        if (irre == NULL) exit(1);
-        front_direct(&SE, &fr, &P, &AL, irre, 0.5, 1, NULL, &m);
-        SRC2 = &SE;
-        printf("   Ф3' ОГРУБЛЁННЫЕ ИЗЛУЧАТЕЛИ: порог %.2f, ячеек %d против %d приёмников\n",
-               g_emitthr, SE.n, S.n);
-      }
-      int32_t stride = 1;
-      while ((int64_t)(SRC2->n / (stride > 0 ? stride : 1)) * (int64_t)S.n > 200000000LL)
-        stride *= 2;
-      if (g_gstride > 0) stride = g_gstride;
-      double tb = now_s();
-      int64_t nemit = 0;
-      double sthru = 0.0, sall = 0.0;
-      double walb = 0.0, wtot = 0.0;
-      for (int32_t j = 0; j < SRC2->n; j += stride) {
-        double ej[3] = {(double)irre[3 * (size_t)j], (double)irre[3 * (size_t)j + 1],
-                        (double)irre[3 * (size_t)j + 2]};
-        if (!(ej[0] + ej[1] + ej[2] > 0.0)) continue;
-        nemit++;
-        /* §529: средневзвешенное альбедо ИЗЛУЧАТЕЛЕЙ, взвешенное их же потоком.
-         * Печатается затем, что предсказание П1 сделано именно через него: если
-         * второй множитель лишний, отношение обязано вырасти ровно в `1/⟨ρ⟩`. */
-        for (int k = 0; k < 3; k++) {
-          wtot += ej[k];
-          walb += ej[k] * alb(&m, S.c[j].mat, k);
-        }
-        double pj[3], nj[3];
-        hz_slice_vertex(&S, j, pj);
-        for (int k = 0; k < 3; k++)
-          pj[k] = fr.org[k] + pj[k] * fr.h;
-        hz_slice_normal(&S, j, nj);
-        double cside = fr.h * (double)((int32_t)1 << (lev - (int)SRC2->c[j].lvl));
-        double aj = cside * cside * (double)stride;
-        for (int32_t i = 0; i < S.n; i++) {
-          if (i == j) continue;
-          double pi[3], ni[3], w[3], r2 = 0.0;
-          hz_slice_vertex(&S, i, pi);
-          for (int k = 0; k < 3; k++)
-            pi[k] = fr.org[k] + pi[k] * fr.h;
-          hz_slice_normal(&S, i, ni);
-          for (int k = 0; k < 3; k++) {
-            w[k] = pj[k] - pi[k];
-            r2 += w[k] * w[k];
-          }
-          if (!(r2 > 0.0)) continue;
-          double r = sqrt(r2);
-          double ci = (w[0] * ni[0] + w[1] * ni[1] + w[2] * ni[2]) / r;
-          double cj = -(w[0] * nj[0] + w[1] * nj[1] + w[2] * nj[2]) / r;
-          if (!(ci > 0.0) || !(cj > 0.0)) continue;
-          /* §474: СКОЛЬКО КОСВЕННОГО ПРИХОДИТ СКВОЗЬ СТЕНЫ. Приближение (1)
-           * названо в коде с самого начала, но НЕ ИЗМЕРЕНО ни разу; в закрытой
-           * комнате оно перестаёт быть безобидным — наружная сторона стены
-           * светит внутрь. Здесь тем же маршем, что у прямого света, считается
-           * доля энергии, чей путь пересекает занятую ячейку. Ключ `indvis`
-           * её ЗАСЛОНЯЕТ, `indmeas` — только считает. */
-          double ff = ci * cj * aj / (3.14159265358979323846 * r2);
-          int blocked = 0;
-          if (indmeas) blocked = shadowed(&P, &fr, pi, pj, 0.5);
-          for (int k = 0; k < 3; k++) {
-            double e = ej[k] * (alb0 ? 0.0 : (g_emitalb2 ? alb(&m, S.c[j].mat, k) : 1.0)) * ff *
-                       alb(&m, S.c[i].mat, k);
-            if (indmeas) {
-              sall += e;
-              if (blocked) sthru += e;
-            }
-            if (blocked && indvis) continue;
-            ind[3 * (size_t)i + (size_t)k] += (float)e;
-          }
-        }
-      }
-      tb = now_s() - tb;
-      /* ПРИЁМКА: отношение косвенного к прямому обязано быть порядка альбедо. */
-      double sd = 0.0, si = 0.0;
-      for (int32_t i = 0; i < S.n; i++)
-        for (int k = 0; k < 3; k++) {
-          sd += (double)irr[3 * (size_t)i + (size_t)k];
-          si += (double)ind[3 * (size_t)i + (size_t)k];
-        }
-      printf("   ОТСКОК: %.1f с (в %.0f раз дороже прямого света), излучателей %lld из %d "
-             "(прореживание %d); СУММА косвенного / прямого = %.4f\n",
-             tb, tb / (t_dir > 0.0 ? t_dir : 1.0), (long long)nemit, S.n, stride,
-             si / (sd > 0.0 ? sd : 1.0));
-      printf("      §529 АЛЬБЕДО ИЗЛУЧАТЕЛЕЙ, взвешенное потоком: %.4f%s\n",
-             walb / (wtot > 0.0 ? wtot : 1.0),
-             g_emitalb2 ? "; ВТОРОЙ множитель ВОЗВРАЩЁН (emitalb2, СТАРОЕ НЕВЕРНОЕ)" : "");
-      if (indmeas)
-        printf("      §474 СКВОЗЬ ЗАСЛОНЫ: %.2f %% энергии отскока идёт путём, пересекающим "
-               "занятую ячейку%s\n",
-               100.0 * sthru / (sall > 0.0 ? sall : 1.0), indvis ? " (и ОТБРОШЕНА)" : "");
-      /* ---- Ф14' (§557): ПОЯЧЕЕЧНОЕ СЛИЧЕНИЕ СВИПА С ГАТЕРОМ ---- */
-      /* СУММАРНОЕ ЧИСЛО НЕ РАЗЛИЧАЕТ ДВЕ БОЛЕЗНИ: постоянный множитель (тогда
-       * это ошибка нормировки, и схема ни при чём) и потерю с расстоянием
-       * (тогда виноват перенос). Спутать их — потерять целый шаг на постройку
-       * схемы, которая не нужна; в проекте так уже выходило трижды (А933,
-       * А955, А994).
-       * ОТНОШЕНИЕ С НУЛЯМИ — НЕ ВЕЛИЧИНА (А999): берутся ячейки, где ГАТЕР выше
-       * порога от собственной медианы, а выброшенное считается тремя
-       * счётчиками, а не прячется.
-       * ГАТЕР — НЕ ИСТИНА, А ВТОРАЯ СХЕМА (А1001): его собственный разброс
-       * меряется тем же прибором через `hgather=` и `stride`. */
-      if (g_cmpcell && indsw != NULL) {
-        const float *A1 = indsw, *B1 = g_cmpself ? indsw : ind;
-        double *gv = malloc((size_t)S.n * sizeof *gv);
-        double *rt = malloc((size_t)S.n * sizeof *rt);
-        if (gv == NULL || rt == NULL) exit(1);
-        int64_t ng = 0;
-        for (int32_t i = 0; i < S.n; i++) {
-          double b = 0.0;
-          for (int k = 0; k < 3; k++)
-            b += (double)B1[3 * (size_t)i + (size_t)k];
-          if (b > 0.0) gv[ng++] = b;
-        }
-        double gmed = 0.0;
-        if (ng > 0) {
-          qsort(gv, (size_t)ng, sizeof *gv, cmp_d);
-          gmed = gv[ng / 2];
-        }
-        /* Порог назван ОТ ДАННЫХ, а не с потолка: тысячная медианы гатера. */
-        double thr2 = 1e-3 * gmed;
-        int64_t nboth0 = 0, ngz = 0, nsz = 0, nuse = 0;
-        /* Корзины по расстоянию ДО БЛИЖАЙШЕГО ИЗЛУЧАТЕЛЯ ПО ПРЯМОЙ. Величина
-         * названа честно (А1000): за стеной она даёт НИЖНЮЮ оценку длины пути,
-         * и если зависимость на такой оси найдётся — вывод тем крепче. */
-        static const double DB[4] = {0.5, 1.5, 3.0, 1e9};
-        double bs[4] = {0, 0, 0, 0}, bn[4] = {0, 0, 0, 0};
-        for (int32_t i = 0; i < S.n; i++) {
-          double a = 0.0, b = 0.0;
-          for (int k = 0; k < 3; k++) {
-            a += (double)A1[3 * (size_t)i + (size_t)k];
-            b += (double)B1[3 * (size_t)i + (size_t)k];
-          }
-          if (!(a > 0.0) && !(b > 0.0)) {
-            nboth0++;
-            continue;
-          }
-          if (!(b > thr2)) {
-            if (a > 0.0) ngz++;
-            continue;
-          }
-          if (!(a > 0.0)) nsz++;
-          rt[nuse++] = a / b;
-          double pw[3];
-          hz_slice_vertex(&S, i, pw);
-          for (int k = 0; k < 3; k++)
-            pw[k] = fr.org[k] + pw[k] * fr.h;
-          double dmin = 1e300;
-          for (int32_t j = 0; j < S.n; j += 16) {
-            if (!(irr[3 * (size_t)j] > 0.0f)) continue;
-            double pj2[3], d2 = 0.0;
-            hz_slice_vertex(&S, j, pj2);
-            for (int k = 0; k < 3; k++) {
-              double dd = fr.org[k] + pj2[k] * fr.h - pw[k];
-              d2 += dd * dd;
-            }
-            if (d2 < dmin) dmin = d2;
-          }
-          dmin = sqrt(dmin);
-          for (int bq = 0; bq < 4; bq++)
-            if (dmin < DB[bq]) {
-              bs[bq] += a / b;
-              bn[bq] += 1.0;
-              break;
-            }
-        }
-        if (nuse > 0) {
-          qsort(rt, (size_t)nuse, sizeof *rt, cmp_d);
-          double p10 = rt[nuse / 10], p50 = rt[nuse / 2], p90 = rt[(nuse * 9) / 10];
-          printf("   Ф14' СВИП / ГАТЕР ПОЯЧЕЕЧНО%s: p10 %.4f, p50 %.4f, p90 %.4f, "
-                 "p90/p10 = %.2f по %lld ячейкам\n",
-                 g_cmpself ? " [cmpself: обязано быть 1.0000]" : "", p10, p50, p90,
-                 p10 > 0.0 ? p90 / p10 : 0.0, (long long)nuse);
-          printf("      ВЫБРОШЕНО: обе нули %lld, гатер ниже порога при ненулевом свипе %lld, "
-                 "свип ноль при живом гатере %lld (порог %.3e = 1e-3 медианы)\n",
-                 (long long)nboth0, (long long)ngz, (long long)nsz, thr2);
-          printf("      ПО РАССТОЯНИЮ ДО БЛИЖАЙШЕГО ИЗЛУЧАТЕЛЯ (по прямой, НИЖНЯЯ оценка "
-                 "пути):\n");
-          static const char *DN[4] = {"< 0.5 м", "0.5…1.5 м", "1.5…3 м", "> 3 м"};
-          for (int bq = 0; bq < 4; bq++)
-            printf("         %-10s среднее отношение %.4f по %.0f ячейкам\n", DN[bq],
-                   bn[bq] > 0.0 ? bs[bq] / bn[bq] : 0.0, bn[bq]);
-        }
-        free(gv);
-        free(rt);
-      }
-      for (int32_t i = 0; i < 3 * S.n; i++)
-        irr[i] += ind[i];
-      if (indsw != NULL) {
-        for (int32_t i = 0; i < 3 * S.n; i++)
-          irr[i] += indsw[i];
-        free(indsw);
-        indsw = NULL;
-      }
-      if (g_emitthr > 0.0) {
-        free(irre);
-        hz_slice_free(&SE);
-      }
-    }
-    free(ind);
-
-    /* ЦВЕТ ЯЧЕЙКИ КЛАДЁТСЯ В ИНДЕКС ПО КЛЮЧУ, чтобы растеризатор мог его взять
-     * по ячейке многоугольника. Индекс ПЛОСКИЙ (отсортированные ключи +
-     * двоичный поиск), а не дерево: у него нет ни спуска, ни владения. */
-    uint64_t *key = malloc((size_t)S.n * sizeof *key);
-    int32_t *ord = malloc((size_t)S.n * sizeof *ord);
-    if (key == NULL || ord == NULL) exit(1);
-    for (int32_t i = 0; i < S.n; i++) {
-      key[i] = cellkey(&S.c[i]);
-      ord[i] = i;
-    }
-    /* Срез уже в мортоновом порядке; ключ (lvl, lo) монотонен по нему не всегда,
-     * поэтому сортируется явно. */
-    for (int32_t i = 1; i < S.n; i++) {
-      uint64_t k = key[i];
-      int32_t o = ord[i];
-      int32_t j = i - 1;
-      while (j >= 0 && key[j] > k) {
-        key[j + 1] = key[j];
-        ord[j + 1] = ord[j];
-        j--;
-      }
-      key[j + 1] = k;
-      ord[j + 1] = o;
-    }
-
-    /* БЕЛАЯ ТОЧКА: перцентиль 99.5 по ЯЧЕЙКАМ СРЕЗА — то же правило, что в
-     * hz_ppm_write, но применённое к населению, у которого оно осмысленно. */
-    double white = 1.0;
-    {
-      float *tmpw = malloc((size_t)S.n * sizeof *tmpw);
-      if (tmpw == NULL) exit(1);
-      for (int32_t i = 0; i < S.n; i++) {
-        float mx = irr[3 * (size_t)i];
-        if (irr[3 * (size_t)i + 1] > mx) mx = irr[3 * (size_t)i + 1];
-        if (irr[3 * (size_t)i + 2] > mx) mx = irr[3 * (size_t)i + 2];
-        tmpw[i] = mx;
-      }
-      qsort(tmpw, (size_t)S.n, sizeof *tmpw, cmp_f);
-      double w995 = (double)tmpw[(size_t)((double)S.n * 0.995)];
-      if (w995 > 0.0) white = w995;
-      free(tmpw);
-    }
-    litctx LC;
-    memset(&LC, 0, sizeof LC);
-    LC.polysum = HZ_FNV_BASIS; /* начальное значение FNV-1a */
-    LC.S = &S;
-    LC.key = key;
-    LC.ord = ord;
-    LC.irr = irr;
-    LC.fr = &fr;
-    LC.white = white;
-    LC.nocull = nocull;
-    LC.uvs = uvs;
-    LC.mesh = &m;
-    LC.ct = &CT;
-    LC.nmtl = m.nmtl;
-    LC.pxrad = LL.pxrad;
-    LC.nomip = g_texnomip;
-    tr3_camera cam;
-    if (tr3_camera_look(&cam, eyec, atc, upc, HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0, res,
-                        res) == 0) {
-      size_t np = (size_t)res * (size_t)res;
-      double *zb = malloc(np * sizeof *zb);
-      unsigned char *rgb = calloc(np * 3, 1);
-      if (zb == NULL || rgb == NULL) exit(1);
-      for (size_t i = 0; i < np; i++)
-        zb[i] = 1e300;
-      LC.cam = &cam;
-      LC.z = zb;
-      LC.rgb = rgb;
-      LC.w = res;
-      LC.h = res;
-      int64_t ahist[10] = {0};
-      double apix[10] = {0};
-      LC.areahist = ahist;
-      LC.areapix = apix;
-      LC.defcol = calloc(np * 3, sizeof *LC.defcol);
-      if (LC.defcol == NULL) exit(1);
-      /* Ш8 (§575): ЗАГРУЗКА ТЕКСТУР. Имя из `map_Kd`, каталог — `ppm256` рядом
-       * с текстурами сцены (готовит `scripts/tex_prep.sh`). Отсутствующая
-       * текстура НЕ ошибка: материал остаётся одноцветным, и число таких
-       * ПЕЧАТАЕТСЯ, а не замалчивается (А891). */
-      if (uvs != NULL && !g_texflat) {
-        LC.texrgb = calloc((size_t)m.nmtl, sizeof *LC.texrgb);
-        LC.texw = calloc((size_t)m.nmtl, sizeof *LC.texw);
-        LC.texh = calloc((size_t)m.nmtl, sizeof *LC.texh);
-        LC.defuv = calloc(np * 2, sizeof *LC.defuv);
-        LC.defmat = calloc(np, 1);
-        LC.texmip = calloc((size_t)m.nmtl, sizeof *LC.texmip);
-        LC.mipw = calloc((size_t)m.nmtl, sizeof *LC.mipw);
-        LC.miph = calloc((size_t)m.nmtl, sizeof *LC.miph);
-        LC.nmip = calloc((size_t)m.nmtl, sizeof *LC.nmip);
-        if (LC.texmip == NULL || LC.mipw == NULL || LC.miph == NULL || LC.nmip == NULL) exit(1);
-        if (LC.texrgb == NULL || LC.texw == NULL || LC.texh == NULL || LC.defuv == NULL ||
-            LC.defmat == NULL)
-          exit(1);
-        char dir[512];
-        snprintf(dir, sizeof dir, "%s", argv[1]);
-        char *sl = strrchr(dir, '/');
-        if (sl != NULL)
-          *sl = '\0';
-        else
-          dir[0] = '\0';
-        int64_t nload = 0, nmiss = 0, tbytes = 0;
-        double tt0 = now_s();
-        for (int32_t mi2 = 0; mi2 < m.nmtl; mi2++) {
-          if (m.mtl[mi2].tex[0] == '\0') continue;
-          /* ПУТЬ В `map_Kd` ОТБРАСЫВАЕТСЯ, И РАЗДЕЛИТЕЛЬ ТАМ ОБРАТНЫЙ. У
-           * Сан-Мигеля стоит `textures\individual_b.png` — экспортёр писал под
-           * Windows. Берём только имя файла: каталог у нас свой (`ppm256`), и
-           * доверять пути из чужого файла на недоверенном входе нельзя тем
-           * более. Замерено: без этого нашлось `0` текстур из `271`. */
-          const char *nm2 = m.mtl[mi2].tex;
-          for (const char *s2 = nm2; *s2 != '\0'; s2++)
-            if (*s2 == '/' || *s2 == '\\') nm2 = s2 + 1;
-          char base[160];
-          snprintf(base, sizeof base, "%s", nm2);
-          char *dot = strrchr(base, '.');
-          if (dot != NULL) *dot = '\0';
-          /* ДВА МЕСТА ПОИСКА, И ЭТО НЕ ПЕРЕСТРАХОВКА. У Сан-Мигеля текстуры
-           * лежат в `textures/`, у Bistro — в нескольких каталогах рядом со
-           * сценой (`BuildingTextures`, `Street`, `Natural`…), и `map_Kd` там
-           * ссылается через `..\`. Мы кладём переведённые в ОДИН плоский
-           * `ppm256` у сцены, поэтому ищем по имени файла в обоих местах. */
-          char path2[900];
-          snprintf(path2, sizeof path2, "%s/textures/ppm256/%s.ppm", dir, base);
-          if (hz_ppm_read(path2, &LC.texrgb[mi2], &LC.texw[mi2], &LC.texh[mi2]) != 0)
-            snprintf(path2, sizeof path2, "%s/ppm256/%s.ppm", dir, base);
-          if (hz_ppm_read(path2, &LC.texrgb[mi2], &LC.texw[mi2], &LC.texh[mi2]) == 0) {
-            nload++;
-            tbytes += (int64_t)LC.texw[mi2] * LC.texh[mi2] * 3;
-            /* МИП-ПИРАМИДА строится сразу: коробка 2×2 на уровень, пока сторона
-             * не станет единицей. Коробка, а не что-то умнее, — потому что
-             * уровень всё равно интерполируется линейно, и лишняя точность
-             * ниже кванта байта. */
-            int lv2 = 1, w2 = LC.texw[mi2], h2 = LC.texh[mi2];
-            while (w2 > 1 || h2 > 1) {
-              w2 = w2 > 1 ? w2 / 2 : 1;
-              h2 = h2 > 1 ? h2 / 2 : 1;
-              lv2++;
-            }
-            LC.nmip[mi2] = lv2;
-            LC.texmip[mi2] = calloc((size_t)lv2, sizeof *LC.texmip[mi2]);
-            LC.mipw[mi2] = calloc((size_t)lv2, sizeof *LC.mipw[mi2]);
-            LC.miph[mi2] = calloc((size_t)lv2, sizeof *LC.miph[mi2]);
-            if (LC.texmip[mi2] == NULL || LC.mipw[mi2] == NULL || LC.miph[mi2] == NULL) exit(1);
-            LC.texmip[mi2][0] = LC.texrgb[mi2];
-            LC.mipw[mi2][0] = LC.texw[mi2];
-            LC.miph[mi2][0] = LC.texh[mi2];
-            for (int l2 = 1; l2 < lv2; l2++) {
-              int pw = LC.mipw[mi2][l2 - 1], ph = LC.miph[mi2][l2 - 1];
-              int cw = pw > 1 ? pw / 2 : 1, ch = ph > 1 ? ph / 2 : 1;
-              unsigned char *dst = malloc((size_t)cw * (size_t)ch * 3);
-              if (dst == NULL) exit(1);
-              const unsigned char *src = LC.texmip[mi2][l2 - 1];
-              for (int y2 = 0; y2 < ch; y2++)
-                for (int x2 = 0; x2 < cw; x2++)
-                  for (int c2 = 0; c2 < 3; c2++) {
-                    int sx0 = (pw > 1) ? 2 * x2 : 0, sy0 = (ph > 1) ? 2 * y2 : 0;
-                    int sx1 = (pw > 1) ? sx0 + 1 : sx0, sy1 = (ph > 1) ? sy0 + 1 : sy0;
-                    size_t o0 = 3 * ((size_t)sy0 * (size_t)pw + (size_t)sx0) + (size_t)c2;
-                    size_t o1 = 3 * ((size_t)sy0 * (size_t)pw + (size_t)sx1) + (size_t)c2;
-                    size_t o2 = 3 * ((size_t)sy1 * (size_t)pw + (size_t)sx0) + (size_t)c2;
-                    size_t o3 = 3 * ((size_t)sy1 * (size_t)pw + (size_t)sx1) + (size_t)c2;
-                    unsigned s5 = (unsigned)src[o0] + src[o1] + src[o2] + src[o3];
-                    dst[3 * ((size_t)y2 * (size_t)cw + (size_t)x2) + (size_t)c2] =
-                        (unsigned char)(s5 / 4);
-                  }
-              LC.texmip[mi2][l2] = dst;
-              LC.mipw[mi2][l2] = cw;
-              LC.miph[mi2][l2] = ch;
-              tbytes += (int64_t)cw * ch * 3;
-            }
-          } else
-            nmiss++;
-        }
-        printf("   Ш8 ТЕКСТУРЫ: загружено %lld, не найдено %lld, память %.1f МБ, за %.2f с\n",
-               (long long)nload, (long long)nmiss, (double)tbytes / 1048576.0, now_s() - tt0);
-      }
-      ta = now_s();
-      /* §573: РАЗДЕЛЕНИЕ ОБХОДА И РАСТЕРИЗАЦИИ. «УБИВАЕТ» §572 сработало
-       * (126 мс против порога 100), и условие требует профилировать, а не
-       * догадываться. Здесь тот же обход гоняется с ПУСТЫМ обработчиком: его
-       * время есть цена обхода дерева и критерия LOD, а разность — цена самой
-       * растеризации. */
-      /* §580: КОПИЯ КОНТЕКСТА С ОТСЕЧЕНИЕМ. Оригинал `LL` идёт в срез, который
-       * кормит ПЕРЕНОС, и там фрустумное отсечение запрещено. */
-      lodctx LLc = LL;
-      LLc.cull = !g_nofrustum;
-      LLc.cam = &cam;
-      LLc.h = fr.h;
-      for (int a = 0; a < 3; a++)
-        LLc.org[a] = fr.org[a];
-      double ta_w = now_s();
-      int wrc0 = hz_dc_walk(&T, lod_stop, &LLc, lit_none, &LC);
-      double t_walk = now_s() - ta_w;
-#ifdef HZ_DC_COUNT
-      {
-        extern long long hz_dc_n_cell, hz_dc_n_face, hz_dc_n_edge, hz_dc_n_leafish, hz_dc_n_stop,
-            hz_dc_n_proc;
-        printf("      СЧЁТ ОБХОДА: cellProc %lld, faceProc %lld, edgeProc %lld, process_edge %lld; "
-               "leafish %lld (из них до lod_stop дошло %lld)\n",
-               hz_dc_n_cell, hz_dc_n_face, hz_dc_n_edge, hz_dc_n_proc, hz_dc_n_leafish,
-               hz_dc_n_stop);
-      }
-#endif
-      ta = now_s();
-      /* Р3 (§581): обход СОБИРАЕТ, отрисовка идёт ПО ПОЛОСАМ параллельно. */
-      if (!g_omp1) {
-        LC.captris = 65536;
-        LC.tris = malloc((size_t)LC.captris * sizeof *LC.tris);
-        if (LC.tris == NULL) exit(1);
-      }
-      int wrc = hz_dc_walk(&T, lod_stop, &LLc, lit_poly, &LC);
-      if (LC.tris != NULL) {
-        int nb2 = omp_get_max_threads();
-        int bh = (res + nb2 - 1) / nb2;
-#pragma omp parallel for schedule(static)
-        for (int b2 = 0; b2 < nb2; b2++) {
-          int y0b = b2 * bh, y1b = y0b + bh - 1;
-          if (y1b >= res) y1b = res - 1;
-          for (int64_t t5 = 0; t5 < LC.ntris; t5++) {
-            /* Отсев по предвычисленному габариту строк — два сравнения вместо
-             * повторного проецирования трёх вершин. Без него деление на полосы
-             * не давало ничего: замерено `218 → 234` мс, то есть ХУЖЕ
-             * однопоточного, потому что каждая полоса перепроецировала все
-             * треугольники заново. */
-            if (LC.tris[t5].iy1 < y0b || LC.tris[t5].iy0 > y1b) continue;
-            lit_tri(&LC, LC.tris[t5].p, LC.tris[t5].col, LC.tris[t5].uv, LC.tris[t5].mat, y0b, y1b);
-          }
-        }
-        free(LC.tris);
-        LC.tris = NULL;
-      }
-      lit_resolve(&LC, g_gamn);
-      printf("      §573 ПРОФИЛЬ РАСТРА: обход дерева с ПУСТЫМ обработчиком %.1f мс (код %d), "
-             "обход+растр %.1f мс — значит сама растеризация %.1f мс\n",
-             t_walk * 1e3, wrc0, (now_s() - ta) * 1e3, (now_s() - ta - t_walk) * 1e3);
-      /* §585: механизм проверяется СЧЁТОМ, а выгода — временем, и путать их
-       * нельзя. `узлов посчитано` — это число РАЗЛИЧНЫХ узлов, у которых ответ
-       * критерия вычислен полностью; при `nomemo` считать нечем, и печатается
-       * ноль, а не подставленное число вызовов. */
-      printf("      §585 ПАМЯТЬ ОТВЕТА: КРИТЕРИЙ СЧИТАН ПОЛНОСТЬЮ %lld раз (различных узлов "
-             "тронуто %lld), перевёрнуто ответов %lld; ПОРЯДКОВАЯ СУММА ПОТОКА МНОГОУГОЛЬНИКОВ "
-             "%016llx\n",
-             hz_dc_walk_memo_stops(), hz_dc_walk_memo_evals(), hz_dc_walk_memo_flips(),
-             (unsigned long long)LC.polysum);
-      double t_rast = now_s() - ta;
-      int64_t ncov = 0;
-      for (size_t i2 = 0; i2 < np; i2++)
-        if (zb[i2] < 1e299) ncov++;
-      printf("      §572 РАСТР: фрагментов прошло z %lld на %lld закрытых пикселей, ГЛУБИНА "
-             "ПЕРЕКРЫТИЯ %.2f; таблица гаммы %d входов; КООРДИНАТА С ПОВЕРХНОСТИ у %lld "
-             "пикселей (%.1f %%)\n",
-             (long long)LC.nfrag, (long long)ncov, (double)LC.nfrag / (double)(ncov ? ncov : 1),
-             g_gamn, (long long)LC.nsurfuv, 100.0 * (double)LC.nsurfuv / (double)(ncov ? ncov : 1));
-      {
-        double tot4 = 0.0;
-        for (int b5 = 0; b5 < 10; b5++)
-          tot4 += apix[b5];
-        printf("      РАЗМЕР ПОЛИГОНА НА ЭКРАНЕ (площадь в пикселях -> сколько их, и какую долю "
-               "экрана они кроют):\n        ");
-        int lo4 = 1;
-        for (int b5 = 0; b5 < 10; b5++) {
-          if (ahist[b5] > 0)
-            printf("%d..%d: %lld шт / %.0f %%   ", lo4, lo4 * 4 - 1, (long long)ahist[b5],
-                   100.0 * apix[b5] / (tot4 > 0.0 ? tot4 : 1.0));
-          lo4 *= 4;
-        }
-        printf("\n");
-      }
-      char path[256];
-      /* Ш18 (§494): СГЛАЖИВАНИЕ. Растр идёт в `res`, а на диск пишется вдвое
-       * меньше со свёрткой коробкой 2×2 — четыре пробы на пиксель. Это НЕ
-       * полноценное сглаживание: края ГЕОМЕТРИИ остаются ступенчатыми на уровне
-       * ячейки, сглаживается только край многоугольника. Так и называется. */
-      int outres = ss2 ? res / 2 : res;
-      unsigned char *outrgb = rgb;
-      if (ss2) {
-        outrgb = malloc((size_t)outres * (size_t)outres * 3);
-        if (outrgb == NULL) exit(1);
-        for (int y = 0; y < outres; y++)
-          for (int x = 0; x < outres; x++)
-            for (int c = 0; c < 3; c++) {
-              unsigned s4 = 0;
-              for (int dy = 0; dy < 2; dy++)
-                for (int dx = 0; dx < 2; dx++)
-                  s4 += rgb[3 * ((size_t)(2 * y + dy) * (size_t)res + (size_t)(2 * x + dx)) +
-                            (size_t)c];
-              outrgb[3 * ((size_t)y * (size_t)outres + (size_t)x) + (size_t)c] =
-                  (unsigned char)((s4 + 2u) / 4u);
-            }
-      }
-      snprintf(path, sizeof path, "img/pfield_lit_L%d_%d.ppm", lev, outres);
-      int prc = hz_ppm_write_rgb(path, outrgb, outres, outres);
-      if (ss2) free(outrgb);
-      printf("   ОТСЕЧЕНИЕ: пришло %lld многоугольников, отброшено %lld (%.1f %%)\n",
-             (long long)LC.nseen, (long long)LC.ncull,
-             100.0 * (double)LC.ncull / (double)(LC.nseen ? LC.nseen : 1));
-      printf("   КАДР СО СВЕТОМ %d²: срез %.1f мс (ячеек %d), ПРЯМОЙ СВЕТ %.1f мс (%.0f нс на "
-             "ячейку), растеризация %.1f мс (код %d), ВСЕГО %.1f мс -> %s (код %d)\n",
-             res, t_slice * 1e3, S.n, t_dir * 1e3, t_dir * 1e9 / (double)(S.n ? S.n : 1),
-             t_rast * 1e3, wrc, (t_slice + t_dir + t_rast) * 1e3, path, prc);
-      g_t_fslice = t_slice;
-      g_t_fdir = t_dir;
-      g_t_fras = t_rast;
-      g_t_frame = t_slice + t_dir + t_rast;
-      free(zb);
-      free(rgb);
-      free(LC.defcol);
-    }
-    free(key);
-    free(ord);
-    free(irr2);
-    free(irr);
-    hz_slice_free(&S);
+    if (g_walk) walk_close();
   }
   /* СВОДКА ПО СТАДИЯМ (08-12, требование пользователя «тайминги считать надо»).
    * Печатается ВСЕГДА, а не только в режиме `render`: до неё числа лежали

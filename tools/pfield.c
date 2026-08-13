@@ -766,6 +766,8 @@ typedef struct {
    * ручкой значит потерять возможность мерить их порознь. Ключ `ceil=`;
    * `0` выключает потолок и возвращает прежнее поведение (негативный контроль). */
   double thrcell;
+  /* Пол по экранному размеру ячейки, пикселей; 0 — выключен. */
+  double thrpoly;
   int64_t hist[HZ_DC_MAX_LOG2SIZE + 2];
   /* §580: отсечение по пирамиде видимости ВО ВРЕМЯ СПУСКА. Ставится ТОЛЬКО на
    * обход растеризатора: для переноса оно незаконно (свет приходит извне
@@ -839,6 +841,17 @@ static int lod_stop(void *ctx, const hz_dctree *t, const hz_dcref *r) {
    * кадре, мерить бессмысленно — её там нельзя ни показать, ни отличить. */
   double pxcell = ((double)r->size / sqrt(d2)) / L->pxrad;
   if (pxcell <= L->thrcell) return 1;
+  /* ПОЛ ПО ЭКРАННОМУ РАЗМЕРУ (замечание пользователя 08-13). Элемент несёт не
+   * только геометрию, но и СВЕТОВУЮ ПРОБУ: облучённость хранится в ячейке, а
+   * растеризатор её интерполирует. Значит на полигоне в тысячу пикселей тень
+   * не изобразится НИКАК — там три значения на всю площадь.
+   * Прежний критерий (невязка) у плоской стены равен нулю и останавливал
+   * дробление немедленно. ЗАМЕРЕНО: полигоны крупнее 64 пикселей кроют 45 %
+   * экрана у Bistro и 43 % у Сан-Мигеля.
+   * Поэтому: пока ячейка КРУПНЕЕ порога в пикселях, дробим независимо от того,
+   * насколько она плоская. Это не поправка к невязке, а ДРУГОЕ ограничение —
+   * по частоте СВЕТА, а не геометрии. */
+  if (L->thrpoly > 0.0 && pxcell > L->thrpoly) return 0;
   double px = (hz_dc_rms(t, r->ni) / sqrt(d2)) / L->pxrad;
   return px <= L->thr;
 }
@@ -2331,6 +2344,8 @@ static int g_render = 0;
 /* §567: потолок LOD по угловому размеру ячейки, пикселей. По умолчанию равен
  * порогу невязки — иначе правка вводила бы ДВА новых числа сразу. */
 static double g_lodceil = 1.0;
+/* §584: пол по экранному размеру полигона, пикселей. 0 — прежнее поведение. */
+static double g_lodpoly = 0.0;
 /* §572: размер таблицы гаммы (`HZ_GAMN` объявлен у растеризатора; здесь стоит то
  * же число, потому что макрос определён ниже по файлу). Негативный контроль
  * `gam16` ломает её нарочно — картинка обязана пойти полосами. */
@@ -3902,6 +3917,10 @@ typedef struct {
    * свою полосу строк и трогает только свои пиксели. */
   struct littri *tris;
   int64_t ntris, captris;
+  /* Гистограмма площади полигона на экране: корзина `k` — площадь `4^k…4^(k+1)`
+   * пикселей. Степень четвёрки, потому что дробление узла делит площадь на 4. */
+  int64_t *areahist;
+  double *areapix;
 } litctx;
 
 static int lit_find(const litctx *L, const hz_dcref *r) {
@@ -4306,6 +4325,36 @@ static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv
         }
         dst->iy0 = okp ? (int)floor(y0f) : 0;
         dst->iy1 = okp ? (int)ceil(y1f) : L->h - 1;
+        /* РАЗМЕР ПОЛИГОНА НА ЭКРАНЕ — гистограмма по площади в пикселях.
+         * Замечание пользователя 08-13: дефекты видны там, где полигон КРУПНЫЙ,
+         * и вопрос «дробить или интерполировать тоньше» решается этим числом, а
+         * не на глаз. Считается ЗДЕСЬ, при сборе: в отрисовке по полосам один
+         * треугольник попадает в несколько потоков, и счёт был бы и гонкой, и
+         * многократным. */
+        if (L->areahist != NULL && okp) {
+          double x0f = 1e300, x1f = -1e300;
+          for (int q3 = 0; q3 < 3; q3++) {
+            double d3[3];
+            for (int c3i = 0; c3i < 3; c3i++)
+              d3[c3i] = p3[q3][c3i] - cm3->eye[c3i];
+            double zz3 = d3[0] * cm3->fwd[0] + d3[1] * cm3->fwd[1] + d3[2] * cm3->fwd[2];
+            double rr3 = d3[0] * cm3->right[0] + d3[1] * cm3->right[1] + d3[2] * cm3->right[2];
+            double sx3 = ((rr3 / (zz3 * cm3->tanx)) + 1.0) * 0.5 * (double)cm3->w;
+            if (sx3 < x0f) x0f = sx3;
+            if (sx3 > x1f) x1f = sx3;
+          }
+          double ar4 = 0.5 * (x1f - x0f) * (y1f - y0f);
+          if (ar4 > 0.0) {
+            int b4 = 0;
+            double t4 = ar4;
+            while (b4 < 9 && t4 >= 4.0) {
+              t4 /= 4.0;
+              b4++;
+            }
+            L->areahist[b4]++;
+            L->areapix[b4] += ar4;
+          }
+        }
       }
     } else
       lit_tri(L, p3, c3, u3, matp, 0, -1);
@@ -4422,6 +4471,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "camauto") == 0) g_camauto = 1;
     if (strcmp(argv[i], "caminside") == 0) g_caminside = 1;
     if (strncmp(argv[i], "ceil=", 5) == 0) g_lodceil = strtod(argv[i] + 5, NULL);
+    if (strncmp(argv[i], "poly=", 5) == 0) g_lodpoly = strtod(argv[i] + 5, NULL);
     /* §570: СОЛНЦЕ — направленный источник для наружной сцены. */
     if (strcmp(argv[i], "sun") == 0) g_sun = 1;
     if (strcmp(argv[i], "gam16") == 0) g_gamn = 16;
@@ -6069,6 +6119,8 @@ int main(int argc, char **argv) {
 
     LH.thrcell = g_lodceil;
 
+    LH.thrpoly = g_lodpoly;
+
     hz_dcslice S0;
     if (hz_slice_init(&S0, lev) != HZ_DC_OK) exit(1);
     if (hz_slice_build(&S0, &T, &ht, lod_stop, &LH) != HZ_DC_OK) exit(1);
@@ -6428,6 +6480,8 @@ int main(int argc, char **argv) {
     LL.thr = lodthr;
 
     LL.thrcell = g_lodceil;
+
+    LL.thrpoly = g_lodpoly;
     hz_dcslice S;
     if (hz_slice_init(&S, lev) != HZ_DC_OK) exit(1);
     double ta = now_s();
@@ -8004,6 +8058,10 @@ int main(int argc, char **argv) {
       LC.rgb = rgb;
       LC.w = res;
       LC.h = res;
+      int64_t ahist[10] = {0};
+      double apix[10] = {0};
+      LC.areahist = ahist;
+      LC.areapix = apix;
       LC.defcol = calloc(np * 3, sizeof *LC.defcol);
       if (LC.defcol == NULL) exit(1);
       /* Ш8 (§575): ЗАГРУЗКА ТЕКСТУР. Имя из `map_Kd`, каталог — `ppm256` рядом
@@ -8165,6 +8223,21 @@ int main(int argc, char **argv) {
              "пикселей (%.1f %%)\n",
              (long long)LC.nfrag, (long long)ncov, (double)LC.nfrag / (double)(ncov ? ncov : 1),
              g_gamn, (long long)LC.nsurfuv, 100.0 * (double)LC.nsurfuv / (double)(ncov ? ncov : 1));
+      {
+        double tot4 = 0.0;
+        for (int b5 = 0; b5 < 10; b5++)
+          tot4 += apix[b5];
+        printf("      РАЗМЕР ПОЛИГОНА НА ЭКРАНЕ (площадь в пикселях -> сколько их, и какую долю "
+               "экрана они кроют):\n        ");
+        int lo4 = 1;
+        for (int b5 = 0; b5 < 10; b5++) {
+          if (ahist[b5] > 0)
+            printf("%d..%d: %lld шт / %.0f %%   ", lo4, lo4 * 4 - 1, (long long)ahist[b5],
+                   100.0 * apix[b5] / (tot4 > 0.0 ? tot4 : 1.0));
+          lo4 *= 4;
+        }
+        printf("\n");
+      }
       char path[256];
       /* Ш18 (§494): СГЛАЖИВАНИЕ. Растр идёт в `res`, а на диск пишется вдвое
        * меньше со свёрткой коробкой 2×2 — четыре пробы на пиксель. Это НЕ

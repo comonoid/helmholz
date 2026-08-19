@@ -8480,12 +8480,23 @@ int main(int argc, char **argv) {
           free(pall);
           free(pnv);
           double t_g2 = now_s() - tb2;
-          double sd2 = 0.0, si2 = 0.0;
-          for (int32_t i = 0; i < S.n; i++)
+          double sd2 = 0.0, si2 = 0.0, sda = 0.0, sia = 0.0, sarea = 0.0;
+          for (int32_t i = 0; i < S.n; i++) {
+            /* ВЗВЕШЕННОЕ ПЛОЩАДЬЮ — ЕДИНСТВЕННОЕ, ЧТО СРАВНИМО МЕЖДУ УРОВНЯМИ
+             * (§603). Сумма ПО ЯЧЕЙКАМ инвариантом не является: число ячеек
+             * меняется с уровнем вчетверо, и отношение поехало бы просто от
+             * смены населения, а не от физики. `Σ E·A / Σ E·A` приближает
+             * `∫E dA / ∫E dA`, а это свойство СЦЕНЫ. */
+            double sidew = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
+            double aa = sidew * sidew;
+            sarea += aa;
             for (int k = 0; k < 3; k++) {
               sd2 += (double)irr[3 * (size_t)i + (size_t)k];
               si2 += (double)ind[3 * (size_t)i + (size_t)k];
+              sda += (double)irr[3 * (size_t)i + (size_t)k] * aa;
+              sia += (double)ind[3 * (size_t)i + (size_t)k] * aa;
             }
+          }
           printf(
               "   Ф6. ИЕРАРХИЧЕСКИЙ ОТСКОК: eps %.3f, узлов дерева %d, СВЯЗЕЙ %lld против %lld пар "
               "(в %.0f раз меньше); дерево %.1f мс, сбор %.1f мс; СУММА косвенного / прямого = "
@@ -8494,6 +8505,9 @@ int main(int argc, char **argv) {
               (double)((long long)S.n * (long long)S.n) / (double)(nlink ? nlink : 1),
               t_build * 1e3, t_g2 * 1e3, si2 / (sd2 > 0.0 ? sd2 : 1.0),
               indvis ? " [С ЗАСЛОНАМИ]" : "");
+          printf("      §603 ВЗВЕШЕННОЕ ПЛОЩАДЬЮ (сравнимо между уровнями): Σ E_ind·A / Σ E_dir·A "
+                 "= %.4f; площадь среза %.1f м²\n",
+                 sia / (sda > 0.0 ? sda : 1.0), sarea);
           /* А1036: доля связей, где поправка ближней зоны ЗНАЧИМА. Без неё «комната
            * почти не сдвинулась» смешивает «далёкое поле цело» с «ближнее чуть
            * уменьшилось». Счётчик ПОПОТОЧНЫЙ и сводится в фиксированном

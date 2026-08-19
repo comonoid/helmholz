@@ -2337,10 +2337,267 @@ static int g_treesweep = 0;
 static double g_sweepthr = 0.0, g_sweeppx = 1.0, g_sweepeye[3] = {0, 0, 0};
 /* Ф6. (§516): угловой порог иерархического отскока; 0 — прежний гатер N². */
 static double g_hgather = 0.0;
+
+/* ---- НОСИТЕЛЬ КОСВЕННОГО СВЕТА — УЗЛЫ ДЕРЕВА (§597) ----------------------
+ *
+ * ЗАЧЕМ. Облучённость лежала в ячейках СРЕЗА, а срез камерозависим и строится
+ * заново каждый кадр. Значит косвенный свет был привязан к камере ПО ПОСТРОЕНИЮ
+ * и выбрасывался при каждом её движении — отсюда `5254` мс «вне кадра» (§593).
+ * Узел дерева камеры не содержит, поэтому ядро считается ОДИН раз и живёт.
+ *
+ * ПОЧЕМУ МАССИВ ЗДЕСЬ, А НЕ В `hz_dctree`. `src/cut/` — ОБЩИЙ СЛОЙ ГЕОМЕТРИИ.
+ * Светимость — не геометрия, и класть её в дерево разреза значило бы сращивать
+ * слои, которые проект держит порознь сознательно. Индекс — номер узла. */
+static float (*g_indnode)[3];
+static int32_t g_indnode_n;
+/* НК1 §597: прежний путь — сбор в срезе, каждый кадр. */
+static int g_indslice = 0;
+/* НК2 §597: подъём по иерархии выключен. Крупные узлы получают ноль, и крупные
+ * ячейки кадра обязаны почернеть — это контроль ЛОЖНОГО НУЛЯ (А917). */
+static int g_indnolift = 0;
+/* НК3 §598/А1028: подъём НЕВЗВЕШЕННЫЙ. Если разницы с взвешенным нет, значит
+ * площади у детей одинаковы, и это надо ЗНАТЬ, а не предполагать. */
+static int g_indflat = 0;
 /* Ф8' (§532): отскок направленным свипом. `nmu,nphi` — набор §2 (1,1 / 2,2 /
  * 2,4 / 4,4 даёт ND = 8, 32, 64, 128); `dpass` — число отскоков (довод №3 §523:
  * матрицы нет, есть ещё один проход); `dirsall` — НЕГАТИВНЫЙ КОНТРОЛЬ, излучать
  * во все стороны вместо наружной полусферы. */
+
+/* СБОР ПО ИЕРАРХИИ ИЗЛУЧАТЕЛЕЙ — ОДНА РЕАЛИЗАЦИЯ НА ОБА ПУТИ (§597).
+ *
+ * Вынесено из кадрового блока БЕЗ изменения смысла: те же `hgather_rec`, то же
+ * деление по приёмникам, тот же фиксированный порядок сведения счётчиков.
+ * Копии не заводится СОЗНАТЕЛЬНО: копия — это два места, где чинить один и тот
+ * же промах, а прежний путь остаётся эталоном (`0.7460` на комнате).
+ *
+ * `ind` — выход, `3` float на ячейку среза; `nlink`, `sthru`, `sall` могут быть
+ * NULL. Альбедо приёмника применяется здесь же, как и было. */
+static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, const opyr *P,
+                       const hz_objmesh *m, int lev, double eps, int blockvis, int alb0, float *ind,
+                       int64_t *nlink, double *sthru, double *sall) {
+  int nth = g_omp1 ? 1 : omp_get_max_threads();
+  int64_t *plink = calloc((size_t)nth, sizeof *plink);
+  double *pthru = calloc((size_t)nth, sizeof *pthru);
+  double *pall = calloc((size_t)nth, sizeof *pall);
+  if (plink == NULL || pthru == NULL || pall == NULL) exit(1);
+#pragma omp parallel for schedule(dynamic, 64) if (!g_omp1)
+  for (int32_t i = 0; i < S->n; i++) {
+    int th = g_omp1 ? 0 : omp_get_thread_num();
+    double pi[3], nn2[3], acc2[3] = {0, 0, 0};
+    hz_slice_vertex(S, i, pi);
+    for (int k = 0; k < 3; k++)
+      pi[k] = fr->org[k] + pi[k] * fr->h;
+    hz_slice_normal(S, i, nn2);
+    double rrecv = fr->h * (double)((int32_t)1 << (lev - (int)S->c[i].lvl));
+    for (int q2 = 0; q2 < 6; q2++)
+      hgather_rec(ET, 0, q2, pi, nn2, eps, rrecv, P, fr, blockvis, acc2, &plink[th], &pthru[th],
+                  &pall[th]);
+    for (int k = 0; k < 3; k++)
+      ind[3 * (size_t)i + (size_t)k] = (float)(acc2[k] * (alb0 ? 0.0 : alb(m, S->c[i].mat, k)));
+  }
+  /* Счётчики сводятся в ФИКСИРОВАННОМ порядке: редукция OpenMP отдала бы его
+   * планировщику, и число поехало бы от запуска к запуску. */
+  for (int t4 = 0; t4 < nth; t4++) {
+    if (nlink != NULL) *nlink += plink[t4];
+    if (sthru != NULL) *sthru += pthru[t4];
+    if (sall != NULL) *sall += pall[t4];
+  }
+  free(plink);
+  free(pthru);
+  free(pall);
+}
+
+/* УЗЕЛ ПО ЯЧЕЙКЕ СРЕЗА (§597, Р3). Ячейка несёт `lo` в сетке САМОГО МЕЛКОГО
+ * уровня и свой уровень `lvl`; номера узла у неё нет. Спуск целочисленный: на
+ * шаге `d` бит ребёнка берётся из разряда `lev−1−d` координаты — та же
+ * нумерация детей, что в `cell_proc` (бит `a` оси `a`).
+ *
+ * ОСТАНОВКА РОВНО НА ГЛУБИНЕ `lvl`, И ЭТО ТРУДНОЕ МЕСТО (А1029): ошибка на
+ * единицу уводит в ребёнка, косвенный свет уезжает в соседнюю ячейку, а на
+ * картинке это выглядит лёгким шумом — то есть НЕ бросается в глаза. Поэтому
+ * возвращается `−1` при любом несоответствии, а вызывающий ОБЯЗАН считать
+ * отказы и печатать их число. */
+static int32_t node_of_cell(const hz_dctree *t, int lev, const hz_dccell *c) {
+  int32_t ni = 0;
+  int lvl = (int)c->lvl;
+  if (lvl < 0 || lvl > lev) return -1;
+  for (int d = 0; d < lvl; d++) {
+    if (t->nd[ni].child0 < 0) return -1; /* дерево мельче, чем просит срез */
+    int bit = 0;
+    for (int a = 0; a < 3; a++)
+      if (((int32_t)c->lo[a] >> (lev - 1 - d)) & 1) bit |= 1 << a;
+    ni = t->nd[ni].child0 + bit;
+  }
+  return ni;
+}
+
+/* КАКОЙ ТРЕУГОЛЬНИК ПРИНАДЛЕЖИТ ЯЧЕЙКЕ СРЕЗА (§597; правило из Ш5б, §430).
+ *
+ * ОДНА РЕАЛИЗАЦИЯ НА ОБА ПУТИ — кадровый и ядро. Прежде правило было записано
+ * прямо в кадровом блоке, и ядро §597 без него получило `mat = 0` у ВСЕХ ячеек:
+ * `Σ E_ind` вышло `1.18` против `Σ E_dir = 2.7e5`, то есть косвенный свет был
+ * НУЛЕВОЙ. Копию заводить нельзя — это два места, где чинить один промах.
+ *
+ * ИСКАТЬ НАДО ПО ВЕРШИНЕ, А НЕ ПО УГЛУ ЯЧЕЙКИ (замерено 08-11): угол лежит
+ * где угодно — внутри тела, в пустоте, на соседнем предмете, — и материал
+ * оттуда берётся чужой (назначено `31 %` ячеек, шар вышел пятнистым). Вершина
+ * же лежит НА поверхности по построению DC.
+ *
+ * Возвращает индекс треугольника или `−1`. */
+static int32_t slice_cell_tri(const hz_dcslice *S, int32_t i, celltris *CT, const frame *fr,
+                              double vw[3]) {
+  hz_slice_vertex(S, i, vw);
+  int32_t cell[3];
+  for (int a = 0; a < 3; a++) {
+    double f = floor(vw[a]);
+    if (f < 0.0) f = 0.0;
+    if (f > (double)(fr->n - 1)) f = (double)(fr->n - 1);
+    cell[a] = (int32_t)f;
+  }
+  const int32_t *ls = NULL;
+  if (ct_list(CT, cell, &ls) == 0) return -1;
+  return ls[0];
+}
+
+/* Материал ячейки по тому же правилу. Возвращает число назначенных. */
+static int64_t slice_assign_mat(hz_dcslice *S, celltris *CT, const frame *fr, const hz_objmesh *m) {
+  int64_t n = 0;
+  for (int32_t i = 0; i < S->n; i++) {
+    double vw[3];
+    int32_t tri = slice_cell_tri(S, i, CT, fr, vw);
+    if (tri < 0) continue;
+    int32_t mi = m->fm != NULL ? m->fm[tri] : 0;
+    if (mi < 0 || mi >= m->nmtl) mi = 0;
+    S->c[i].mat = (uint8_t)(mi < 255 ? mi : 255);
+    n++;
+  }
+  return n;
+}
+
+/* ПОДЪЁМ ПО ИЕРАРХИИ (§597, Р4; правка А1028).
+ *
+ * ЗАЧЕМ. Ядро считается на срезе ПОЛНОЙ глубины, а камера может взять КРУПНЫЙ
+ * узел, которого в полном срезе нет вовсе. Без подъёма он получил бы ноль — а
+ * «нет пометки» есть НЕИЗВЕСТНО, а не ноль (А917, четвёртый случай за проект).
+ *
+ * ВЗВЕШИВАЕТСЯ ЧИСЛОМ ЛИСТЬЕВ С ВЕРШИНОЙ, А НЕ ПРОСТЫМ СРЕДНИМ ПО ВОСЬМИ, И
+ * РАЗНИЦА НЕ КОСМЕТИЧЕСКАЯ (А1028). Облучённость есть ПЛОТНОСТЬ, а не
+ * аддитивная величина; у детей разное количество поверхности внутри, и простое
+ * среднее по восьми дало бы крупному узлу не ту величину, которую он несёт.
+ * Число листьев с вершиной — заместитель площади: точной площади под рукой нет,
+ * и подменять её единицей было бы той же ошибкой, только молча.
+ * `indflat` (НК3) возвращает невзвешенное среднее.
+ *
+ * Возвращает число листьев с вершиной в поддереве. */
+static int32_t ind_lift(const hz_dctree *t, int32_t ni) {
+  if (t->nd[ni].child0 < 0) {
+    /* Лист: значение уже разложено (либо ноль, если вершины нет). */
+    return hz_dc_hasvert(t, ni) ? 1 : 0;
+  }
+  double acc[3] = {0, 0, 0};
+  double wsum = 0.0;
+  int32_t nleaf = 0;
+  for (int k = 0; k < 8; k++) {
+    int32_t ci = t->nd[ni].child0 + k;
+    int32_t nc = ind_lift(t, ci);
+    nleaf += nc;
+    if (nc == 0) continue;
+    double w = g_indflat ? 1.0 : (double)nc;
+    for (int a = 0; a < 3; a++)
+      acc[a] += (double)g_indnode[ci][a] * w;
+    wsum += w;
+  }
+  if (!g_indnolift && wsum > 0.0)
+    for (int a = 0; a < 3; a++)
+      g_indnode[ni][a] = (float)(acc[a] / wsum);
+  return nleaf;
+}
+
+/* ЯДРО КОСВЕННОГО СВЕТА — СЧИТАЕТСЯ ОДИН РАЗ, ЖИВЁТ МЕЖДУ КАДРАМИ (§597).
+ *
+ * Приёмники — срез ПОЛНОЙ ГЛУБИНЫ (`stop = NULL`): он камеронезависим ПО
+ * ОПРЕДЕЛЕНИЮ, а не по удачно выбранному порогу. Отвергнутая альтернатива
+ * (считать на кадровом срезе первой камеры) записана в А1030: она оставила бы
+ * скрытую привязку к точке запуска — «свет хороший там, откуда я вышел».
+ *
+ * ИСТОЧНИК ОБЯЗАН БЫТЬ КАМЕРОНЕЗАВИСИМЫМ, иначе всё это бессмысленно.
+ * Проверено чтением (А1033): под `sun` в расчёт входят только точка приёмника,
+ * фиксированное направление, диагональ сцены и постоянный цвет. А вот
+ * `hall_light` ищет потолок полости СПУСКОМ ОТ КАМЕРЫ — с площадным источником
+ * ядро несовместимо, и это записанный долг, а не забытое. */
+static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *fr, const opyr *P,
+                           const arealight *AL, const hz_objmesh *m, celltris *CT, int lev,
+                           double eps, int blockvis) {
+  double t0 = now_s();
+  g_indnode_n = T->n;
+  g_indnode = calloc((size_t)T->n, sizeof *g_indnode);
+  if (g_indnode == NULL) exit(1);
+
+  hz_dcslice SF;
+  if (hz_slice_init(&SF, lev) != HZ_DC_OK) exit(1);
+  if (hz_slice_build(&SF, T, ht, NULL, NULL) != HZ_DC_OK) exit(1);
+  /* МАТЕРИАЛ ЯЧЕЙКАМ ЯДРА — ТЕМ ЖЕ ПРАВИЛОМ, ЧТО В КАДРЕ. Без него альбедо
+   * приёмника берётся у материала `0`, и косвенный свет выходит НУЛЕВЫМ
+   * (замерено: `Σ E_ind = 1.18` против `Σ E_dir = 2.7e5`). */
+  int64_t nmatc = slice_assign_mat(&SF, CT, fr, m);
+  double t_slice = now_s() - t0;
+
+  double t1 = now_s();
+  float *irrF = malloc(3 * (size_t)SF.n * sizeof *irrF);
+  float *indF = calloc(3 * (size_t)SF.n, sizeof *indF);
+  if (irrF == NULL || indF == NULL) exit(1);
+  front_direct(&SF, fr, P, AL, irrF, 0.5, 1, NULL, m);
+  double t_dir = now_s() - t1;
+
+  double t2 = now_s();
+  etree ET;
+  memset(&ET, 0, sizeof ET);
+  etree_build(&ET, &SF, fr, irrF, m, 0, SF.n, 0, lev);
+  double t_tree = now_s() - t2;
+
+  double t3 = now_s();
+  int64_t nlink = 0;
+  gather_run(&ET, &SF, fr, P, m, lev, eps, blockvis, 0, indF, &nlink, NULL, NULL);
+  double t_gath = now_s() - t3;
+
+  /* РАСКЛАДКА ПО УЗЛАМ. Отказы СЧИТАЮТСЯ и печатаются: спуск на глубину `lvl` —
+   * трудное место (А1029), и молчаливый промах выглядел бы лёгким шумом. */
+  double t4 = now_s();
+  int64_t nbad = 0, nput = 0;
+  double sd = 0.0, si = 0.0;
+  for (int32_t i = 0; i < SF.n; i++) {
+    int32_t ni = node_of_cell(T, lev, &SF.c[i]);
+    if (ni < 0 || !hz_dc_hasvert(T, ni)) {
+      nbad++;
+      continue;
+    }
+    for (int a = 0; a < 3; a++)
+      g_indnode[ni][a] = indF[3 * (size_t)i + (size_t)a];
+    nput++;
+    for (int a = 0; a < 3; a++) {
+      sd += (double)irrF[3 * (size_t)i + (size_t)a];
+      si += (double)indF[3 * (size_t)i + (size_t)a];
+    }
+  }
+  ind_lift(T, 0);
+  double t_put = now_s() - t4;
+
+  /* А1032: ДВОЙНОЙ УЧЁТ ловится ОТНОШЕНИЕМ, а не «стало ярче». На комнате
+   * эталон отношения — `0.7460` при `hgather = 0.5`. */
+  printf("   §597 ЯДРО КОСВЕННОГО: приёмников %d (полная глубина), связей %lld, узлов %d, "
+         "память %.1f МБ, материал назначен %lld\n"
+         "      срез %.2f с + прямой %.2f с + дерево %.2f с + СБОР %.2f с + раскладка %.2f с "
+         "= %.2f с; РАСКЛАДКА: узлов заполнено %lld, ОТКАЗОВ %lld\n"
+         "      Σ E_dir = %.6e, Σ E_ind = %.6e, отношение = %.4f (двойной учёт дал бы вдвое)\n",
+         SF.n, (long long)nlink, T->n, (double)T->n * sizeof *g_indnode / 1048576.0,
+         (long long)nmatc, t_slice, t_dir, t_tree, t_gath, t_put, now_s() - t0, (long long)nput,
+         (long long)nbad, sd, si, si / (sd > 0.0 ? sd : 1.0));
+
+  etree_free(&ET);
+  free(irrF);
+  free(indF);
+  hz_slice_free(&SF);
+}
 static int g_dsweep = 0, g_dnmu = 2, g_dnphi = 2, g_dpass = 1, g_dirsall = 0, g_dblkopen = 0;
 /* Ф9. (§536): замер границы узости доли; `dlobeflat` — негативный контроль. */
 static int g_lobetest = 0, g_dlobeflat = 0;
@@ -4825,6 +5082,11 @@ int main(int argc, char **argv) {
       g_render = 1;
       lit = 1;
     }
+    /* §597: НК1 — прежний путь (сбор в срезе, каждый кадр); НК2 — без подъёма по
+     * иерархии; НК3 — подъём невзвешенный. */
+    if (strcmp(argv[i], "indslice") == 0) g_indslice = 1;
+    if (strcmp(argv[i], "indnolift") == 0) g_indnolift = 1;
+    if (strcmp(argv[i], "indflat") == 0) g_indflat = 1;
     if (strcmp(argv[i], "nomemo") == 0) hz_dc_walk_memo(HZ_DC_MEMO_OFF);
     if (strcmp(argv[i], "memoscramble") == 0) hz_dc_walk_memo(HZ_DC_MEMO_SCRAMBLE);
     if (strcmp(argv[i], "texflat") == 0) g_texflat = 1;
@@ -6820,6 +7082,20 @@ int main(int argc, char **argv) {
      * правится в конце каждого прохода, и всё, что от неё зависит (срез, свет,
      * растр), считается заново; всё, что не зависит (дерево, рёбра, текстуры,
      * таблица треугольников ячейки), остаётся построенным. */
+    /* ЯДРО КОСВЕННОГО СВЕТА СЧИТАЕТСЯ ЗДЕСЬ — ОДИН РАЗ, ДО ЦИКЛА (§597).
+     * Камеры в нём нет, поэтому оно переживает и кадр, и ходьбу. Источник
+     * обязан быть камеронезависимым: под `sun` это проверено чтением (А1033),
+     * с площадным `hall_light` ядро несовместимо и потому не строится. */
+    if (g_hgather > 0.0 && !g_indslice) {
+      if (!g_sun) {
+        printf("   §597 ЯДРО НЕ СТРОИТСЯ: источник площадной, а `hall_light` ищет потолок "
+               "СПУСКОМ ОТ КАМЕРЫ — сценно закреплённое ядро с ним несовместимо. Нужен `sun=`.\n");
+      } else {
+        arealight ALc;
+        hall_light(&ALc, &P, &fr, lo, hi, LL.eye, 0);
+        ind_core_build(&T, &ht, &fr, &P, &ALc, &m, &CT, lev, g_hgather, indvis);
+      }
+    }
     int walk_alive = 1;
     if (g_walk && !walk_open(res)) return 2;
     double t_prev = 1.0 / 30.0; /* первый шаг движения — как при 30 к/с */
@@ -6962,6 +7238,40 @@ int main(int argc, char **argv) {
       int64_t nstep_w = 0;
       front_direct(&S, &fr, &P, &AL, irr, 0.5, 1, &nstep_w, &m);
       double t_dir = now_s() - ta;
+      /* КОСВЕННЫЙ СВЕТ ИЗ УЗЛОВ (§597, Р5). Сбора в кадре НЕТ: ячейка среза
+       * находит свой узел спуском O(глубины) и ЧИТАЕТ готовое значение.
+       * Отказы спуска СЧИТАЮТСЯ — молчаливый промах выглядел бы лёгким шумом
+       * (А1029), а не отказом. */
+      double t_ind = 0.0;
+      int64_t nindbad = 0;
+      double s_dir = 0.0, s_ind = 0.0;
+      if (g_indnode != NULL) {
+        double ti0 = now_s();
+        for (int32_t i = 0; i < S.n; i++) {
+          int32_t ni = node_of_cell(&T, lev, &S.c[i]);
+          if (ni < 0 || ni >= g_indnode_n) {
+            nindbad++;
+            continue;
+          }
+          for (int a = 0; a < 3; a++) {
+            s_dir += (double)irr[3 * (size_t)i + (size_t)a];
+            s_ind += (double)g_indnode[ni][a];
+            irr[3 * (size_t)i + (size_t)a] += g_indnode[ni][a];
+          }
+        }
+        t_ind = now_s() - ti0;
+        /* А1029: отказы спуска ПЕЧАТАЮТСЯ — ноль обязателен, иначе раскладка
+         * неверна, и это видно числом, а не глазом.
+         * А1032: отношение косвенного к прямому — ловушка на ДВОЙНОЙ УЧЁТ.
+         * Печатается один раз (первый кадр), чтобы не засорять цикл ходьбы. */
+        static int said = 0;
+        if (!said) {
+          said = 1;
+          printf("   §597 КОСВЕННЫЙ ИЗ УЗЛОВ: %.1f мс на %d ячеек, ОТКАЗОВ СПУСКА %lld; "
+                 "Σ E_ind / Σ E_dir = %.4f\n",
+                 t_ind * 1e3, S.n, (long long)nindbad, s_ind / (s_dir > 0.0 ? s_dir : 1.0));
+        }
+      }
       /* ---- ДИАГНОСТИКА КАДРА: ВСЁ, ЧТО НИЖЕ, К КАРТИНКЕ НЕ ОТНОСИТСЯ (§589) ----
        * Свип, арбитр-марш, эталоны, поячеечные сличения, иерархический отскок —
        * это ЗАМЕРЫ, а не кадр. Одним прогоном они стоят секунды и потому в цикле
@@ -8085,7 +8395,10 @@ int main(int argc, char **argv) {
           stree_free(&TD);
           tr3_dirs_free(&DR);
         }
-        if (g_hgather > 0.0) {
+        /* §597: ПРЕЖНИЙ ПУТЬ ИДЁТ ТОЛЬКО ПРИ `indslice` (НК1). Иначе косвенный
+         * уже пришёл из узлов, и второй сбор дал бы ДВОЙНОЙ УЧЁТ — а он
+         * выглядит как «стало ярче», то есть как улучшение (А1032). */
+        if (g_hgather > 0.0 && g_indslice) {
           /* Ф6. (§516): ОТСКОК ПО ИЕРАРХИИ ИЗЛУЧАТЕЛЕЙ. */
           etree ET;
           memset(&ET, 0, sizeof ET);
@@ -8730,14 +9043,15 @@ int main(int argc, char **argv) {
            * работает» и «работает, но смотрю в стену» неотличимы, а проверять
            * придётся первым делом. */
           double t_wall = now_s() - t_iter0;
-          double t_other = t_wall - tf - t_mat - t_sort - t_walk;
-          printf("   кадр %6.0f мс (%.2f к/с) = срез %.0f + свет %.0f + растр %.0f + материал %.0f "
-                 "+ сортировка %.0f + ПРОФИЛЬНЫЙ ОБХОД %.0f + прочее %.0f; ячеек %d, "
-                 "многоугольников %lld; глаз (%.2f %.2f %.2f) взгляд (%.2f %.2f %.2f)\n",
-                 t_wall * 1e3, 1.0 / (t_wall > 0.0 ? t_wall : 1.0), t_slice * 1e3, t_dir * 1e3,
-                 t_rast * 1e3, t_mat * 1e3, t_sort * 1e3, t_walk * 1e3, t_other * 1e3, S.n,
-                 (long long)LC.nseen, eyec[0], eyec[1], eyec[2], atc[0] - eyec[0], atc[1] - eyec[1],
-                 atc[2] - eyec[2]);
+          double t_other = t_wall - tf - t_mat - t_sort - t_walk - t_ind;
+          printf(
+              "   кадр %6.0f мс (%.2f к/с) = срез %.0f + свет %.0f + растр %.0f + материал %.0f "
+              "+ сортировка %.0f + КОСВЕННЫЙ %.0f + профильный обход %.0f + прочее %.0f; ячеек %d, "
+              "многоугольников %lld; глаз (%.2f %.2f %.2f) взгляд (%.2f %.2f %.2f)\n",
+              t_wall * 1e3, 1.0 / (t_wall > 0.0 ? t_wall : 1.0), t_slice * 1e3, t_dir * 1e3,
+              t_rast * 1e3, t_mat * 1e3, t_sort * 1e3, t_ind * 1e3, t_walk * 1e3, t_other * 1e3,
+              S.n, (long long)LC.nseen, eyec[0], eyec[1], eyec[2], atc[0] - eyec[0],
+              atc[1] - eyec[1], atc[2] - eyec[2]);
           tf = t_wall; /* движение считается по НАСТОЯЩЕМУ времени кадра */
           fflush(stdout);
           walk_alive = walk_present(outrgb, outres, &res, eyec, atc, upc, t_prev);

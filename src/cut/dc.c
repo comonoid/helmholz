@@ -285,9 +285,16 @@ int hz_dc_init(hz_dctree *t, int log2size) {
   t->nsumcap = 0;
   t->nzeronrm = 0;
   t->nd = calloc((size_t)t->cap, sizeof(hz_dcnode));
-  if (t->nd == NULL) return HZ_DC_ENOMEM;
+  t->qf = calloc((size_t)t->cap, sizeof(hz_qef));
+  if (t->nd == NULL || t->qf == NULL) {
+    free(t->nd);
+    free(t->qf);
+    t->nd = NULL;
+    t->qf = NULL;
+    return HZ_DC_ENOMEM;
+  }
   t->nd[0].child0 = -1;
-  hz_qef_zero(&t->nd[0].q);
+  hz_qef_zero(&t->qf[0]);
   t->n = 1;
   return HZ_DC_OK;
 }
@@ -295,6 +302,8 @@ int hz_dc_init(hz_dctree *t, int log2size) {
 void hz_dc_free(hz_dctree *t) {
   free(t->nd);
   t->nd = NULL;
+  free(t->qf);
+  t->qf = NULL;
   free(t->nsum);
   t->nsum = NULL;
   t->nsumcap = 0;
@@ -343,6 +352,11 @@ static int nsum_alloc(hz_dctree *t) {
 
 /* Блок из 8 подряд, строго вперёд — дословно node_alloc8 октодерева: на «индекс
  * ребёнка больше индекса родителя» опирается и завершаемость спуска. */
+void hz_dc_drop_forms(hz_dctree *t) {
+  free(t->qf);
+  t->qf = NULL;
+}
+
 static int32_t dc_alloc8(hz_dctree *t) {
   if (t->n + 8 > t->cap) {
     int32_t nc = t->cap * 2;
@@ -350,13 +364,21 @@ static int32_t dc_alloc8(hz_dctree *t) {
     hz_dcnode *nn = realloc(t->nd, (size_t)nc * sizeof(hz_dcnode));
     if (nn == NULL) return -1;
     t->nd = nn;
+    /* Формы растут ВМЕСТЕ с узлами, пока не сняты (§632). Сняты — не растут, и
+     * это не молчание: дробить дерево без форм нечем, и такой путь отсекается
+     * в `hz_dc_repair`. */
+    if (t->qf != NULL) {
+      hz_qef *nq2 = realloc(t->qf, (size_t)nc * sizeof(hz_qef));
+      if (nq2 == NULL) return -1;
+      t->qf = nq2;
+    }
     t->cap = nc;
   }
   int32_t base = t->n;
   for (int i = 0; i < 8; i++) {
     memset(&t->nd[base + i], 0, sizeof(hz_dcnode));
     t->nd[base + i].child0 = -1;
-    hz_qef_zero(&t->nd[base + i].q);
+    hz_qef_zero(&t->qf[base + i]);
   }
   t->n += 8;
   return base;
@@ -400,7 +422,7 @@ static void unit_edge(int i, int *axis, int off[3]) {
 /* Форма листа размера 1 из таблицы рёбер. ПОРЯДОК ОБХОДА РЁБЕР ФИКСИРОВАН — на
  * нём стоит побитовое совпадение починки с перестройкой (Г49). */
 static void leaf_qef(hz_dctree *t, int32_t ni, const int32_t lo[3], const hz_htab *ht) {
-  hz_qef_zero(&t->nd[ni].q);
+  hz_qef_zero(&t->qf[ni]);
   for (int i = 0; i < 12; i++) {
     int axis, off[3];
     unit_edge(i, &axis, off);
@@ -412,7 +434,7 @@ static void leaf_qef(hz_dctree *t, int32_t ni, const int32_t lo[3], const hz_hta
     double loc[3];
     for (int k = 0; k < 3; k++)
       loc[k] = (double)(e->p[k] - lo[k]) + (k == axis ? e->t : 0.0);
-    hz_qef_add_sample(&t->nd[ni].q, loc, e->nrm);
+    hz_qef_add_sample(&t->qf[ni], loc, e->nrm);
   }
 }
 
@@ -424,7 +446,10 @@ static void solve_node(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t si
   nd->err = 0.0;
   for (int k = 0; k < 3; k++)
     nd->vx[k] = 0.0;
-  if (nd->q.n <= 0) return;
+  /* §632: число образцов ПЕРЕПИСЫВАЕТСЯ В УЗЕЛ здесь и только здесь — это
+   * единственное, что нужно от формы после постройки (`hz_dc_rms`). */
+  nd->nq = t->qf[ni].n;
+  if (t->qf[ni].n <= 0) return;
   if (!hz_dc_manifold(nd->corner)) {
     /* Г47: вершины НЕ выдаём. Одна вершина на два листа поверхности — это
      * материал там, где его нет, а «коробка ∩ полуплоскости» двух листов не
@@ -435,7 +460,7 @@ static void solve_node(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t si
   }
   double blo[3] = {0.0, 0.0, 0.0}, bhi[3] = {(double)size, (double)size, (double)size};
   double x[3], r;
-  int st = hz_qef_solve(&nd->q, blo, bhi, x, &r);
+  int st = hz_qef_solve(&t->qf[ni], blo, bhi, x, &r);
   if (st == HZ_QEF_EMPTY) return;
   if (st == HZ_QEF_CLAMPED) {
     nd->flags |= HZ_DC_CLAMPED;
@@ -459,16 +484,16 @@ static void sum_children(hz_dctree *t, int32_t ni, int32_t size) {
     double sh[3];
     for (int a = 0; a < 3; a++)
       sh[a] = ((i >> a) & 1) ? (double)half : 0.0;
-    hz_qef_add_shifted(&acc, &t->nd[c0 + i].q, sh);
+    hz_qef_add_shifted(&acc, &t->qf[c0 + i], sh);
   }
-  t->nd[ni].q = acc;
+  t->qf[ni] = acc;
 }
 
 static int build_rec(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size,
                      const hz_signgrid *g, const hz_htab *ht) {
   t->nd[ni].corner = corner_mask(g, lo, size);
   t->nd[ni].child0 = -1;
-  hz_qef_zero(&t->nd[ni].q);
+  hz_qef_zero(&t->qf[ni]);
   if (box_uniform(g, lo, size)) return HZ_DC_OK; /* поверхности внутри нет */
 
   if (size == 1) {
@@ -544,7 +569,7 @@ static int shape_occ_rec(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t 
   t->nd[ni].corner = 0; /* знака нет; hz_dc_manifold(0) = 1, отказа Г47 не будет */
   t->nd[ni].ecross = 0;
   t->nd[ni].edir = 0;
-  hz_qef_zero(&t->nd[ni].q);
+  hz_qef_zero(&t->qf[ni]);
   if (!oc(ctx, lo, size) || size == 1) return HZ_DC_OK;
   int32_t c0 = dc_alloc8(t);
   if (c0 < 0) return HZ_DC_ENOMEM;
@@ -747,6 +772,7 @@ static void node_nsum_from_children(hz_dctree *t, const hz_htab *ht, int32_t ni,
 }
 
 int hz_dc_fix_cell(hz_dctree *t, const hz_htab *ht, const int32_t cell[3]) {
+  if (t->qf == NULL) return HZ_DC_ENOMEM;
   int32_t path[HZ_DC_MAX_LOG2SIZE + 1], psize[HZ_DC_MAX_LOG2SIZE + 1];
   int32_t plo[HZ_DC_MAX_LOG2SIZE + 1][3];
   int depth = 0;
@@ -791,6 +817,8 @@ int hz_dc_forms_lazy(hz_dctree *t, const hz_htab *ht) {
 }
 
 int hz_dc_repair(hz_dctree *t, const hz_htab *ht, const int32_t cell[3]) {
+  /* §632: без форм починка НЕВОЗМОЖНА, и это отказ, а не тишина (Г25). */
+  if (t->qf == NULL) return HZ_DC_ENOMEM;
   int32_t path[HZ_DC_MAX_LOG2SIZE + 1], psize[HZ_DC_MAX_LOG2SIZE + 1];
   int32_t plo[HZ_DC_MAX_LOG2SIZE + 1][3];
   int depth = 0;

@@ -177,6 +177,7 @@ static int mtl_add(hz_objmesh *m, const char *name, size_t n, double kd) {
   for (int c = 0; c < 3; c++) {
     m->mtl[m->nmtl].kd3[c] = kd;
     m->mtl[m->nmtl].ks3[c] = 0.0;
+    m->mtl[m->nmtl].ke3[c] = 0.0;
   }
   m->mtl[m->nmtl].ns = 0.0;
   m->mtl[m->nmtl].ior = 1.0;
@@ -225,6 +226,13 @@ static void mtl_load(hz_objmesh *m, const char *objpath, const char *name, size_
       m->mtl[cur].ks3[0] = strtod(p + 2, &e);
       m->mtl[cur].ks3[1] = strtod(e, &e);
       m->mtl[cur].ks3[2] = strtod(e, &e);
+    } else if (p[0] == 0x4B && p[1] == 0x65 && is_sp(p[2]) && cur >= 0) {
+      /* `Ke` — излучение (§618). Сравнение побайтно, как у соседей: имена полей
+       * `.mtl` регистрозависимы, и `strncmp` тут ничего не добавил бы. */
+      char *e = NULL;
+      m->mtl[cur].ke3[0] = strtod(p + 2, &e);
+      m->mtl[cur].ke3[1] = strtod(e, &e);
+      m->mtl[cur].ke3[2] = strtod(e, &e);
     } else if (p[0] == 0x4E && p[1] == 0x73 && is_sp(p[2]) && cur >= 0) {
       m->mtl[cur].ns = strtod(p + 2, NULL);
     } else if (p[0] == 0x4E && p[1] == 0x69 && is_sp(p[2]) && cur >= 0) {

@@ -2323,6 +2323,10 @@ static int g_gnonorm = 0;
 static int g_nolinkcache = 0;
 /* §616: прежний ПЛОСКИЙ марш заслона — эталон и негативный контроль. */
 static int g_gflatvis = 0;
+/* §618, НК: не читать `Ke`. Без солнца `Σ b_0` обязана стать РОВНО НОЛЬ. */
+static int g_nokemit = 0;
+/* §618: `b0` ТОЛЬКО из `Ke` — ни солнца, ни площадки. */
+static int g_keonly = 0;
 
 static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], const double ni_[3],
                         double eps, double rrecv, const opyr *P, const frame *fr, int vis,
@@ -2726,8 +2730,34 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
   float *irrF = malloc(3 * (size_t)SF.n * sizeof *irrF);
   float *indF = calloc(3 * (size_t)SF.n, sizeof *indF);
   if (irrF == NULL || indF == NULL) exit(1);
-  front_direct(&SF, fr, P, AL, irrF, 0.5, 1, NULL, m);
+  /* §618, `keonly`: НИКАКОГО внешнего источника. `b0` целиком из `Ke`, то есть
+   * сцена светит сама — ровно §1.7. Площадка `hall_light` при этом не зовётся
+   * вовсе, и её камерозависимость (§597) перестаёт мешать. */
+  if (g_keonly)
+    memset(irrF, 0, 3 * (size_t)SF.n * sizeof *irrF);
+  else
+    front_direct(&SF, fr, P, AL, irrF, 0.5, 1, NULL, m);
+  /* §618: ИЗЛУЧАЮЩИЕ ПОВЕРХНОСТИ. §1.7: «источник есть полигон с заданным
+   * `L_e`, отдельной машинерии нет». Прибавляется к `b0`, а не заменяет его:
+   * сцена может светиться И быть освещённой. Солнце и площадка становятся
+   * необязательными. */
+  int64_t nemit = 0, nkemat = 0;
+  if (!g_nokemit) {
+    for (int32_t q = 0; q < m->nmtl; q++)
+      if (m->mtl[q].ke3[0] > 0.0 || m->mtl[q].ke3[1] > 0.0 || m->mtl[q].ke3[2] > 0.0) nkemat++;
+    for (int32_t i = 0; i < SF.n; i++) {
+      const double *ke = m->mtl[SF.c[i].mat < m->nmtl ? SF.c[i].mat : 0].ke3;
+      if (!(ke[0] > 0.0 || ke[1] > 0.0 || ke[2] > 0.0)) continue;
+      for (int k = 0; k < 3; k++)
+        irrF[3 * (size_t)i + (size_t)k] += (float)ke[k];
+      nemit++;
+    }
+  }
   double t_dir = now_s() - t1;
+  printf("   §618 ИЗЛУЧАЮЩИЕ ПОВЕРХНОСТИ: материалов с Ke > 0 — %lld из %d; ячеек среза со "
+         "свечением %lld из %d (%.2f %%)\n",
+         (long long)nkemat, m->nmtl, (long long)nemit, SF.n,
+         100.0 * (double)nemit / (double)(SF.n ? SF.n : 1));
 
   /* РЯД НЕЙМАНА: `b0` — прямой свет, `b_{k+1} = K·b_k`, ответ `Σ b_k` (§607).
    *
@@ -5356,6 +5386,12 @@ int main(int argc, char **argv) {
     /* §597: НК1 — прежний путь (сбор в срезе, каждый кадр); НК2 — без подъёма по
      * иерархии; НК3 — подъём невзвешенный. */
     if (strncmp(argv[i], "hbounce=", 8) == 0) g_hbounce = (int)strtol(argv[i] + 8, NULL, 10);
+    if (strcmp(argv[i], "keonly") == 0) {
+      g_keonly = 1;
+      g_render = 1;
+      lit = 1;
+    }
+    if (strcmp(argv[i], "nokemit") == 0) g_nokemit = 1;
     if (strcmp(argv[i], "gflatvis") == 0) g_gflatvis = 1;
     if (strcmp(argv[i], "nolinkcache") == 0) g_nolinkcache = 1;
     if (strcmp(argv[i], "gnonorm") == 0) g_gnonorm = 1;
@@ -7364,9 +7400,10 @@ int main(int argc, char **argv) {
      * обязан быть камеронезависимым: под `sun` это проверено чтением (А1033),
      * с площадным `hall_light` ядро несовместимо и потому не строится. */
     if (g_hgather > 0.0 && !g_indslice) {
-      if (!g_sun) {
+      if (!g_sun && !g_keonly) {
         printf("   §597 ЯДРО НЕ СТРОИТСЯ: источник площадной, а `hall_light` ищет потолок "
-               "СПУСКОМ ОТ КАМЕРЫ — сценно закреплённое ядро с ним несовместимо. Нужен `sun=`.\n");
+               "СПУСКОМ ОТ КАМЕРЫ — сценно закреплённое ядро с ним несовместимо. Нужен `sun=` "
+               "или `keonly` (§618: светятся сами поверхности).\n");
       } else {
         arealight ALc;
         hall_light(&ALc, &P, &fr, lo, hi, LL.eye, 0);
@@ -7513,7 +7550,19 @@ int main(int argc, char **argv) {
       /* РАБОЧИЙ ПУТЬ — С ПОДЪЁМОМ (§426): тот же предикат, вчетверо дешевле.
        * Плоский марш остаётся АРБИТРОМ и зовётся ниже. */
       int64_t nstep_w = 0;
-      front_direct(&S, &fr, &P, &AL, irr, 0.5, 1, &nstep_w, &m);
+      /* §618: при `keonly` внешнего источника НЕТ и в кадре — `b0` берётся из `Ke`
+       * тех же материалов, что и в ядре. Иначе кадр светился бы площадкой, а
+       * косвенный приходил бы от светящихся тел: две разные сцены в одном кадре. */
+      if (g_keonly) {
+        memset(irr, 0, 3 * (size_t)S.n * sizeof *irr);
+        if (!g_nokemit)
+          for (int32_t i2 = 0; i2 < S.n; i2++) {
+            const double *ke = m.mtl[S.c[i2].mat < m.nmtl ? S.c[i2].mat : 0].ke3;
+            for (int k2 = 0; k2 < 3; k2++)
+              irr[3 * (size_t)i2 + (size_t)k2] += (float)ke[k2];
+          }
+      } else
+        front_direct(&S, &fr, &P, &AL, irr, 0.5, 1, &nstep_w, &m);
       double t_dir = now_s() - ta;
       /* КОСВЕННЫЙ СВЕТ ИЗ УЗЛОВ (§597, Р5). Сбора в кадре НЕТ: ячейка среза
        * находит свой узел спуском O(глубины) и ЧИТАЕТ готовое значение.

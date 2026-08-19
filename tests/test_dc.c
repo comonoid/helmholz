@@ -379,6 +379,40 @@ static int nodes_equal(const hz_dctree *a, const hz_dctree *b, int32_t *first_di
   return 1;
 }
 
+/* §634: ОТКАЗ ПОЧИНКИ БЕЗ ФОРМ — контроль обещания, данного в §632.
+ *
+ * ЗАЧЕМ. `hz_dc_drop_forms` освобождает формы ради памяти (`160 -> 48` Б на узел,
+ * §633), а починка без них СЧИТАТЬ НЕ МОЖЕТ: ей нужно решать вершину заново.
+ * Обещано было «вернёт ошибку, а не посчитает по мусору» — и это ОБЕЩАНИЕ, пока
+ * не проверено. Молчаливый успех здесь означал бы чтение освобождённой памяти,
+ * то есть хуже, чем не экономить вовсе. */
+static void t_repair_noforms(void) {
+  const int L = 4;
+  sph s = {{8.3, 7.7, 8.1}, 5.5};
+  hz_signgrid g = {NULL, 0, 0};
+  hz_htab ht;
+  hz_htab_init(&ht);
+  check(hz_dc_sample(&g, &ht, L, sph_sign, sph_cross, &s) == HZ_DC_OK, "опрос (без форм)");
+  hz_dctree t;
+  hz_dc_init(&t, L);
+  check(hz_dc_build(&t, &g, &ht) == HZ_DC_OK, "сборка (без форм)");
+  /* Ячейка берётся У РЕБРА С ПЕРЕСЕЧЕНИЕМ, а не наугад: у пустой починка
+   * законно откажет, и контроль перестал бы различать «отказ по отсутствию
+   * форм» и «отказ по отсутствию поверхности». */
+  const hz_hedge *e0 = &ht.e[0];
+  int32_t cell[3] = {e0->p[0], e0->p[1], e0->p[2]};
+  for (int a = 0; a < 3; a++)
+    if (cell[a] > 0 && a != e0->axis) cell[a]--;
+  check(hz_dc_repair(&t, &ht, cell) == HZ_DC_OK, "починка ПРИ формах проходит");
+  hz_dc_drop_forms(&t);
+  check(hz_dc_repair(&t, &ht, cell) == HZ_DC_ENOMEM,
+        "починка БЕЗ форм ОТКАЗЫВАЕТ, а не считает по мусору");
+  check(hz_dc_fix_cell(&t, &ht, cell) == HZ_DC_ENOMEM, "правка ячейки БЕЗ форм тоже отказывает");
+  hz_dc_free(&t);
+  hz_htab_free(&ht);
+  hz_signgrid_free(&g);
+}
+
 static void t_repair(void) {
   const int L = 4;
   sph s = {{8.3, 7.7, 8.1}, 5.5};
@@ -607,12 +641,14 @@ int main(void) {
   printf("  занятость вместо нормалей -> ребро ОБЯЗАНО скруглиться (>0.05)\n");
   printf("  независимый счёт того же пересечения -> биты ОБЯЗАНЫ разойтись\n");
   printf("  починка по СТАРЫМ данным -> совпадения с перестройкой БЫТЬ НЕ МОЖЕТ\n");
+  printf("  починка БЕЗ ФОРМ (§632) -> ОБЯЗАНА вернуть ошибку, а не посчитать\n");
   printf("=== РЕЗУЛЬТАТЫ ===\n");
 
   t_sphere();
   t_sharp();
   t_shared_edge();
   t_repair();
+  t_repair_noforms();
   t_manifold();
   t_thin();
   t_uniq();

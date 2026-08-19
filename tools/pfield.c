@@ -2237,9 +2237,14 @@ static int32_t etree_build(etree *T, const hz_dcslice *S, const frame *fr, const
 
 /* Спуск ведётся ПО ОДНОЙ КОРЗИНЕ; корзины узла лежат подряд, и пустых среди них
  * нет — поэтому обход читает ровно то, что нужно, и ни байтом больше. */
+/* §600: НК1 — прежнее ТОЧЕЧНОЕ ядро; НК2 — поправка в 1000 раз (обязана уехать
+ * в ДАЛЁКОМ поле, чем и проверяет, что П2 не слепа). */
+static int g_gpoint = 0, g_gwide = 0;
+
 static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], const double ni_[3],
                         double eps, double rrecv, const opyr *P, const frame *fr, int vis,
-                        double out[3], int64_t *nlink, double *sthru, double *sall) {
+                        double out[3], int64_t *nlink, double *sthru, double *sall,
+                        int64_t *nnear) {
   const enode *e = &T->e[ni];
   const ebin *bb = NULL;
   for (int k = 0; k < e->nb; k++)
@@ -2259,7 +2264,7 @@ static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], c
   double spread = 1.0 - (double)bb->nsum / (double)bb->area;
   if (e->nch > 0 && (spread > g_hspread || (d4 > eps * r2 && 2.0 * (double)bb->rad > rrecv))) {
     for (int k = 0; k < e->nch; k++)
-      hgather_rec(T, e->ch[k], q, pi, ni_, eps, rrecv, P, fr, vis, out, nlink, sthru, sall);
+      hgather_rec(T, e->ch[k], q, pi, ni_, eps, rrecv, P, fr, vis, out, nlink, sthru, sall, nnear);
     return;
   }
   double di = w[0] * ni_[0] + w[1] * ni_[1] + w[2] * ni_[2];
@@ -2267,7 +2272,27 @@ static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], c
   if (!(di > 0.0) || !(dj > 0.0)) return; /* отсев БЕЗ корня */
   double rr = sqrt(r2);
   (*nlink)++;
-  double g = (di / rr) * (dj / rr) / (3.14159265358979323846 * r2);
+  /* ОГРАНИЧЕННОЕ ЯДРО ВМЕСТО ТОЧЕЧНОГО (§600). Точечное `cos·cos/(π r²)`
+   * расходится как `1/r²`, и условие дробления выше при КРУПНОМ приёмнике
+   * ложно — связь принимается вплотную. Замерено (§599): на Bistro отношение
+   * косвенного к прямому вышло `1 712 335` вместо порядка единицы.
+   *
+   * ФИЗИКА, КОТОРУЮ ТОЧЕЧНОЕ ЯДРО НЕ ЗНАЕТ: облучённость от полусферы яркости
+   * `B` равна `B`, и больше не бывает НИКОГДА. Прибавка `A_j` в знаменателе
+   * даёт `E = B·cos·cos·A/(π r² + A) ≤ B` — граница по ПОСТРОЕНИЮ, а не по
+   * порогу. На далёких связях `A ≪ π r²`, поправка исчезает, и далёкое поле
+   * обязано остаться прежним (это проверяется П2 §600 на комнате).
+   *
+   * `bb->area` — СУММА площадей ячеек корзины, а не площадь пятна, которое они
+   * занимают (А1034). Граница `E ≤ B` верна при любом соотношении, но для
+   * рассеянной корзины `π·rad²` ограничивало бы сильнее. Это НЕ ПРОВЕРЕННАЯ
+   * альтернатива и записанный замерный долг, а не молчаливый выбор. */
+  double soft = g_gpoint ? 0.0 : (double)bb->area * (g_gwide ? 1000.0 : 1.0);
+  double g = (di / rr) * (dj / rr) / (3.14159265358979323846 * r2 + soft);
+  /* А1036: доля связей, где поправка ЗНАЧИМА. Счётчик ПОПОТОЧНЫЙ, как и
+   * остальные: гонка в горячем цикле недопустима, а редукция OpenMP отдала бы
+   * порядок планировщику. */
+  if (nnear != NULL && soft > 0.01 * 3.14159265358979323846 * r2) (*nnear)++;
   int blocked = 0;
   double cw[3] = {(double)bb->c[0], (double)bb->c[1], (double)bb->c[2]};
   if (vis) blocked = shadowed(P, fr, pi, cw, 0.5);
@@ -2374,12 +2399,13 @@ static int g_indflat = 0;
  * NULL. Альбедо приёмника применяется здесь же, как и было. */
 static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, const opyr *P,
                        const hz_objmesh *m, int lev, double eps, int blockvis, int alb0, float *ind,
-                       int64_t *nlink, double *sthru, double *sall) {
+                       int64_t *nlink, double *sthru, double *sall, int64_t *nnear) {
   int nth = g_omp1 ? 1 : omp_get_max_threads();
   int64_t *plink = calloc((size_t)nth, sizeof *plink);
   double *pthru = calloc((size_t)nth, sizeof *pthru);
   double *pall = calloc((size_t)nth, sizeof *pall);
-  if (plink == NULL || pthru == NULL || pall == NULL) exit(1);
+  int64_t *pnear = calloc((size_t)nth, sizeof *pnear);
+  if (plink == NULL || pthru == NULL || pall == NULL || pnear == NULL) exit(1);
 #pragma omp parallel for schedule(dynamic, 64) if (!g_omp1)
   for (int32_t i = 0; i < S->n; i++) {
     int th = g_omp1 ? 0 : omp_get_thread_num();
@@ -2391,7 +2417,7 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
     double rrecv = fr->h * (double)((int32_t)1 << (lev - (int)S->c[i].lvl));
     for (int q2 = 0; q2 < 6; q2++)
       hgather_rec(ET, 0, q2, pi, nn2, eps, rrecv, P, fr, blockvis, acc2, &plink[th], &pthru[th],
-                  &pall[th]);
+                  &pall[th], &pnear[th]);
     for (int k = 0; k < 3; k++)
       ind[3 * (size_t)i + (size_t)k] = (float)(acc2[k] * (alb0 ? 0.0 : alb(m, S->c[i].mat, k)));
   }
@@ -2399,12 +2425,14 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
    * планировщику, и число поехало бы от запуска к запуску. */
   for (int t4 = 0; t4 < nth; t4++) {
     if (nlink != NULL) *nlink += plink[t4];
+    if (nnear != NULL) *nnear += pnear[t4];
     if (sthru != NULL) *sthru += pthru[t4];
     if (sall != NULL) *sall += pall[t4];
   }
   free(plink);
   free(pthru);
   free(pall);
+  free(pnear);
 }
 
 /* УЗЕЛ ПО ЯЧЕЙКЕ СРЕЗА (§597, Р3). Ячейка несёт `lo` в сетке САМОГО МЕЛКОГО
@@ -2557,7 +2585,8 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
 
   double t3 = now_s();
   int64_t nlink = 0;
-  gather_run(&ET, &SF, fr, P, m, lev, eps, blockvis, 0, indF, &nlink, NULL, NULL);
+  int64_t nnear = 0;
+  gather_run(&ET, &SF, fr, P, m, lev, eps, blockvis, 0, indF, &nlink, NULL, NULL, &nnear);
   double t_gath = now_s() - t3;
 
   /* РАСКЛАДКА ПО УЗЛАМ. Отказы СЧИТАЮТСЯ и печатаются: спуск на глубину `lvl` —
@@ -5084,6 +5113,8 @@ int main(int argc, char **argv) {
     }
     /* §597: НК1 — прежний путь (сбор в срезе, каждый кадр); НК2 — без подъёма по
      * иерархии; НК3 — подъём невзвешенный. */
+    if (strcmp(argv[i], "gpoint") == 0) g_gpoint = 1;
+    if (strcmp(argv[i], "gwide") == 0) g_gwide = 1;
     if (strcmp(argv[i], "indslice") == 0) g_indslice = 1;
     if (strcmp(argv[i], "indnolift") == 0) g_indnolift = 1;
     if (strcmp(argv[i], "indflat") == 0) g_indflat = 1;
@@ -8417,9 +8448,10 @@ int main(int argc, char **argv) {
            * запуску. Здесь оно воспроизводимо. */
           int nth = g_omp1 ? 1 : omp_get_max_threads();
           int64_t *plink = calloc((size_t)nth, sizeof *plink);
+          int64_t *pnv = calloc((size_t)nth, sizeof *pnv);
           double *pthru = calloc((size_t)nth, sizeof *pthru);
           double *pall = calloc((size_t)nth, sizeof *pall);
-          if (plink == NULL || pthru == NULL || pall == NULL) exit(1);
+          if (plink == NULL || pthru == NULL || pall == NULL || pnv == NULL) exit(1);
 #pragma omp parallel for schedule(dynamic, 64) if (!g_omp1)
           for (int32_t i = 0; i < S.n; i++) {
             int th = g_omp1 ? 0 : omp_get_thread_num();
@@ -8431,12 +8463,14 @@ int main(int argc, char **argv) {
             double rrecv = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
             for (int q2 = 0; q2 < 6; q2++)
               hgather_rec(&ET, 0, q2, pi, nn2, g_hgather, rrecv, &P, &fr, indvis, acc2, &plink[th],
-                          &pthru[th], &pall[th]);
+                          &pthru[th], &pall[th], &pnv[th]);
             for (int k = 0; k < 3; k++)
               ind[3 * (size_t)i + (size_t)k] =
                   (float)(acc2[k] * (alb0 ? 0.0 : alb(&m, S.c[i].mat, k)));
           }
+          int64_t pnear2 = 0;
           for (int t4 = 0; t4 < nth; t4++) {
+            pnear2 += pnv[t4];
             nlink += plink[t4];
             sthru2 += pthru[t4];
             sall2 += pall[t4];
@@ -8444,6 +8478,7 @@ int main(int argc, char **argv) {
           free(plink);
           free(pthru);
           free(pall);
+          free(pnv);
           double t_g2 = now_s() - tb2;
           double sd2 = 0.0, si2 = 0.0;
           for (int32_t i = 0; i < S.n; i++)
@@ -8459,6 +8494,15 @@ int main(int argc, char **argv) {
               (double)((long long)S.n * (long long)S.n) / (double)(nlink ? nlink : 1),
               t_build * 1e3, t_g2 * 1e3, si2 / (sd2 > 0.0 ? sd2 : 1.0),
               indvis ? " [С ЗАСЛОНАМИ]" : "");
+          /* А1036: доля связей, где поправка ближней зоны ЗНАЧИМА. Без неё «комната
+           * почти не сдвинулась» смешивает «далёкое поле цело» с «ближнее чуть
+           * уменьшилось». Счётчик ПОПОТОЧНЫЙ и сводится в фиксированном
+           * порядке — как и остальные здесь. Гонку в горячем цикле оставлять
+           * нельзя даже в диагностике: число стало бы невоспроизводимым. */
+          printf("      §600 БЛИЖНЯЯ ЗОНА: связей с ЗНАЧИМОЙ поправкой (A > 0.01 pi r^2) около "
+                 "%lld из %lld (%.2f %%)\n",
+                 (long long)pnear2, (long long)nlink,
+                 100.0 * (double)pnear2 / (double)(nlink ? nlink : 1));
           g_t_bounce = t_build + t_g2;
           if (indmeas || indvis)
             printf("      §474 СКВОЗЬ ЗАСЛОНЫ: %.2f %%\n",
@@ -8899,6 +8943,7 @@ int main(int argc, char **argv) {
           printf("   Ш8 ТЕКСТУРЫ: загружено %lld, не найдено %lld, память %.1f МБ, за %.2f с\n",
                  (long long)nload, (long long)nmiss, (double)tbytes / 1048576.0, now_s() - tt0);
         }
+        if (!g_walk) printf("   §600 БЕЛАЯ ТОЧКА (перцентиль 99.5 по срезу): %.6e\n", white);
         /* Кадровый контекст получает УКАЗАТЕЛИ на разово загруженное. Владения он
          * не берёт: освобождать их в конце кадра значило бы грузить их заново. */
         if (uvs != NULL && !g_texflat) {

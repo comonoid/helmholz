@@ -2243,8 +2243,8 @@ static int g_gpoint = 0, g_gwide = 0;
 
 static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], const double ni_[3],
                         double eps, double rrecv, const opyr *P, const frame *fr, int vis,
-                        double out[3], int64_t *nlink, double *sthru, double *sall,
-                        int64_t *nnear) {
+                        double out[3], int64_t *nlink, double *sthru, double *sall, int64_t *nnear,
+                        double *ffsum) {
   const enode *e = &T->e[ni];
   const ebin *bb = NULL;
   for (int k = 0; k < e->nb; k++)
@@ -2264,7 +2264,8 @@ static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], c
   double spread = 1.0 - (double)bb->nsum / (double)bb->area;
   if (e->nch > 0 && (spread > g_hspread || (d4 > eps * r2 && 2.0 * (double)bb->rad > rrecv))) {
     for (int k = 0; k < e->nch; k++)
-      hgather_rec(T, e->ch[k], q, pi, ni_, eps, rrecv, P, fr, vis, out, nlink, sthru, sall, nnear);
+      hgather_rec(T, e->ch[k], q, pi, ni_, eps, rrecv, P, fr, vis, out, nlink, sthru, sall, nnear,
+                  ffsum);
     return;
   }
   double di = w[0] * ni_[0] + w[1] * ni_[1] + w[2] * ni_[2];
@@ -2293,6 +2294,10 @@ static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], c
    * остальные: гонка в горячем цикле недопустима, а редукция OpenMP отдала бы
    * порядок планировщику. */
   if (nnear != NULL && soft > 0.01 * 3.14159265358979323846 * r2) (*nnear)++;
+  /* §609: СУММА ФОРМФАКТОРОВ. `F_ij = cos_i cos_j A/(π r² + A)` есть в точности
+   * `g · A_j`. Физика: `Σ_j F_ij ≤ 1` у полностью замкнутой точки и СТРОГО
+   * МЕНЬШЕ у открытой. Всякий приёмник выше единицы — доказательство завышения. */
+  if (ffsum != NULL) *ffsum += g * (double)bb->area;
   int blocked = 0;
   double cw[3] = {(double)bb->c[0], (double)bb->c[1], (double)bb->c[2]};
   if (vis) blocked = shadowed(P, fr, pi, cw, 0.5);
@@ -2403,7 +2408,7 @@ static int g_hbounce = 1;
  * NULL. Альбедо приёмника применяется здесь же, как и было. */
 static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, const opyr *P,
                        const hz_objmesh *m, int lev, double eps, int blockvis, int alb0, float *ind,
-                       int64_t *nlink, double *sthru, double *sall, int64_t *nnear) {
+                       int64_t *nlink, double *sthru, double *sall, int64_t *nnear, double *ffout) {
   int nth = g_omp1 ? 1 : omp_get_max_threads();
   int64_t *plink = calloc((size_t)nth, sizeof *plink);
   double *pthru = calloc((size_t)nth, sizeof *pthru);
@@ -2413,7 +2418,7 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
 #pragma omp parallel for schedule(dynamic, 64) if (!g_omp1)
   for (int32_t i = 0; i < S->n; i++) {
     int th = g_omp1 ? 0 : omp_get_thread_num();
-    double pi[3], nn2[3], acc2[3] = {0, 0, 0};
+    double pi[3], nn2[3], acc2[3] = {0, 0, 0}, ffacc = 0.0;
     hz_slice_vertex(S, i, pi);
     for (int k = 0; k < 3; k++)
       pi[k] = fr->org[k] + pi[k] * fr->h;
@@ -2421,9 +2426,10 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
     double rrecv = fr->h * (double)((int32_t)1 << (lev - (int)S->c[i].lvl));
     for (int q2 = 0; q2 < 6; q2++)
       hgather_rec(ET, 0, q2, pi, nn2, eps, rrecv, P, fr, blockvis, acc2, &plink[th], &pthru[th],
-                  &pall[th], &pnear[th]);
+                  &pall[th], &pnear[th], &ffacc);
     for (int k = 0; k < 3; k++)
       ind[3 * (size_t)i + (size_t)k] = (float)(acc2[k] * (alb0 ? 0.0 : alb(m, S->c[i].mat, k)));
+    if (ffout != NULL) ffout[i] = ffacc;
   }
   /* Счётчики сводятся в ФИКСИРОВАННОМ порядке: редукция OpenMP отдала бы его
    * планировщику, и число поехало бы от запуска к запуску. */
@@ -2593,6 +2599,10 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
    * а §599/§604 записали, что внешнего эталона отскока на Bistro нет. */
   double t_tree = 0.0, t_gath = 0.0;
   int64_t nlink = 0, nnear = 0;
+  /* §609: сумма формфакторов копится ТОЛЬКО на первом отскоке — она свойство
+   * ГЕОМЕТРИИ и от яркости излучателей не зависит вовсе. */
+  double *ffv = calloc((size_t)SF.n, sizeof *ffv);
+  if (ffv == NULL) exit(1);
   float *bcur = malloc(3 * (size_t)SF.n * sizeof *bcur);
   float *bnext = calloc(3 * (size_t)SF.n, sizeof *bnext);
   if (bcur == NULL || bnext == NULL) exit(1);
@@ -2610,7 +2620,8 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
     t_tree += now_s() - ta1;
     double ta2 = now_s();
     int64_t nl = 0;
-    gather_run(&ETk, &SF, fr, P, m, lev, eps, blockvis, 0, bnext, &nl, NULL, NULL, &nnear);
+    gather_run(&ETk, &SF, fr, P, m, lev, eps, blockvis, 0, bnext, &nl, NULL, NULL, &nnear,
+               k == 0 ? ffv : NULL);
     t_gath += now_s() - ta2;
     if (k == 0) nlink = nl;
     etree_free(&ETk);
@@ -2633,6 +2644,23 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
       double a = alb(m, (uint8_t)(q < 255 ? q : 255), k);
       if (a > rhomax) rhomax = a;
     }
+  /* §609: ПОЯЧЕЕЧНЫЙ ФАЛЬСИФИКАТОР. `Σ_j F_ij ≤ 1` у замкнутой точки и СТРОГО
+   * МЕНЬШЕ у открытой; Bistro — улица с небом. Всякий приёмник выше единицы есть
+   * доказательство завышения, и это не сводная величина, а поячеечная. */
+  {
+    double *fs = malloc((size_t)SF.n * sizeof *fs);
+    if (fs == NULL) exit(1);
+    memcpy(fs, ffv, (size_t)SF.n * sizeof *fs);
+    qsort(fs, (size_t)SF.n, sizeof *fs, cmp_d);
+    int64_t nover = 0;
+    for (int32_t i = 0; i < SF.n; i++)
+      if (ffv[i] > 1.0) nover++;
+    printf("   §609 СУММА ФОРМФАКТОРОВ Σ_j F_ij (физика: < 1 у открытой точки):\n"
+           "      медиана %.4f, p90 %.4f, МАКСИМУМ %.4f; ВЫШЕ ЕДИНИЦЫ %lld из %d (%.1f %%)\n",
+           fs[SF.n / 2], fs[(int32_t)((double)SF.n * 0.9)], fs[SF.n - 1], (long long)nover, SF.n,
+           100.0 * (double)nover / (double)(SF.n ? SF.n : 1));
+    free(fs);
+  }
   printf("   §607 РЯД НЕЙМАНА: отскоков %d, ρ_max = %.4f\n", nb, rhomax);
   for (int k = 0; k < nb; k++)
     printf("      Σ b_%d = %.6e -> Σ b_%d = %.6e; ОТНОШЕНИЕ %.4f %s\n", k, sb[k], k + 1, sb[k + 1],
@@ -8513,7 +8541,7 @@ int main(int argc, char **argv) {
             double rrecv = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
             for (int q2 = 0; q2 < 6; q2++)
               hgather_rec(&ET, 0, q2, pi, nn2, g_hgather, rrecv, &P, &fr, indvis, acc2, &plink[th],
-                          &pthru[th], &pall[th], &pnv[th]);
+                          &pthru[th], &pall[th], &pnv[th], NULL);
             for (int k = 0; k < 3; k++)
               ind[3 * (size_t)i + (size_t)k] =
                   (float)(acc2[k] * (alb0 ? 0.0 : alb(&m, S.c[i].mat, k)));

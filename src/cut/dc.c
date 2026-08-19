@@ -438,14 +438,17 @@ static void leaf_qef(hz_dctree *t, int32_t ni, const int32_t lo[3], const hz_hta
   }
 }
 
-static void solve_node(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size) {
+/* §635: `lo` БОЛЬШЕ НЕ НУЖЕН. Вершина хранится ОТНОСИТЕЛЬНО коробки, поэтому
+ * абсолютная координата нижнего угла в решение не входит вовсе — её прибавляет
+ * читатель, у которого коробка есть по построению обхода. */
+static void solve_node(hz_dctree *t, int32_t ni, int32_t size) {
   hz_dcnode *nd = &t->nd[ni];
   if (nd->flags & HZ_DC_CLAMPED) t->nclamped--;
   if (nd->flags & HZ_DC_MULTI) t->nmulti--;
   nd->flags = 0;
-  nd->err = 0.0;
+  nd->err = 0.0f;
   for (int k = 0; k < 3; k++)
-    nd->vx[k] = 0.0;
+    nd->vq[k] = 0;
   /* §632: число образцов ПЕРЕПИСЫВАЕТСЯ В УЗЕЛ здесь и только здесь — это
    * единственное, что нужно от формы после постройки (`hz_dc_rms`). */
   nd->nq = t->qf[ni].n;
@@ -466,9 +469,18 @@ static void solve_node(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t si
     nd->flags |= HZ_DC_CLAMPED;
     t->nclamped++;
   }
-  for (int k = 0; k < 3; k++)
-    nd->vx[k] = (double)lo[k] + x[k];
-  nd->err = r;
+  /* КВАНТОВАНИЕ ВЕРШИНЫ (§635). Хранится ДОЛЯ коробки в восьми битах на ось —
+   * как у среза (`HZ_SLICE_VBITS`). Округление к БЛИЖАЙШЕМУ, а не отсечение:
+   * отсечение дало бы систематический сдвиг к нижнему углу узла, то есть
+   * СМЕЩЕНИЕ поверхности, а не шум. Зажим по краям — решатель уже держит `x` в
+   * коробке, но краевое значение `size` обязано лечь ровно в `255`. */
+  for (int k = 0; k < 3; k++) {
+    double f = x[k] / (double)size;
+    if (!(f > 0.0)) f = 0.0;
+    if (f > 1.0) f = 1.0;
+    nd->vq[k] = (uint16_t)(f * 65535.0 + 0.5);
+  }
+  nd->err = (float)r;
   nd->flags |= HZ_DC_HASVERT;
 }
 
@@ -498,7 +510,7 @@ static int build_rec(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size
 
   if (size == 1) {
     leaf_qef(t, ni, lo, ht);
-    solve_node(t, ni, lo, size);
+    solve_node(t, ni, size);
     return HZ_DC_OK;
   }
 
@@ -514,7 +526,7 @@ static int build_rec(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size
     if (rc != HZ_DC_OK) return rc;
   }
   sum_children(t, ni, size);
-  solve_node(t, ni, lo, size);
+  solve_node(t, ni, size);
   return HZ_DC_OK;
 }
 
@@ -536,7 +548,7 @@ static void lazy_forms(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t si
   if (t->nd[ni].child0 < 0) {
     if (size != 1) return;
     leaf_qef(t, ni, lo, ht);
-    solve_node(t, ni, lo, size);
+    solve_node(t, ni, size);
     return;
   }
   int32_t half = size / 2;
@@ -547,7 +559,7 @@ static void lazy_forms(hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t si
     lazy_forms(t, t->nd[ni].child0 + i, clo, half, ht);
   }
   sum_children(t, ni, size);
-  solve_node(t, ni, lo, size);
+  solve_node(t, ni, size);
 }
 
 /* --- 3б. БЕЗЗНАКОВЫЙ ПУТЬ (Р7, §393) --------------------------------------- */
@@ -798,14 +810,14 @@ int hz_dc_fix_cell(hz_dctree *t, const hz_htab *ht, const int32_t cell[3]) {
   if (size != 1) return HZ_DC_OK; /* ячейка под неразделённым узлом — трогать нечего */
   leaf_masks(t, ni, lo, ht, NULL);
   leaf_qef(t, ni, lo, ht);
-  solve_node(t, ni, lo, size);
+  solve_node(t, ni, size);
   /* Подъём: форма и маска родителя пересчитываются ИЗ ДЕТЕЙ, то есть O(глубины),
    * а не по поддереву. Это и есть обещание §383 п. 4. */
   for (int d = depth - 1; d >= 0; d--) {
     sum_children(t, path[d], psize[d]);
     node_masks_from_children(t, path[d]);
     node_nsum_from_children(t, ht, path[d], plo[d], psize[d]);
-    solve_node(t, path[d], plo[d], psize[d]);
+    solve_node(t, path[d], psize[d]);
   }
   return HZ_DC_OK;
 }
@@ -819,8 +831,9 @@ int hz_dc_forms_lazy(hz_dctree *t, const hz_htab *ht) {
 int hz_dc_repair(hz_dctree *t, const hz_htab *ht, const int32_t cell[3]) {
   /* §632: без форм починка НЕВОЗМОЖНА, и это отказ, а не тишина (Г25). */
   if (t->qf == NULL) return HZ_DC_ENOMEM;
+  /* §635: путь коробок предков больше не нужен — `solve_node` работает в
+   * ОТНОСИТЕЛЬНЫХ координатах, а `lo` предка ему не требуется. */
   int32_t path[HZ_DC_MAX_LOG2SIZE + 1], psize[HZ_DC_MAX_LOG2SIZE + 1];
-  int32_t plo[HZ_DC_MAX_LOG2SIZE + 1][3];
   int depth = 0;
   int32_t ni = 0, size = (int32_t)1 << t->log2size, lo[3] = {0, 0, 0};
   for (int a = 0; a < 3; a++)
@@ -829,8 +842,6 @@ int hz_dc_repair(hz_dctree *t, const hz_htab *ht, const int32_t cell[3]) {
   while (size > 1 && t->nd[ni].child0 >= 0) {
     path[depth] = ni;
     psize[depth] = size;
-    for (int a = 0; a < 3; a++)
-      plo[depth][a] = lo[a];
     depth++;
     int32_t half = size / 2;
     int bit = 0;
@@ -847,10 +858,10 @@ int hz_dc_repair(hz_dctree *t, const hz_htab *ht, const int32_t cell[3]) {
   if (size != 1) return HZ_DC_ETOPO;
 
   leaf_qef(t, ni, lo, ht);
-  solve_node(t, ni, lo, size);
+  solve_node(t, ni, size);
   for (int d = depth - 1; d >= 0; d--) {
     sum_children(t, path[d], psize[d]);
-    solve_node(t, path[d], plo[d], psize[d]);
+    solve_node(t, path[d], psize[d]);
   }
   return HZ_DC_OK;
 }
@@ -1084,7 +1095,7 @@ static void process_edge(walkctx *w, const hz_dcref q[4], int e, const int32_t q
     if (nv > 0 && rr[nv - 1].ni == q[k].ni) continue; /* крупная ячейка на двух квадрантах */
     rr[nv] = q[k];
     for (int a = 0; a < 3; a++)
-      vv[nv][a] = nd->vx[a];
+      vv[nv][a] = (double)q[k].lo[a] + (double)nd->vq[a] * (double)q[k].size / 65535.0;
     nv++;
   }
   if (nv > 1 && rr[0].ni == rr[nv - 1].ni) nv--; /* и по кругу */

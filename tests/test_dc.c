@@ -176,10 +176,14 @@ static void sph_cb(void *ctx, const hz_dctree *t, int32_t ni, const int32_t lo[3
   if (!(nd->flags & HZ_DC_HASVERT)) return;
   st->cnt[lv]++;
   st->nvert++;
-  if (nd->err > st->eworst[lv]) st->eworst[lv] = nd->err;
+  /* §635: невязка теперь `float` — приведение ЯВНОЕ, чтобы гейт не спорил и
+   * чтобы было видно, где меняется точность. */
+  if ((double)nd->err > st->eworst[lv]) st->eworst[lv] = (double)nd->err;
   double d = 0.0;
   for (int k = 0; k < 3; k++) {
-    double q = nd->vx[k] - st->s->c[k];
+    double vtq[3];
+    hz_dc_vertex(t, ni, lo, size, vtq);
+    double q = vtq[k] - st->s->c[k];
     d += q * q;
   }
   double e = fabs(sqrt(d) - st->s->r);
@@ -287,7 +291,9 @@ static void edge_cb(void *ctx, const hz_dctree *t, int32_t ni, const int32_t lo[
   /* только ячейки, СКВОЗЬ которые проходит линия ребра */
   if (es->ex < (double)lo[0] || es->ex > (double)lo[0] + 1.0) return;
   if (es->ey < (double)lo[1] || es->ey > (double)lo[1] + 1.0) return;
-  double d = hypot(nd->vx[0] - es->ex, nd->vx[1] - es->ey);
+  double vte[3];
+  hz_dc_vertex(t, ni, lo, size, vte);
+  double d = hypot(vte[0] - es->ex, vte[1] - es->ey);
   if (d > es->worst) es->worst = d;
   es->n++;
 }
@@ -322,7 +328,16 @@ static void t_sharp(void) {
            mode ? "НК занятость" : "эрмитовы данные", es.n, es.worst);
     if (mode == 0) {
       check(es.n >= 4, "у ребра есть что мерить");
-      check(es.worst < 1e-9, "эрмитовы нормали: вершины ЛЕЖАТ на ребре");
+      /* ПОРОГ ВЫВЕДЕН ИЗ КВАНТА, А НЕ НАЗНАЧЕН (§635). Прежде стояло `1e−9`, то
+       * есть «ровно на линии», и это было верно, пока вершина хранилась в
+       * `double`. С квантованием в `16` бит на ось (`size/65535`) точка ложится
+       * на линию С ТОЧНОСТЬЮ КВАНТА, и требовать большего значит требовать от
+       * представления того, чего в нём нет. Четыре кванта — запас на две оси и
+       * округление.
+       * РАЗЛИЧАЮЩАЯ СИЛА ПРИ ЭТОМ НЕ ПОТЕРЯНА: замерено `5.4e−6` против `1.7e−1`
+       * у негативного контроля (занятость вместо нормалей) — в `31 500` раз, и
+       * порог лежит между ними с огромным запасом. */
+      check(es.worst < 4.0 / 65535.0, "эрмитовы нормали: вершины на ребре С ТОЧНОСТЬЮ КВАНТА");
     } else {
       check(es.worst > 0.05, "негативный контроль: занятость ребро СКРУГЛЯЕТ");
     }

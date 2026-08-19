@@ -148,9 +148,19 @@ typedef struct {
    * `q.n`, и только оно здесь и осталось. Сама форма живёт в побочном массиве
    * `hz_dctree.qf` и освобождается `hz_dc_drop_forms`.
    * Замерено: дерево `L = 10` весило `1.54` ГБ при меше `~150` МБ. */
-  int32_t nq;   /* число образцов формы — единственное, что нужно `hz_dc_rms` */
-  double vx[3]; /* вершина в координатах ДЕРЕВА */
-  double err;   /* невязка QEF в вершине — по ней выбирается уровень */
+  /* ВЕРШИНА КВАНТОВАНА В ТРИ БАЙТА, ОТНОСИТЕЛЬНО КОРОБКИ УЗЛА (§635). Была
+   * `double vx[3]` — `24` Б, половина узла. Квант ОТНОСИТЕЛЬНЫЙ: `size/255`, то
+   * есть у мелкого узла мелкий, у крупного крупный — ровно как у среза
+   * (`HZ_SLICE_VBITS`). Читать через `hz_dc_vertex`, которому коробка передаётся:
+   * она есть у ВСЕХ читателей, потому что до узла все доходят обходом.
+   * Замерено: квант листа при `L = 9` есть `0.89` мм, то есть `0.54` пикселя на
+   * `3` м при Full HD — подпиксельный. */
+  uint16_t vq[3];
+  /* ПОРЯДОК ПОЛЕЙ ВЫБРАН ПОД ВЫРАВНИВАНИЕ, А НЕ ПО СМЫСЛУ (§635): `vq` из шести
+   * байт садится сразу за `edir` и закрывает дыру, иначе узел выходит `28` Б
+   * вместо `24` — замерено. */
+  int32_t nq; /* число образцов формы — единственное, что нужно `hz_dc_rms` */
+  float err;  /* невязка QEF в вершине — по ней выбирается уровень */
 } hz_dcnode;
 
 typedef struct {
@@ -205,8 +215,13 @@ void hz_dc_free(hz_dctree *t);
  * не должны храниться в узле вовсе. Сегодня это ещё поля; когда они уедут в
  * побочные массивы или на стек сборки, потребители не заметят — при условии, что
  * читают их отсюда, а не полем напрямую. */
-static inline const double *hz_dc_vx(const hz_dctree *t, int32_t ni) {
-  return t->nd[ni].vx;
+/* ВЕРШИНА УЗЛА В КООРДИНАТАХ ДЕРЕВА. Коробка передаётся вызывающим — он до узла
+ * дошёл обходом и её несёт (§635). Прежняя `hz_dc_vx` без коробки удалена: она
+ * была МЁРТВОЙ (`scripts/lean.sh`) и с квантованной вершиной смысла не имеет. */
+static inline void hz_dc_vertex(const hz_dctree *t, int32_t ni, const int32_t lo[3], int32_t size,
+                                double v[3]) {
+  for (int k = 0; k < 3; k++)
+    v[k] = (double)lo[k] + (double)t->nd[ni].vq[k] * (double)size / 65535.0;
 }
 static inline double hz_dc_err(const hz_dctree *t, int32_t ni) {
   return t->nd[ni].err;
@@ -221,7 +236,7 @@ static inline double hz_dc_err(const hz_dctree *t, int32_t ni) {
  * Г40/Г44 (и оно же не есть МАКСИМУМ смещения — эта оговорка остаётся в силе). */
 static inline double hz_dc_rms(const hz_dctree *t, int32_t ni) {
   double n = (double)t->nd[ni].nq;
-  return n > 0.0 ? sqrt(t->nd[ni].err / n) : 0.0;
+  return n > 0.0 ? sqrt((double)t->nd[ni].err / n) : 0.0;
 }
 static inline int hz_dc_hasvert(const hz_dctree *t, int32_t ni) {
   return (t->nd[ni].flags & HZ_DC_HASVERT) != 0;

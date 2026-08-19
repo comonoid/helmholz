@@ -458,7 +458,7 @@ static void collect_verts(const hz_dctree *t, int32_t ni, const int32_t lo[3], i
     if (out != NULL && *n < cap) {
       for (int a = 0; a < 3; a++) {
         out[*n].lo[a] = lo[a];
-        out[*n].vx[a] = t->nd[ni].vx[a];
+        out[*n].vx[a] = (double)lo[a] + (double)t->nd[ni].vq[a] * (double)size / 65535.0;
       }
       out[*n].size = size;
     }

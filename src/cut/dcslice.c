@@ -96,7 +96,9 @@ static int sb_push(sbctx *B, int32_t ni, const int32_t lo[3], int32_t size, int 
    * контроль ставит 1). */
   double q = (double)((1u << B->s->vbits) - 1u);
   for (int a = 0; a < 3; a++) {
-    double f = (hz_dc_vx(B->t, ni)[a] - (double)lo[a]) / (double)size;
+    double vtmp[3];
+    hz_dc_vertex(B->t, ni, lo, size, vtmp);
+    double f = (vtmp[a] - (double)lo[a]) / (double)size;
     if (f < 0.0) f = 0.0;
     if (f > 1.0) f = 1.0;
     double u = floor(f * q + 0.5);

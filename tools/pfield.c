@@ -2323,6 +2323,10 @@ static int g_gnonorm = 0;
 static int g_nolinkcache = 0;
 /* §616: прежний ПЛОСКИЙ марш заслона — эталон и негативный контроль. */
 static int g_gflatvis = 0;
+/* §621: `hangle` — прежний УГЛОВОЙ критерий дробления (негативный контроль и
+ * путь отката); `hcontrib` — доля от масштаба сцены для отбора по вкладу. */
+static int g_hangle = 0;
+static double g_hcontrib = 1e-3;
 /* §618, НК: не читать `Ke`. Без солнца `Σ b_0` обязана стать РОВНО НОЛЬ. */
 static int g_nokemit = 0;
 /* §618: `b0` ТОЛЬКО из `Ke` — ни солнца, ни площадки. */
@@ -2332,9 +2336,9 @@ static int g_keonly = 0;
 static int64_t g_march_steps = 0;
 
 static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], const double ni_[3],
-                        double eps, double rrecv, const opyr *P, const frame *fr, int vis,
-                        double out[3], int64_t *nlink, double *sthru, double *sall, int64_t *nnear,
-                        double *ffsum, linkcache *lc, int lcth, int64_t *nmarch) {
+                        double eps, double tau, double rrecv, const opyr *P, const frame *fr,
+                        int vis, double out[3], int64_t *nlink, double *sthru, double *sall,
+                        int64_t *nnear, double *ffsum, linkcache *lc, int lcth, int64_t *nmarch) {
   const enode *e = &T->e[ni];
   const ebin *bb = NULL;
   for (int k = 0; k < e->nb; k++)
@@ -2352,10 +2356,33 @@ static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], c
   /* Корень — только на принятой связи: критерий спуска через КВАДРАТЫ. */
   double d4 = 4.0 * (double)bb->rad * (double)bb->rad;
   double spread = 1.0 - (double)bb->nsum / (double)bb->area;
-  if (e->nch > 0 && (spread > g_hspread || (d4 > eps * r2 && 2.0 * (double)bb->rad > rrecv))) {
+  /* §621: ДРОБЛЕНИЕ ПО ВКЛАДУ, А НЕ ПО УГЛОВОМУ РАЗМЕРУ.
+   *
+   * ЗАМЕРЕНО (§620): по угловому критерию величина НЕ СХОДИТСЯ — приращения при
+   * измельчении `eps` идут `+7`, `+25`, `+14`, `+13 %` и не убывают, при том что
+   * цена строго линейна по числу связей. Признак отбирал связи не по тому, что
+   * важно: `d4 > eps·r2` смотрит на УГЛОВОЙ РАЗМЕР излучателя и НЕ смотрит на
+   * его ЯРКОСТЬ, поэтому тусклая близкая площадка дробилась как яркая.
+   *
+   * ОЦЕНКА ВКЛАДА — КОНСЕРВАТИВНАЯ, СВЕРХУ: косинусы не больше единицы, значит
+   * вклад не больше `flux_max/(π r² + A)`. Так критерий никогда не НЕДОдробит, а
+   * косинусы для решения не считаются — оно остаётся дешевле самого сложения.
+   * ПОРОГ — ДОЛЯ ОТ МАСШТАБА СЦЕНЫ (`tau`, см. `gather_run`), а не абсолютное
+   * число: абсолютных порогов проект не допускает. */
+  int split;
+  if (g_hangle) {
+    split = d4 > eps * r2 && 2.0 * (double)bb->rad > rrecv;
+  } else {
+    double fmax = (double)bb->flux[0];
+    if ((double)bb->flux[1] > fmax) fmax = (double)bb->flux[1];
+    if ((double)bb->flux[2] > fmax) fmax = (double)bb->flux[2];
+    double cmax = fmax / (3.14159265358979323846 * r2 + (double)bb->area);
+    split = cmax > tau && 2.0 * (double)bb->rad > rrecv;
+  }
+  if (e->nch > 0 && (spread > g_hspread || split)) {
     for (int k = 0; k < e->nch; k++)
-      hgather_rec(T, e->ch[k], q, pi, ni_, eps, rrecv, P, fr, vis, out, nlink, sthru, sall, nnear,
-                  ffsum, lc, lcth, nmarch);
+      hgather_rec(T, e->ch[k], q, pi, ni_, eps, tau, rrecv, P, fr, vis, out, nlink, sthru, sall,
+                  nnear, ffsum, lc, lcth, nmarch);
     return;
   }
   double di = w[0] * ni_[0] + w[1] * ni_[1] + w[2] * ni_[2];
@@ -2521,6 +2548,18 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
                        const hz_objmesh *m, int lev, double eps, int blockvis, int alb0, float *ind,
                        int64_t *nlink, double *sthru, double *sall, int64_t *nnear, double *ffout,
                        linkcache *lc) {
+  /* §621: МАСШТАБ СЦЕНЫ ДЛЯ ПОРОГА ВКЛАДА — средневзвешенная по площади
+   * радиосить излучателей, взятая с КОРНЯ дерева. Порог задаётся её долей, а не
+   * абсолютным числом: абсолютных порогов проект не допускает, и здесь величина
+   * выводится из самой сцены. */
+  double bsum = 0.0, asum = 0.0;
+  for (int k = 0; k < ET->e[0].nb; k++) {
+    const ebin *rb = &ET->b[ET->e[0].b0 + k];
+    asum += (double)rb->area;
+    for (int c = 0; c < 3; c++)
+      bsum += (double)rb->flux[c] / 3.0;
+  }
+  double tau = g_hcontrib * (asum > 0.0 ? bsum / asum : 0.0);
   int nth = g_omp1 ? 1 : omp_get_max_threads();
   int64_t *plink = calloc((size_t)nth, sizeof *plink);
   double *pthru = calloc((size_t)nth, sizeof *pthru);
@@ -2539,8 +2578,8 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
     hz_slice_normal(S, i, nn2);
     double rrecv = fr->h * (double)((int32_t)1 << (lev - (int)S->c[i].lvl));
     for (int q2 = 0; q2 < 6; q2++)
-      hgather_rec(ET, 0, q2, pi, nn2, eps, rrecv, P, fr, blockvis, acc2, &plink[th], &pthru[th],
-                  &pall[th], &pnear[th], &ffacc, lc, th, &pmar[th]);
+      hgather_rec(ET, 0, q2, pi, nn2, eps, tau, rrecv, P, fr, blockvis, acc2, &plink[th],
+                  &pthru[th], &pall[th], &pnear[th], &ffacc, lc, th, &pmar[th]);
     /* §611: НОРМИРОВКА. `Σ_j F_ij` физически не больше единицы; замерено, что у
      * `68.9 %` приёмников она больше (§610, медиана `1.8367`). Деление на
      * `max(1, Σ F)` делает оператор СЖАТИЕМ по построению.
@@ -5401,6 +5440,8 @@ int main(int argc, char **argv) {
       lit = 1;
     }
     if (strcmp(argv[i], "nokemit") == 0) g_nokemit = 1;
+    if (strcmp(argv[i], "hangle") == 0) g_hangle = 1;
+    if (strncmp(argv[i], "hcontrib=", 9) == 0) g_hcontrib = strtod(argv[i] + 9, NULL);
     if (strcmp(argv[i], "gflatvis") == 0) g_gflatvis = 1;
     if (strcmp(argv[i], "nolinkcache") == 0) g_nolinkcache = 1;
     if (strcmp(argv[i], "gnonorm") == 0) g_gnonorm = 1;
@@ -8766,8 +8807,8 @@ int main(int argc, char **argv) {
             hz_slice_normal(&S, i, nn2);
             double rrecv = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
             for (int q2 = 0; q2 < 6; q2++)
-              hgather_rec(&ET, 0, q2, pi, nn2, g_hgather, rrecv, &P, &fr, indvis, acc2, &plink[th],
-                          &pthru[th], &pall[th], &pnv[th], NULL, NULL, 0, NULL);
+              hgather_rec(&ET, 0, q2, pi, nn2, g_hgather, 0.0, rrecv, &P, &fr, indvis, acc2,
+                          &plink[th], &pthru[th], &pall[th], &pnv[th], NULL, NULL, 0, NULL);
             for (int k = 0; k < 3; k++)
               ind[3 * (size_t)i + (size_t)k] =
                   (float)(acc2[k] * (alb0 ? 0.0 : alb(&m, S.c[i].mat, k)));

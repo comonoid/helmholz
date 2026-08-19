@@ -5058,6 +5058,7 @@ static SDL_Window *g_win;
 static SDL_Renderer *g_ren;
 static SDL_Texture *g_tex;
 static int g_texres;
+static int g_texresh;
 /* Базис камеры. Заводится из `eyec/atc/upc` при первом кадре. */
 static double g_wpos[3], g_wfwd[3], g_wup[3], g_wright[3];
 static int g_winit;
@@ -5095,7 +5096,7 @@ static void wrot(double v[3], const double k[3], double t) {
     v[a] = v[a] * c + kv[a] * s + k[a] * d * (1.0 - c);
 }
 
-static int walk_open(int res) {
+static int walk_open(int resw, int resh) {
   if (SDL_Init(SDL_INIT_VIDEO) != 0) {
     fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
     return 0;
@@ -5110,7 +5111,7 @@ static int walk_open(int res) {
    * зрения. Неквадратный кадр — отдельная правка камеры, а не подгонка здесь. */
   g_win =
       SDL_CreateWindow("helmholz — ходьба по сцене", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                       res, res, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
+                       resw, resh, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
   if (g_win == NULL) {
     fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
     return 0;
@@ -5121,12 +5122,13 @@ static int walk_open(int res) {
     fprintf(stderr, "SDL_CreateRenderer: %s\n", SDL_GetError());
     return 0;
   }
-  g_tex = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, res, res);
+  g_tex = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, resw, resh);
   if (g_tex == NULL) {
     fprintf(stderr, "SDL_CreateTexture: %s\n", SDL_GetError());
     return 0;
   }
-  g_texres = res;
+  g_texres = resw;
+  g_texresh = resh;
   SDL_SetRelativeMouseMode(SDL_TRUE);
   return 1;
 }
@@ -5142,8 +5144,8 @@ static void walk_close(void) {
  * `dt` — сколько заняло ПРЕДЫДУЩЕЕ построение кадра: движение считается по
  * времени, а не по кадрам, иначе скорость ходьбы зависела бы от того, куда
  * смотришь (у нас кадр от 0.15 до 0.9 с — разница втрое). */
-static int walk_present(const unsigned char *rgb, int res, int *res_next, double eyec[3],
-                        double atc[3], double upc[3], double dt) {
+static int walk_present(const unsigned char *rgb, int resw, int resh, int *resw_next,
+                        int *resh_next, double eyec[3], double atc[3], double upc[3], double dt) {
   if (!g_winit) {
     g_winit = 1;
     for (int a = 0; a < 3; a++) {
@@ -5160,15 +5162,16 @@ static int walk_present(const unsigned char *rgb, int res, int *res_next, double
   /* Кадр пришёл не того размера, что текстура (окно потянули, пока он считался)
    * — пересоздать под кадр, а не выходить: терять ходьбу из-за движения мышью по
    * рамке нельзя. */
-  if (res != g_texres) {
+  if (resw != g_texres || resh != g_texresh) {
     SDL_Texture *nt =
-        SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, res, res);
+        SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, resw, resh);
     if (nt == NULL) return 0;
     SDL_DestroyTexture(g_tex);
     g_tex = nt;
-    g_texres = res;
+    g_texres = resw;
+    g_texresh = resh;
   }
-  SDL_UpdateTexture(g_tex, NULL, rgb, res * 3);
+  SDL_UpdateTexture(g_tex, NULL, rgb, resw * 3);
   SDL_RenderClear(g_ren);
   SDL_RenderCopy(g_ren, g_tex, NULL, NULL);
   SDL_RenderPresent(g_ren);
@@ -5181,18 +5184,22 @@ static int walk_present(const unsigned char *rgb, int res, int *res_next, double
     /* СМЕНА РАЗМЕРА ОКНА = СМЕНА РАЗРЕШЕНИЯ СЛЕДУЮЩЕГО КАДРА. Текстура
      * пересоздаётся здесь же, потому что нынешний кадр в неё уже показан. */
     if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+      /* §631: кадр теперь НЕКВАДРАТНЫЙ, и окно берётся как есть — камера это
+       * умела всегда (`tany = tanx·h/w`), упиралось в одно число разрешения. */
       int ww = e.window.data1, wh = e.window.data2;
-      int side = ww < wh ? ww : wh;
-      if (side < 64) side = 64; /* ниже 64 пикселей кадр перестаёт что-либо показывать */
-      if (side != g_texres) {
-        SDL_Texture *nt = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGB24,
-                                            SDL_TEXTUREACCESS_STREAMING, side, side);
+      if (ww < 64) ww = 64;
+      if (wh < 64) wh = 64;
+      if (ww != g_texres || wh != g_texresh) {
+        SDL_Texture *nt =
+            SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, ww, wh);
         if (nt != NULL) {
           SDL_DestroyTexture(g_tex);
           g_tex = nt;
-          g_texres = side;
-          *res_next = side;
-          printf("   разрешение -> %d² (окно %d x %d)\n", side, ww, wh);
+          g_texres = ww;
+          g_texresh = wh;
+          *resw_next = ww;
+          *resh_next = wh;
+          printf("   разрешение -> %d x %d\n", ww, wh);
           fflush(stdout);
         }
       }
@@ -5282,17 +5289,20 @@ static int walk_present(const unsigned char *rgb, int res, int *res_next, double
 #else
 /* БЕЗ SDL ХОДЬБА НЕ МОЛЧИТ, А ОТКАЗЫВАЕТ. Тихо отрисовать один кадр вместо
  * запрошенного цикла — худший вид отказа: выглядит как работа. */
-static int walk_open(int res) {
-  (void)res;
+static int walk_open(int resw, int resh) {
+  (void)resw;
+  (void)resh;
   fprintf(stderr, "pfield: ключ `walk` требует сборки с SDL — собирайте `make build/pwalk`\n");
   return 0;
 }
 static void walk_close(void) {}
-static int walk_present(const unsigned char *rgb, int res, int *res_next, double eyec[3],
-                        double atc[3], double upc[3], double dt) {
+static int walk_present(const unsigned char *rgb, int resw, int resh, int *resw_next,
+                        int *resh_next, double eyec[3], double atc[3], double upc[3], double dt) {
   (void)rgb;
-  (void)res;
-  (void)res_next;
+  (void)resw;
+  (void)resh;
+  (void)resw_next;
+  (void)resh_next;
   (void)eyec;
   (void)atc;
   (void)upc;
@@ -5306,7 +5316,13 @@ int main(int argc, char **argv) {
     fprintf(stderr, "pfield ФАЙЛ.obj МАСШТАБ [lev=N] [nonrm] [occdump=ПУТЬ] [polydump=ПУТЬ]\n");
     return 2;
   }
-  int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, res = 512, sweepaxis = 0;
+  /* §631: РАЗРЕШЕНИЕ ПО УМОЛЧАНИЮ — FULL HD, И КАДР НЕКВАДРАТНЫЙ. Камера это
+   * умела всегда (`tr3_camera_look` берёт `w` и `h` порознь и держит пиксель
+   * квадратным: `tany = tanx·h/w`); упиралось всё в то, что в этом файле
+   * разрешение было ОДНИМ числом. Замечание пользователя 08-13: «у меня 4k, на
+   * нём 512x512 смотрится ну такое себе; мы же Full HD делаем». */
+  int lev = 6, nonrm = 0, vq1 = 0, hit = 0, nofix = 0, lit = 0, sweepaxis = 0;
+  int resw = 1920, resh = 1080;
   /* Ф8'-0 (§524): замер грязи после удара. `hitrad` — радиус сферы в метрах;
    * `0.20` — то же значение, на котором сняты числа 4г, и негативный контроль
    * меняет именно его. */
@@ -5603,7 +5619,16 @@ int main(int argc, char **argv) {
       lit = 1;
       sweepaxis = 1;
     }
-    if (strncmp(argv[i], "res=", 4) == 0) res = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "res=", 4) == 0) {
+      /* `res=WxH` или `res=N` (квадрат). */
+      char *e2 = NULL;
+      long w2 = strtol(argv[i] + 4, &e2, 10);
+      long h2 = (e2 != NULL && (*e2 == 0x78 || *e2 == 0x58)) ? strtol(e2 + 1, NULL, 10) : w2;
+      if (w2 > 0 && h2 > 0) {
+        resw = (int)w2;
+        resh = (int)h2;
+      }
+    }
     if (strncmp(argv[i], "thr=", 4) == 0) lodthr = strtod(argv[i] + 4, NULL);
     /* Выгрузка занятости для сверки с эталоном Ш0 (`tools/poccref.c`). */
     if (strncmp(argv[i], "occdump=", 8) == 0) occdump = argv[i] + 8;
@@ -7264,7 +7289,7 @@ int main(int argc, char **argv) {
      * дерево, чем то, которое работает. */
     for (int a = 0; a < 3; a++)
       g_sweepeye[a] = eyeg[a];
-    g_sweeppx = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / (double)res;
+    g_sweeppx = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / (double)resw;
     arealight AL;
     hall_light(&AL, &P, &fr, lo, hi, eyeg, 1);
     double su[HZ_LIGHT_SAMPLES], sv[HZ_LIGHT_SAMPLES];
@@ -7461,7 +7486,7 @@ int main(int argc, char **argv) {
       }
     }
     int walk_alive = 1;
-    if (g_walk && !walk_open(res)) return 2;
+    if (g_walk && !walk_open(resw, resh)) return 2;
     double t_prev = 1.0 / 30.0; /* первый шаг движения — как при 30 к/с */
     for (;;) {
       /* СЕКУНДОМЕР НА ВСЮ ИТЕРАЦИЮ, А НЕ НА ТРИ НАЗВАННЫЕ СТАДИИ (§590).
@@ -7473,7 +7498,7 @@ int main(int argc, char **argv) {
       double t_iter0 = now_s();
       for (int a = 0; a < 3; a++)
         LL.eye[a] = (eyec[a] - fr.org[a]) / fr.h;
-      LL.pxrad = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / (double)res;
+      LL.pxrad = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / (double)resw;
       /* Ф5. (§514): камера дерева свипа — та же, что у среза, и в тех же единицах.
        * Разные камеры у тени и у поверхности дали бы несогласованную подробность. */
       for (int a = 0; a < 3; a++)
@@ -9178,8 +9203,8 @@ int main(int argc, char **argv) {
       LC.nomip = g_texnomip;
       tr3_camera cam;
       if (tr3_camera_look(&cam, eyec, atc, upc, HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0,
-                          res, res) == 0) {
-        size_t np = (size_t)res * (size_t)res;
+                          resw, resh) == 0) {
+        size_t np = (size_t)resw * (size_t)resh;
         double *zb = malloc(np * sizeof *zb);
         unsigned char *rgb = calloc(np * 3, 1);
         if (zb == NULL || rgb == NULL) exit(1);
@@ -9188,8 +9213,8 @@ int main(int argc, char **argv) {
         LC.cam = &cam;
         LC.z = zb;
         LC.rgb = rgb;
-        LC.w = res;
-        LC.h = res;
+        LC.w = resw;
+        LC.h = resh;
         int64_t ahist[10] = {0};
         double apix[10] = {0};
         LC.areahist = ahist;
@@ -9358,11 +9383,11 @@ int main(int argc, char **argv) {
         int wrc = hz_dc_walk(&T, lod_stop, &LLc, lit_poly, &LC);
         if (LC.tris != NULL) {
           int nb2 = omp_get_max_threads();
-          int bh = (res + nb2 - 1) / nb2;
+          int bh = (resh + nb2 - 1) / nb2;
 #pragma omp parallel for schedule(static)
           for (int b2 = 0; b2 < nb2; b2++) {
             int y0b = b2 * bh, y1b = y0b + bh - 1;
-            if (y1b >= res) y1b = res - 1;
+            if (y1b >= resh) y1b = resh - 1;
             for (int64_t t5 = 0; t5 < LC.ntris; t5++) {
               /* Отсев по предвычисленному габариту строк — два сравнения вместо
                * повторного проецирования трёх вершин. Без него деление на полосы
@@ -9420,27 +9445,27 @@ int main(int argc, char **argv) {
          * меньше со свёрткой коробкой 2×2 — четыре пробы на пиксель. Это НЕ
          * полноценное сглаживание: края ГЕОМЕТРИИ остаются ступенчатыми на уровне
          * ячейки, сглаживается только край многоугольника. Так и называется. */
-        int outres = ss2 ? res / 2 : res;
+        int outw = ss2 ? resw / 2 : resw, outh = ss2 ? resh / 2 : resh;
         unsigned char *outrgb = rgb;
         if (ss2) {
-          outrgb = malloc((size_t)outres * (size_t)outres * 3);
+          outrgb = malloc((size_t)outw * (size_t)outh * 3);
           if (outrgb == NULL) exit(1);
-          for (int y = 0; y < outres; y++)
-            for (int x = 0; x < outres; x++)
+          for (int y = 0; y < outh; y++)
+            for (int x = 0; x < outw; x++)
               for (int c = 0; c < 3; c++) {
                 unsigned s4 = 0;
                 for (int dy = 0; dy < 2; dy++)
                   for (int dx = 0; dx < 2; dx++)
-                    s4 += rgb[3 * ((size_t)(2 * y + dy) * (size_t)res + (size_t)(2 * x + dx)) +
+                    s4 += rgb[3 * ((size_t)(2 * y + dy) * (size_t)resw + (size_t)(2 * x + dx)) +
                               (size_t)c];
-                outrgb[3 * ((size_t)y * (size_t)outres + (size_t)x) + (size_t)c] =
+                outrgb[3 * ((size_t)y * (size_t)outw + (size_t)x) + (size_t)c] =
                     (unsigned char)((s4 + 2u) / 4u);
               }
         }
-        snprintf(path, sizeof path, "img/pfield_lit_L%d_%d.ppm", lev, outres);
+        snprintf(path, sizeof path, "img/pfield_lit_L%d_%dx%d.ppm", lev, outw, outh);
         /* В ХОДЬБЕ КАДР НЕ ПИШЕТСЯ НА ДИСК: `786` КБ на кадр — это и лишняя
          * работа, и мусор в `img/`. Снимок делает отдельный запуск без `walk`. */
-        int prc = g_walk ? 0 : hz_ppm_write_rgb(path, outrgb, outres, outres);
+        int prc = g_walk ? 0 : hz_ppm_write_rgb(path, outrgb, outw, outh);
         if (g_walk) {
           double tf = t_slice + t_dir + t_rast;
           /* ПОЛОЖЕНИЕ ПЕЧАТАЕТСЯ, А НЕ ПОДРАЗУМЕВАЕТСЯ: без него «управление не
@@ -9458,7 +9483,7 @@ int main(int argc, char **argv) {
               atc[1] - eyec[1], atc[2] - eyec[2]);
           tf = t_wall; /* движение считается по НАСТОЯЩЕМУ времени кадра */
           fflush(stdout);
-          walk_alive = walk_present(outrgb, outres, &res, eyec, atc, upc, t_prev);
+          walk_alive = walk_present(outrgb, outw, outh, &resw, &resh, eyec, atc, upc, t_prev);
           t_prev = tf;
         }
         if (ss2) free(outrgb);
@@ -9466,10 +9491,11 @@ int main(int argc, char **argv) {
           printf("   ОТСЕЧЕНИЕ: пришло %lld многоугольников, отброшено %lld (%.1f %%)\n",
                  (long long)LC.nseen, (long long)LC.ncull,
                  100.0 * (double)LC.ncull / (double)(LC.nseen ? LC.nseen : 1));
-          printf("   КАДР СО СВЕТОМ %d²: срез %.1f мс (ячеек %d), ПРЯМОЙ СВЕТ %.1f мс (%.0f нс на "
-                 "ячейку), растеризация %.1f мс (код %d), ВСЕГО %.1f мс -> %s (код %d)\n",
-                 res, t_slice * 1e3, S.n, t_dir * 1e3, t_dir * 1e9 / (double)(S.n ? S.n : 1),
-                 t_rast * 1e3, wrc, (t_slice + t_dir + t_rast) * 1e3, path, prc);
+          printf(
+              "   КАДР СО СВЕТОМ %dx%d: срез %.1f мс (ячеек %d), ПРЯМОЙ СВЕТ %.1f мс (%.0f нс на "
+              "ячейку), растеризация %.1f мс (код %d), ВСЕГО %.1f мс -> %s (код %d)\n",
+              outw, outh, t_slice * 1e3, S.n, t_dir * 1e3, t_dir * 1e9 / (double)(S.n ? S.n : 1),
+              t_rast * 1e3, wrc, (t_slice + t_dir + t_rast) * 1e3, path, prc);
         }
         g_t_fslice = t_slice;
         g_t_fdir = t_dir;

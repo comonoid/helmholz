@@ -4496,8 +4496,17 @@ static int walk_open(int res) {
     fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
     return 0;
   }
-  g_win = SDL_CreateWindow("helmholz — ходьба по сцене", SDL_WINDOWPOS_CENTERED,
-                           SDL_WINDOWPOS_CENTERED, res, res, SDL_WINDOW_SHOWN);
+  /* ОКНО ТЯНЕТСЯ, И РАЗРЕШЕНИЕ ИДЁТ ЗА НИМ ПО-НАСТОЯЩЕМУ (§591). Без
+   * `RESIZABLE` окно было фиксированным, а растянутое средствами оконного
+   * менеджера давало ПИКСЕЛИ: текстура оставалась `res × res`, её просто
+   * масштабировали. Теперь смена размера меняет `res` СЛЕДУЮЩЕГО кадра, то есть
+   * считается настоящий кадр нового разрешения.
+   * СТОРОНА БЕРЁТСЯ МЕНЬШАЯ: камера пока квадратная (`tr3_camera_look` получает
+   * `res, res`), и растягивать её на неквадратное окно значило бы врать про поле
+   * зрения. Неквадратный кадр — отдельная правка камеры, а не подгонка здесь. */
+  g_win =
+      SDL_CreateWindow("helmholz — ходьба по сцене", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                       res, res, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
   if (g_win == NULL) {
     fprintf(stderr, "SDL_CreateWindow: %s\n", SDL_GetError());
     return 0;
@@ -4529,8 +4538,8 @@ static void walk_close(void) {
  * `dt` — сколько заняло ПРЕДЫДУЩЕЕ построение кадра: движение считается по
  * времени, а не по кадрам, иначе скорость ходьбы зависела бы от того, куда
  * смотришь (у нас кадр от 0.15 до 0.9 с — разница втрое). */
-static int walk_present(const unsigned char *rgb, int res, double eyec[3], double atc[3],
-                        double upc[3], double dt) {
+static int walk_present(const unsigned char *rgb, int res, int *res_next, double eyec[3],
+                        double atc[3], double upc[3], double dt) {
   if (!g_winit) {
     g_winit = 1;
     for (int a = 0; a < 3; a++) {
@@ -4544,7 +4553,17 @@ static int walk_present(const unsigned char *rgb, int res, double eyec[3], doubl
     wcross(g_wright, g_wfwd, g_wup);
     wnorm(g_wup);
   }
-  if (res != g_texres) return 0;
+  /* Кадр пришёл не того размера, что текстура (окно потянули, пока он считался)
+   * — пересоздать под кадр, а не выходить: терять ходьбу из-за движения мышью по
+   * рамке нельзя. */
+  if (res != g_texres) {
+    SDL_Texture *nt =
+        SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGB24, SDL_TEXTUREACCESS_STREAMING, res, res);
+    if (nt == NULL) return 0;
+    SDL_DestroyTexture(g_tex);
+    g_tex = nt;
+    g_texres = res;
+  }
   SDL_UpdateTexture(g_tex, NULL, rgb, res * 3);
   SDL_RenderClear(g_ren);
   SDL_RenderCopy(g_ren, g_tex, NULL, NULL);
@@ -4555,6 +4574,25 @@ static int walk_present(const unsigned char *rgb, int res, double eyec[3], doubl
   int nmot = 0;
   while (SDL_PollEvent(&e)) {
     if (e.type == SDL_QUIT) return 0;
+    /* СМЕНА РАЗМЕРА ОКНА = СМЕНА РАЗРЕШЕНИЯ СЛЕДУЮЩЕГО КАДРА. Текстура
+     * пересоздаётся здесь же, потому что нынешний кадр в неё уже показан. */
+    if (e.type == SDL_WINDOWEVENT && e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+      int ww = e.window.data1, wh = e.window.data2;
+      int side = ww < wh ? ww : wh;
+      if (side < 64) side = 64; /* ниже 64 пикселей кадр перестаёт что-либо показывать */
+      if (side != g_texres) {
+        SDL_Texture *nt = SDL_CreateTexture(g_ren, SDL_PIXELFORMAT_RGB24,
+                                            SDL_TEXTUREACCESS_STREAMING, side, side);
+        if (nt != NULL) {
+          SDL_DestroyTexture(g_tex);
+          g_tex = nt;
+          g_texres = side;
+          *res_next = side;
+          printf("   разрешение -> %d² (окно %d x %d)\n", side, ww, wh);
+          fflush(stdout);
+        }
+      }
+    }
     if (e.type == SDL_MOUSEMOTION && g_wgrab) {
       dyaw += (double)e.motion.xrel * HZ_WALK_MOUSE_RAD_PER_PX;
       dpitch += (double)e.motion.yrel * HZ_WALK_MOUSE_RAD_PER_PX;
@@ -4646,10 +4684,11 @@ static int walk_open(int res) {
   return 0;
 }
 static void walk_close(void) {}
-static int walk_present(const unsigned char *rgb, int res, double eyec[3], double atc[3],
-                        double upc[3], double dt) {
+static int walk_present(const unsigned char *rgb, int res, int *res_next, double eyec[3],
+                        double atc[3], double upc[3], double dt) {
   (void)rgb;
   (void)res;
+  (void)res_next;
   (void)eyec;
   (void)atc;
   (void)upc;
@@ -8701,7 +8740,7 @@ int main(int argc, char **argv) {
                  atc[2] - eyec[2]);
           tf = t_wall; /* движение считается по НАСТОЯЩЕМУ времени кадра */
           fflush(stdout);
-          walk_alive = walk_present(outrgb, outres, eyec, atc, upc, t_prev);
+          walk_alive = walk_present(outrgb, outres, &res, eyec, atc, upc, t_prev);
           t_prev = tf;
         }
         if (ss2) free(outrgb);

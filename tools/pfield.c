@@ -1844,8 +1844,17 @@ static int shadowed_h(const opyr *P, const frame *fr, const double a[3], const d
   for (int k = 0; k < 3; k++)
     d[k] /= len;
   double skip = 1.5 * fr->h; /* тот же отступ начала, что и у плоского (А776) */
+  /* ОТСТУП И В КОНЦЕ — НАЙДЕНО §617. Плоский марш исключает последние образцы
+   * (`i < ns − 1`), а здесь этого не было, и марш упирался в СОБСТВЕННУЮ ячейку
+   * цели. Пока единственным потребителем был прямой свет, пробел не проявлялся:
+   * там цель — солнце, точка далеко ВНЕ геометрии, и конец луча ни на что не
+   * попадает. У связи «поверхность -> поверхность» цель ЛЕЖИТ НА ПОВЕРХНОСТИ, и
+   * каждая связь объявлялась заслонённой. Замерено: `Σ b_1` падало в `4.8` раза.
+   * Довод тот же, что у А776, и симметричный ему: луч обязан выйти из своей
+   * ячейки и её соседа по грани НА ОБОИХ концах. */
+  double tend = len - skip;
   double t = skip;
-  while (t < len) {
+  while (t < tend) {
     int32_t c[3];
     int ok = 1;
     for (int k = 0; k < 3; k++) {
@@ -2312,6 +2321,8 @@ static int g_gnonorm = 0;
 /* §613, НК2: не хранить связи — обходить дерево на каждом отскоке. Без этого
  * контроля «стало быстрее» неотличимо от «стало меньше работы». */
 static int g_nolinkcache = 0;
+/* §616: прежний ПЛОСКИЙ марш заслона — эталон и негативный контроль. */
+static int g_gflatvis = 0;
 
 static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], const double ni_[3],
                         double eps, double rrecv, const opyr *P, const frame *fr, int vis,
@@ -2368,7 +2379,12 @@ static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], c
   if (nnear != NULL && soft > 0.01 * 3.14159265358979323846 * r2) (*nnear)++;
   int blocked = 0;
   double cw[3] = {(double)bb->c[0], (double)bb->c[1], (double)bb->c[2]};
-  if (vis) blocked = shadowed(P, fr, pi, cw, 0.5);
+  /* §616: ИЕРАРХИЧЕСКИЙ МАРШ, А НЕ ПЛОСКИЙ. Плоский идёт шагом в полячейки и
+   * платит ПО РАССТОЯНИЮ: на Bistro (сцена `512` ячеек) длинная связь стоила
+   * порядка тысячи проб. `shadowed_h` пропускает крупные пустые узлы ЦЕЛИКОМ и
+   * заявлен тем же предикатом (§426, А784) — прямой свет считает им давно.
+   * Замечание пользователя 08-13: «все заслоны уже есть в архитектуре». */
+  if (vis) blocked = g_gflatvis ? shadowed(P, fr, pi, cw, 0.5) : shadowed_h(P, fr, pi, cw, NULL);
   /* §609: СУММА ФОРМФАКТОРОВ. `F_ij = cos_i cos_j A/(π r² + A)` есть в точности
    * `g · A_j`. Физика: `Σ_j F_ij ≤ 1` у полностью замкнутой точки и СТРОГО МЕНЬШЕ
    * у открытой. Всякий приёмник выше единицы — доказательство завышения.
@@ -5340,6 +5356,7 @@ int main(int argc, char **argv) {
     /* §597: НК1 — прежний путь (сбор в срезе, каждый кадр); НК2 — без подъёма по
      * иерархии; НК3 — подъём невзвешенный. */
     if (strncmp(argv[i], "hbounce=", 8) == 0) g_hbounce = (int)strtol(argv[i] + 8, NULL, 10);
+    if (strcmp(argv[i], "gflatvis") == 0) g_gflatvis = 1;
     if (strcmp(argv[i], "nolinkcache") == 0) g_nolinkcache = 1;
     if (strcmp(argv[i], "gnonorm") == 0) g_gnonorm = 1;
     if (strcmp(argv[i], "gpoint") == 0) g_gpoint = 1;

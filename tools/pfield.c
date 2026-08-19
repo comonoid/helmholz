@@ -2383,6 +2383,10 @@ static int g_indnolift = 0;
 /* НК3 §598/А1028: подъём НЕВЗВЕШЕННЫЙ. Если разницы с взвешенным нет, значит
  * площади у детей одинаковы, и это надо ЗНАТЬ, а не предполагать. */
 static int g_indflat = 0;
+/* §607: число отскоков в ядре (ряд Неймана). Потолок назван константой, чтобы
+ * массив сумм не заводился по вводу пользователя. */
+#define HZ_BOUNCE_MAX 8
+static int g_hbounce = 1;
 /* Ф8' (§532): отскок направленным свипом. `nmu,nphi` — набор §2 (1,1 / 2,2 /
  * 2,4 / 4,4 даёт ND = 8, 32, 64, 128); `dpass` — число отскоков (довод №3 §523:
  * матрицы нет, есть ещё один проход); `dirsall` — НЕГАТИВНЫЙ КОНТРОЛЬ, излучать
@@ -2577,17 +2581,63 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
   front_direct(&SF, fr, P, AL, irrF, 0.5, 1, NULL, m);
   double t_dir = now_s() - t1;
 
-  double t2 = now_s();
-  etree ET;
-  memset(&ET, 0, sizeof ET);
-  etree_build(&ET, &SF, fr, irrF, m, 0, SF.n, 0, lev);
-  double t_tree = now_s() - t2;
-
-  double t3 = now_s();
-  int64_t nlink = 0;
-  int64_t nnear = 0;
-  gather_run(&ET, &SF, fr, P, m, lev, eps, blockvis, 0, indF, &nlink, NULL, NULL, &nnear);
-  double t_gath = now_s() - t3;
+  /* РЯД НЕЙМАНА: `b0` — прямой свет, `b_{k+1} = K·b_k`, ответ `Σ b_k` (§607).
+   *
+   * ДЕРЕВО ИЗЛУЧАТЕЛЕЙ СТРОИТСЯ ИЗ `b_k`, А НЕ ИЗ НАКОПЛЕННОЙ СУММЫ, и это не
+   * мелочь: из суммы члены ряда сложились бы ДВАЖДЫ, и «второй отскок» дал бы
+   * завышение, неотличимое на глаз от настоящего переотражения.
+   *
+   * ЗАЧЕМ МЕРИТЬ ОТНОШЕНИЯ `Σ b_{k+1} / Σ b_k`. Оператор переноса есть СЖАТИЕ:
+   * для замкнутой сцены с альбедо `ρ < 1` обязано быть `Σ b_{k+1} ≤ ρ_max·Σ b_k`.
+   * Это ВНУТРЕННИЙ эталон — он не требует ни другой реализации, ни другой сцены,
+   * а §599/§604 записали, что внешнего эталона отскока на Bistro нет. */
+  double t_tree = 0.0, t_gath = 0.0;
+  int64_t nlink = 0, nnear = 0;
+  float *bcur = malloc(3 * (size_t)SF.n * sizeof *bcur);
+  float *bnext = calloc(3 * (size_t)SF.n, sizeof *bnext);
+  if (bcur == NULL || bnext == NULL) exit(1);
+  memcpy(bcur, irrF, 3 * (size_t)SF.n * sizeof *bcur);
+  double sb[HZ_BOUNCE_MAX + 1];
+  sb[0] = 0.0;
+  for (int32_t i = 0; i < 3 * SF.n; i++)
+    sb[0] += (double)irrF[i];
+  int nb = g_hbounce < 1 ? 1 : (g_hbounce > HZ_BOUNCE_MAX ? HZ_BOUNCE_MAX : g_hbounce);
+  for (int k = 0; k < nb; k++) {
+    double ta1 = now_s();
+    etree ETk;
+    memset(&ETk, 0, sizeof ETk);
+    etree_build(&ETk, &SF, fr, bcur, m, 0, SF.n, 0, lev);
+    t_tree += now_s() - ta1;
+    double ta2 = now_s();
+    int64_t nl = 0;
+    gather_run(&ETk, &SF, fr, P, m, lev, eps, blockvis, 0, bnext, &nl, NULL, NULL, &nnear);
+    t_gath += now_s() - ta2;
+    if (k == 0) nlink = nl;
+    etree_free(&ETk);
+    sb[k + 1] = 0.0;
+    for (int32_t i = 0; i < 3 * SF.n; i++) {
+      sb[k + 1] += (double)bnext[i];
+      indF[i] += bnext[i];
+    }
+    float *sw = bcur;
+    bcur = bnext;
+    bnext = sw;
+  }
+  free(bcur);
+  free(bnext);
+  /* НАИБОЛЬШЕЕ АЛЬБЕДО СЦЕНЫ — граница сжатия. Без него «больше единицы» не с
+   * чем сравнивать: граница есть `ρ_max`, а не `1` (Р3 §607). */
+  double rhomax = 0.0;
+  for (int32_t q = 0; q < m->nmtl; q++)
+    for (int k = 0; k < 3; k++) {
+      double a = alb(m, (uint8_t)(q < 255 ? q : 255), k);
+      if (a > rhomax) rhomax = a;
+    }
+  printf("   §607 РЯД НЕЙМАНА: отскоков %d, ρ_max = %.4f\n", nb, rhomax);
+  for (int k = 0; k < nb; k++)
+    printf("      Σ b_%d = %.6e -> Σ b_%d = %.6e; ОТНОШЕНИЕ %.4f %s\n", k, sb[k], k + 1, sb[k + 1],
+           sb[k + 1] / (sb[k] > 0.0 ? sb[k] : 1.0),
+           sb[k + 1] / (sb[k] > 0.0 ? sb[k] : 1.0) <= rhomax ? "(сжатие)" : "<- ВЫШЕ ГРАНИЦЫ");
 
   /* РАСКЛАДКА ПО УЗЛАМ. Отказы СЧИТАЮТСЯ и печатаются: спуск на глубину `lvl` —
    * трудное место (А1029), и молчаливый промах выглядел бы лёгким шумом. */
@@ -2622,7 +2672,6 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
          (long long)nmatc, t_slice, t_dir, t_tree, t_gath, t_put, now_s() - t0, (long long)nput,
          (long long)nbad, sd, si, si / (sd > 0.0 ? sd : 1.0));
 
-  etree_free(&ET);
   free(irrF);
   free(indF);
   hz_slice_free(&SF);
@@ -5113,6 +5162,7 @@ int main(int argc, char **argv) {
     }
     /* §597: НК1 — прежний путь (сбор в срезе, каждый кадр); НК2 — без подъёма по
      * иерархии; НК3 — подъём невзвешенный. */
+    if (strncmp(argv[i], "hbounce=", 8) == 0) g_hbounce = (int)strtol(argv[i] + 8, NULL, 10);
     if (strcmp(argv[i], "gpoint") == 0) g_gpoint = 1;
     if (strcmp(argv[i], "gwide") == 0) g_gwide = 1;
     if (strcmp(argv[i], "indslice") == 0) g_indslice = 1;

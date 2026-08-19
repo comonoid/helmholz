@@ -2240,6 +2240,8 @@ static int32_t etree_build(etree *T, const hz_dcslice *S, const frame *fr, const
 /* §600: НК1 — прежнее ТОЧЕЧНОЕ ядро; НК2 — поправка в 1000 раз (обязана уехать
  * в ДАЛЁКОМ поле, чем и проверяет, что П2 не слепа). */
 static int g_gpoint = 0, g_gwide = 0;
+/* §611: НК1 — без нормировки суммы формфакторов. */
+static int g_gnonorm = 0;
 
 static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], const double ni_[3],
                         double eps, double rrecv, const opyr *P, const frame *fr, int vis,
@@ -2294,13 +2296,15 @@ static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], c
    * остальные: гонка в горячем цикле недопустима, а редукция OpenMP отдала бы
    * порядок планировщику. */
   if (nnear != NULL && soft > 0.01 * 3.14159265358979323846 * r2) (*nnear)++;
-  /* §609: СУММА ФОРМФАКТОРОВ. `F_ij = cos_i cos_j A/(π r² + A)` есть в точности
-   * `g · A_j`. Физика: `Σ_j F_ij ≤ 1` у полностью замкнутой точки и СТРОГО
-   * МЕНЬШЕ у открытой. Всякий приёмник выше единицы — доказательство завышения. */
-  if (ffsum != NULL) *ffsum += g * (double)bb->area;
   int blocked = 0;
   double cw[3] = {(double)bb->c[0], (double)bb->c[1], (double)bb->c[2]};
   if (vis) blocked = shadowed(P, fr, pi, cw, 0.5);
+  /* §609: СУММА ФОРМФАКТОРОВ. `F_ij = cos_i cos_j A/(π r² + A)` есть в точности
+   * `g · A_j`. Физика: `Σ_j F_ij ≤ 1` у полностью замкнутой точки и СТРОГО МЕНЬШЕ
+   * у открытой. Всякий приёмник выше единицы — доказательство завышения.
+   * СЧИТАЕТСЯ ПОСЛЕ ЗАСЛОНА И ТОЛЬКО ПО ПРОШЕДШИМ СВЯЗЯМ (§612): иначе замер
+   * слеп к тому, чинят ли заслоны сумму, — а именно это и надо проверить. */
+  if (ffsum != NULL && !(blocked && vis)) *ffsum += g * (double)bb->area;
   for (int k = 0; k < 3; k++) {
     double v = (double)bb->flux[k] * g;
     if (sall != NULL) {
@@ -2427,8 +2431,16 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
     for (int q2 = 0; q2 < 6; q2++)
       hgather_rec(ET, 0, q2, pi, nn2, eps, rrecv, P, fr, blockvis, acc2, &plink[th], &pthru[th],
                   &pall[th], &pnear[th], &ffacc);
+    /* §611: НОРМИРОВКА. `Σ_j F_ij` физически не больше единицы; замерено, что у
+     * `68.9 %` приёмников она больше (§610, медиана `1.8367`). Деление на
+     * `max(1, Σ F)` делает оператор СЖАТИЕМ по построению.
+     * ЧЕСТНО: это заставляет энергию сохраняться, но перекрытие шести корзин НЕ
+     * чинит — ошибка перераспределяется по направлениям. Диагностика `Σ F`
+     * печатается ПОСЛЕ нормировки и обязана показывать прежние `1.84`. */
+    double fnorm = (!g_gnonorm && ffacc > 1.0) ? 1.0 / ffacc : 1.0;
     for (int k = 0; k < 3; k++)
-      ind[3 * (size_t)i + (size_t)k] = (float)(acc2[k] * (alb0 ? 0.0 : alb(m, S->c[i].mat, k)));
+      ind[3 * (size_t)i + (size_t)k] =
+          (float)(acc2[k] * fnorm * (alb0 ? 0.0 : alb(m, S->c[i].mat, k)));
     if (ffout != NULL) ffout[i] = ffacc;
   }
   /* Счётчики сводятся в ФИКСИРОВАННОМ порядке: редукция OpenMP отдала бы его
@@ -5191,6 +5203,7 @@ int main(int argc, char **argv) {
     /* §597: НК1 — прежний путь (сбор в срезе, каждый кадр); НК2 — без подъёма по
      * иерархии; НК3 — подъём невзвешенный. */
     if (strncmp(argv[i], "hbounce=", 8) == 0) g_hbounce = (int)strtol(argv[i] + 8, NULL, 10);
+    if (strcmp(argv[i], "gnonorm") == 0) g_gnonorm = 1;
     if (strcmp(argv[i], "gpoint") == 0) g_gpoint = 1;
     if (strcmp(argv[i], "gwide") == 0) g_gwide = 1;
     if (strcmp(argv[i], "indslice") == 0) g_indslice = 1;

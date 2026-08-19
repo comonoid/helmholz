@@ -2327,11 +2327,14 @@ static int g_gflatvis = 0;
 static int g_nokemit = 0;
 /* §618: `b0` ТОЛЬКО из `Ke` — ни солнца, ни площадки. */
 static int g_keonly = 0;
+/* §620: шагов иерархического марша заслона — чтобы делить время замером, а не
+ * догадкой. Сводится в фиксированном порядке из попоточных. */
+static int64_t g_march_steps = 0;
 
 static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], const double ni_[3],
                         double eps, double rrecv, const opyr *P, const frame *fr, int vis,
                         double out[3], int64_t *nlink, double *sthru, double *sall, int64_t *nnear,
-                        double *ffsum, linkcache *lc, int lcth) {
+                        double *ffsum, linkcache *lc, int lcth, int64_t *nmarch) {
   const enode *e = &T->e[ni];
   const ebin *bb = NULL;
   for (int k = 0; k < e->nb; k++)
@@ -2352,7 +2355,7 @@ static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], c
   if (e->nch > 0 && (spread > g_hspread || (d4 > eps * r2 && 2.0 * (double)bb->rad > rrecv))) {
     for (int k = 0; k < e->nch; k++)
       hgather_rec(T, e->ch[k], q, pi, ni_, eps, rrecv, P, fr, vis, out, nlink, sthru, sall, nnear,
-                  ffsum, lc, lcth);
+                  ffsum, lc, lcth, nmarch);
     return;
   }
   double di = w[0] * ni_[0] + w[1] * ni_[1] + w[2] * ni_[2];
@@ -2388,7 +2391,7 @@ static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], c
    * порядка тысячи проб. `shadowed_h` пропускает крупные пустые узлы ЦЕЛИКОМ и
    * заявлен тем же предикатом (§426, А784) — прямой свет считает им давно.
    * Замечание пользователя 08-13: «все заслоны уже есть в архитектуре». */
-  if (vis) blocked = g_gflatvis ? shadowed(P, fr, pi, cw, 0.5) : shadowed_h(P, fr, pi, cw, NULL);
+  if (vis) blocked = g_gflatvis ? shadowed(P, fr, pi, cw, 0.5) : shadowed_h(P, fr, pi, cw, nmarch);
   /* §609: СУММА ФОРМФАКТОРОВ. `F_ij = cos_i cos_j A/(π r² + A)` есть в точности
    * `g · A_j`. Физика: `Σ_j F_ij ≤ 1` у полностью замкнутой точки и СТРОГО МЕНЬШЕ
    * у открытой. Всякий приёмник выше единицы — доказательство завышения.
@@ -2523,7 +2526,8 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
   double *pthru = calloc((size_t)nth, sizeof *pthru);
   double *pall = calloc((size_t)nth, sizeof *pall);
   int64_t *pnear = calloc((size_t)nth, sizeof *pnear);
-  if (plink == NULL || pthru == NULL || pall == NULL || pnear == NULL) exit(1);
+  int64_t *pmar = calloc((size_t)nth, sizeof *pmar);
+  if (plink == NULL || pthru == NULL || pall == NULL || pnear == NULL || pmar == NULL) exit(1);
 #pragma omp parallel for schedule(dynamic, 64) if (!g_omp1)
   for (int32_t i = 0; i < S->n; i++) {
     int th = g_omp1 ? 0 : omp_get_thread_num();
@@ -2536,7 +2540,7 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
     double rrecv = fr->h * (double)((int32_t)1 << (lev - (int)S->c[i].lvl));
     for (int q2 = 0; q2 < 6; q2++)
       hgather_rec(ET, 0, q2, pi, nn2, eps, rrecv, P, fr, blockvis, acc2, &plink[th], &pthru[th],
-                  &pall[th], &pnear[th], &ffacc, lc, th);
+                  &pall[th], &pnear[th], &ffacc, lc, th, &pmar[th]);
     /* §611: НОРМИРОВКА. `Σ_j F_ij` физически не больше единицы; замерено, что у
      * `68.9 %` приёмников она больше (§610, медиана `1.8367`). Деление на
      * `max(1, Σ F)` делает оператор СЖАТИЕМ по построению.
@@ -2559,6 +2563,7 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
   for (int t4 = 0; t4 < nth; t4++) {
     if (nlink != NULL) *nlink += plink[t4];
     if (nnear != NULL) *nnear += pnear[t4];
+    g_march_steps += pmar[t4];
     if (sthru != NULL) *sthru += pthru[t4];
     if (sall != NULL) *sall += pall[t4];
   }
@@ -2566,6 +2571,7 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
   free(pthru);
   free(pall);
   free(pnear);
+  free(pmar);
 }
 
 /* ПРИМЕНИТЬ ХРАНИМЫЕ СВЯЗИ — БЕЗ ОБХОДА ДЕРЕВА (§613).
@@ -2853,6 +2859,9 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
            100.0 * (double)nover / (double)(SF.n ? SF.n : 1));
     free(fs);
   }
+  printf("   §620 ЦЕНА ЗАСЛОНА: шагов иерархического марша %lld на %lld связей (%.1f на связь)\n",
+         (long long)g_march_steps, (long long)nlink,
+         (double)g_march_steps / (double)(nlink ? nlink : 1));
   printf("   §607 РЯД НЕЙМАНА: отскоков %d, ρ_max = %.4f\n", nb, rhomax);
   for (int k = 0; k < nb; k++)
     printf("      Σ b_%d = %.6e -> Σ b_%d = %.6e; ОТНОШЕНИЕ %.4f %s; отскок %.2f с\n", k, sb[k],
@@ -8758,7 +8767,7 @@ int main(int argc, char **argv) {
             double rrecv = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
             for (int q2 = 0; q2 < 6; q2++)
               hgather_rec(&ET, 0, q2, pi, nn2, g_hgather, rrecv, &P, &fr, indvis, acc2, &plink[th],
-                          &pthru[th], &pall[th], &pnv[th], NULL, NULL, 0);
+                          &pthru[th], &pall[th], &pnv[th], NULL, NULL, 0, NULL);
             for (int k = 0; k < 3; k++)
               ind[3 * (size_t)i + (size_t)k] =
                   (float)(acc2[k] * (alb0 ? 0.0 : alb(&m, S.c[i].mat, k)));

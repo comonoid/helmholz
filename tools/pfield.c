@@ -1337,6 +1337,20 @@ static uint64_t cellkey(const hz_dccell *c) {
          (uint64_t)c->lo[2];
 }
 
+/* Пара «ключ ячейки — её номер в срезе» для сортировки индекса цвета (§590).
+ * Сравнение вторым полем делает порядок ОДНОЗНАЧНЫМ при равных ключах, то есть
+ * заменяет устойчивость, которой у `qsort` нет. */
+typedef struct {
+  uint64_t k;
+  int32_t o;
+} cellkv;
+
+static int cmp_cellkv(const void *x, const void *y) {
+  const cellkv *a = (const cellkv *)x, *b = (const cellkv *)y;
+  if (a->k != b->k) return a->k < b->k ? -1 : 1;
+  return a->o < b->o ? -1 : (a->o > b->o ? 1 : 0);
+}
+
 static int cmp_u64(const void *x, const void *y) {
   uint64_t a = *(const uint64_t *)x, b = *(const uint64_t *)y;
   return a < b ? -1 : (a > b ? 1 : 0);
@@ -6771,6 +6785,13 @@ int main(int argc, char **argv) {
     if (g_walk && !walk_open(res)) return 2;
     double t_prev = 1.0 / 30.0; /* первый шаг движения — как при 30 к/с */
     for (;;) {
+      /* СЕКУНДОМЕР НА ВСЮ ИТЕРАЦИЮ, А НЕ НА ТРИ НАЗВАННЫЕ СТАДИИ (§590).
+       * Первая редакция ходилки печатала `срез + свет + растр` и называла это
+       * кадром. Это ПОДМЕНА ВЕЛИЧИНЫ: в итерации есть работа помимо этих трёх, и
+       * пользователь увидел `0.2` к/с там, где строка обещала `5`. Разность
+       * теперь печатается ОТДЕЛЬНОЙ статьёй «прочее» — величина, которую никто
+       * не мерил, обязана быть видна, а не растворяться. */
+      double t_iter0 = now_s();
       for (int a = 0; a < 3; a++)
         LL.eye[a] = (eyec[a] - fr.org[a]) / fr.h;
       LL.pxrad = (HZ_CFG_FOV_DEG * 3.14159265358979323846 / 180.0) / (double)res;
@@ -6813,6 +6834,7 @@ int main(int argc, char **argv) {
        * LOD. Для отскока это законно (энергия), для резкой границы текстуры —
        * нет; текстур пока и нет. */
       float *uvs = (m.vt != NULL && m.ft != NULL) ? calloc(2 * (size_t)S.n, sizeof *uvs) : NULL;
+      double t_mat = now_s();
       {
         int64_t nmat = 0, nuv = 0;
         for (int32_t i = 0; i < S.n; i++) {
@@ -6885,11 +6907,13 @@ int main(int argc, char **argv) {
             }
           }
         }
-        printf("   МАТЕРИАЛ В СРЕЗЕ: назначен %lld ячейкам из %d, материалов в сцене %d; "
-               "КООРДИНАТА ТЕКСТУРЫ у %lld (%.1f %%)\n",
-               (long long)nmat, S.n, m.nmtl, (long long)nuv,
-               100.0 * (double)nuv / (double)(S.n ? S.n : 1));
+        if (!g_walk)
+          printf("   МАТЕРИАЛ В СРЕЗЕ: назначен %lld ячейкам из %d, материалов в сцене %d; "
+                 "КООРДИНАТА ТЕКСТУРЫ у %lld (%.1f %%)\n",
+                 (long long)nmat, S.n, m.nmtl, (long long)nuv,
+                 100.0 * (double)nuv / (double)(S.n ? S.n : 1));
       }
+      t_mat = now_s() - t_mat;
 
       float *irr = malloc(3 * (size_t)S.n * sizeof *irr);
       if (irr == NULL) exit(1);
@@ -8323,6 +8347,7 @@ int main(int argc, char **argv) {
       /* ЦВЕТ ЯЧЕЙКИ КЛАДЁТСЯ В ИНДЕКС ПО КЛЮЧУ, чтобы растеризатор мог его взять
        * по ячейке многоугольника. Индекс ПЛОСКИЙ (отсортированные ключи +
        * двоичный поиск), а не дерево: у него нет ни спуска, ни владения. */
+      double t_sort = now_s();
       uint64_t *key = malloc((size_t)S.n * sizeof *key);
       int32_t *ord = malloc((size_t)S.n * sizeof *ord);
       if (key == NULL || ord == NULL) exit(1);
@@ -8330,19 +8355,36 @@ int main(int argc, char **argv) {
         key[i] = cellkey(&S.c[i]);
         ord[i] = i;
       }
-      /* Срез уже в мортоновом порядке; ключ (lvl, lo) монотонен по нему не всегда,
-       * поэтому сортируется явно. */
-      for (int32_t i = 1; i < S.n; i++) {
-        uint64_t k = key[i];
-        int32_t o = ord[i];
-        int32_t j = i - 1;
-        while (j >= 0 && key[j] > k) {
-          key[j + 1] = key[j];
-          ord[j + 1] = ord[j];
-          j--;
+      /* СОРТИРОВКА ЗА `n log n`, А НЕ ЗА `n²` (§590).
+       *
+       * ЗДЕСЬ СТОЯЛА ВСТАВОЧНАЯ СОРТИРОВКА, и в комментарии рядом было честно
+       * написано, почему вход к ней не отсортирован: срез идёт в МОРТОНОВОМ
+       * порядке, а ключ лексикографичен по `(lvl, x, y, z)` — это разные
+       * порядки, да ещё `lvl` в старших битах. То есть вход был практически
+       * случайным, и вставка вырождалась в `n²`.
+       * ЗАМЕРЕНО (§590, Bistro, `256²`, `poly=0`, `129 836` ячеек): `1828` мс из
+       * `2084` мс кадра — `88 %`. В однокадровом прогоне это тонуло в `38` с
+       * постройки и потому не было видно ни разу.
+       *
+       * ТАЙ-БРЕЙК ПО `ord` — НЕ УКРАШЕНИЕ. Вставочная сортировка УСТОЙЧИВА, а
+       * `qsort` нет; при равных ключах порядок решал бы, чей цвет достанется
+       * ячейке, и картинка поехала бы. Сравнение вторым ключом по возрастанию
+       * `ord` даёт РОВНО тот же результат, что устойчивая сортировка исходно
+       * возрастающего `ord`, — то есть побитовость сохраняется по построению, а
+       * не по надежде. */
+      {
+        cellkv *kv = malloc((size_t)S.n * sizeof *kv);
+        if (kv == NULL) exit(1);
+        for (int32_t i = 0; i < S.n; i++) {
+          kv[i].k = key[i];
+          kv[i].o = ord[i];
         }
-        key[j + 1] = k;
-        ord[j + 1] = o;
+        qsort(kv, (size_t)S.n, sizeof *kv, cmp_cellkv);
+        for (int32_t i = 0; i < S.n; i++) {
+          key[i] = kv[i].k;
+          ord[i] = kv[i].o;
+        }
+        free(kv);
       }
 
       /* БЕЛАЯ ТОЧКА: перцентиль 99.5 по ЯЧЕЙКАМ СРЕЗА — то же правило, что в
@@ -8362,6 +8404,7 @@ int main(int argc, char **argv) {
         if (w995 > 0.0) white = w995;
         free(tmpw);
       }
+      t_sort = now_s() - t_sort;
       litctx LC;
       memset(&LC, 0, sizeof LC);
       LC.polysum = HZ_FNV_BASIS; /* начальное значение FNV-1a */
@@ -8529,8 +8572,14 @@ int main(int argc, char **argv) {
         LLc.h = fr.h;
         for (int a = 0; a < 3; a++)
           LLc.org[a] = fr.org[a];
+        /* §590: В ХОДЬБЕ ПРОФИЛЬНОГО ОБХОДА НЕТ. Это ЗАМЕР (§573) — второй
+         * полный обход дерева с пустым обработчиком, нужный только чтобы отделить
+         * цену обхода от цены рисования. Замерено: `141` мс на кадр при `512²`,
+         * то есть `13 %` кадра платились за прибор. В однокадровом прогоне он
+         * остаётся: там он и осмыслен. */
         double ta_w = now_s();
-        int wrc0 = hz_dc_walk(&T, lod_stop, &LLc, lit_none, &LC);
+        int wrc0 = 0;
+        if (!g_walk) wrc0 = hz_dc_walk(&T, lod_stop, &LLc, lit_none, &LC);
         double t_walk = now_s() - ta_w;
 #ifdef HZ_DC_COUNT
         {
@@ -8641,11 +8690,16 @@ int main(int argc, char **argv) {
           /* ПОЛОЖЕНИЕ ПЕЧАТАЕТСЯ, А НЕ ПОДРАЗУМЕВАЕТСЯ: без него «управление не
            * работает» и «работает, но смотрю в стену» неотличимы, а проверять
            * придётся первым делом. */
-          printf("   кадр %6.1f мс (%.2f к/с): срез %.1f + свет %.1f + растр %.1f; ячеек %d, "
+          double t_wall = now_s() - t_iter0;
+          double t_other = t_wall - tf - t_mat - t_sort - t_walk;
+          printf("   кадр %6.0f мс (%.2f к/с) = срез %.0f + свет %.0f + растр %.0f + материал %.0f "
+                 "+ сортировка %.0f + ПРОФИЛЬНЫЙ ОБХОД %.0f + прочее %.0f; ячеек %d, "
                  "многоугольников %lld; глаз (%.2f %.2f %.2f) взгляд (%.2f %.2f %.2f)\n",
-                 tf * 1e3, 1.0 / (tf > 0.0 ? tf : 1.0), t_slice * 1e3, t_dir * 1e3, t_rast * 1e3,
-                 S.n, (long long)LC.nseen, eyec[0], eyec[1], eyec[2], atc[0] - eyec[0],
-                 atc[1] - eyec[1], atc[2] - eyec[2]);
+                 t_wall * 1e3, 1.0 / (t_wall > 0.0 ? t_wall : 1.0), t_slice * 1e3, t_dir * 1e3,
+                 t_rast * 1e3, t_mat * 1e3, t_sort * 1e3, t_walk * 1e3, t_other * 1e3, S.n,
+                 (long long)LC.nseen, eyec[0], eyec[1], eyec[2], atc[0] - eyec[0], atc[1] - eyec[1],
+                 atc[2] - eyec[2]);
+          tf = t_wall; /* движение считается по НАСТОЯЩЕМУ времени кадра */
           fflush(stdout);
           walk_alive = walk_present(outrgb, outres, eyec, atc, upc, t_prev);
           t_prev = tf;

@@ -2240,13 +2240,83 @@ static int32_t etree_build(etree *T, const hz_dcslice *S, const frame *fr, const
 /* §600: НК1 — прежнее ТОЧЕЧНОЕ ядро; НК2 — поправка в 1000 раз (обязана уехать
  * в ДАЛЁКОМ поле, чем и проверяет, что П2 не слепа). */
 static int g_gpoint = 0, g_gwide = 0;
+
+/* ---- ХРАНИМЫЕ СВЯЗИ СБОРА (§613) -----------------------------------------
+ *
+ * ЗАЧЕМ. Видимость есть свойство ГЕОМЕТРИИ: ни яркость излучателей, ни BRDF, ни
+ * камера в неё не входят. Замерено (§612): заслоны поднимают сбор с `11.1` до
+ * `59.3` с. Платить это на КАЖДОМ отскоке — значит сделать многократный отскок
+ * невозможным ровно тогда, когда он стал осмысленным.
+ *
+ * ЧТО ХРАНИТСЯ. На приёмник — список `(номер корзины, g)`, и только тот, что
+ * ПРОШЁЛ заслон. Дальше `E_i = Σ g·flux[корзина]`, обхода дерева нет вовсе.
+ *
+ * ПОЧЕМУ БУФЕРЫ ПОПОТОЧНЫЕ. Приёмники делятся по потокам, и каждый поток пишет
+ * свой буфер подряд. Атомарных операций нет, а ПОРЯДОК СЛОЖЕНИЯ ВНУТРИ приёмника
+ * не меняется — потому первый отскок обязан совпасть с необходимым путём
+ * ПОБИТОВО, и это проверяется, а не предполагается.
+ *
+ * НОМЕРА КОРЗИН УСТОЙЧИВЫ МЕЖДУ ОТСКОКАМИ, потому что `etree_build`
+ * детерминирована при том же срезе: дерево перестраивается каждый отскок
+ * (`1.05` с), но раскладка корзин повторяется. Переписывать построение ради
+ * обновления одних потоков — отдельная работа, и `1.05` с против `59` не та
+ * статья, ради которой стоит рисковать. */
+typedef struct {
+  int32_t bin;
+  float g;
+} glink;
+
+typedef struct {
+  glink **buf;  /* [поток] растущий массив */
+  int64_t *n;   /* сколько занято */
+  int64_t *cap; /* сколько выделено */
+  int64_t *off; /* [приёмник] смещение в буфере своего потока */
+  int32_t *cnt; /* [приёмник] сколько связей */
+  int8_t *th;   /* [приёмник] чей это буфер */
+  int nth;
+  int32_t nrecv;
+} linkcache;
+
+static void lc_free(linkcache *L) {
+  if (L->buf != NULL)
+    for (int t = 0; t < L->nth; t++)
+      free(L->buf[t]);
+  free(L->buf);
+  free(L->n);
+  free(L->cap);
+  free(L->off);
+  free(L->cnt);
+  free(L->th);
+  memset(L, 0, sizeof *L);
+}
+
+static int lc_init(linkcache *L, int nth, int32_t nrecv) {
+  memset(L, 0, sizeof *L);
+  L->nth = nth;
+  L->nrecv = nrecv;
+  L->buf = calloc((size_t)nth, sizeof *L->buf);
+  L->n = calloc((size_t)nth, sizeof *L->n);
+  L->cap = calloc((size_t)nth, sizeof *L->cap);
+  L->off = calloc((size_t)nrecv, sizeof *L->off);
+  L->cnt = calloc((size_t)nrecv, sizeof *L->cnt);
+  L->th = calloc((size_t)nrecv, sizeof *L->th);
+  if (L->buf == NULL || L->n == NULL || L->cap == NULL || L->off == NULL || L->cnt == NULL ||
+      L->th == NULL) {
+    lc_free(L);
+    return 0;
+  }
+  return 1;
+}
 /* §611: НК1 — без нормировки суммы формфакторов. */
 static int g_gnonorm = 0;
+/* §613, НК2: не хранить связи — обходить дерево на каждом отскоке. Без этого
+ * контроля «стало быстрее» неотличимо от «стало меньше работы». */
+static int g_nolinkcache = 0;
 
 static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], const double ni_[3],
                         double eps, double rrecv, const opyr *P, const frame *fr, int vis,
                         double out[3], int64_t *nlink, double *sthru, double *sall, int64_t *nnear,
-                        double *ffsum) {
+                        double *ffsum, linkcache *lc, int lcth) {
   const enode *e = &T->e[ni];
   const ebin *bb = NULL;
   for (int k = 0; k < e->nb; k++)
@@ -2267,7 +2337,7 @@ static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], c
   if (e->nch > 0 && (spread > g_hspread || (d4 > eps * r2 && 2.0 * (double)bb->rad > rrecv))) {
     for (int k = 0; k < e->nch; k++)
       hgather_rec(T, e->ch[k], q, pi, ni_, eps, rrecv, P, fr, vis, out, nlink, sthru, sall, nnear,
-                  ffsum);
+                  ffsum, lc, lcth);
     return;
   }
   double di = w[0] * ni_[0] + w[1] * ni_[1] + w[2] * ni_[2];
@@ -2305,6 +2375,20 @@ static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], c
    * СЧИТАЕТСЯ ПОСЛЕ ЗАСЛОНА И ТОЛЬКО ПО ПРОШЕДШИМ СВЯЗЯМ (§612): иначе замер
    * слеп к тому, чинят ли заслоны сумму, — а именно это и надо проверить. */
   if (ffsum != NULL && !(blocked && vis)) *ffsum += g * (double)bb->area;
+  /* §613: связь ЗАПОМИНАЕТСЯ, если прошла заслон. Индекс корзины устойчив
+   * между отскоками (см. шапку `linkcache`). */
+  if (lc != NULL && !(blocked && vis)) {
+    if (lc->n[lcth] >= lc->cap[lcth]) {
+      int64_t nc = lc->cap[lcth] > 0 ? lc->cap[lcth] * 2 : 1 << 16;
+      glink *nb2 = realloc(lc->buf[lcth], (size_t)nc * sizeof *nb2);
+      if (nb2 == NULL) exit(1);
+      lc->buf[lcth] = nb2;
+      lc->cap[lcth] = nc;
+    }
+    lc->buf[lcth][lc->n[lcth]].bin = (int32_t)(bb - T->b);
+    lc->buf[lcth][lc->n[lcth]].g = (float)g;
+    lc->n[lcth]++;
+  }
   for (int k = 0; k < 3; k++) {
     double v = (double)bb->flux[k] * g;
     if (sall != NULL) {
@@ -2412,7 +2496,8 @@ static int g_hbounce = 1;
  * NULL. Альбедо приёмника применяется здесь же, как и было. */
 static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, const opyr *P,
                        const hz_objmesh *m, int lev, double eps, int blockvis, int alb0, float *ind,
-                       int64_t *nlink, double *sthru, double *sall, int64_t *nnear, double *ffout) {
+                       int64_t *nlink, double *sthru, double *sall, int64_t *nnear, double *ffout,
+                       linkcache *lc) {
   int nth = g_omp1 ? 1 : omp_get_max_threads();
   int64_t *plink = calloc((size_t)nth, sizeof *plink);
   double *pthru = calloc((size_t)nth, sizeof *pthru);
@@ -2423,6 +2508,7 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
   for (int32_t i = 0; i < S->n; i++) {
     int th = g_omp1 ? 0 : omp_get_thread_num();
     double pi[3], nn2[3], acc2[3] = {0, 0, 0}, ffacc = 0.0;
+    int64_t lc0 = lc != NULL ? lc->n[th] : 0;
     hz_slice_vertex(S, i, pi);
     for (int k = 0; k < 3; k++)
       pi[k] = fr->org[k] + pi[k] * fr->h;
@@ -2430,7 +2516,7 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
     double rrecv = fr->h * (double)((int32_t)1 << (lev - (int)S->c[i].lvl));
     for (int q2 = 0; q2 < 6; q2++)
       hgather_rec(ET, 0, q2, pi, nn2, eps, rrecv, P, fr, blockvis, acc2, &plink[th], &pthru[th],
-                  &pall[th], &pnear[th], &ffacc);
+                  &pall[th], &pnear[th], &ffacc, lc, th);
     /* §611: НОРМИРОВКА. `Σ_j F_ij` физически не больше единицы; замерено, что у
      * `68.9 %` приёмников она больше (§610, медиана `1.8367`). Деление на
      * `max(1, Σ F)` делает оператор СЖАТИЕМ по построению.
@@ -2442,6 +2528,11 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
       ind[3 * (size_t)i + (size_t)k] =
           (float)(acc2[k] * fnorm * (alb0 ? 0.0 : alb(m, S->c[i].mat, k)));
     if (ffout != NULL) ffout[i] = ffacc;
+    if (lc != NULL) {
+      lc->off[i] = lc0;
+      lc->cnt[i] = (int32_t)(lc->n[th] - lc0);
+      lc->th[i] = (int8_t)th;
+    }
   }
   /* Счётчики сводятся в ФИКСИРОВАННОМ порядке: редукция OpenMP отдала бы его
    * планировщику, и число поехало бы от запуска к запуску. */
@@ -2457,10 +2548,33 @@ static void gather_run(const etree *ET, const hz_dcslice *S, const frame *fr, co
   free(pnear);
 }
 
+/* ПРИМЕНИТЬ ХРАНИМЫЕ СВЯЗИ — БЕЗ ОБХОДА ДЕРЕВА (§613).
+ *
+ * `E_i = Σ g·flux[корзина]`, затем нормировка §611 и альбедо приёмника — всё
+ * ровно как в `gather_run`, иначе первый и второй отскок считались бы разными
+ * формулами. Сумма формфакторов берётся ГОТОВОЙ (`ffv`): она геометрическая и
+ * между отскоками не меняется. */
+static void gather_apply(const linkcache *lc, const etree *T, const hz_dcslice *S,
+                         const hz_objmesh *m, const double *ffv, float *ind) {
+#pragma omp parallel for schedule(dynamic, 256) if (!g_omp1)
+  for (int32_t i = 0; i < lc->nrecv; i++) {
+    const glink *lk = lc->buf[lc->th[i]] + lc->off[i];
+    int32_t nl = lc->cnt[i];
+    double acc[3] = {0, 0, 0};
+    for (int32_t j = 0; j < nl; j++) {
+      const ebin *bb = &T->b[lk[j].bin];
+      for (int k = 0; k < 3; k++)
+        acc[k] += (double)bb->flux[k] * (double)lk[j].g;
+    }
+    double fnorm = (!g_gnonorm && ffv[i] > 1.0) ? 1.0 / ffv[i] : 1.0;
+    for (int k = 0; k < 3; k++)
+      ind[3 * (size_t)i + (size_t)k] = (float)(acc[k] * fnorm * alb(m, S->c[i].mat, k));
+  }
+}
 /* УЗЕЛ ПО ЯЧЕЙКЕ СРЕЗА (§597, Р3). Ячейка несёт `lo` в сетке САМОГО МЕЛКОГО
  * уровня и свой уровень `lvl`; номера узла у неё нет. Спуск целочисленный: на
- * шаге `d` бит ребёнка берётся из разряда `lev−1−d` координаты — та же
- * нумерация детей, что в `cell_proc` (бит `a` оси `a`).
+ * шаге `d` бит ребёнка берётся из разряда `lev−1−d` координаты — та же нумерация
+ * детей, что в `cell_proc` (бит `a` оси `a`).
  *
  * ОСТАНОВКА РОВНО НА ГЛУБИНЕ `lvl`, И ЭТО ТРУДНОЕ МЕСТО (А1029): ошибка на
  * единицу уводит в ребёнка, косвенный свет уезжает в соседнюю ячейку, а на
@@ -2615,10 +2729,13 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
    * ГЕОМЕТРИИ и от яркости излучателей не зависит вовсе. */
   double *ffv = calloc((size_t)SF.n, sizeof *ffv);
   if (ffv == NULL) exit(1);
+  linkcache LC2;
+  if (!lc_init(&LC2, g_omp1 ? 1 : omp_get_max_threads(), SF.n)) exit(1);
   float *bcur = malloc(3 * (size_t)SF.n * sizeof *bcur);
   float *bnext = calloc(3 * (size_t)SF.n, sizeof *bnext);
   if (bcur == NULL || bnext == NULL) exit(1);
   memcpy(bcur, irrF, 3 * (size_t)SF.n * sizeof *bcur);
+  double tbk[HZ_BOUNCE_MAX];
   double sb[HZ_BOUNCE_MAX + 1];
   sb[0] = 0.0;
   for (int32_t i = 0; i < 3 * SF.n; i++)
@@ -2632,8 +2749,13 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
     t_tree += now_s() - ta1;
     double ta2 = now_s();
     int64_t nl = 0;
-    gather_run(&ETk, &SF, fr, P, m, lev, eps, blockvis, 0, bnext, &nl, NULL, NULL, &nnear,
-               k == 0 ? ffv : NULL);
+    if (k == 0 || g_nolinkcache) {
+      gather_run(&ETk, &SF, fr, P, m, lev, eps, blockvis, 0, bnext, &nl, NULL, NULL, &nnear,
+                 k == 0 ? ffv : NULL, (k == 0 && !g_nolinkcache) ? &LC2 : NULL);
+    } else {
+      /* §613: ВТОРОЙ И ДАЛЬШЕ — БЕЗ ОБХОДА. Видимость уже оплачена. */
+      gather_apply(&LC2, &ETk, &SF, m, ffv, bnext);
+    }
     t_gath += now_s() - ta2;
     if (k == 0) nlink = nl;
     etree_free(&ETk);
@@ -2642,12 +2764,24 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
       sb[k + 1] += (double)bnext[i];
       indF[i] += bnext[i];
     }
+    tbk[k] = now_s() - ta1;
     float *sw = bcur;
     bcur = bnext;
     bnext = sw;
   }
   free(bcur);
   free(bnext);
+  {
+    int64_t nlc = 0;
+    for (int t = 0; t < LC2.nth; t++)
+      nlc += LC2.n[t];
+    if (!g_nolinkcache)
+      printf("   §613 ХРАНИМЫЕ СВЯЗИ: прошло заслон %lld из %lld геометрических (%.1f %%), "
+             "память %.2f ГБ\n",
+             (long long)nlc, (long long)nlink, 100.0 * (double)nlc / (double)(nlink ? nlink : 1),
+             (double)nlc * sizeof(glink) / 1073741824.0);
+  }
+  lc_free(&LC2);
   /* НАИБОЛЬШЕЕ АЛЬБЕДО СЦЕНЫ — граница сжатия. Без него «больше единицы» не с
    * чем сравнивать: граница есть `ρ_max`, а не `1` (Р3 §607). */
   double rhomax = 0.0;
@@ -2675,9 +2809,10 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
   }
   printf("   §607 РЯД НЕЙМАНА: отскоков %d, ρ_max = %.4f\n", nb, rhomax);
   for (int k = 0; k < nb; k++)
-    printf("      Σ b_%d = %.6e -> Σ b_%d = %.6e; ОТНОШЕНИЕ %.4f %s\n", k, sb[k], k + 1, sb[k + 1],
-           sb[k + 1] / (sb[k] > 0.0 ? sb[k] : 1.0),
-           sb[k + 1] / (sb[k] > 0.0 ? sb[k] : 1.0) <= rhomax ? "(сжатие)" : "<- ВЫШЕ ГРАНИЦЫ");
+    printf("      Σ b_%d = %.6e -> Σ b_%d = %.6e; ОТНОШЕНИЕ %.4f %s; отскок %.2f с\n", k, sb[k],
+           k + 1, sb[k + 1], sb[k + 1] / (sb[k] > 0.0 ? sb[k] : 1.0),
+           sb[k + 1] / (sb[k] > 0.0 ? sb[k] : 1.0) <= rhomax ? "(сжатие)" : "<- ВЫШЕ ГРАНИЦЫ",
+           tbk[k]);
 
   /* РАСКЛАДКА ПО УЗЛАМ. Отказы СЧИТАЮТСЯ и печатаются: спуск на глубину `lvl` —
    * трудное место (А1029), и молчаливый промах выглядел бы лёгким шумом. */
@@ -5083,7 +5218,11 @@ int main(int argc, char **argv) {
    * меняет именно его. */
   int hitsweep = 0, hitnoocc = 0;
   double hitrad = 0.20;
-  int nrmflip = 0, nonsum = 0, indvis = 0, indmeas = 0, dosolid = 0;
+  /* §613: ЗАСЛОНЫ ПО УМОЛЧАНИЮ. До этого шага `indvis` был ключом ЗАМЕРА, и все
+   * числа отскока снимались БЕЗ заслонов — то есть `79.99 %` энергии приходило
+   * сквозь стены (§612). Теперь наоборот: заслоны включены, а `noindvis`
+   * возвращает прежнее поведение как негативный контроль. */
+  int nrmflip = 0, nonsum = 0, indvis = 1, indmeas = 0, dosolid = 0;
   int doxfer = 0, xfernosolid = 0, doxsweep = 0, nmu = 4, xcorner = 0, xinnerfluid = 0;
   int ss2 = 0, xtrace = 0, qplane = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
@@ -5151,10 +5290,8 @@ int main(int argc, char **argv) {
       dosolid = 1;
       xfernosolid = 1;
     }
-    if (strcmp(argv[i], "indvis") == 0) {
-      indmeas = 1;
-      indvis = 1;
-    }
+    if (strcmp(argv[i], "indvis") == 0) indmeas = 1; /* заслоны и так включены (§613) */
+    if (strcmp(argv[i], "noindvis") == 0) indvis = 0;
     /* НЕГАТИВНЫЙ КОНТРОЛЬ §397: вершина среза в один бит на ось. */
     if (strcmp(argv[i], "vq1") == 0) vq1 = 1;
     /* Ш4: удар сферой, два случая врозь (А669). */
@@ -5203,6 +5340,7 @@ int main(int argc, char **argv) {
     /* §597: НК1 — прежний путь (сбор в срезе, каждый кадр); НК2 — без подъёма по
      * иерархии; НК3 — подъём невзвешенный. */
     if (strncmp(argv[i], "hbounce=", 8) == 0) g_hbounce = (int)strtol(argv[i] + 8, NULL, 10);
+    if (strcmp(argv[i], "nolinkcache") == 0) g_nolinkcache = 1;
     if (strcmp(argv[i], "gnonorm") == 0) g_gnonorm = 1;
     if (strcmp(argv[i], "gpoint") == 0) g_gpoint = 1;
     if (strcmp(argv[i], "gwide") == 0) g_gwide = 1;
@@ -8554,7 +8692,7 @@ int main(int argc, char **argv) {
             double rrecv = fr.h * (double)((int32_t)1 << (lev - (int)S.c[i].lvl));
             for (int q2 = 0; q2 < 6; q2++)
               hgather_rec(&ET, 0, q2, pi, nn2, g_hgather, rrecv, &P, &fr, indvis, acc2, &plink[th],
-                          &pthru[th], &pall[th], &pnv[th], NULL);
+                          &pthru[th], &pall[th], &pnv[th], NULL, NULL, 0);
             for (int k = 0; k < 3; k++)
               ind[3 * (size_t)i + (size_t)k] =
                   (float)(acc2[k] * (alb0 ? 0.0 : alb(&m, S.c[i].mat, k)));

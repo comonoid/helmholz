@@ -6854,12 +6854,12 @@ int main(int argc, char **argv) {
        * Недостача считается ЗДЕСЬ, а не берётся из `st.balance`: так видно, из
        * каких именно членов она сложилась. */
       {
-        double lack = st.pin + st.psout - st.pout - st.pabs - st.psin;
+        double lack = st.pin + st.psout - st.pout - st.pabs - st.psin - st.psolid;
         double den = st.psout > 0.0 ? st.psout : 1.0;
         printf("      БАЛАНС К40: втекло %.4e + отдано поверхностями %.4e = вытекло %.4e + "
-               "поглощено объёмом %.4e + упало на поверхности %.4e; НЕДОСТАЧА %.4e = %.1f %% "
-               "отданного\n",
-               st.pin, st.psout, st.pout, st.pabs, st.psin, lack, 100.0 * lack / den);
+               "поглощено объёмом %.4e + упало на поверхности %.4e + УШЛО В СПЛОШНОЕ %.4e; "
+               "НЕДОСТАЧА %.4e = %.1f %% отданного\n",
+               st.pin, st.psout, st.pout, st.pabs, st.psin, st.psolid, lack, 100.0 * lack / den);
       }
       printf("      ГДЕ МАКСИМУМ: в полости %.4e, вне её %.4e; флюидный объём ячейки с "
              "максимумом %.3e м³ (у целой ячейки %.3e)\n",

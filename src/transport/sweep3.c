@@ -509,6 +509,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     nfb_fg = nfb_fp = nfb_eg = nfb_ep = nfb_thin = 0;
     st->pin = st->pout = st->pabs = 0.0;
     double pin_acc = 0.0, pout_acc = 0.0;
+    /* §705: поток, ушедший в СПЛОШНЫЕ ячейки и прежде нигде не учтённый. */
+    double psolid_acc = 0.0;
     int fail = 0;
 
     for (int mm = 0; mm < nd; mm++) {
@@ -560,6 +562,26 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       for (int32_t oi = 0; oi < no; oi++) {
         int32_t c = order[oi];
         if (cu != NULL && cu->solid[c]) { /* ячейка целиком в материале */
+          /* §705: СКОЛЬКО ЭНЕРГИИ ЗДЕСЬ ТЕРЯЕТСЯ. До этой правки радианс
+           * сплошной ячейки просто обнулялся, и вошедший в неё поток не
+           * записывался никуда — ни в поглощённое, ни в вытекшее. Отсюда
+           * незамкнутое тождество К40 (недостача 75.6 %, §675).
+           * Считается ТОЧНО, а не оценкой: поток через грань есть
+           * `|ω·n| · Σ_j L_сосед[j] · ∫b_j dA`, где `∫b_j dA` — первая строка
+           * ФЛЮИДНОЙ матрицы грани, уже посчитанной разрезом. */
+          for (int32_t k2 = m->fstart[c]; k2 < m->fstart[c + 1]; k2++) {
+            int32_t f2 = m->flist[k2];
+            int32_t nb2 = (m->f[f2].ca == c) ? m->f[f2].cb : m->f[f2].ca;
+            if (nb2 < 0 || cu->solid[nb2]) continue;
+            double on2 = om[m->f[f2].axis];
+            int into = (m->f[f2].ca == nb2 && on2 > 0.0) || (m->f[f2].cb == nb2 && on2 < 0.0);
+            if (!into) continue;
+            const double (*fm2)[4] = (m->f[f2].ca == nb2) ? cu->ffm[f2] : cu->ffmb[f2];
+            double flx = 0.0;
+            for (int j = 0; j < 4; j++)
+              flx += L[nb2 * 4 + j] * fm2[0][j];
+            psolid_acc += fabs(on2) * d->w[mm] * flx;
+          }
           for (int j = 0; j < 4; j++)
             L[c * 4 + j] = 0.0;
           continue;
@@ -828,6 +850,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     }
     st->pin = pin_acc;
     st->pout = pout_acc;
+    st->psolid = psolid_acc;
 
     /* --- стенки и поверхности: новый исходящий радианс, DG1 по положению --- */
     if (p->wall_rho != NULL)
@@ -1322,7 +1345,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         st->pemit += 4.0 * M_PI * p->eps[c * 4] * vol;
       }
     }
-  st->balance = st->pin + st->psout + st->pemit - st->pout - st->pabs - st->psin;
+  st->balance = st->pin + st->psout + st->pemit - st->pout - st->pabs - st->psin - st->psolid;
   st->iters = it;
   st->resid = resid;
   st->nclip = nclip_last;

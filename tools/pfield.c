@@ -474,6 +474,124 @@ static void collect_verts(const hz_dctree *t, int32_t ni, const int32_t lo[3], i
   }
 }
 
+/* §654: СКОЛЬКО ЛИСТОВ ПОВЕРХНОСТИ ВИДНО В МАСКЕ РЁБЕР ЯЧЕЙКИ.
+ *
+ * ЗАЧЕМ. Вопрос «стоит ли менять ядро на Cubical Marching Squares» (§653)
+ * упирается в одно: много ли у нас ячеек, несущих БОЛЬШЕ ОДНОГО куска
+ * поверхности. Dual contouring кладёт в ячейку ОДНУ вершину и такую ячейку
+ * представить не может; CMS выделяет петли и может. Счётчик `nmulti` на этот
+ * вопрос не отвечает: он про маску УГЛОВ, а в беззнаковом пути её нет (§654).
+ *
+ * КАК. Ровно первым шагом CMS: на каждой из шести граней пересечённые рёбра
+ * соединяются попарно (двумерный marching squares), после чего число связных
+ * компонент среди пересечённых рёбер и есть число петель. Соединение делается
+ * объединением множеств по двенадцати рёбрам — целочисленно, без геометрии.
+ *
+ * ЧЕГО ЭТА ВЕЛИЧИНА НЕ ЗНАЕТ (А1062): два ПАРАЛЛЕЛЬНЫХ листа, пересекающих одни
+ * и те же рёбра, дают ту же маску, что один лист. Значит это НИЖНЯЯ оценка
+ * числа листов, и называть её надо так.
+ *
+ * НЕОДНОЗНАЧНАЯ ГРАНЬ (А1064): при ЧЕТЫРЁХ пересечениях на грани двумерный
+ * marching squares выбирает соединение ПО ЗНАКАМ УГЛОВ, а знака у нас нет
+ * вовсе. Такие грани СЧИТАЮТСЯ отдельно, а соединяются произвольно, но
+ * ОДИНАКОВО у обоих соседей — то есть щели это не даёт, а правильность не
+ * обещана. */
+static int ecross_loops(uint16_t m, int *nambig) {
+  int par[12];
+  for (int i = 0; i < 12; i++)
+    par[i] = i;
+  for (int f = 0; f < 3; f++)
+    for (int s = 0; s < 2; s++) {
+      int e[4], ne = 0;
+      for (int i = 0; i < 12; i++) {
+        if (!((m >> i) & 1u)) continue;
+        int a = i / 4, k = i % 4;
+        if (a == f) continue; /* ребро идёт вдоль оси грани — на грани не лежит */
+        int u = (a + 1) % 3;
+        int off = (f == u) ? (k & 1) : ((k >> 1) & 1);
+        if (off != s) continue;
+        if (ne < 4) e[ne++] = i;
+      }
+      if (ne == 4 && nambig != NULL) (*nambig)++;
+      for (int j = 0; j + 1 < ne; j += 2) {
+        int x = e[j], y = e[j + 1];
+        while (par[x] != x)
+          x = par[x];
+        while (par[y] != y)
+          y = par[y];
+        if (x != y) par[x] = y;
+      }
+    }
+  int nloop = 0;
+  for (int i = 0; i < 12; i++) {
+    if (!((m >> i) & 1u)) continue;
+    int x = i;
+    while (par[x] != x)
+      x = par[x];
+    if (x == i) nloop++;
+  }
+  return nloop;
+}
+
+typedef struct {
+  int64_t npop;     /* листья размера 1 с непустой маской рёбер — ЗНАМЕНАТЕЛЬ */
+  int64_t nloop[4]; /* петель 0 / 1 / 2 / >=3 */
+  int64_t nambigc;  /* ячеек, где есть неоднозначная грань */
+  int64_t nambigf;  /* самих неоднозначных граней */
+  int64_t nopp;     /* ячеек со ВСТРЕЧНЫМИ эрмитовыми нормалями (n_i·n_j < 0) */
+} sheetstat;
+
+static void sheet_rec(const hz_dctree *t, const hz_htab *ht, int32_t ni, const int32_t lo[3],
+                      int32_t size, sheetstat *S) {
+  if (t->nd[ni].child0 < 0) {
+    /* ПОПУЛЯЦИЯ ОГРАНИЧЕНА ЯВНО (А1063): только лист размера 1. У крупного узла
+     * `ecross` есть ИЛИ по детям (А709), и петли по нему считать бессмысленно. */
+    if (size != 1) return;
+    uint16_t m = t->nd[ni].ecross;
+    if (m == 0) return;
+    S->npop++;
+    int amb = 0;
+    int nl = ecross_loops(m, &amb);
+    if (amb > 0) {
+      S->nambigc++;
+      S->nambigf += amb;
+    }
+    S->nloop[nl <= 0 ? 0 : (nl >= 3 ? 3 : nl)]++;
+    /* ВСТРЕЧНЫЕ НОРМАЛИ — признак ИЗ ДРУГОЙ ПРИРОДЫ, чем петли: он видит два
+     * листа даже там, где маска одна. Но он ШИРЕ: складка острее 90 градусов
+     * даёт встречные нормали без всяких двух листов (П5 это и говорит). */
+    double nr[12][3];
+    int nn = 0;
+    for (int i = 0; i < 12; i++) {
+      int a = i / 4, k = i % 4;
+      int u = (a + 1) % 3, v = (a + 2) % 3;
+      int32_t p[3] = {lo[0], lo[1], lo[2]};
+      p[u] += k & 1;
+      p[v] += (k >> 1) & 1;
+      const hz_hedge *e = hz_htab_find(ht, a, p);
+      if (e == NULL || e->in_lo == HZ_HEDGE_ERASED) continue;
+      for (int c = 0; c < 3; c++)
+        nr[nn][c] = e->nrm[c];
+      nn++;
+    }
+    for (int i = 0; i < nn; i++)
+      for (int j = i + 1; j < nn; j++)
+        if (nr[i][0] * nr[j][0] + nr[i][1] * nr[j][1] + nr[i][2] * nr[j][2] < 0.0) {
+          S->nopp++;
+          i = nn;
+          break;
+        }
+    return;
+  }
+  int32_t half = size / 2;
+  for (int i = 0; i < 8; i++) {
+    int32_t clo[3];
+    for (int a = 0; a < 3; a++)
+      clo[a] = lo[a] + (((i >> a) & 1) ? half : 0);
+    sheet_rec(t, ht, t->nd[ni].child0 + i, clo, half, S);
+  }
+}
+
 static void surf_err(const hz_dctree *T, const frame *fr, const hz_objmesh *m, trilist_fn tl,
                      void *tctx, const char *tag) {
   int64_t nv = 0;
@@ -6155,6 +6273,42 @@ int main(int argc, char **argv) {
   printf("   ДЕРЕВО: спуск %.2f с (узлов %d), маски %.2f с (крупный лист с маской %d — обязан "
          "быть 0), формы %.2f с (код %d; ЗАГНАНО %d)\n",
          t_shape, T.n, t_masks, T.nbigmask, t_dc, rc, T.nclamped);
+  /* Г47/§654: отказ выдать вершину при неманифолдной маске УГЛОВ. Печатается С
+   * ПОМЕТКОЙ, потому что в БЕЗЗНАКОВОМ пути (`hz_dc_shape_occ`, которым строится
+   * всё рабочее) `corner` ставится нулём явно (`dc.c:596`), `hz_dc_manifold(0)`
+   * возвращает единицу, и число не может отличаться от нуля ПО ПОСТРОЕНИЮ.
+   * Печатать его без этой строки значило бы выдать ложный ноль за измерение. */
+  printf("   Г47 ОТКАЗОВ ПО НЕМАНИФОЛДНОЙ МАСКЕ УГЛОВ: %d%s\n", T.nmulti,
+         T.unsgn ? "  [БЕЗЗНАКОВЫЙ ПУТЬ: знака углов нет, число есть СТРУКТУРНЫЙ НОЛЬ, "
+                   "а не замер — §654]"
+                 : "");
+  {
+    /* САМОПРОВЕРКА ДЕТЕКТОРА ПЕРЕД ЗАМЕРОМ (Р4 §654). Без неё «ноль
+     * многопетельных» неотличим от «детектор всегда возвращает единицу».
+     * `0x00F0` — плоскость поперёк, режет четыре ребра одной оси: одна петля.
+     * `0x999` — срезаны два ПРОТИВОПОЛОЖНЫХ угла, по три ребра у каждого: две. */
+    int a1 = 0, a2 = 0;
+    int l1 = ecross_loops(0x00F0u, &a1), l2 = ecross_loops(0x999u, &a2);
+    printf("   §654 САМОПРОВЕРКА ДЕТЕКТОРА ПЕТЕЛЬ: плоскость -> %d (ждём 1), два угла -> %d "
+           "(ждём 2) — %s\n",
+           l1, l2, (l1 == 1 && l2 == 2) ? "СОШЛОСЬ" : "ОТКАЗ");
+    sheetstat SH;
+    memset(&SH, 0, sizeof SH);
+    int32_t z0[3] = {0, 0, 0};
+    sheet_rec(&T, &ht, 0, z0, fr.n, &SH);
+    double den = (double)(SH.npop ? SH.npop : 1);
+    printf("   §654 ЛИСТОВ ПОВЕРХНОСТИ В ЯЧЕЙКЕ (НИЖНЯЯ оценка по маске рёбер; популяция — "
+           "листья размера 1 с непустой маской, их %lld):\n"
+           "      петель 1: %lld (%.3f %%); 2: %lld (%.3f %%); >=3: %lld (%.3f %%); "
+           "маска без петель: %lld\n"
+           "      неоднозначных граней %lld в %lld ячейках (%.3f %%); ВСТРЕЧНЫЕ НОРМАЛИ у %lld "
+           "(%.3f %%)\n",
+           (long long)SH.npop, (long long)SH.nloop[1], 100.0 * (double)SH.nloop[1] / den,
+           (long long)SH.nloop[2], 100.0 * (double)SH.nloop[2] / den, (long long)SH.nloop[3],
+           100.0 * (double)SH.nloop[3] / den, (long long)SH.nloop[0], (long long)SH.nambigf,
+           (long long)SH.nambigc, 100.0 * (double)SH.nambigc / den, (long long)SH.nopp,
+           100.0 * (double)SH.nopp / den);
+  }
   double t_tree = t_shape + t_masks + t_dc;
   int64_t nv = 0;
   int32_t zero[3] = {0, 0, 0};

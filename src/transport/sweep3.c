@@ -280,6 +280,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   double *phiprev_dbg = NULL;
   /* §721: усиление проектора по элементам — только под `trace`. */
   double *gdbg = NULL;
+  /* §723: обусловленность матрицы обновления ячейки, максимум по направлениям. */
+  double *kadbg = NULL;
   double *hs_se = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   double *hs_out = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   /* ЭТАП C: ЗЕРКАЛЬНЫЕ ГРАНИ. Индекс `mfid[f]` есть номер грани среди
@@ -320,6 +322,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     free(binf);
     free(sout);
     free(sinf);
+    free(kadbg);
     free(gdbg);
     free(phiprev_dbg);
     free(hs_se);
@@ -490,6 +493,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
    * применение ОПЕРАТОРА к заданному вектору, а не итерация от нуля (см.
    * `sweep3.h`). Ограничение про `bout`/`sout` там же. */
   if (p->trace > 0 && nse > 0) gdbg = calloc((size_t)nse, sizeof *gdbg);
+  if (p->trace > 0) kadbg = calloc((size_t)nc, sizeof *kadbg);
   if (p->trace > 0) {
     phiprev_dbg = calloc((size_t)nc, sizeof *phiprev_dbg);
     if (phiprev_dbg != NULL)
@@ -773,6 +777,13 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         for (int j = 0; j < 4; j++)
           a0row[j] = A[0][j];
         double cf[4];
+        if (p->trace > 0 && kadbg != NULL) {
+          /* §723: обусловленность матрицы ОБНОВЛЕНИЯ ячейки. Это не `mvol`:
+           * `A` собирается на лету из объёма, граней и поверхностных элементов,
+           * и именно её решает `solve4`. Берётся МАКСИМУМ по направлениям. */
+          double ka = mass_cond(A);
+          if (ka > kadbg[c]) kadbg[c] = ka;
+        }
         if (solve4(A, rhs, cf) != 0)
           for (int j = 0; j < 4; j++)
             cf[j] = 0.0;
@@ -1315,6 +1326,32 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     if (phiprev_dbg != NULL)
       for (int32_t ci = 0; ci < nc; ci++)
         phiprev_dbg[ci] = phi[4 * (size_t)ci];
+    /* §723: распределение обусловленности матрицы обновления ячейки. */
+    if (p->trace > 0 && kadbg != NULL) {
+      double *kv = malloc((size_t)nc * sizeof *kv);
+      if (kv != NULL) {
+        int64_t nk = 0;
+        double kmx = 0.0;
+        int32_t ikmx = -1;
+        for (int32_t ci = 0; ci < nc; ci++) {
+          if (!(kadbg[ci] > 0.0)) continue;
+          kv[nk++] = kadbg[ci];
+          if (kadbg[ci] > kmx) {
+            kmx = kadbg[ci];
+            ikmx = ci;
+          }
+        }
+        if (nk > 0) {
+          qsort(kv, (size_t)nk, sizeof *kv, cmp_dbl_dbg);
+          printf("    §723 κ(A) ОБНОВЛЕНИЯ ЯЧЕЙКИ (такт %d): ячеек %lld, медиана %.4g, p99 %.4g, "
+                 "МАКСИМУМ %.4g (ячейка %d); у ячейки 81060 κ(A) = %.4g\n",
+                 it, (long long)nk, kv[nk / 2], kv[(nk * 99) / 100], kmx, ikmx,
+                 (81060 < nc) ? kadbg[81060] : -1.0);
+        }
+        free(kv);
+      }
+      memset(kadbg, 0, (size_t)nc * sizeof *kadbg);
+    }
     /* §721: распределение усиления проектора по элементам. Медиана печатается
      * рядом с максимумом — без неё «максимум велик» не читается (А1063). */
     if (p->trace > 0 && gdbg != NULL && nse > 0) {

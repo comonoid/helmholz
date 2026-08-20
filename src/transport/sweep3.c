@@ -1034,6 +1034,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     if (p->trace > 0 && cu != NULL && phiprev_dbg != NULL) {
       typedef struct {
         double frac, g, k;
+        int32_t ci;
       } grec;
       grec *gr = malloc((size_t)nc * sizeof *gr);
       if (gr != NULL) {
@@ -1047,6 +1048,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
           gr[ng].frac = cu->mvol[ci][0][0] / vcell;
           gr[ng].g = b / a;
           gr[ng].k = mass_cond(cu->mvol[ci]);
+          gr[ng].ci = ci;
           ng++;
         }
         double *tmp = malloc((size_t)(ng > 0 ? ng : 1) * sizeof *tmp);
@@ -1082,6 +1084,61 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
                    "%.4g  медиана κ %.4g\n",
                    lo, hi > 1.0e29 ? 1.0 : hi, (long long)cnt, tmp[cnt / 2], tmp[(cnt * 99) / 100],
                    tmp[cnt - 1], kmed);
+          }
+        }
+        /* §695: СВОЙСТВА НАСЕЛЕНИЯ ВЫШЕ `p99` ПО РОСТУ. Популяция задана РАНГОМ,
+         * а не порогом (урок А1089): берутся ячейки, чей рост больше значения
+         * `p99` того же распределения. Те же величины считаются по ВСЕЙ сцене —
+         * без знаменателя доля не читается (А1063), и совпадение сценной доли с
+         * уже напечатанными 22.19 % служит проверкой прибора. */
+        if (ng > 0) {
+          double gp99 = tmp[(ng * 99) / 100];
+          for (int pass2 = 0; pass2 < 2; pass2++) {
+            int64_t ncel = 0, nbnd = 0, fj = 0, fa = 0;
+            double *fr2 = malloc((size_t)ng * sizeof *fr2);
+            double *kk2 = malloc((size_t)ng * sizeof *kk2);
+            double *nf2 = malloc((size_t)ng * sizeof *nf2);
+            if (fr2 == NULL || kk2 == NULL || nf2 == NULL) {
+              free(fr2);
+              free(kk2);
+              free(nf2);
+              break;
+            }
+            for (int64_t i = 0; i < ng; i++) {
+              if (pass2 == 0 && !(gr[i].g > gp99)) continue;
+              int32_t ci = gr[i].ci;
+              int bnd = 0, nfc = 0;
+              for (int32_t q = m->fstart[ci]; q < m->fstart[ci + 1]; q++) {
+                int32_t fi = m->flist[q];
+                int32_t nb = (m->f[fi].ca == ci) ? m->f[fi].cb : m->f[fi].ca;
+                nfc++;
+                fa++;
+                if (nb < 0)
+                  bnd = 1;
+                else if (m->csize[nb] != m->csize[ci])
+                  fj++;
+              }
+              fr2[ncel] = gr[i].frac;
+              kk2[ncel] = gr[i].k;
+              nf2[ncel] = (double)nfc;
+              ncel++;
+              if (bnd) nbnd++;
+            }
+            if (ncel > 0) {
+              qsort(fr2, (size_t)ncel, sizeof *fr2, cmp_dbl_dbg);
+              qsort(kk2, (size_t)ncel, sizeof *kk2, cmp_dbl_dbg);
+              qsort(nf2, (size_t)ncel, sizeof *nf2, cmp_dbl_dbg);
+              printf("    §695 %s: ячеек %lld; граней %lld, с ПЕРЕПАДОМ %lld (%.2f %%); медиана "
+                     "граней %.0f; на границе области %lld (%.2f %%); медиана доли флюида %.4g; "
+                     "медиана κ %.4g\n",
+                     pass2 == 0 ? "ВЫШЕ p99 ПО РОСТУ" : "ВСЯ СЦЕНА (тот же счёт)", (long long)ncel,
+                     (long long)fa, (long long)fj, 100.0 * (double)fj / (double)(fa ? fa : 1),
+                     nf2[ncel / 2], (long long)nbnd, 100.0 * (double)nbnd / (double)ncel,
+                     fr2[ncel / 2], kk2[ncel / 2]);
+            }
+            free(fr2);
+            free(kk2);
+            free(nf2);
           }
         }
         free(tmp);

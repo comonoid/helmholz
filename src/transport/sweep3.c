@@ -1124,6 +1124,39 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       if (dd > resid) resid = dd;
       bprev[i] = bout[i];
     }
+    /* §725: НАБЛЮДАЕМЫЙ КОЭФФИЦИЕНТ УСИЛЕНИЯ ЭЛЕМЕНТА ЗА ТАКТ. Величина уже
+     * течёт через развёртку: `sout` этого такта против `sprev` прошлого.
+     * Считается ДО перезаписи `sprev` в блоке невязки. */
+    if (p->trace > 0 && nse > 0) {
+      double *gi = malloc((size_t)nse * sizeof *gi);
+      if (gi != NULL) {
+        int64_t ng2 = 0, ngt = 0;
+        double gmx2 = 0.0;
+        int32_t igm = -1;
+        for (int32_t e2 = 0; e2 < nse; e2++) {
+          double a = fabs(sprev[e2 * 4]), b = fabs(sout[e2 * 4]);
+          if (!(a > 0.0)) continue;
+          double g2 = b / a;
+          gi[ng2++] = g2;
+          if (g2 > 1.0) ngt++;
+          if (g2 > gmx2) {
+            gmx2 = g2;
+            igm = e2;
+          }
+        }
+        if (ng2 > 0) {
+          qsort(gi, (size_t)ng2, sizeof *gi, cmp_dbl_dbg);
+          printf("    §725 УСИЛЕНИЕ ЭЛЕМЕНТА ЗА ТАКТ %d: элементов %lld, медиана %.4g, p99 %.4g, "
+                 "МАКСИМУМ %.4g (элемент %d); с g > 1: %lld (%.2f %%); у 98531 g = %.4g\n",
+                 it, (long long)ng2, gi[ng2 / 2], gi[(ng2 * 99) / 100], gmx2, igm, (long long)ngt,
+                 100.0 * (double)ngt / (double)ng2,
+                 (98531 < nse && sprev[98531 * 4] != 0.0)
+                     ? fabs(sout[98531 * 4]) / fabs(sprev[98531 * 4])
+                     : -1.0);
+        }
+        free(gi);
+      }
+    }
     for (int32_t i = 0; i < nse * 4; i++) {
       double dd = fabs(sout[i] - sprev[i]);
       if (dd > resid) resid = dd;

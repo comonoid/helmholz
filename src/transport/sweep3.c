@@ -347,6 +347,11 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     }
 
   int nclip_last = 0, it = 0, nfb = 0;
+  /* §677: ОТКАТ РАСЩЕПЛЁН НА ЧЕТЫРЕ. К86 говорит, что условий два и природа у
+   * них разная: вырождение элемента — свойство ГЕОМЕТРИИ (множество постоянно),
+   * `corner_min < 0` — свойство ПОЛЯ, то есть ПЕРЕКЛЮЧАТЕЛЬ. Пока они считались
+   * одним числом, сказать, ЧТО дрожит, было нечем. `_thin` — доля на ЩЕПКАХ. */
+  int nfb_fg = 0, nfb_fp = 0, nfb_eg = 0, nfb_ep = 0, nfb_thin = 0;
   double resid = 0.0;
   /* К81: пол невязки ловится ЗАСТОЕМ, а не порогом на её величину */
   double best = 1e300;
@@ -362,6 +367,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     memset(sinfall, 0, (size_t)nth * (size_t)(nse > 0 ? nse : 1) * 4 * sizeof(double));
     nclip_last = 0;
     nfb = 0;
+    nfb_fg = nfb_fp = nfb_eg = nfb_ep = nfb_thin = 0;
     st->pin = st->pout = st->pabs = 0.0;
     double pin_acc = 0.0, pout_acc = 0.0;
     int fail = 0;
@@ -716,8 +722,26 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
          * безусловно, и потому выключение ограничителя оператор линейным НЕ
          * ДЕЛАЛО: Крылов решал не ту систему и приходил к другому ответу
          * (невязка сошедшегося ответа Неймана под его оператором была 1.000). */
-        if (tr3_project_plane(fmm, rr, nul, ee) != 0 || (p->limiter && corner_min(ee) < 0.0)) {
+        int fb_geom_f = tr3_project_plane(fmm, rr, nul, ee) != 0;
+        if (fb_geom_f || (p->limiter && corner_min(ee) < 0.0)) {
           nfb++;
+          /* §677: КАКОГО РОДА ОТКАТ. Геометрический считается отдельно от
+           * полевого — только второй способен дрожать от такта к такту, и
+           * только он может давать предельный цикл. ЩЕПКА определяется по
+           * флюидному объёму ЯЧЕЙКИ, к которой грань принадлежит с наветренной
+           * стороны: порог `1 %` целой ячейки — не магический, он ровно тот, по
+           * которому §675 назвал максимум `φ` сидящим на щепке. */
+          if (fb_geom_f)
+            nfb_fg++;
+          else {
+            nfb_fp++;
+            if (cu != NULL && m->f[f].ca >= 0) {
+              double vfl = cu->mvol[m->f[f].ca][0][0];
+              double s3 = (double)m->csize[m->f[f].ca];
+              double vcell = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+              if (vcell > 0.0 && vfl < 0.01 * vcell) nfb_thin++;
+            }
+          }
           /* ОТКАЗ В ЗАКРЫТУЮ СТОРОНУ: либо элемент выродился геометрически, либо
            * проекция ушла в минус. Тогда остаётся ТОЧНОЕ среднее по грани —
            * константа, представимая в любом случае. Порога в критерии нет. */
@@ -789,10 +813,20 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       /* та же правка К39: нулевой вектор у поверхностного элемента хранится
        * рядом с матрицей масс и выведен из уравнения плоскости (cut3.h) */
       /* К86, то же самое на поверхностных элементах */
-      if (tr3_project_plane(fmm, rr, se->nul, ee) != 0 || (p->limiter && corner_min(ee) < 0.0)) {
+      int fb_geom_e = tr3_project_plane(fmm, rr, se->nul, ee) != 0;
+      if (fb_geom_e || (p->limiter && corner_min(ee) < 0.0)) {
         ee[0] = sinf[e * 4] / fmm[0][0];
         ee[1] = ee[2] = ee[3] = 0.0;
         nfb++;
+        if (fb_geom_e)
+          nfb_eg++;
+        else {
+          nfb_ep++;
+          double vfl = cu->mvol[se->cell][0][0];
+          double s3 = (double)m->csize[se->cell];
+          double vcell = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+          if (vcell > 0.0 && vfl < 0.01 * vcell) nfb_thin++;
+        }
       }
       for (int j = 0; j < 4; j++)
         sout[e * 4 + j] = (hs_se[e] > 0.0 ? rho * ee[j] / hs_se[e] : 0.0);
@@ -852,8 +886,9 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
      * если невязка стоит, а эти два числа МЕНЯЮТСЯ — это переключатель, а не
      * скорость, и лечится оно не разгоном. */
     if (p->trace > 0 && (it % p->trace == 0 || resid < tol))
-      printf("    it %5d  resid %.3e  phi0 %.9f  nclip %d  nfb %d\n", it, resid, phi[0], nclip_last,
-             nfb);
+      printf("    it %5d  resid %.3e  nclip %d  nfb %d = грани(геом %d, поле %d) + элементы(геом "
+             "%d, поле %d); из полевых на ЩЕПКАХ %d\n",
+             it, resid, nclip_last, nfb, nfb_fg, nfb_fp, nfb_eg, nfb_ep, nfb_thin);
     if (resid < tol) break;
 
     /* ОСТАНОВКА ПО ЗАСТОЮ, А НЕ ТОЛЬКО ПО ДОПУСКУ — К81.

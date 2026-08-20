@@ -5457,6 +5457,7 @@ int main(int argc, char **argv) {
    * магическое, оно ключ, и негативный контроль ставит его в ноль. */
   int xhall = 0;
   int xemitfacet = 0; /* §670 НК: излучение по-старому, ПО ФАСЕТУ */
+  int xnolim = 0;     /* §677 НК: выключить ограничитель — оператор станет ЛИНЕЙНЫМ */
   /* §674: потолок итераций и допуск были зашиты числами `30` и `1e-4`. Ключи
    * нужны, чтобы отличить «не сошлось» от «не дали сойтись». */
   int xit = 30;
@@ -5495,6 +5496,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xtrace") == 0) xtrace = 1;
     if (strcmp(argv[i], "xhall") == 0) xhall = 1;
     if (strcmp(argv[i], "xemitfacet") == 0) xemitfacet = 1;
+    if (strcmp(argv[i], "xnolim") == 0) xnolim = 1;
     if (strncmp(argv[i], "xit=", 4) == 0) xit = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "xtol=", 5) == 0) xtol = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "xrho=", 5) == 0) xrho = strtod(argv[i] + 5, NULL);
@@ -6606,7 +6608,7 @@ int main(int argc, char **argv) {
                           .nfacet = ftab.n,
                           .sig_t = sig_t,
                           .sig_s = sig_s,
-                          .limiter = 1,
+                          .limiter = xnolim ? 0 : 1,
                           .trace = xtrace};
       tr3_stats st;
       memset(&st, 0, sizeof st);

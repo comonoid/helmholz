@@ -319,6 +319,52 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     hs_out[e] = so;
   }
 
+  /* §682: КОЭФФИЦИЕНТ ПЕРЕДАЧИ ЭЛЕМЕНТА. Две суммы выше считаются по ОДНОМУ
+   * набору ординат, но по РАЗНЫМ полусферам, и точная квадратура дала бы обе
+   * равными π. Исходящий радианс делится на `hs_se`, а мощность с элемента
+   * набирается по `hs_out`, поэтому отношение `rho·hs_out/hs_se` есть
+   * коэффициент передачи: больше единицы — оператор усиливает при ЛЮБОМ альбедо.
+   * Печатается один раз, до итераций, и только при `trace` — это прибор, а не
+   * рабочий путь. */
+  if (p->trace > 0 && nse > 0) {
+    double *v = malloc((size_t)nse * sizeof *v);
+    if (v != NULL) {
+      double gmax = 0.0, rmax = 0.0, axmax = 0.0;
+      int64_t nax = 0, ngt1 = 0;
+      for (int32_t e = 0; e < nse; e++) {
+        v[e] = hs_se[e];
+        double r = hs_se[e] > 0.0 ? hs_out[e] / hs_se[e] : 0.0;
+        double rho = (p->facet_rho != NULL && cu->se[e].facet < p->nfacet)
+                         ? p->facet_rho[cu->se[e].facet]
+                         : 0.0;
+        if (r > rmax) rmax = r;
+        if (rho * r > gmax) gmax = rho * r;
+        if (rho * r > 1.0) ngt1++;
+        int axial = 0;
+        for (int a = 0; a < 3; a++)
+          if (fabs(cu->se[e].n[a]) > 0.996) axial = 1;
+        if (axial) {
+          nax++;
+          if (fabs(r - 1.0) > axmax) axmax = fabs(r - 1.0);
+        }
+      }
+      for (int32_t i = 1; i < nse; i++) { /* сортировка вставками мала: один раз */
+        double x = v[i];
+        int32_t j = i - 1;
+        while (j >= 0 && v[j] > x) {
+          v[j + 1] = v[j];
+          j--;
+        }
+        v[j + 1] = x;
+      }
+      printf("    §682 ПЕРЕДАЧА ЭЛЕМЕНТА: элементов %d; hs_se мин %.4f p1 %.4f медиана %.4f "
+             "макс %.4f (пи = %.4f); max hs_out/hs_se %.4f; MAX rho*hs_out/hs_se %.4f, у %lld "
+             "элементов оно > 1; ОСЕВЫХ %lld, у них max |hs_out/hs_se - 1| = %.3e\n",
+             nse, v[0], v[nse / 100], v[nse / 2], v[nse - 1], 3.14159265358979323846, rmax, gmax,
+             (long long)ngt1, (long long)nax, axmax);
+      free(v);
+    }
+  }
   /* ПРИ `warm_start` ВХОДНОЕ ПОЛЕ СОХРАНЯЕТСЯ — тогда один проход есть
    * применение ОПЕРАТОРА к заданному вектору, а не итерация от нуля (см.
    * `sweep3.h`). Ограничение про `bout`/`sout` там же. */

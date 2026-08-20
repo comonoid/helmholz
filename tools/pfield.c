@@ -61,6 +61,11 @@ static int cmp_f(const void *x, const void *y) {
   return (a < b) ? -1 : ((a > b) ? 1 : 0);
 }
 
+static int cmp_dev699(const void *a, const void *b) {
+  double x = *(const double *)a, y = *(const double *)b;
+  return x < y ? -1 : (x > y ? 1 : 0);
+}
+
 static int cmp_d(const void *x, const void *y) {
   double a = *(const double *)x, b = *(const double *)y;
   return (a < b) ? -1 : ((a > b) ? 1 : 0);
@@ -5458,6 +5463,7 @@ int main(int argc, char **argv) {
   int xhall = 0;
   int xemitfacet = 0; /* §670 НК: излучение по-старому, ПО ФАСЕТУ */
   int xnolim = 0;     /* §677 НК: выключить ограничитель — оператор станет ЛИНЕЙНЫМ */
+  int xconst = 0;     /* §699: печь на разрезанной геометрии — точное решение известно */
   int xwholemass = 0; /* §697: подмена матрицы масс целой — различитель, прогон нефизичен */
   /* §674: потолок итераций и допуск были зашиты числами `30` и `1e-4`. Ключи
    * нужны, чтобы отличить «не сошлось» от «не дали сойтись». */
@@ -5499,6 +5505,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xemitfacet") == 0) xemitfacet = 1;
     if (strcmp(argv[i], "xnolim") == 0) xnolim = 1;
     if (strcmp(argv[i], "xwholemass") == 0) xwholemass = 1;
+    if (strcmp(argv[i], "xconst") == 0) xconst = 1;
     if (strncmp(argv[i], "xit=", 4) == 0) xit = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "xtol=", 5) == 0) xtol = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "xrho=", 5) == 0) xrho = strtod(argv[i] + 5, NULL);
@@ -6618,6 +6625,26 @@ int main(int argc, char **argv) {
                "Σ π·L·площадь %.4e\n",
                emitpow, (long long)nconf, (long long)nbigcell, (long long)nnomat,
                xemitfacet ? "ФАСЕТ (НК §670)" : "ЭЛЕМЕНТ (§670)", emitpow2);
+      /* §699: ПЕЧЬ НА РАЗРЕЗАННОЙ ГЕОМЕТРИИ. Форма задачи взята у `t_furnace` из
+       * `tests/test_sweep3.c`, где она проходит на коробках: альбедо РОВНО 1,
+       * отражение 1, влёт постоянный. Тогда постоянный радианс есть ТОЧНОЕ
+       * решение, и ответ `φ = 4π·binc0` известен без всякой эталонной
+       * реализации. Меняется ровно одно — сцена. */
+      double bconst = 0.0;
+      if (xconst) {
+        bconst = 1.0;
+        for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+          sig_t[ci] = 0.8;
+          sig_s[ci] = 0.8;
+        }
+        for (int32_t i = 0; i < ftab.n; i++)
+          frho[i] = 1.0;
+        for (int32_t k = 0; k < cut.nse; k++)
+          eemit[k] = 0.0;
+        printf("   §699 ПЕЧЬ НА РАЗРЕЗЕ: альбедо 1 (σ_t = σ_s = 0.8), отражение 1, влёт %.3f; "
+               "точное решение φ = 4π·влёт = %.6f\n",
+               bconst, 4.0 * 3.14159265358979323846 * bconst);
+      }
       tr3_dirs dirs;
       if (tr3_dirs_product(&dirs, nmu, nmu) != 0) exit(1);
       tr3_problem prob = {.m = &mesh,
@@ -6627,6 +6654,7 @@ int main(int argc, char **argv) {
                           .facet_emit = femit,
                           .elem_emit = (xhall || xemitfacet) ? NULL : eemit,
                           .nfacet = ftab.n,
+                          .binc0 = bconst,
                           .sig_t = sig_t,
                           .sig_s = sig_s,
                           .limiter = xnolim ? 0 : 1,
@@ -6636,6 +6664,63 @@ int main(int argc, char **argv) {
       double tsw = now_s();
       int src = tr3_sweep_solve(&prob, xit, xtol, phi, &st);
       tsw = now_s() - tsw;
+      if (xconst) {
+        /* §699: ОТКЛОНЕНИЕ ОТ ТОЧНОГО РЕШЕНИЯ. Считается по ФЛЮИДНЫМ ячейкам:
+         * в сплошных поля нет по построению, и включать их значило бы мерить
+         * пустоту. Печатается и максимум наклонов — печь проверяет только
+         * среднее (К12), а наклоны суть две трети неизвестных. */
+        double exact4pi = 4.0 * 3.14159265358979323846 * bconst;
+        double worst = 0.0, wslope = 0.0;
+        int32_t wc = -1;
+        int64_t nfl = 0;
+        for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+          if (!(cut.mvol[ci][0][0] > 0.0)) continue;
+          nfl++;
+          double e = fabs(phi[4 * (size_t)ci] - exact4pi) / exact4pi;
+          if (e > worst) {
+            worst = e;
+            wc = ci;
+          }
+          for (int j = 1; j < 4; j++) {
+            double sl = fabs(phi[4 * (size_t)ci + (size_t)j]) / exact4pi;
+            if (sl > wslope) wslope = sl;
+          }
+        }
+        double wfrac = -1.0;
+        if (wc >= 0) {
+          double s3 = (double)mesh.csize[wc];
+          double V = s3 * s3 * s3 * ofr.u[0] * ofr.u[1] * ofr.u[2];
+          wfrac = V > 0.0 ? cut.mvol[wc][0][0] / V : -1.0;
+        }
+        /* §699 ПОПРАВКА ПРИБОРА ПО ХОДУ: максимум сам по себе неоднозначен.
+         * Отклонение `1.000` значит `φ = 0`, а нулевая ячейка может быть
+         * ЗАМУРОВАННОЙ полостью — туда свету взяться неоткуда, и ноль там
+         * ЗАКОНЕН. Различить можно только распределением: если тождество держится
+         * везде, кроме отрезанных карманов, медиана обязана быть нулевой. */
+        {
+          double *dv = malloc((size_t)(nfl > 0 ? nfl : 1) * sizeof *dv);
+          if (dv != NULL) {
+            int64_t nd2 = 0, nzero = 0;
+            for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+              if (!(cut.mvol[ci][0][0] > 0.0)) continue;
+              double v = phi[4 * (size_t)ci];
+              if (!(v > 0.0)) nzero++;
+              dv[nd2++] = fabs(v - exact4pi) / exact4pi;
+            }
+            qsort(dv, (size_t)nd2, sizeof *dv, cmp_dev699);
+            printf("   §699 РАСПРЕДЕЛЕНИЕ ОТКЛОНЕНИЯ: медиана %.3e, p90 %.3e, p99 %.3e, макс "
+                   "%.3e; ячеек РОВНО В НУЛЕ %lld из %lld (%.2f %%)\n",
+                   dv[nd2 / 2], dv[(nd2 * 9) / 10], dv[(nd2 * 99) / 100], dv[nd2 - 1],
+                   (long long)nzero, (long long)nd2, 100.0 * (double)nzero / (double)nd2);
+            free(dv);
+          }
+        }
+        printf("   §699 ПЕЧЬ НА РАЗРЕЗЕ, ИСХОД: флюидных ячеек %lld; МАКС ОТН. ОТКЛОНЕНИЕ %.3e "
+               "(ячейка %d, доля флюида %.4g, размер %d); макс наклон %.3e; итераций %d, "
+               "невязка %.3e, nclip %d\n",
+               (long long)nfl, worst, wc, wfrac, wc >= 0 ? mesh.csize[wc] : -1, wslope, st.iters,
+               st.resid, st.nclip);
+      }
       /* ГДЕ максимум — в комнате или снаружи. Без этого «φ = 1.9e5» неотличимо
        * от «φ велико в ячейке-щепке вне сцены» (правило А807: печатать вход
        * подозреваемой стадии, а не только её выход). */

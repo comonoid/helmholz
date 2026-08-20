@@ -86,6 +86,36 @@ static int solve4(double a[4][4], double b[4], double x[4]) {
   return 0;
 }
 
+/* §690: ОБУСЛОВЛЕННОСТЬ МАТРИЦЫ МАСС ЯЧЕЙКИ, `‖M‖_F · ‖M⁻¹‖_F`.
+ *
+ * Обратная берётся ЧЕТЫРЬМЯ решениями `M x = e_i` тем же `solve4`, каким
+ * пользуется рабочий путь: тогда мерится обусловленность ТОГО решателя, а не
+ * абстрактная. `solve4` портит вход, поэтому копия обязательна.
+ *
+ * ЧИСЛО, ПО КОТОРОМУ ЭТО ПРОВЕРЯЕТСЯ, ИЗВЕСТНО ТОЧНО: у ЦЕЛОЙ кубической ячейки
+ * матрица диагональна, `diag(V, V/12, V/12, V/12)`, и `κ = ‖M‖_F·‖M⁻¹‖_F`
+ * от `V` не зависит — это `12·√(1+3/144)·√(1+3·144)/12`… считать не нужно:
+ * важно, что величина ОДНА И ТА ЖЕ у всех целых ячеек любого размера. Разброс у
+ * целых и есть проверка прибора. */
+static double mass_cond(const double M[4][4]) {
+  double nf = 0.0;
+  for (int i = 0; i < 4; i++)
+    for (int j = 0; j < 4; j++)
+      nf += M[i][j] * M[i][j];
+  nf = sqrt(nf);
+  if (!(nf > 0.0)) return -1.0;
+  double ni = 0.0;
+  for (int k = 0; k < 4; k++) {
+    double A[4][4], b[4] = {0, 0, 0, 0}, x[4];
+    memcpy(A, M, sizeof A);
+    b[k] = 1.0;
+    if (solve4(A, b, x) != 0) return -2.0; /* вырождена: отдельный исход, не число */
+    for (int i = 0; i < 4; i++)
+      ni += x[i] * x[i];
+  }
+  return nf * sqrt(ni);
+}
+
 /* Решение 3x3 с частичным выбором. Возврат 1 при вырождении. */
 static int solve3(double a[3][3], double b[3], double x[3]) {
   for (int k = 0; k < 3; k++) {
@@ -241,6 +271,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   double *binfall = NULL, *sinfall = NULL;
   double *sout = calloc((size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
   double *sinf = calloc((size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
+  /* §690: снимок `φ` прошлого такта — только под `trace`, рабочий путь не платит. */
+  double *phiprev_dbg = NULL;
   double *hs_se = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   double *hs_out = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   /* ЭТАП C: ЗЕРКАЛЬНЫЕ ГРАНИ. Индекс `mfid[f]` есть номер грани среди
@@ -281,6 +313,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     free(binf);
     free(sout);
     free(sinf);
+    free(phiprev_dbg);
     free(hs_se);
     free(hs_out);
     free(bprev);
@@ -317,6 +350,55 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     }
     hs_se[e] = s;
     hs_out[e] = so;
+  }
+
+  /* §690 (ПРИЧИНА): распределение обусловленности матрицы масс ФЛЮИДНОЙ части,
+   * отдельно у ЩЕПОК и у ЦЕЛЫХ. Печатается один раз, до итераций. */
+  if (p->trace > 0 && cu != NULL) {
+    double *kw = malloc((size_t)nc * sizeof *kw), *kt = malloc((size_t)nc * sizeof *kt);
+    if (kw != NULL && kt != NULL) {
+      int64_t nw = 0, nt = 0, nsing = 0;
+      for (int32_t ci = 0; ci < nc; ci++) {
+        double s3 = (double)m->csize[ci];
+        double vcell = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+        double vfl = cu->mvol[ci][0][0];
+        if (!(vfl > 0.0) || !(vcell > 0.0)) continue;
+        double k = mass_cond(cu->mvol[ci]);
+        if (k < 0.0) {
+          nsing++;
+          continue;
+        }
+        if (vfl < 0.01 * vcell)
+          kt[nt++] = k;
+        else
+          kw[nw++] = k;
+      }
+      for (int64_t i = 1; i < nw; i++) {
+        double x = kw[i];
+        int64_t j = i - 1;
+        while (j >= 0 && kw[j] > x) {
+          kw[j + 1] = kw[j];
+          j--;
+        }
+        kw[j + 1] = x;
+      }
+      for (int64_t i = 1; i < nt; i++) {
+        double x = kt[i];
+        int64_t j = i - 1;
+        while (j >= 0 && kt[j] > x) {
+          kt[j + 1] = kt[j];
+          j--;
+        }
+        kt[j + 1] = x;
+      }
+      printf("    §690 ОБУСЛОВЛЕННОСТЬ МАТРИЦЫ МАСС: ЦЕЛЫХ %lld (медиана %.4g, p99 %.4g, макс "
+             "%.4g); ЩЕПОК %lld (медиана %.4g, p99 %.4g, макс %.4g); ВЫРОЖДЕННЫХ %lld\n",
+             (long long)nw, nw ? kw[nw / 2] : -1.0, nw ? kw[(nw * 99) / 100] : -1.0,
+             nw ? kw[nw - 1] : -1.0, (long long)nt, nt ? kt[nt / 2] : -1.0,
+             nt ? kt[(nt * 99) / 100] : -1.0, nt ? kt[nt - 1] : -1.0, (long long)nsing);
+    }
+    free(kw);
+    free(kt);
   }
 
   /* §682: КОЭФФИЦИЕНТ ПЕРЕДАЧИ ЭЛЕМЕНТА. Две суммы выше считаются по ОДНОМУ
@@ -368,6 +450,12 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   /* ПРИ `warm_start` ВХОДНОЕ ПОЛЕ СОХРАНЯЕТСЯ — тогда один проход есть
    * применение ОПЕРАТОРА к заданному вектору, а не итерация от нуля (см.
    * `sweep3.h`). Ограничение про `bout`/`sout` там же. */
+  if (p->trace > 0) {
+    phiprev_dbg = calloc((size_t)nc, sizeof *phiprev_dbg);
+    if (phiprev_dbg != NULL)
+      for (int32_t ci = 0; ci < nc; ci++)
+        phiprev_dbg[ci] = phi[4 * (size_t)ci];
+  }
   if (!p->warm_start) memset(phi, 0, (size_t)nc * 4 * sizeof(double));
   /* К76: ПОВЕРХНОСТНОЕ СОСТОЯНИЕ ТОЖЕ МОЖЕТ ПРИЙТИ ИЗВНЕ. Без него «тёплый
    * старт» на сцене с отражением тёплым не является: `bout`/`sout` есть вторая
@@ -935,6 +1023,50 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       printf("    it %5d  resid %.3e  nclip %d  nfb %d = грани(геом %d, поле %d) + элементы(геом "
              "%d, поле %d); из полевых на ЩЕПКАХ %d\n",
              it, resid, nclip_last, nfb, nfb_fg, nfb_fp, nfb_eg, nfb_ep, nfb_thin);
+    /* §690 (СЛЕДСТВИЕ): ГДЕ ИМЕННО РАСТЁТ ПОЛЕ. Взрыв на шесть порядков за такт
+     * обязан где-то сидеть; если он размазан — виноват не разрез. Печатается
+     * десятка худших вместе со свойствами ячейки, чтобы причина и следствие
+     * стояли в одной строке. */
+    if (p->trace > 0 && cu != NULL && phiprev_dbg != NULL) {
+      double gtop[10];
+      int32_t itop[10];
+      for (int k = 0; k < 10; k++) {
+        gtop[k] = -1.0;
+        itop[k] = -1;
+      }
+      double gsum = 0.0;
+      int64_t ngr = 0;
+      for (int32_t ci = 0; ci < nc; ci++) {
+        double a = fabs(phiprev_dbg[ci]), b = fabs(phi[4 * (size_t)ci]);
+        if (!(a > 0.0)) continue;
+        double g = b / a;
+        gsum += g;
+        ngr++;
+        for (int k = 0; k < 10; k++)
+          if (g > gtop[k]) {
+            for (int q = 9; q > k; q--) {
+              gtop[q] = gtop[q - 1];
+              itop[q] = itop[q - 1];
+            }
+            gtop[k] = g;
+            itop[k] = ci;
+            break;
+          }
+      }
+      printf("    §690 РОСТ ЗА ТАКТ %d: средний %.3e по %lld ячейкам; ДЕСЯТКА ХУДШИХ:\n", it,
+             ngr ? gsum / (double)ngr : 0.0, (long long)ngr);
+      for (int k = 0; k < 10 && itop[k] >= 0; k++) {
+        int32_t ci = itop[k];
+        double s3 = (double)m->csize[ci];
+        double vcell = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+        double vfl = cu->mvol[ci][0][0];
+        printf("      рост %.3e  ячейка %d  размер %d  доля флюида %.3e  κ(M) %.4g\n", gtop[k], ci,
+               m->csize[ci], vcell > 0.0 ? vfl / vcell : -1.0, mass_cond(cu->mvol[ci]));
+      }
+    }
+    if (phiprev_dbg != NULL)
+      for (int32_t ci = 0; ci < nc; ci++)
+        phiprev_dbg[ci] = phi[4 * (size_t)ci];
     if (resid < tol) break;
 
     /* ОСТАНОВКА ПО ЗАСТОЮ, А НЕ ТОЛЬКО ПО ДОПУСКУ — К81.

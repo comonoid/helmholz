@@ -5463,6 +5463,7 @@ int main(int argc, char **argv) {
   int xhall = 0;
   int xemitfacet = 0; /* §670 НК: излучение по-старому, ПО ФАСЕТУ */
   int xnolim = 0;     /* §677 НК: выключить ограничитель — оператор станет ЛИНЕЙНЫМ */
+  double xthin = 0.0; /* §711: доля флюида, ниже которой ячейка считается сплошной */
   int xconst = 0;     /* §699: печь на разрезанной геометрии — точное решение известно */
   int xwholemass = 0; /* §697: подмена матрицы масс целой — различитель, прогон нефизичен */
   /* §674: потолок итераций и допуск были зашиты числами `30` и `1e-4`. Ключи
@@ -5506,6 +5507,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xnolim") == 0) xnolim = 1;
     if (strcmp(argv[i], "xwholemass") == 0) xwholemass = 1;
     if (strcmp(argv[i], "xconst") == 0) xconst = 1;
+    if (strncmp(argv[i], "xthin=", 6) == 0) xthin = strtod(argv[i] + 6, NULL);
     if (strncmp(argv[i], "xit=", 4) == 0) xit = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "xtol=", 5) == 0) xtol = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "xrho=", 5) == 0) xrho = strtod(argv[i] + 5, NULL);
@@ -6458,6 +6460,38 @@ int main(int argc, char **argv) {
     tx = now_s();
     tr3_cut cut;
     int crc = tr3_cut_build(&cut, &mesh, &ftab, &cmap, xfernosolid ? NULL : solid);
+    /* §711: ЩЕПКИ УХОДЯТ ИЗ НОСИТЕЛЯ. Ячейка, где флюида меньше `xthin` доли,
+     * объявляется СПЛОШНОЙ: она и так почти целиком материал, а деление на её
+     * исчезающий объём даёт радианс на порядки выше соседского (§710). Её грани
+     * к флюидным соседям становятся стыком, у которого с §707 есть граничное
+     * условие, — энергия не теряется, а отражается.
+     * Порог задаётся КЛЮЧОМ и просматривается свипом: назначать его числом в
+     * коде значило бы повторить ошибку §690. */
+    if (xthin > 0.0 && crc == 0) {
+      int64_t nconv = 0;
+      double vlost = 0.0, vall = 0.0;
+      for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+        double vfl = cut.mvol[ci][0][0];
+        if (!(vfl > 0.0)) continue;
+        vall += vfl;
+      }
+      for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+        double vfl = cut.mvol[ci][0][0];
+        if (!(vfl > 0.0) || cut.solid[ci]) continue;
+        double s3 = (double)mesh.csize[ci];
+        double V = s3 * s3 * s3 * ofr.u[0] * ofr.u[1] * ofr.u[2];
+        if (!(V > 0.0) || vfl >= xthin * V) continue;
+        cut.solid[ci] = 1;
+        vlost += vfl;
+        nconv++;
+        for (int i = 0; i < 4; i++)
+          for (int j = 0; j < 4; j++)
+            cut.mvol[ci][i][j] = 0.0;
+      }
+      printf("   §711 ЩЕПКИ ИЗ НОСИТЕЛЯ (порог %.3e): переведено в сплошные %lld ячеек; "
+             "потеряно флюидного объёма %.4e из %.4e (%.4f %%)\n",
+             xthin, (long long)nconv, vlost, vall, 100.0 * vlost / (vall > 0.0 ? vall : 1.0));
+    }
     /* §702: СЧЁТ СТЫКА «ФЛЮИД — СПЛОШНОЕ». Грани флюидных ячеек раскладываются
      * на три класса; сумма обязана дать полное число, и это печатается как
      * проверка разбиения. Класс «стык» делится надвое: есть ли у флюидной ячейки

@@ -1299,6 +1299,44 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     if (phiprev_dbg != NULL)
       for (int32_t ci = 0; ci < nc; ci++)
         phiprev_dbg[ci] = phi[4 * (size_t)ci];
+    /* §713: ГДЕ СИДИТ МАКСИМУМ. `resid` есть макс-норма по ТРЁМ носителям сразу,
+     * и по ней нельзя сказать, что именно взорвалось. Разделяем и печатаем
+     * врозь, с адресом худшего. */
+    if (p->trace > 0) {
+      double mphi = 0.0, mbout = 0.0, msout = 0.0;
+      int32_t iphi = -1, ibout = -1, isout = -1;
+      for (int32_t i = 0; i < nc * 4; i++)
+        if (fabs(phin[i]) > mphi) {
+          mphi = fabs(phin[i]);
+          iphi = i / 4;
+        }
+      for (int32_t i = 0; i < m->nf * 4; i++)
+        if (fabs(bout[i]) > mbout) {
+          mbout = fabs(bout[i]);
+          ibout = i / 4;
+        }
+      for (int32_t i = 0; i < nse * 4; i++)
+        if (fabs(sout[i]) > msout) {
+          msout = fabs(sout[i]);
+          isout = i / 4;
+        }
+      double ffr = -1.0;
+      if (iphi >= 0 && cu != NULL) {
+        double s3 = (double)m->csize[iphi];
+        double V = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+        ffr = V > 0.0 ? cu->mvol[iphi][0][0] / V : -1.0;
+      }
+      const char *bkind = "нет";
+      if (ibout >= 0)
+        bkind = (m->f[ibout].cb < 0)
+                    ? "ГРАНЬ КУБА"
+                    : ((cu != NULL && (cu->solid[m->f[ibout].ca] || cu->solid[m->f[ibout].cb]))
+                           ? "СТЫК"
+                           : "внутренняя");
+      printf("    §713 ТАКТ %d, МАКСИМУМ ПО НОСИТЕЛЯМ: |φ| %.4e (ячейка %d, доля флюида %.4g); "
+             "|bout| %.4e (грань %d, %s); |sout| %.4e (элемент %d)\n",
+             it, mphi, iphi, ffr, mbout, ibout, bkind, msout, isout);
+    }
     /* §709 (Р2): СРЕДНЕЕ ПРОТИВ НАКЛОНОВ. Баланс проверяет только нулевой момент
      * (К12), наклоны переносят ноль энергии и потому невидимы для него. Если
      * растут именно они — расходимость сидит в DG1, а не в переносе. */

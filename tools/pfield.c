@@ -5463,6 +5463,10 @@ int main(int argc, char **argv) {
   int xhall = 0;
   int xemitfacet = 0; /* §670 НК: излучение по-старому, ПО ФАСЕТУ */
   int xnolim = 0;     /* §677 НК: выключить ограничитель — оператор станет ЛИНЕЙНЫМ */
+  /* §714: альбедо стыка вынесено в ОТДЕЛЬНЫЙ ключ и по умолчанию ВЫКЛЮЧЕНО:
+   * условие §707 усиливает (`bout` доходит до `4.9e+34` за один проход), и
+   * держать его рабочим путём нельзя, пока не починено. */
+  double xsolidrho = 0.0;
   double xthin = 0.0; /* §711: доля флюида, ниже которой ячейка считается сплошной */
   int xconst = 0;     /* §699: печь на разрезанной геометрии — точное решение известно */
   int xwholemass = 0; /* §697: подмена матрицы масс целой — различитель, прогон нефизичен */
@@ -5508,6 +5512,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xwholemass") == 0) xwholemass = 1;
     if (strcmp(argv[i], "xconst") == 0) xconst = 1;
     if (strncmp(argv[i], "xthin=", 6) == 0) xthin = strtod(argv[i] + 6, NULL);
+    if (strncmp(argv[i], "xsolidrho=", 10) == 0) xsolidrho = strtod(argv[i] + 10, NULL);
     if (strncmp(argv[i], "xit=", 4) == 0) xit = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "xtol=", 5) == 0) xtol = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "xrho=", 5) == 0) xrho = strtod(argv[i] + 5, NULL);
@@ -6742,7 +6747,7 @@ int main(int argc, char **argv) {
                           .facet_emit = femit,
                           .elem_emit = (xhall || xemitfacet) ? NULL : eemit,
                           .nfacet = ftab.n,
-                          .solid_rho = xrho,
+                          .solid_rho = xsolidrho,
                           .binc0 = bconst,
                           .sig_t = sig_t,
                           .sig_s = sig_s,

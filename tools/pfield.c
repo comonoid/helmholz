@@ -5457,6 +5457,10 @@ int main(int argc, char **argv) {
    * магическое, оно ключ, и негативный контроль ставит его в ноль. */
   int xhall = 0;
   int xemitfacet = 0; /* §670 НК: излучение по-старому, ПО ФАСЕТУ */
+  /* §674: потолок итераций и допуск были зашиты числами `30` и `1e-4`. Ключи
+   * нужны, чтобы отличить «не сошлось» от «не дали сойтись». */
+  int xit = 30;
+  double xtol = 1e-4;
   double xrho = 0.7;
   int ss2 = 0, xtrace = 0, qplane = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
@@ -5491,6 +5495,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xtrace") == 0) xtrace = 1;
     if (strcmp(argv[i], "xhall") == 0) xhall = 1;
     if (strcmp(argv[i], "xemitfacet") == 0) xemitfacet = 1;
+    if (strncmp(argv[i], "xit=", 4) == 0) xit = (int)strtol(argv[i] + 4, NULL, 10);
+    if (strncmp(argv[i], "xtol=", 5) == 0) xtol = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "xrho=", 5) == 0) xrho = strtod(argv[i] + 5, NULL);
     if (strcmp(argv[i], "noshift") == 0) g_noshift = 1;
     if (strcmp(argv[i], "raysweep") == 0) g_raysweep = 1;
@@ -6605,7 +6611,7 @@ int main(int argc, char **argv) {
       tr3_stats st;
       memset(&st, 0, sizeof st);
       double tsw = now_s();
-      int src = tr3_sweep_solve(&prob, 30, 1e-4, phi, &st);
+      int src = tr3_sweep_solve(&prob, xit, xtol, phi, &st);
       tsw = now_s() - tsw;
       /* ГДЕ максимум — в комнате или снаружи. Без этого «φ = 1.9e5» неотличимо
        * от «φ велико в ячейке-щепке вне сцены» (правило А807: печатать вход
@@ -6679,6 +6685,20 @@ int main(int argc, char **argv) {
       printf("      ЭНЕРГИЯ: втекло %.4e, вытекло %.4e, поглощено %.4e, баланс %.2e; в "
              "поверхности %.4e, из них %.4e; max φ %.4e, max исходящий радианс %.4e\n",
              st.pin, st.pout, st.pabs, st.balance, st.psin, st.psout, phimax, soutmax);
+      /* ТОЖДЕСТВО К40 ПЕЧАТАЕТСЯ ЯВНО И С ДОЛЕЙ (§674). До этого «баланс» стоял
+       * одним числом без знаменателя, и прочесть его было нельзя: `5.61` — это
+       * много или мало? Теперь видно, что это `76 %` излучённого.
+       *     pin + psout = pout + pabs + psin
+       * Недостача считается ЗДЕСЬ, а не берётся из `st.balance`: так видно, из
+       * каких именно членов она сложилась. */
+      {
+        double lack = st.pin + st.psout - st.pout - st.pabs - st.psin;
+        double den = st.psout > 0.0 ? st.psout : 1.0;
+        printf("      БАЛАНС К40: втекло %.4e + отдано поверхностями %.4e = вытекло %.4e + "
+               "поглощено объёмом %.4e + упало на поверхности %.4e; НЕДОСТАЧА %.4e = %.1f %% "
+               "отданного\n",
+               st.pin, st.psout, st.pout, st.pabs, st.psin, lack, 100.0 * lack / den);
+      }
       printf("      ГДЕ МАКСИМУМ: в полости %.4e, вне её %.4e; флюидный объём ячейки с "
              "максимумом %.3e м³ (у целой ячейки %.3e)\n",
              phimax_in, phimax_out, volmin_at_max, pow((double)(1 << (lev - 6)) * fr.h, 3.0));

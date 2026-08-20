@@ -5458,6 +5458,7 @@ int main(int argc, char **argv) {
   int xhall = 0;
   int xemitfacet = 0; /* §670 НК: излучение по-старому, ПО ФАСЕТУ */
   int xnolim = 0;     /* §677 НК: выключить ограничитель — оператор станет ЛИНЕЙНЫМ */
+  int xwholemass = 0; /* §697: подмена матрицы масс целой — различитель, прогон нефизичен */
   /* §674: потолок итераций и допуск были зашиты числами `30` и `1e-4`. Ключи
    * нужны, чтобы отличить «не сошлось» от «не дали сойтись». */
   int xit = 30;
@@ -5497,6 +5498,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xhall") == 0) xhall = 1;
     if (strcmp(argv[i], "xemitfacet") == 0) xemitfacet = 1;
     if (strcmp(argv[i], "xnolim") == 0) xnolim = 1;
+    if (strcmp(argv[i], "xwholemass") == 0) xwholemass = 1;
     if (strncmp(argv[i], "xit=", 4) == 0) xit = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "xtol=", 5) == 0) xtol = strtod(argv[i] + 5, NULL);
     if (strncmp(argv[i], "xrho=", 5) == 0) xrho = strtod(argv[i] + 5, NULL);
@@ -6449,6 +6451,25 @@ int main(int argc, char **argv) {
     tx = now_s();
     tr3_cut cut;
     int crc = tr3_cut_build(&cut, &mesh, &ftab, &cmap, xfernosolid ? NULL : solid);
+    /* §697: СИНТЕТИЧЕСКИЙ КОНТРОЛЬ. Флюидная матрица масс заменяется матрицей
+     * ЦЕЛОЙ ячейки — диагональю `diag(V, V/12, V/12, V/12)` в базисе
+     * `{1, ξ, η, ζ}`. Прогон НЕФИЗИЧЕН и служит РАЗЛИЧИТЕЛЕМ: он отвечает, сидит
+     * ли усиление в объёме разреза. Его числа в доклады о физике не идут. */
+    if (xwholemass && crc == 0) {
+      for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+        double s3 = (double)mesh.csize[ci];
+        double V = s3 * s3 * s3 * ofr.u[0] * ofr.u[1] * ofr.u[2];
+        for (int i = 0; i < 4; i++)
+          for (int j = 0; j < 4; j++)
+            cut.mvol[ci][i][j] = 0.0;
+        cut.mvol[ci][0][0] = V;
+        for (int i = 1; i < 4; i++)
+          cut.mvol[ci][i][i] = V / 12.0;
+      }
+      printf("   §697 ПОДМЕНА: флюидная матрица масс заменена ЦЕЛОЙ у всех %d ячеек "
+             "(ПРОГОН НЕФИЗИЧЕН, только различитель)\n",
+             mesh.ncell);
+    }
     double t_cut = now_s() - tx;
     double vfl = 0.0;
     if (crc == 0)

@@ -6458,6 +6458,60 @@ int main(int argc, char **argv) {
     tx = now_s();
     tr3_cut cut;
     int crc = tr3_cut_build(&cut, &mesh, &ftab, &cmap, xfernosolid ? NULL : solid);
+    /* §702: СЧЁТ СТЫКА «ФЛЮИД — СПЛОШНОЕ». Грани флюидных ячеек раскладываются
+     * на три класса; сумма обязана дать полное число, и это печатается как
+     * проверка разбиения. Класс «стык» делится надвое: есть ли у флюидной ячейки
+     * хотя бы один поверхностный элемент. Ячейка без элементов — место, где
+     * энергия уходит в материал и нигде не учитывается (`sweep3.c:562`
+     * обнуляет радианс сплошной ячейки). */
+    if (crc == 0) {
+      int64_t nff = 0, nfs = 0, nbd = 0, nfs_bare = 0, ncell_bare = 0, ncell_fl = 0;
+      double aff = 0.0, afs = 0.0, abd = 0.0, afs_bare = 0.0, asel = 0.0;
+      for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+        if (cut.solid[ci]) continue;
+        if (!(cut.mvol[ci][0][0] > 0.0)) continue;
+        ncell_fl++;
+        int has_se = (cut.sestart[ci + 1] > cut.sestart[ci]);
+        if (!has_se) ncell_bare++;
+        for (int32_t q = mesh.fstart[ci]; q < mesh.fstart[ci + 1]; q++) {
+          int32_t fi = mesh.flist[q];
+          int32_t nb = (mesh.f[fi].ca == ci) ? mesh.f[fi].cb : mesh.f[fi].ca;
+          double ar = cut.farea[fi];
+          if (nb < 0) {
+            nbd++;
+            abd += ar;
+          } else if (cut.solid[nb]) {
+            nfs++;
+            afs += ar;
+            if (!has_se) {
+              nfs_bare++;
+              afs_bare += ar;
+            }
+          } else {
+            nff++;
+            aff += ar;
+          }
+        }
+      }
+      for (int32_t k = 0; k < cut.nse; k++)
+        asel += cut.se[k].area;
+      double atot = aff + afs + abd;
+      printf("   §702 ГРАНИ ФЛЮИДНЫХ ЯЧЕЕК (%lld ячеек, из них БЕЗ элементов %lld = %.2f %%):\n"
+             "      флюид-флюид  %8lld граней, площадь %.4e (%.2f %%)\n"
+             "      ФЛЮИД-СПЛОШНОЕ %6lld граней, площадь %.4e (%.2f %%); ИЗ НИХ В ЯЧЕЙКАХ БЕЗ "
+             "ЭЛЕМЕНТОВ %lld, площадь %.4e (%.2f %% от всей границы флюида)\n"
+             "      граница области %5lld граней, площадь %.4e (%.2f %%)\n"
+             "      СУММА КЛАССОВ %lld против полного числа граней флюидных ячеек — обязана "
+             "совпасть\n"
+             "      площадь поверхностных ЭЛЕМЕНТОВ %.4e; отношение к площади стыка %.4f\n",
+             (long long)ncell_fl, (long long)ncell_bare,
+             100.0 * (double)ncell_bare / (double)(ncell_fl ? ncell_fl : 1), (long long)nff, aff,
+             100.0 * aff / (atot > 0.0 ? atot : 1.0), (long long)nfs, afs,
+             100.0 * afs / (atot > 0.0 ? atot : 1.0), (long long)nfs_bare, afs_bare,
+             100.0 * afs_bare / (atot > 0.0 ? atot : 1.0), (long long)nbd, abd,
+             100.0 * abd / (atot > 0.0 ? atot : 1.0), (long long)(nff + nfs + nbd), asel,
+             afs > 0.0 ? asel / afs : -1.0);
+    }
     /* §697: СИНТЕТИЧЕСКИЙ КОНТРОЛЬ. Флюидная матрица масс заменяется матрицей
      * ЦЕЛОЙ ячейки — диагональю `diag(V, V/12, V/12, V/12)` в базисе
      * `{1, ξ, η, ζ}`. Прогон НЕФИЗИЧЕН и служит РАЗЛИЧИТЕЛЕМ: он отвечает, сидит

@@ -116,6 +116,11 @@ static double mass_cond(const double M[4][4]) {
   return nf * sqrt(ni);
 }
 
+static int cmp_dbl_dbg(const void *a, const void *b) {
+  double x = *(const double *)a, y = *(const double *)b;
+  return x < y ? -1 : (x > y ? 1 : 0);
+}
+
 /* Решение 3x3 с частичным выбором. Возврат 1 при вырождении. */
 static int solve3(double a[3][3], double b[3], double x[3]) {
   for (int k = 0; k < 3; k++) {
@@ -1023,6 +1028,79 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       printf("    it %5d  resid %.3e  nclip %d  nfb %d = грани(геом %d, поле %d) + элементы(геом "
              "%d, поле %d); из полевых на ЩЕПКАХ %d\n",
              it, resid, nclip_last, nfb, nfb_fg, nfb_fp, nfb_eg, nfb_ep, nfb_thin);
+    /* §693: РОСТ КАК ФУНКЦИЯ ДОЛИ ФЛЮИДА, БЕЗ ПОРОГОВ. Декада — способ показать
+     * кривую: каждая ячейка попадает ровно в одну, ни одна не отбрасывается.
+     * Печатается медиана (а не среднее — А1090), p99 и максимум. */
+    if (p->trace > 0 && cu != NULL && phiprev_dbg != NULL) {
+      typedef struct {
+        double frac, g, k;
+      } grec;
+      grec *gr = malloc((size_t)nc * sizeof *gr);
+      if (gr != NULL) {
+        int64_t ng = 0;
+        for (int32_t ci = 0; ci < nc; ci++) {
+          double a = fabs(phiprev_dbg[ci]), b = fabs(phi[4 * (size_t)ci]);
+          if (!(a > 0.0)) continue;
+          double s3 = (double)m->csize[ci];
+          double vcell = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+          if (!(vcell > 0.0)) continue;
+          gr[ng].frac = cu->mvol[ci][0][0] / vcell;
+          gr[ng].g = b / a;
+          gr[ng].k = mass_cond(cu->mvol[ci]);
+          ng++;
+        }
+        double *tmp = malloc((size_t)(ng > 0 ? ng : 1) * sizeof *tmp);
+        if (tmp != NULL && ng > 0) {
+          for (int64_t i = 0; i < ng; i++)
+            tmp[i] = gr[i].g;
+          qsort(tmp, (size_t)ng, sizeof *tmp, cmp_dbl_dbg);
+          printf("    §693 РОСТ ПО СЦЕНЕ (такт %d): ячеек %lld, МЕДИАНА %.4g, p99 %.4g, макс "
+                 "%.4g\n",
+                 it, (long long)ng, tmp[ng / 2], tmp[(ng * 99) / 100], tmp[ng - 1]);
+          printf("    §693 ЗАВИСИМОСТЬ ОТ ДОЛИ ФЛЮИДА (декады, без порогов):\n");
+          for (int dec = 9; dec >= 0; dec--) {
+            double lo = (dec == 0) ? 0.0 : pow(10.0, -(double)dec);
+            double hi = (dec == 0) ? 1.0e30 : pow(10.0, -(double)(dec - 1));
+            int64_t cnt = 0;
+            for (int64_t i = 0; i < ng; i++)
+              if (gr[i].frac >= lo && gr[i].frac < hi) tmp[cnt++] = gr[i].g;
+            if (cnt == 0) continue;
+            qsort(tmp, (size_t)cnt, sizeof *tmp, cmp_dbl_dbg);
+            double kmed = 0.0;
+            {
+              int64_t c2 = 0;
+              double *tk = malloc((size_t)cnt * sizeof *tk);
+              if (tk != NULL) {
+                for (int64_t i = 0; i < ng; i++)
+                  if (gr[i].frac >= lo && gr[i].frac < hi) tk[c2++] = gr[i].k;
+                qsort(tk, (size_t)c2, sizeof *tk, cmp_dbl_dbg);
+                kmed = tk[c2 / 2];
+                free(tk);
+              }
+            }
+            printf("      доля [%.0e, %.0e): ячеек %7lld  медиана роста %.4g  p99 %.4g  макс "
+                   "%.4g  медиана κ %.4g\n",
+                   lo, hi > 1.0e29 ? 1.0 : hi, (long long)cnt, tmp[cnt / 2], tmp[(cnt * 99) / 100],
+                   tmp[cnt - 1], kmed);
+          }
+        }
+        free(tmp);
+        free(gr);
+      }
+      /* ПЕРЕПАД УРОВНЕЙ У ЯЧЕЙКИ: сколько её граней имеют соседа ДРУГОГО
+       * размера. Печатается и по сцене — иначе сравнивать не с чем (А1063). */
+      int64_t fall = 0, fjump = 0;
+      for (int32_t ci = 0; ci < nc; ci++)
+        for (int32_t q = m->fstart[ci]; q < m->fstart[ci + 1]; q++) {
+          int32_t fi = m->flist[q];
+          int32_t nb = (m->f[fi].ca == ci) ? m->f[fi].cb : m->f[fi].ca;
+          fall++;
+          if (nb >= 0 && m->csize[nb] != m->csize[ci]) fjump++;
+        }
+      printf("    §693 ПЕРЕПАД УРОВНЕЙ ПО СЦЕНЕ: граней %lld, из них с соседом другого размера "
+             "%lld (%.2f %%)\n",
+             (long long)fall, (long long)fjump, 100.0 * (double)fjump / (double)(fall ? fall : 1));
+    }
     /* §690 (СЛЕДСТВИЕ): ГДЕ ИМЕННО РАСТЁТ ПОЛЕ. Взрыв на шесть порядков за такт
      * обязан где-то сидеть; если он размазан — виноват не разрез. Печатается
      * десятка худших вместе со свойствами ячейки, чтобы причина и следствие

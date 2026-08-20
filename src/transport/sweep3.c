@@ -1150,7 +1150,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
                  "МАКСИМУМ %.4g (элемент %d); с g > 1: %lld (%.2f %%); у 98531 g = %.4g\n",
                  it, (long long)ng2, gi[ng2 / 2], gi[(ng2 * 99) / 100], gmx2, igm, (long long)ngt,
                  100.0 * (double)ngt / (double)ng2,
-                 (98531 < nse && sprev[98531 * 4] != 0.0)
+                 (98531 < nse && fabs(sprev[98531 * 4]) > 0.0)
                      ? fabs(sout[98531 * 4]) / fabs(sprev[98531 * 4])
                      : -1.0);
         }

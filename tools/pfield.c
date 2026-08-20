@@ -5467,9 +5467,10 @@ int main(int argc, char **argv) {
    * условие §707 усиливает (`bout` доходит до `4.9e+34` за один проход), и
    * держать его рабочим путём нельзя, пока не починено. */
   double xsolidrho = 0.0;
-  double xthin = 0.0; /* §711: доля флюида, ниже которой ячейка считается сплошной */
-  int xconst = 0;     /* §699: печь на разрезанной геометрии — точное решение известно */
-  int xwholemass = 0; /* §697: подмена матрицы масс целой — различитель, прогон нефизичен */
+  double xsemin = 0.0; /* §717: доля h², ниже которой элемент убирается из носителя */
+  double xthin = 0.0;  /* §711: доля флюида, ниже которой ячейка считается сплошной */
+  int xconst = 0;      /* §699: печь на разрезанной геометрии — точное решение известно */
+  int xwholemass = 0;  /* §697: подмена матрицы масс целой — различитель, прогон нефизичен */
   /* §674: потолок итераций и допуск были зашиты числами `30` и `1e-4`. Ключи
    * нужны, чтобы отличить «не сошлось» от «не дали сойтись». */
   int xit = 30;
@@ -5512,6 +5513,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xwholemass") == 0) xwholemass = 1;
     if (strcmp(argv[i], "xconst") == 0) xconst = 1;
     if (strncmp(argv[i], "xthin=", 6) == 0) xthin = strtod(argv[i] + 6, NULL);
+    if (strncmp(argv[i], "xsemin=", 7) == 0) xsemin = strtod(argv[i] + 7, NULL);
     if (strncmp(argv[i], "xsolidrho=", 10) == 0) xsolidrho = strtod(argv[i] + 10, NULL);
     if (strncmp(argv[i], "xit=", 4) == 0) xit = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "xtol=", 5) == 0) xtol = strtod(argv[i] + 5, NULL);
@@ -6465,6 +6467,57 @@ int main(int argc, char **argv) {
     tx = now_s();
     tr3_cut cut;
     int crc = tr3_cut_build(&cut, &mesh, &ftab, &cmap, xfernosolid ? NULL : solid);
+    /* §717: ПЛОЩАДИ ЭЛЕМЕНТОВ И УДАЛЕНИЕ ВЫРОЖДЕННЫХ. Элемент есть сечение
+     * коробки плоскостью; у плоскости, чуть задевшей угол, площадь исчезающе
+     * мала, а исходящий радианс считается делением на его матрицу масс — тот же
+     * механизм, что у ячейки-щепки (§714), только на другом носителе.
+     * Удаление идёт ДО подачи `Ke`, чтобы `Σ Ke·площадь` считалась по
+     * оставшимся и приёмка «вышло = излучено» осталась верной. */
+    if (crc == 0) {
+      double h2 = ofr.u[0] * ofr.u[1];
+      double *ar = malloc((size_t)(cut.nse > 0 ? cut.nse : 1) * sizeof *ar);
+      if (ar != NULL) {
+        int64_t na = 0;
+        double atot0 = 0.0;
+        for (int32_t k = 0; k < cut.nse; k++) {
+          if (!(cut.se[k].area > 0.0)) continue;
+          ar[na++] = cut.se[k].area / h2;
+          atot0 += cut.se[k].area;
+        }
+        if (na > 0) {
+          qsort(ar, (size_t)na, sizeof *ar, cmp_dev699);
+          int64_t nb1 = 0, nb2 = 0, nb3 = 0;
+          for (int64_t i = 0; i < na; i++) {
+            if (ar[i] < 1e-6) nb1++;
+            if (ar[i] < 1e-4) nb2++;
+            if (ar[i] < 1e-2) nb3++;
+          }
+          printf("   §717 ПЛОЩАДЬ ЭЛЕМЕНТОВ (в долях h²): элементов %lld; мин %.3e, p1 %.3e, "
+                 "медиана %.3e, макс %.3e; ниже 1e-6: %lld (%.2f %%), ниже 1e-4: %lld (%.2f %%), "
+                 "ниже 1e-2: %lld (%.2f %%)\n",
+                 (long long)na, ar[0], ar[na / 100], ar[na / 2], ar[na - 1], (long long)nb1,
+                 100.0 * (double)nb1 / (double)na, (long long)nb2, 100.0 * (double)nb2 / (double)na,
+                 (long long)nb3, 100.0 * (double)nb3 / (double)na);
+        }
+        free(ar);
+        if (xsemin > 0.0) {
+          int64_t nrem = 0;
+          double arem = 0.0;
+          for (int32_t k = 0; k < cut.nse; k++) {
+            if (!(cut.se[k].area > 0.0)) continue;
+            if (cut.se[k].area >= xsemin * h2) continue;
+            arem += cut.se[k].area;
+            cut.se[k].area = 0.0;
+            memset(cut.se[k].m, 0, sizeof cut.se[k].m);
+            nrem++;
+          }
+          printf("   §717 УДАЛЕНО ВЫРОЖДЕННЫХ ЭЛЕМЕНТОВ (порог %.3e h²): %lld из %d; потеряно "
+                 "площади %.4e из %.4e (%.4f %%)\n",
+                 xsemin, (long long)nrem, cut.nse, arem, atot0,
+                 100.0 * arem / (atot0 > 0.0 ? atot0 : 1.0));
+        }
+      }
+    }
     /* §711: ЩЕПКИ УХОДЯТ ИЗ НОСИТЕЛЯ. Ячейка, где флюида меньше `xthin` доли,
      * объявляется СПЛОШНОЙ: она и так почти целиком материал, а деление на её
      * исчезающий объём даёт радианс на порядки выше соседского (§710). Её грани

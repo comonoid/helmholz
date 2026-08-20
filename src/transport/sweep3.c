@@ -357,6 +357,37 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     hs_out[e] = so;
   }
 
+  /* §709 (Р1): СОГЛАСОВАНЫ ЛИ МАТРИЦЫ ГРАНИ. `ffmx[i][0]` и `ffm[i][0]` суть
+   * один и тот же интеграл `∫b^ca_i dA` (базисный член `b_0 ≡ 1`), и то же для
+   * `ffmx[0][j]` против `ffmb[j][0]`. Расхождение означало бы, что вылет из
+   * одной ячейки и влёт в другую считаются по РАЗНЫМ величинам. Проверяется
+   * один раз, до итераций. */
+  if (p->trace > 0 && cu != NULL) {
+    double wmax = 0.0, wmax_j = 0.0;
+    int64_t nbadf = 0, nfl2 = 0;
+    for (int32_t f = 0; f < m->nf; f++) {
+      int32_t ca = m->f[f].ca, cb = m->f[f].cb;
+      if (cb < 0 || cu->solid[ca] || cu->solid[cb]) continue;
+      nfl2++;
+      for (int i = 0; i < 4; i++) {
+        double a = cu->ffmx[f][i][0], b = cu->ffm[f][i][0];
+        double sc = fabs(a) + fabs(b);
+        double e = sc > 0.0 ? fabs(a - b) / sc : 0.0;
+        if (e > wmax) wmax = e;
+        double a2 = cu->ffmx[f][0][i], b2 = cu->ffmb[f][i][0];
+        double sc2 = fabs(a2) + fabs(b2);
+        double e2 = sc2 > 0.0 ? fabs(a2 - b2) / sc2 : 0.0;
+        if (e2 > wmax_j) wmax_j = e2;
+        if (e > 1e-12 || e2 > 1e-12) {
+          nbadf++;
+          break;
+        }
+      }
+    }
+    printf("    §709 МАТРИЦЫ ГРАНИ: флюид-флюид граней %lld; max |ffmx[i][0] − ffm[i][0]| отн. "
+           "%.3e; max |ffmx[0][j] − ffmb[j][0]| отн. %.3e; НАРУШЕНИЙ выше 1e-12: %lld\n",
+           (long long)nfl2, wmax, wmax_j, (long long)nbadf);
+  }
   /* §690 (ПРИЧИНА): распределение обусловленности матрицы масс ФЛЮИДНОЙ части,
    * отдельно у ЩЕПОК и у ЦЕЛЫХ. Печатается один раз, до итераций. */
   if (p->trace > 0 && cu != NULL) {
@@ -1268,6 +1299,33 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     if (phiprev_dbg != NULL)
       for (int32_t ci = 0; ci < nc; ci++)
         phiprev_dbg[ci] = phi[4 * (size_t)ci];
+    /* §709 (Р2): СРЕДНЕЕ ПРОТИВ НАКЛОНОВ. Баланс проверяет только нулевой момент
+     * (К12), наклоны переносят ноль энергии и потому невидимы для него. Если
+     * растут именно они — расходимость сидит в DG1, а не в переносе. */
+    if (p->trace > 0) {
+      double m0 = 0.0, m1 = 0.0;
+      double wf = -1.0;
+      int32_t wc2 = -1;
+      for (int32_t ci = 0; ci < nc; ci++) {
+        double a0 = fabs(phi[4 * (size_t)ci]);
+        if (a0 > m0) m0 = a0;
+        for (int j = 1; j < 4; j++) {
+          double aj = fabs(phi[4 * (size_t)ci + (size_t)j]);
+          if (aj > m1) {
+            m1 = aj;
+            wc2 = ci;
+          }
+        }
+      }
+      if (wc2 >= 0 && cu != NULL) {
+        double s3 = (double)m->csize[wc2];
+        double V = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+        wf = V > 0.0 ? cu->mvol[wc2][0][0] / V : -1.0;
+      }
+      printf("    §709 ТАКТ %d: max|СРЕДНЕЕ| %.4e, max|НАКЛОН| %.4e, отношение %.4e; худший по "
+             "наклону — ячейка %d, доля флюида %.4g\n",
+             it, m0, m1, m0 > 0.0 ? m1 / m0 : -1.0, wc2, wf);
+    }
     if (resid < tol) break;
 
     /* ОСТАНОВКА ПО ЗАСТОЮ, А НЕ ТОЛЬКО ПО ДОПУСКУ — К81.

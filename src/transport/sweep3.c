@@ -278,6 +278,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   double *sinf = calloc((size_t)(nse > 0 ? nse : 1) * 4, sizeof(double));
   /* §690: снимок `φ` прошлого такта — только под `trace`, рабочий путь не платит. */
   double *phiprev_dbg = NULL;
+  /* §721: усиление проектора по элементам — только под `trace`. */
+  double *gdbg = NULL;
   double *hs_se = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   double *hs_out = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   /* ЭТАП C: ЗЕРКАЛЬНЫЕ ГРАНИ. Индекс `mfid[f]` есть номер грани среди
@@ -318,6 +320,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     free(binf);
     free(sout);
     free(sinf);
+    free(gdbg);
     free(phiprev_dbg);
     free(hs_se);
     free(hs_out);
@@ -486,6 +489,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   /* ПРИ `warm_start` ВХОДНОЕ ПОЛЕ СОХРАНЯЕТСЯ — тогда один проход есть
    * применение ОПЕРАТОРА к заданному вектору, а не итерация от нуля (см.
    * `sweep3.h`). Ограничение про `bout`/`sout` там же. */
+  if (p->trace > 0 && nse > 0) gdbg = calloc((size_t)nse, sizeof *gdbg);
   if (p->trace > 0) {
     phiprev_dbg = calloc((size_t)nc, sizeof *phiprev_dbg);
     if (phiprev_dbg != NULL)
@@ -1050,6 +1054,18 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
        * рядом с матрицей масс и выведен из уравнения плоскости (cut3.h) */
       /* К86, то же самое на поверхностных элементах */
       int fb_geom_e = tr3_project_plane(fmm, rr, se->nul, ee) != 0;
+      /* §721: БЕЗРАЗМЕРНОЕ УСИЛЕНИЕ ПРОЕКТОРА, считается ПОСЛЕ проекции и ДО
+       * отката: `g` показывает, во сколько раз решение DG1 больше безопасного
+       * константного ответа `rr[0]/M[0][0]`, которым откат и пользуется. У
+       * здорового элемента `g` порядка единицы. */
+      if (p->trace > 0 && gdbg != NULL) {
+        double nee = 0.0;
+        for (int j = 0; j < 4; j++)
+          nee += ee[j] * ee[j];
+        nee = sqrt(nee);
+        double safe = fabs(rr[0]) > 0.0 ? fabs(rr[0]) / fmm[0][0] : 0.0;
+        gdbg[e] = safe > 0.0 ? nee / safe : 0.0;
+      }
       if (fb_geom_e || (p->limiter && corner_min(ee) < 0.0)) {
         ee[0] = sinf[e * 4] / fmm[0][0];
         ee[1] = ee[2] = ee[3] = 0.0;
@@ -1299,6 +1315,32 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     if (phiprev_dbg != NULL)
       for (int32_t ci = 0; ci < nc; ci++)
         phiprev_dbg[ci] = phi[4 * (size_t)ci];
+    /* §721: распределение усиления проектора по элементам. Медиана печатается
+     * рядом с максимумом — без неё «максимум велик» не читается (А1063). */
+    if (p->trace > 0 && gdbg != NULL && nse > 0) {
+      double *gg = malloc((size_t)nse * sizeof *gg);
+      if (gg != NULL) {
+        int64_t ngg = 0;
+        double gmx = 0.0;
+        int32_t igmx = -1;
+        for (int32_t e2 = 0; e2 < nse; e2++) {
+          if (!(gdbg[e2] > 0.0)) continue;
+          gg[ngg++] = gdbg[e2];
+          if (gdbg[e2] > gmx) {
+            gmx = gdbg[e2];
+            igmx = e2;
+          }
+        }
+        if (ngg > 0) {
+          qsort(gg, (size_t)ngg, sizeof *gg, cmp_dbl_dbg);
+          printf("    §721 УСИЛЕНИЕ ПРОЕКТОРА (такт %d): элементов %lld, медиана %.4g, p99 %.4g, "
+                 "МАКСИМУМ %.4g на элементе %d; у элемента 98531 g = %.4g\n",
+                 it, (long long)ngg, gg[ngg / 2], gg[(ngg * 99) / 100], gmx, igmx,
+                 (98531 < nse) ? gdbg[98531] : -1.0);
+        }
+        free(gg);
+      }
+    }
     /* §713: ГДЕ СИДИТ МАКСИМУМ. `resid` есть макс-норма по ТРЁМ носителям сразу,
      * и по ней нельзя сказать, что именно взорвалось. Разделяем и печатаем
      * врозь, с адресом худшего. */

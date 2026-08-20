@@ -108,6 +108,7 @@ int tr3_krylov_solve(const tr3_problem *p, int maxit, double tol, double *phi, d
   k.lin.trace = 0;
   k.lin.wall_emit = p->wall_rho != NULL ? wz : NULL;
   k.lin.facet_emit = fz;
+  k.lin.elem_emit = NULL; /* §670: у ЛИНЕЙНОГО оператора излучения нет */
   k.lin.eps = NULL;
   k.lin.eps_dir[0] = k.lin.eps_dir[1] = k.lin.eps_dir[2] = 0.0;
   k.lin.binc0 = 0.0;
@@ -294,6 +295,7 @@ int tr3_krylov_residual(const tr3_problem *p, const double *phi, const double *b
   k.lin.trace = 0;
   k.lin.wall_emit = p->wall_rho != NULL ? wz : NULL;
   k.lin.facet_emit = fz;
+  k.lin.elem_emit = NULL; /* §670: у ЛИНЕЙНОГО оператора излучения нет */
   k.lin.eps = NULL;
   k.lin.eps_dir[0] = k.lin.eps_dir[1] = k.lin.eps_dir[2] = 0.0;
   k.lin.binc0 = 0.0;

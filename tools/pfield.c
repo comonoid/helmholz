@@ -5456,6 +5456,7 @@ int main(int argc, char **argv) {
    * воспроизведения старых прогонов; `xrho` — альбедо фасета, число не
    * магическое, оно ключ, и негативный контроль ставит его в ноль. */
   int xhall = 0;
+  int xemitfacet = 0; /* §670 НК: излучение по-старому, ПО ФАСЕТУ */
   double xrho = 0.7;
   int ss2 = 0, xtrace = 0, qplane = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
@@ -5489,6 +5490,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "ss2") == 0) ss2 = 1;
     if (strcmp(argv[i], "xtrace") == 0) xtrace = 1;
     if (strcmp(argv[i], "xhall") == 0) xhall = 1;
+    if (strcmp(argv[i], "xemitfacet") == 0) xemitfacet = 1;
     if (strncmp(argv[i], "xrho=", 5) == 0) xrho = strtod(argv[i] + 5, NULL);
     if (strcmp(argv[i], "noshift") == 0) g_noshift = 1;
     if (strcmp(argv[i], "raysweep") == 0) g_raysweep = 1;
@@ -6468,9 +6470,13 @@ int main(int argc, char **argv) {
     if (crc == 0 && doxsweep) {
       double *frho = calloc((size_t)ftab.n, sizeof *frho);
       double *femit = calloc((size_t)ftab.n, sizeof *femit);
+      /* §670: излучение ПО ЭЛЕМЕНТУ, в РАДИАНСЕ. Фасетный массив остаётся ради
+       * ключа `xemitfacet` (негативный контроль) и ветви `xhall`. */
+      double *eemit = calloc((size_t)(cut.nse > 0 ? cut.nse : 1), sizeof *eemit);
       double *sig_t = calloc((size_t)mesh.ncell, sizeof *sig_t);
       double *sig_s = calloc((size_t)mesh.ncell, sizeof *sig_s);
       double *phi = calloc((size_t)mesh.ncell * 4, sizeof *phi);
+      if (eemit == NULL) exit(1);
       if (frho == NULL || femit == NULL || sig_t == NULL || sig_s == NULL || phi == NULL) exit(1);
       for (int32_t i = 0; i < ftab.n; i++)
         frho[i] = xrho;
@@ -6549,12 +6555,24 @@ int main(int argc, char **argv) {
           int32_t fi = cut.se[k].facet;
           if (femit[fi] > 0.0 && fabs(femit[fi] - e) > 0.0) nconf++;
           if (e > femit[fi]) femit[fi] = e;
+          /* §670: ЕДИНИЦА. `Ke` хранится излучённой РАДИОСНОСТЬЮ (`scene_obj.h`),
+           * а развёртка складывает величину с ИСХОДЯЩИМ РАДИАНСОМ. Для
+           * ламбертова излучателя `B = π·L`, поэтому делим на `π` — это перевод
+           * единиц, а не подгонка множителя. Проверяется точно: при `ρ = 0`
+           * исходящая мощность обязана совпасть с `Σ Ke·площадь`. */
+          eemit[k] = e / 3.14159265358979323846;
           emitpow += e * cut.se[k].area;
           nlit++;
         }
       }
       /* ВХОД РАЗВЁРТКИ, А НЕ ТОЛЬКО ЕЁ ВЫХОД (А807). Ложный ноль на выходе
        * неотличим от «источник не задан», пока не напечатан сам источник. */
+      /* ВТОРАЯ СУММА СЧИТАЕТСЯ ПО САМОМУ МАССИВУ (§670 Р4), а не повторным
+       * умножением тех же чисел: иначе она совпала бы тождественно и не могла
+       * бы поймать ошибку ЗАПИСИ в `eemit`. */
+      double emitpow2 = 0.0;
+      for (int32_t k = 0; k < cut.nse; k++)
+        emitpow2 += 3.14159265358979323846 * eemit[k] * cut.se[k].area;
       int64_t nlitfac = 0, nlitfluid = 0;
       for (int32_t i = 0; i < ftab.n; i++)
         if (femit[i] > 0.0) nlitfac++;
@@ -6567,8 +6585,10 @@ int main(int argc, char **argv) {
              xhall ? "площадка от камеры (§479)" : "Ke материалов (§667)");
       if (!xhall)
         printf("      ИСТОЧНИК ИЗ Ke: мощность Σ Ke·площадь %.4e, расхождений материала на общем "
-               "фасете %lld, элементов в КРУПНЫХ ячейках %lld, без материала %lld\n",
-               emitpow, (long long)nconf, (long long)nbigcell, (long long)nnomat);
+               "фасете %lld, элементов в КРУПНЫХ ячейках %lld, без материала %lld; НОСИТЕЛЬ %s, "
+               "Σ π·L·площадь %.4e\n",
+               emitpow, (long long)nconf, (long long)nbigcell, (long long)nnomat,
+               xemitfacet ? "ФАСЕТ (НК §670)" : "ЭЛЕМЕНТ (§670)", emitpow2);
       tr3_dirs dirs;
       if (tr3_dirs_product(&dirs, nmu, nmu) != 0) exit(1);
       tr3_problem prob = {.m = &mesh,
@@ -6576,6 +6596,7 @@ int main(int argc, char **argv) {
                           .cut = &cut,
                           .facet_rho = frho,
                           .facet_emit = femit,
+                          .elem_emit = (xhall || xemitfacet) ? NULL : eemit,
                           .nfacet = ftab.n,
                           .sig_t = sig_t,
                           .sig_s = sig_s,
@@ -6734,6 +6755,7 @@ int main(int argc, char **argv) {
       free(st.sout);
       tr3_dirs_free(&dirs);
       free(frho);
+      free(eemit);
       free(femit);
       free(sig_t);
       free(sig_s);

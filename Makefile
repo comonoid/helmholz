@@ -103,9 +103,11 @@ build/test_tet3: tests/test_tet3.c src/transport/tet3.c src/transport/tet3.h \
 	  src/cut/surf.c -lm'
 
 build/test_sweep3: tests/test_sweep3.c src/transport/sweep3.c src/transport/mesh3.c \
+                   src/transport/krylov3.c \
                    src/transport/dirs3.c src/transport/tet3.c src/transport/cut3.c src/transport/quad.c \
                    src/cut/poly3.c src/octree.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_sweep3.c src/transport/sweep3.c \
+	  src/transport/krylov3.c \
 	  src/transport/mesh3.c src/transport/dirs3.c src/transport/tet3.c src/transport/cut3.c src/transport/quad.c \
 	  src/cut/poly3.c src/octree.c src/transport/cam3.c src/transport/ray3.c src/cut/surf.c src/image.c -lm'
 

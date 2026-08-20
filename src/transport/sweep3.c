@@ -336,9 +336,15 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   if (p->sout_in != NULL && nse > 0)
     memcpy(sout, p->sout_in, (size_t)nse * 4 * sizeof(double));
   else
-    for (int32_t e = 0; e < nse; e++)
-      if (p->facet_emit != NULL && cu->se[e].facet < p->nfacet)
+    for (int32_t e = 0; e < nse; e++) {
+      /* §670: излучение по ЭЛЕМЕНТУ имеет приоритет; фасетное осталось для
+       * воспроизведения прежних прогонов. Оба места (здесь и в рабочем цикле)
+       * правятся ВМЕСТЕ — иначе первая итерация разойдётся со следующими. */
+      if (p->elem_emit != NULL)
+        sout[e * 4] = p->elem_emit[e];
+      else if (p->facet_emit != NULL && cu->se[e].facet < p->nfacet)
         sout[e * 4] = p->facet_emit[cu->se[e].facet];
+    }
 
   int nclip_last = 0, it = 0, nfb = 0;
   double resid = 0.0;
@@ -771,7 +777,10 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     for (int32_t e = 0; e < nse; e++) {
       const tr3_selem *se = &cu->se[e];
       double rho = (p->facet_rho != NULL && se->facet < p->nfacet) ? p->facet_rho[se->facet] : 0.0;
-      double em = (p->facet_emit != NULL && se->facet < p->nfacet) ? p->facet_emit[se->facet] : 0.0;
+      double em =
+          p->elem_emit != NULL
+              ? p->elem_emit[e]
+              : ((p->facet_emit != NULL && se->facet < p->nfacet) ? p->facet_emit[se->facet] : 0.0);
       double fmm[4][4], rr[4], ee[4];
       memcpy(fmm, se->m, sizeof fmm);
       for (int j = 0; j < 4; j++)

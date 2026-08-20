@@ -5452,6 +5452,11 @@ int main(int argc, char **argv) {
    * возвращает прежнее поведение как негативный контроль. */
   int nrmflip = 0, nonsum = 0, indvis = 1, indmeas = 0, dosolid = 0;
   int doxfer = 0, xfernosolid = 0, doxsweep = 0, nmu = 4, xcorner = 0, xinnerfluid = 0;
+  /* §667: `xhall` — прежний источник-площадка от камеры, оставлен для
+   * воспроизведения старых прогонов; `xrho` — альбедо фасета, число не
+   * магическое, оно ключ, и негативный контроль ставит его в ноль. */
+  int xhall = 0;
+  double xrho = 0.7;
   int ss2 = 0, xtrace = 0, qplane = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
   double oven = 0.0, plates = 0.0;
@@ -5483,6 +5488,8 @@ int main(int argc, char **argv) {
     /* Ш18 (§494): растр в `res`, на диск вдвое меньше свёрткой 2×2. */
     if (strcmp(argv[i], "ss2") == 0) ss2 = 1;
     if (strcmp(argv[i], "xtrace") == 0) xtrace = 1;
+    if (strcmp(argv[i], "xhall") == 0) xhall = 1;
+    if (strncmp(argv[i], "xrho=", 5) == 0) xrho = strtod(argv[i] + 5, NULL);
     if (strcmp(argv[i], "noshift") == 0) g_noshift = 1;
     if (strcmp(argv[i], "raysweep") == 0) g_raysweep = 1;
     if (strncmp(argv[i], "seed=", 5) == 0) g_seed = (int32_t)strtol(argv[i] + 5, NULL, 10);
@@ -6337,6 +6344,13 @@ int main(int argc, char **argv) {
          (double)T.nsumcap * 24.0 / 1048576.0,
          T.n > 0 ? (double)T.nsumcap * 24.0 / (double)T.n : 0.0);
 
+  /* СПИСОК ТРЕУГОЛЬНИКОВ НА ЯЧЕЙКУ СТРОИТСЯ ЗДЕСЬ, А НЕ ПОСЛЕ СТЫКА (§667).
+   * Материал поверхности берётся только отсюда, а стыку с переносом он нужен,
+   * чтобы подать `Ke` в источник развёртки. Перенос вверх — правка ПОРЯДКА, не
+   * расчёта: ниже по тексту `CT` используется как прежде. */
+  celltris CT;
+  ct_build(&CT, &m, &fr, P.b[lev], nocc);
+
   /* ---- 3г. СТЫК С ПЕРЕНОСОМ (Ш13, §479) ---- */
   /* ЧТО ЗДЕСЬ ПРОВЕРЯЕТСЯ. Развёртка по ординатам даёт глобальное освещение С
    * ЗАСЛОНАМИ по построению — ту физику, что маршем стоит 65 с (§474). Её стык
@@ -6459,7 +6473,7 @@ int main(int argc, char **argv) {
       double *phi = calloc((size_t)mesh.ncell * 4, sizeof *phi);
       if (frho == NULL || femit == NULL || sig_t == NULL || sig_s == NULL || phi == NULL) exit(1);
       for (int32_t i = 0; i < ftab.n; i++)
-        frho[i] = 0.7;
+        frho[i] = xrho;
       double lc[3], lu = 0.0, lv = 0.0;
       for (int k = 0; k < 3; k++)
         lc[k] = 0.5 * (lo[k] + hi[k]);
@@ -6485,16 +6499,57 @@ int main(int argc, char **argv) {
       lc[1] = ceilY;
       lu = 0.25 * (hi[0] - lo[0]);
       lv = 0.25 * (hi[2] - lo[2]);
-      int64_t nlit = 0;
-      for (int32_t k = 0; k < cut.nse; k++) {
-        if (cut.se[k].nv <= 0) continue;
-        double c[3] = {0, 0, 0};
-        for (int q = 0; q < cut.se[k].nv; q++)
+      int64_t nlit = 0, nconf = 0, nbigcell = 0, nnomat = 0;
+      double emitpow = 0.0;
+      if (xhall) {
+        /* ПРЕЖНИЙ ИСТОЧНИК (§479): площадка под потолком, найденная спуском ОТ
+         * КАМЕРЫ. Оставлен ключом, чтобы прежние прогоны воспроизводились, но
+         * умолчанием быть не может: он камерозависим (§597) и на сцене без
+         * потолка над камерой даёт РОВНО НОЛЬ светящихся фасетов (§665). */
+        for (int32_t k = 0; k < cut.nse; k++) {
+          if (cut.se[k].nv <= 0) continue;
+          double c[3] = {0, 0, 0};
+          for (int q = 0; q < cut.se[k].nv; q++)
+            for (int a = 0; a < 3; a++)
+              c[a] += cut.se[k].v[q][a] / (double)cut.se[k].nv;
+          if (fabs(c[0] - lc[0]) <= lu && fabs(c[2] - lc[2]) <= lv && c[1] >= lc[1] - 2.0 * fr.h &&
+              c[1] <= lc[1] + 2.0 * fr.h) {
+            femit[cut.se[k].facet] = 1.0;
+            nlit++;
+          }
+        }
+      } else {
+        /* ИСТОЧНИК ИЗ `Ke` (§667, ровно как §618 сделал для сбора). Путь:
+         * элемент -> его ячейка -> треугольники ячейки -> материал -> `ke3`.
+         * Свип монохромный, поэтому берётся среднее трёх каналов; единицы —
+         * излучённая РАДИОСИТЬ без множителя `π` (`scene_obj.h`).
+         *
+         * ФАСЕТ ОБЩИЙ У МНОГИХ ЭЛЕМЕНТОВ, А МАТЕРИАЛ ЖИВЁТ У ЭЛЕМЕНТА (§667 Р3):
+         * одна плоскость может нести и вывеску, и тёмную стену. Берётся
+         * МАКСИМУМ, а число расхождений СЧИТАЕТСЯ и печатается — приближение
+         * обязано быть числом, а не умолчанием. */
+        for (int32_t k = 0; k < cut.nse; k++) {
+          if (cut.se[k].nv <= 0) continue;
+          int32_t ci = cut.se[k].cell;
+          if (ci < 0 || ci >= mesh.ncell) continue;
+          if (mesh.csize[ci] > 1) nbigcell++;
+          int32_t cellc[3];
           for (int a = 0; a < 3; a++)
-            c[a] += cut.se[k].v[q][a] / (double)cut.se[k].nv;
-        if (fabs(c[0] - lc[0]) <= lu && fabs(c[2] - lc[2]) <= lv && c[1] >= lc[1] - 2.0 * fr.h &&
-            c[1] <= lc[1] + 2.0 * fr.h) {
-          femit[cut.se[k].facet] = 1.0;
+            cellc[a] = mesh.clo[ci][a];
+          const int32_t *ls = NULL;
+          if (ct_list(&CT, cellc, &ls) == 0) {
+            nnomat++;
+            continue;
+          }
+          int32_t mi = m.fm != NULL ? m.fm[ls[0]] : 0;
+          if (mi < 0 || mi >= m.nmtl) mi = 0;
+          const double *ke = m.mtl[mi].ke3;
+          double e = (ke[0] + ke[1] + ke[2]) / 3.0;
+          if (!(e > 0.0)) continue;
+          int32_t fi = cut.se[k].facet;
+          if (femit[fi] > 0.0 && fabs(femit[fi] - e) > 0.0) nconf++;
+          if (e > femit[fi]) femit[fi] = e;
+          emitpow += e * cut.se[k].area;
           nlit++;
         }
       }
@@ -6505,10 +6560,15 @@ int main(int argc, char **argv) {
         if (femit[i] > 0.0) nlitfac++;
       for (int32_t k = 0; k < cut.nse; k++)
         if (femit[cut.se[k].facet] > 0.0 && cut.mvol[cut.se[k].cell][0][0] > 0.0) nlitfluid++;
-      printf("      ВХОД РАЗВЁРТКИ: светящихся ФАСЕТОВ %lld из %d, светящихся элементов во "
-             "ФЛЮИДНЫХ ячейках %lld из %lld; альбедо фасета %.2f, ординат %d\n",
-             (long long)nlitfac, ftab.n, (long long)nlitfluid, (long long)nlit, frho[0],
-             2 * nmu * 4 * nmu);
+      printf("      ВХОД РАЗВЁРТКИ: светящихся ФАСЕТОВ %lld из %d (%.3f %%), светящихся элементов "
+             "во ФЛЮИДНЫХ ячейках %lld из %lld; альбедо фасета %.2f, ординат %d; ИСТОЧНИК %s\n",
+             (long long)nlitfac, ftab.n, 100.0 * (double)nlitfac / (double)(ftab.n ? ftab.n : 1),
+             (long long)nlitfluid, (long long)nlit, frho[0], 2 * nmu * 4 * nmu,
+             xhall ? "площадка от камеры (§479)" : "Ke материалов (§667)");
+      if (!xhall)
+        printf("      ИСТОЧНИК ИЗ Ke: мощность Σ Ke·площадь %.4e, расхождений материала на общем "
+               "фасете %lld, элементов в КРУПНЫХ ячейках %lld, без материала %lld\n",
+               emitpow, (long long)nconf, (long long)nbigcell, (long long)nnomat);
       tr3_dirs dirs;
       if (tr3_dirs_product(&dirs, nmu, nmu) != 0) exit(1);
       tr3_problem prob = {.m = &mesh,
@@ -6688,8 +6748,6 @@ int main(int argc, char **argv) {
   }
 
   /* ---- 4. приёмка: потеря поля (популяция — ВХОД) ---- */
-  celltris CT;
-  ct_build(&CT, &m, &fr, P.b[lev], nocc); /* нужен дальше материалам среза */
   if (!g_render) surf_err(&T, &fr, &m, ct_list, &CT, "");
   if (!g_render) {
     covstat st;

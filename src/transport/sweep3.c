@@ -1333,6 +1333,43 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
                     : ((cu != NULL && (cu->solid[m->f[ibout].ca] || cu->solid[m->f[ibout].cb]))
                            ? "СТЫК"
                            : "внутренняя");
+      /* §719: СВОЙСТВА ХУДШИХ ОБЪЕКТОВ, А НЕ ТОЛЬКО ИХ НОМЕРА. Рядом печатается
+       * ТИПИЧНЫЙ элемент (медианный по площади) — иначе «κ = 1e4» не с чем
+       * сравнить (А1063). */
+      if (isout >= 0 && cu != NULL) {
+        double h2 = m->fr.u[0] * m->fr.u[1];
+        const tr3_selem *sw = &cu->se[isout];
+        double kk = mass_cond(sw->m);
+        int32_t cw = sw->cell;
+        double ffr2 = -1.0, kc = -1.0;
+        int nfc2 = 0;
+        if (cw >= 0 && cw < nc) {
+          double s3 = (double)m->csize[cw];
+          double V = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+          ffr2 = V > 0.0 ? cu->mvol[cw][0][0] / V : -1.0;
+          kc = mass_cond(cu->mvol[cw]);
+          nfc2 = (int)(m->fstart[cw + 1] - m->fstart[cw]);
+        }
+        /* типичный элемент: берётся первый, чья площадь ближе всего к медиане
+         * из уже напечатанного распределения — здесь просто площадь около 0.124 h² */
+        int32_t itypic = -1;
+        double bestd = 1e300;
+        for (int32_t e2 = 0; e2 < nse; e2++) {
+          if (!(cu->se[e2].area > 0.0)) continue;
+          double d2 = fabs(cu->se[e2].area / h2 - 0.124);
+          if (d2 < bestd) {
+            bestd = d2;
+            itypic = e2;
+          }
+        }
+        printf("    §719 ХУДШИЙ ЭЛЕМЕНТ %d: площадь %.4e h², hs_se %.4f, κ(M_e) %.4g, ячейка %d "
+               "(доля флюида %.4g, граней %d, κ(mvol) %.4g)\n",
+               isout, sw->area / h2, hs_se[isout], kk, cw, ffr2, nfc2, kc);
+        if (itypic >= 0)
+          printf("    §719 ТИПИЧНЫЙ ЭЛЕМЕНТ %d (для сравнения): площадь %.4e h², hs_se %.4f, "
+                 "κ(M_e) %.4g\n",
+                 itypic, cu->se[itypic].area / h2, hs_se[itypic], mass_cond(cu->se[itypic].m));
+      }
       printf("    §713 ТАКТ %d, МАКСИМУМ ПО НОСИТЕЛЯМ: |φ| %.4e (ячейка %d, доля флюида %.4g); "
              "|bout| %.4e (грань %d, %s); |sout| %.4e (элемент %d)\n",
              it, mphi, iphi, ffr, mbout, ibout, bkind, msout, isout);

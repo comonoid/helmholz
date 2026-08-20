@@ -6708,6 +6708,7 @@ int main(int argc, char **argv) {
                           .facet_emit = femit,
                           .elem_emit = (xhall || xemitfacet) ? NULL : eemit,
                           .nfacet = ftab.n,
+                          .solid_rho = xrho,
                           .binc0 = bconst,
                           .sig_t = sig_t,
                           .sig_s = sig_s,

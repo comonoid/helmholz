@@ -562,26 +562,11 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       for (int32_t oi = 0; oi < no; oi++) {
         int32_t c = order[oi];
         if (cu != NULL && cu->solid[c]) { /* ячейка целиком в материале */
-          /* §705: СКОЛЬКО ЭНЕРГИИ ЗДЕСЬ ТЕРЯЕТСЯ. До этой правки радианс
-           * сплошной ячейки просто обнулялся, и вошедший в неё поток не
-           * записывался никуда — ни в поглощённое, ни в вытекшее. Отсюда
-           * незамкнутое тождество К40 (недостача 75.6 %, §675).
-           * Считается ТОЧНО, а не оценкой: поток через грань есть
-           * `|ω·n| · Σ_j L_сосед[j] · ∫b_j dA`, где `∫b_j dA` — первая строка
-           * ФЛЮИДНОЙ матрицы грани, уже посчитанной разрезом. */
-          for (int32_t k2 = m->fstart[c]; k2 < m->fstart[c + 1]; k2++) {
-            int32_t f2 = m->flist[k2];
-            int32_t nb2 = (m->f[f2].ca == c) ? m->f[f2].cb : m->f[f2].ca;
-            if (nb2 < 0 || cu->solid[nb2]) continue;
-            double on2 = om[m->f[f2].axis];
-            int into = (m->f[f2].ca == nb2 && on2 > 0.0) || (m->f[f2].cb == nb2 && on2 < 0.0);
-            if (!into) continue;
-            const double (*fm2)[4] = (m->f[f2].ca == nb2) ? cu->ffm[f2] : cu->ffmb[f2];
-            double flx = 0.0;
-            for (int j = 0; j < 4; j++)
-              flx += L[nb2 * 4 + j] * fm2[0][j];
-            psolid_acc += fabs(on2) * d->w[mm] * flx;
-          }
+          /* §705/§707: НАКОПЛЕНИЕ ПЕРЕЕХАЛО В ЦИКЛ ПО ГРАНЯМ. Здесь оно стояло,
+           * пока стык не имел граничного условия; теперь тот же поток считается
+           * там же, где считается вылет через грани куба, и оставлять его тут
+           * значит считать дважды — регрессия §707 П1 это и поймала (`5.6072 ->
+           * 11.214`, ровно вдвое). */
           for (int j = 0; j < 4; j++)
             L[c * 4 + j] = 0.0;
           continue;
@@ -690,6 +675,22 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
               pin_acc += -on * d->w[mm] * accj[0];
             } else {
               int32_t up = mine_is_a ? m->f[f].cb : m->f[f].ca;
+              if (cu != NULL && cu->solid[up]) {
+                /* §707: ВЛЁТ СО СТЫКА «ФЛЮИД — СПЛОШНОЕ». Радианс сплошной
+                 * ячейки нулевой по построению (материал непрозрачен), поэтому
+                 * брать надо не его, а ИСХОДЯЩИЙ радианс стены, хранимый на
+                 * грани, — ровно как у граней куба. В `pin_acc` это НЕ идёт:
+                 * втекло — про поток ИЗВНЕ области, а здесь возвращает своя же
+                 * стена. */
+                const double (*fmine2)[4] = mine_is_a ? cu->ffm[f] : cu->ffmb[f];
+                double accs[4] = {0, 0, 0, 0};
+                for (int j = 0; j < 4; j++)
+                  for (int i = 0; i < 4; i++)
+                    accs[j] += bout[f * 4 + i] * fmine2[i][j];
+                for (int j = 0; j < 4; j++)
+                  rhs[j] -= on * accs[j];
+                continue;
+              }
               double fxb[4][4];
               const double (*fx)[4];
               if (cu != NULL) {
@@ -781,33 +782,54 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       for (int32_t c = 0; c < nc; c++)
         for (int j = 0; j < 4; j++)
           phit[c * 4 + j] += d->w[mm] * L[c * 4 + j];
-
       for (int32_t f = 0; f < m->nf; f++) {
-        if (m->f[f].cb >= 0) continue;
-        int wall = (int)(~m->f[f].cb);
-        double on = om[m->f[f].axis] * ((wall & 1) ? 1.0 : -1.0);
-        if (!(on > 0.0)) continue;
-        int32_t c = m->f[f].ca;
-        double fmmb[4][4];
+        /* §707: ЭТОТ ЦИКЛ ТЕПЕРЬ ОБСЛУЖИВАЕТ ДВА РОДА ГРАНИЦ, А НЕ ОДИН.
+         * Прежде здесь были только грани КУБА (`cb < 0`), а поток, уходивший из
+         * флюидной ячейки в СПЛОШНУЮ, не накапливался нигде и терялся — это и
+         * есть измеренные `76 %` (§706). Стык «флюид — сплошное» есть такая же
+         * стена: осевая грань с известной внешней нормалью, и потому обходится
+         * тем же кодом с той же нормировкой `hsum`. */
+        int32_t c;
+        double on;
         const double (*fmm)[4];
-        if (cu != NULL) {
-          fmm = cu->ffm[f];
+        double fmmb[4][4];
+        int at_solid = 0;
+        if (m->f[f].cb < 0) {
+          int wall0 = (int)(~m->f[f].cb);
+          on = om[m->f[f].axis] * ((wall0 & 1) ? 1.0 : -1.0);
+          if (!(on > 0.0)) continue;
+          c = m->f[f].ca;
+          if (cu != NULL) {
+            fmm = cu->ffm[f];
+          } else {
+            double v[4][3];
+            tr3_face_corners(m, f, v);
+            face_mass2(m, (const double (*)[4][3]) & v, c, c, fmmb);
+            fmm = fmmb;
+          }
+        } else if (cu != NULL && (cu->solid[m->f[f].ca] != cu->solid[m->f[f].cb])) {
+          int a_solid = cu->solid[m->f[f].ca] ? 1 : 0;
+          c = a_solid ? m->f[f].cb : m->f[f].ca;
+          on = a_solid ? -om[m->f[f].axis] : om[m->f[f].axis];
+          if (!(on > 0.0)) continue;
+          fmm = a_solid ? cu->ffmb[f] : cu->ffm[f];
+          at_solid = 1;
         } else {
-          double v[4][3];
-          tr3_face_corners(m, f, v);
-          face_mass2(m, (const double (*)[4][3]) & v, c, c, fmmb);
-          fmm = fmmb;
+          continue;
         }
         double accj[4] = {0, 0, 0, 0};
         for (int j = 0; j < 4; j++)
           for (int i = 0; i < 4; i++)
             accj[j] += L[c * 4 + i] * fmm[i][j];
-        pout_acc += on * d->w[mm] * accj[0];
+        if (at_solid)
+          psolid_acc += on * d->w[mm] * accj[0]; /* пришло В СТЕНУ */
+        else
+          pout_acc += on * d->w[mm] * accj[0]; /* вышло ИЗ ОБЛАСТИ */
         for (int j = 0; j < 4; j++)
           binft[f * 4 + j] += on * d->w[mm] * accj[j];
         /* ЭТАП C: у зеркальной грани копится момент ПО ОРДИНАТЕ, без веса —
          * зеркало не интегрирует по полусфере, оно переставляет направление. */
-        if (mfid != NULL && mfid[f] >= 0)
+        if (!at_solid && mfid != NULL && mfid[f] >= 0)
           for (int j = 0; j < 4; j++)
             mspin[((size_t)mfid[f] * (size_t)nd + (size_t)mm) * 4 + (size_t)j] += accj[j];
       }
@@ -850,20 +872,41 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     }
     st->pin = pin_acc;
     st->pout = pout_acc;
-    st->psolid = psolid_acc;
+    /* §707: в баланс идёт ПОГЛОЩЁННОЕ стеной, а не весь пришедший поток:
+     * доля `solid_rho` возвращается во флюид и учтена влётом с грани. */
+    st->psolid = (1.0 - (p->solid_rho > 0.0 ? p->solid_rho : 0.0)) * psolid_acc;
 
     /* --- стенки и поверхности: новый исходящий радианс, DG1 по положению --- */
-    if (p->wall_rho != NULL)
+    if (p->wall_rho != NULL || (cu != NULL && p->solid_rho > 0.0))
       for (int32_t f = 0; f < m->nf; f++) {
-        if (m->f[f].cb >= 0) continue;
-        int wall = (int)(~m->f[f].cb);
+        /* §707: та же развилка, что при накоплении, — грань КУБА или СТЫК. */
+        int32_t cown;
+        int wall = -1;
+        double rho_w;
+        if (m->f[f].cb < 0) {
+          if (p->wall_rho == NULL) continue;
+          wall = (int)(~m->f[f].cb);
+          rho_w = p->wall_rho[wall];
+          cown = m->f[f].ca;
+        } else if (cu != NULL && p->solid_rho > 0.0 &&
+                   (cu->solid[m->f[f].ca] != cu->solid[m->f[f].cb])) {
+          int a_solid = cu->solid[m->f[f].ca] ? 1 : 0;
+          cown = a_solid ? m->f[f].cb : m->f[f].ca;
+          /* Номер «стенки» по ВНЕШНЕЙ нормали флюидной ячейки: у грани оси `a`
+           * это `2a+1`, если материал с плюс-стороны, и `2a` — если с минус.
+           * Та же нумерация, что у граней куба, поэтому `hsum` берётся готовым. */
+          wall = 2 * m->f[f].axis + (a_solid ? 1 : 0);
+          rho_w = p->solid_rho;
+        } else {
+          continue;
+        }
         double fmm[4][4], rr[4], ee[4];
         if (cu != NULL) {
-          memcpy(fmm, cu->ffm[f], sizeof fmm);
+          memcpy(fmm, (cown == m->f[f].ca) ? cu->ffm[f] : cu->ffmb[f], sizeof fmm);
         } else {
           double v[4][3];
           tr3_face_corners(m, f, v);
-          face_mass2(m, (const double (*)[4][3]) & v, m->f[f].ca, m->f[f].ca, fmm);
+          face_mass2(m, (const double (*)[4][3]) & v, cown, cown, fmm);
         }
         if (!(fmm[0][0] > 0.0)) continue;
         for (int j = 0; j < 4; j++)
@@ -875,7 +918,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
          * то есть DG1 по положению не работал НИ РАЗУ, а его исход менялся от
          * итерации к итерации и не давал развёртке сойтись. */
         double nul[4];
-        tr3_face_null(m, f, m->f[f].ca, nul);
+        tr3_face_null(m, f, cown, nul);
         /* ДВА РАЗНЫХ УСЛОВИЯ, И ТОЛЬКО ВТОРОЕ ЕСТЬ НЕЛИНЕЙНОСТЬ — К86.
          * Вырождение элемента есть свойство ГЕОМЕТРИИ: множество вырожденных
          * элементов от поля не зависит вовсе, и откат на них ЛИНЕЕН. А
@@ -911,8 +954,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
           ee[1] = ee[2] = ee[3] = 0.0;
         }
         for (int j = 0; j < 4; j++)
-          bout[f * 4 + j] = (hsum[wall] > 0.0 ? p->wall_rho[wall] * ee[j] / hsum[wall] : 0.0);
-        if (p->wall_emit != NULL) bout[f * 4] += p->wall_emit[wall];
+          bout[f * 4 + j] = (hsum[wall] > 0.0 ? rho_w * ee[j] / hsum[wall] : 0.0);
+        if (m->f[f].cb < 0 && p->wall_emit != NULL) bout[f * 4] += p->wall_emit[wall];
       }
 
     /* ЭТАП C: ЗЕРКАЛЬНЫЕ ГРАНИ — СВЯЗЬ `m → m′` ТОЧНОЙ ПЕРЕСТАНОВКОЙ.

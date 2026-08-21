@@ -5463,6 +5463,11 @@ int main(int argc, char **argv) {
   int xhall = 0;
   int xemitfacet = 0; /* §670 НК: излучение по-старому, ПО ФАСЕТУ */
   int xnolim = 0;     /* §677 НК: выключить ограничитель — оператор станет ЛИНЕЙНЫМ */
+  int xunit = 0;      /* §729: применить оператор к ЕДИНИЧНОМУ состоянию (источники в
+                       * ноль, φ = bout = sout = 1); всё, что вышло > 1 при альбедо
+                       * 0.7, — локальный усилитель с адресом. С зеркалами (wall_spec)
+                       * прокидка состояния незаконна — mspec наружу не выносится
+                       * (А1108); здесь wall_spec не задаётся вовсе. */
   /* §714: альбедо стыка вынесено в ОТДЕЛЬНЫЙ ключ и по умолчанию ВЫКЛЮЧЕНО:
    * условие §707 усиливает (`bout` доходит до `4.9e+34` за один проход), и
    * держать его рабочим путём нельзя, пока не починено. */
@@ -5510,6 +5515,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xhall") == 0) xhall = 1;
     if (strcmp(argv[i], "xemitfacet") == 0) xemitfacet = 1;
     if (strcmp(argv[i], "xnolim") == 0) xnolim = 1;
+    if (strcmp(argv[i], "xunit") == 0) xunit = 1;
     if (strcmp(argv[i], "xwholemass") == 0) xwholemass = 1;
     if (strcmp(argv[i], "xconst") == 0) xconst = 1;
     if (strncmp(argv[i], "xthin=", 6) == 0) xthin = strtod(argv[i] + 6, NULL);
@@ -6809,7 +6815,114 @@ int main(int argc, char **argv) {
       tr3_stats st;
       memset(&st, 0, sizeof st);
       double tsw = now_s();
-      int src = tr3_sweep_solve(&prob, xit, xtol, phi, &st);
+      int src = 0;
+      if (!xunit) {
+        src = tr3_sweep_solve(&prob, xit, xtol, phi, &st);
+      } else {
+        /* §729: ПРИМЕНИТЬ ОПЕРАТОР К ЕДИНИЧНОМУ СОСТОЯНИЮ. Источники в ноль,
+         * φ = bout = sout = 1, и `xit` применений по одному такту с прокидкой
+         * поверхностного состояния (К76: `bout_in`/`sout_in`). Всё, что вышло
+         * `> 1` при альбедо < 1, — локальный усилитель с адресом. На сценах
+         * без рассеяния (σ_s = 0) и с `wall_rho = NULL` состояние — только
+         * `sout`; `φ` печатается как показание в нормировке `φ/4π` (единичный
+         * радианс со всех сторон даёт скалярный поток 4π, §699). */
+        if (xconst) {
+          fprintf(stderr, "xunit несовместим с xconst: печь задаёт источники, xunit их обнуляет\n");
+          exit(1);
+        }
+        prob.elem_emit = NULL;
+        prob.facet_emit = NULL;
+        prob.warm_start = 1;
+        for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+          phi[4 * (size_t)ci] = 1.0;
+          phi[4 * (size_t)ci + 1] = phi[4 * (size_t)ci + 2] = phi[4 * (size_t)ci + 3] = 0.0;
+        }
+        double *ub = calloc((size_t)mesh.nf * 4, sizeof *ub);
+        double *us = calloc((size_t)(cut.nse > 0 ? cut.nse : 1) * 4, sizeof *us);
+        double *scr9 = malloc((size_t)(mesh.ncell > cut.nse ? mesh.ncell : cut.nse) * sizeof *scr9);
+        if (ub == NULL || us == NULL || scr9 == NULL) exit(1);
+        for (int32_t f = 0; f < mesh.nf; f++)
+          ub[4 * (size_t)f] = 1.0;
+        for (int32_t k = 0; k < cut.nse; k++)
+          us[4 * (size_t)k] = 1.0;
+        const double fourpi = 4.0 * 3.14159265358979323846;
+        for (int ap = 1; ap <= xit; ap++) {
+          prob.bout_in = ub;
+          prob.sout_in = us;
+          memset(&st, 0, sizeof st);
+          src = tr3_sweep_solve(&prob, 1, 0.0, phi, &st);
+          if (src != 0) break;
+          /* элементы: население — ненулевой нулевой коэффициент; нуль здесь
+           * означает «не участвует» (за фильтрами xthin/xsemin или без влёта),
+           * а не «усиление нулевое» — класс А1097 */
+          int64_t nz = 0, ngt1 = 0;
+          double emax = 0.0;
+          int32_t iemax = -1;
+          for (int32_t k = 0; k < cut.nse; k++) {
+            double v = fabs(st.sout[4 * (size_t)k]);
+            if (!(v > 0.0)) continue;
+            scr9[nz++] = v;
+            if (v > 1.0) ngt1++;
+            if (v > emax) {
+              emax = v;
+              iemax = k;
+            }
+          }
+          if (nz > 0) {
+            qsort(scr9, (size_t)nz, sizeof *scr9, cmp_dev699);
+            printf("   §729 ПРИМЕНЕНИЕ %d, ЭЛЕМЕНТЫ (нулевой коэфф.): ненулевых %lld из %d, "
+                   "медиана %.4g, p99 %.4g, МАКС %.4g (элемент %d); > 1: %lld (%.2f %%)\n",
+                   ap, (long long)nz, cut.nse, scr9[nz / 2], scr9[(nz * 99) / 100], emax, iemax,
+                   (long long)ngt1, 100.0 * (double)ngt1 / (double)nz);
+          }
+          /* ячейки: φ/4π по флюиду; нули включаются — замурованные полости
+           * законны (§699). Σφ и max φ в %.17g — слепок проводки П5(б):
+           * такт 1 обязан совпасть побитово между xrho=0.7 и xrho=0. */
+          int64_t nfl9 = 0, cgt1 = 0;
+          double cmax = 0.0, csum = 0.0, phimax = 0.0;
+          int32_t icmax = -1;
+          for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+            if (!(cut.mvol[ci][0][0] > 0.0)) continue;
+            double v = phi[4 * (size_t)ci] / fourpi;
+            scr9[nfl9++] = fabs(v);
+            csum += fabs(phi[4 * (size_t)ci]);
+            if (fabs(phi[4 * (size_t)ci]) > phimax) phimax = fabs(phi[4 * (size_t)ci]);
+            if (v > 1.0) cgt1++;
+            if (fabs(v) > cmax) {
+              cmax = fabs(v);
+              icmax = ci;
+            }
+          }
+          if (nfl9 > 0) {
+            qsort(scr9, (size_t)nfl9, sizeof *scr9, cmp_dev699);
+            printf("   §729   ЯЧЕЙКИ φ/4π: флюидных %lld, медиана %.4g, p99 %.4g, МАКС %.4g "
+                   "(ячейка %d); > 1: %lld (%.2f %%); слепок: Σ|φ| %.17g, max|φ| %.17g\n",
+                   (long long)nfl9, scr9[nfl9 / 2], scr9[(nfl9 * 99) / 100], cmax, icmax,
+                   (long long)cgt1, 100.0 * (double)cgt1 / (double)nfl9, csum, phimax);
+          }
+          double bmax = 0.0;
+          int32_t ibmax = -1;
+          for (int32_t f = 0; f < mesh.nf; f++)
+            if (fabs(st.bout[4 * (size_t)f]) > bmax) {
+              bmax = fabs(st.bout[4 * (size_t)f]);
+              ibmax = f;
+            }
+          printf("   §729   ГРАНИ bout (канал инертен при wall_rho = NULL): max %.4g (грань "
+                 "%d)\n",
+                 bmax, ibmax);
+          /* прокидка состояния: владение прежним входом снимается, новым — у
+           * последнего `st`, и его освобождает общий путь ниже */
+          free(ub);
+          free(us);
+          ub = st.bout;
+          us = st.sout;
+        }
+        free(scr9);
+        if (src != 0) {
+          free(ub);
+          free(us);
+        }
+      }
       tsw = now_s() - tsw;
       if (xconst) {
         /* §699: ОТКЛОНЕНИЕ ОТ ТОЧНОГО РЕШЕНИЯ. Считается по ФЛЮИДНЫМ ячейкам:

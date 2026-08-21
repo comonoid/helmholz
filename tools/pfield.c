@@ -5468,6 +5468,7 @@ int main(int argc, char **argv) {
                         * 0.7, — локальный усилитель с адресом. С зеркалами (wall_spec)
                         * прокидка состояния незаконна — mspec наружу не выносится
                         * (А1108); здесь wall_spec не задаётся вовсе. */
+  int xnomaxp = 0;     /* §735 НК: выключить принцип максимума — вернуть расходимость */
   int32_t xchain = -1; /* §731: трасса цепочки к ячейке — только под xunit: пол
                         * обрыва прогулки есть уровень единичного входа */
   int32_t xcelll[4] = {-1, -1, -1, -1}; /* §733: вскрытие обновления, до 4 ячеек */
@@ -5520,6 +5521,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xemitfacet") == 0) xemitfacet = 1;
     if (strcmp(argv[i], "xnolim") == 0) xnolim = 1;
     if (strcmp(argv[i], "xunit") == 0) xunit = 1;
+    if (strcmp(argv[i], "xnomaxp") == 0) xnomaxp = 1;
     if (strncmp(argv[i], "xchain=", 7) == 0) xchain = (int32_t)strtol(argv[i] + 7, NULL, 10);
     if (strncmp(argv[i], "xcell=", 6) == 0) {
       const char *pl = argv[i] + 6;
@@ -6825,6 +6827,7 @@ int main(int argc, char **argv) {
                           .sig_t = sig_t,
                           .sig_s = sig_s,
                           .limiter = xnolim ? 0 : 1,
+                          .maxp_off = xnomaxp,
                           .chain_cell1 = xchain >= 0 ? xchain + 1 : 0,
                           .trace = xtrace};
       if (xchain >= 0 && !xunit) {

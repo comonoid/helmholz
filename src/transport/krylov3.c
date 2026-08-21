@@ -104,6 +104,8 @@ int tr3_krylov_solve(const tr3_problem *p, int maxit, double tol, double *phi, d
   }
   k.lin = *p;
   k.lin.limiter = 0;
+  k.lin.maxp_off =
+      1; /* §735: принцип максимума нелинеен — Крылову нужен ЛИНЕЙНЫЙ оператор, как и с limiter */
   k.lin.warm_start = 1;
   k.lin.trace = 0;
   k.lin.wall_emit = p->wall_rho != NULL ? wz : NULL;
@@ -128,6 +130,7 @@ int tr3_krylov_solve(const tr3_problem *p, int maxit, double tol, double *phi, d
   {
     tr3_problem p0 = *p;
     p0.limiter = 0;
+    p0.maxp_off = 1; /* §735: тем же путём, что оператор */
     p0.warm_start = 1;
     p0.trace = 0;
     p0.bout_in = zb;
@@ -291,6 +294,8 @@ int tr3_krylov_residual(const tr3_problem *p, const double *phi, const double *b
   k.w = w;
   k.lin = *p;
   k.lin.limiter = 0;
+  k.lin.maxp_off =
+      1; /* §735: принцип максимума нелинеен — Крылову нужен ЛИНЕЙНЫЙ оператор, как и с limiter */
   k.lin.warm_start = 1;
   k.lin.trace = 0;
   k.lin.wall_emit = p->wall_rho != NULL ? wz : NULL;
@@ -313,6 +318,7 @@ int tr3_krylov_residual(const tr3_problem *p, const double *phi, const double *b
   }
   tr3_problem p0 = *p;
   p0.limiter = 0;
+  p0.maxp_off = 1; /* §735: тем же путём, что оператор */
   p0.warm_start = 1;
   p0.trace = 0;
   p0.bout_in = zb;

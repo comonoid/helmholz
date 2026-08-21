@@ -121,6 +121,34 @@ static int cmp_dbl_dbg(const void *a, const void *b) {
   return x < y ? -1 : (x > y ? 1 : 0);
 }
 
+static int cmp_i32_dbg(const void *a, const void *b) {
+  int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
+  return x < y ? -1 : (x > y ? 1 : 0);
+}
+
+/* §727: медиана значений > 0 по набору индексов. Значения ≤ 0 исключаются:
+ * нуль у усиления проектора значит «не считано» (А1097, ложный ноль), а
+ * отрицательная κ — флаг вырождения из mass_cond, не число. Возврат −1:
+ * положительных значений в наборе нет. */
+static double med_idx_dbg(const double *v, const int32_t *idx, int64_t n, double *scratch) {
+  int64_t k = 0;
+  for (int64_t i = 0; i < n; i++)
+    if (v[idx[i]] > 0.0) scratch[k++] = v[idx[i]];
+  if (k == 0) return -1.0;
+  qsort(scratch, (size_t)k, sizeof *scratch, cmp_dbl_dbg);
+  return scratch[k / 2];
+}
+
+/* §727: число различных значений; буфер сортируется на месте */
+static int64_t nuniq_i32_dbg(int32_t *a, int64_t n) {
+  if (n == 0) return 0;
+  qsort(a, (size_t)n, sizeof *a, cmp_i32_dbg);
+  int64_t u = 1;
+  for (int64_t i = 1; i < n; i++)
+    if (a[i] != a[i - 1]) u++;
+  return u;
+}
+
 /* Решение 3x3 с частичным выбором. Возврат 1 при вырождении. */
 static int solve3(double a[3][3], double b[3], double x[3]) {
   for (int k = 0; k < 3; k++) {
@@ -893,6 +921,9 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       free(binf);
       free(sout);
       free(sinf);
+      free(kadbg);
+      free(gdbg);
+      free(phiprev_dbg);
       free(hs_se);
       free(hs_out);
       free(bprev);
@@ -1156,6 +1187,98 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         }
         free(gi);
       }
+    }
+    /* §727: ЧТО ОБЩЕГО У ХВОСТА. Медианы шести уже стоящих величин по
+     * множеству S (усиление за такт выше порога), по всей популяции §725 и по
+     * контрольной выборке того же размера — без неё различия не читаются
+     * (А1063), а если различия появятся и у неё, врёт сам отбор. Считается ДО
+     * перезаписи `sprev`; `kadbg` в этой точке ещё держит значения ТЕКУЩЕГО
+     * такта (обнуляется ниже, в блоке §723). */
+    if (p->trace > 0 && nse > 0 && cu != NULL && gdbg != NULL && kadbg != NULL) {
+      /* §726: медиана g_it 1.05, хвост 6e+06…1.1e+07. Два порога: 100 —
+       * исходное задание (отстоит от обеих мод на два порядка), 1e+06 выделяет
+       * сам «миллионный» хвост. А1101: порог 100 ловит ещё и широкое плечо
+       * (10…24 % популяции), разбавляющее медианный портрет. */
+      static const double gthr2[2] = {100.0, 1e+06};
+      enum { NQ = 6 };
+      double *q6 = malloc((size_t)NQ * (size_t)nse * sizeof *q6);
+      int32_t *pe = malloc((size_t)nse * sizeof *pe);
+      int32_t *te = malloc((size_t)nse * sizeof *te);
+      int32_t *ke = malloc((size_t)nse * sizeof *ke);
+      int32_t *cbuf = malloc((size_t)nse * sizeof *cbuf);
+      double *scr = malloc((size_t)nse * sizeof *scr);
+      if (q6 != NULL && pe != NULL && te != NULL && ke != NULL && cbuf != NULL && scr != NULL) {
+        double h2 = m->fr.u[0] * m->fr.u[1];
+        int64_t npop = 0;
+        for (int32_t e2 = 0; e2 < nse; e2++) {
+          const tr3_selem *se2 = &cu->se[e2];
+          int32_t c2 = se2->cell;
+          double *qq = q6; /* строка q — величина, столбец — элемент */
+          qq[0 * (size_t)nse + (size_t)e2] = se2->area / h2;
+          qq[1 * (size_t)nse + (size_t)e2] = hs_se[e2];
+          qq[2 * (size_t)nse + (size_t)e2] = gdbg[e2];
+          double ffr3 = -1.0, kmv = -1.0, ka = -1.0;
+          if (c2 >= 0 && c2 < nc) {
+            double s3 = (double)m->csize[c2];
+            double vcell = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+            ffr3 = vcell > 0.0 ? cu->mvol[c2][0][0] / vcell : -1.0;
+            kmv = mass_cond(cu->mvol[c2]);
+            ka = kadbg[c2];
+          }
+          qq[3 * (size_t)nse + (size_t)e2] = ffr3;
+          qq[4 * (size_t)nse + (size_t)e2] = kmv;
+          qq[5 * (size_t)nse + (size_t)e2] = ka;
+          if (fabs(sprev[e2 * 4]) > 0.0) pe[npop++] = e2;
+        }
+        for (int t2 = 0; t2 < 2 && npop > 0; t2++) {
+          const double gtail = gthr2[t2];
+          int64_t ntl = 0;
+          for (int64_t i = 0; i < npop; i++) {
+            int32_t e2 = pe[i];
+            if (fabs(sout[e2 * 4]) / fabs(sprev[e2 * 4]) > gtail) te[ntl++] = e2;
+          }
+          if (ntl == 0) continue;
+          /* А1100: контроль — хеш-детерминированный, НЕ стрижка. Элементы
+           * одной ячейки лежат в массиве подряд, и выборка «каждый k-й» при
+           * k ≥ 2 не может взять двух из одной ячейки — её доля различных
+           * ячеек равна 1 по построению, как база кластеризации она слепа.
+           * Кнутов множитель даёт воспроизводимую псевдослучайную выборку
+           * ожидаемого размера ntl без rand(). */
+          int64_t nk2 = 0;
+          for (int64_t i = 0; i < npop; i++) {
+            uint32_t hsh = (uint32_t)pe[i] * 2654435761u;
+            if ((int64_t)(hsh % (uint32_t)npop) < ntl) ke[nk2++] = pe[i];
+          }
+          double mt[NQ], mp[NQ], mk[NQ];
+          for (int q = 0; q < NQ; q++) {
+            const double *vq = q6 + (size_t)q * (size_t)nse;
+            mt[q] = med_idx_dbg(vq, te, ntl, scr);
+            mp[q] = med_idx_dbg(vq, pe, npop, scr);
+            mk[q] = nk2 > 0 ? med_idx_dbg(vq, ke, nk2, scr) : -1.0;
+          }
+          for (int64_t i = 0; i < ntl; i++)
+            cbuf[i] = cu->se[te[i]].cell;
+          int64_t uct = nuniq_i32_dbg(cbuf, ntl);
+          for (int64_t i = 0; i < nk2; i++)
+            cbuf[i] = cu->se[ke[i]].cell;
+          int64_t uck = nuniq_i32_dbg(cbuf, nk2);
+          printf("    §727 ХВОСТ g > %g (такт %d): элементов %lld из %lld (%.2f %%), различных "
+                 "ячеек %lld из %lld (контроль: %lld из %lld)\n",
+                 gtail, it, (long long)ntl, (long long)npop, 100.0 * (double)ntl / (double)npop,
+                 (long long)uct, (long long)ntl, (long long)uck, (long long)nk2);
+          printf("    §727   медианы ХВОСТ/ВСЕ/КОНТРОЛЬ: площадь h² %.4g/%.4g/%.4g; hs_se "
+                 "%.4g/%.4g/%.4g; g_proj %.4g/%.4g/%.4g; доля флюида %.4g/%.4g/%.4g; κ(mvol) "
+                 "%.4g/%.4g/%.4g; κ(A) %.4g/%.4g/%.4g\n",
+                 mt[0], mp[0], mk[0], mt[1], mp[1], mk[1], mt[2], mp[2], mk[2], mt[3], mp[3], mk[3],
+                 mt[4], mp[4], mk[4], mt[5], mp[5], mk[5]);
+        }
+      }
+      free(q6);
+      free(pe);
+      free(te);
+      free(ke);
+      free(cbuf);
+      free(scr);
     }
     for (int32_t i = 0; i < nse * 4; i++) {
       double dd = fabs(sout[i] - sprev[i]);
@@ -1649,6 +1772,9 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   free(phin);
   free(binf);
   free(sinf);
+  free(kadbg);
+  free(gdbg);
+  free(phiprev_dbg);
   free(hs_se);
   free(hs_out);
   free(bprev);

@@ -5461,16 +5461,17 @@ int main(int argc, char **argv) {
    * воспроизведения старых прогонов; `xrho` — альбедо фасета, число не
    * магическое, оно ключ, и негативный контроль ставит его в ноль. */
   int xhall = 0;
-  int xemitfacet = 0;  /* §670 НК: излучение по-старому, ПО ФАСЕТУ */
-  int xnolim = 0;      /* §677 НК: выключить ограничитель — оператор станет ЛИНЕЙНЫМ */
-  int xunit = 0;       /* §729: применить оператор к ЕДИНИЧНОМУ состоянию (источники в
-                        * ноль, φ = bout = sout = 1); всё, что вышло > 1 при альбедо
-                        * 0.7, — локальный усилитель с адресом. С зеркалами (wall_spec)
-                        * прокидка состояния незаконна — mspec наружу не выносится
-                        * (А1108); здесь wall_spec не задаётся вовсе. */
-  int xnomaxp = 0;     /* §735 НК: выключить принцип максимума — вернуть расходимость */
-  int32_t xchain = -1; /* §731: трасса цепочки к ячейке — только под xunit: пол
-                        * обрыва прогулки есть уровень единичного входа */
+  int xemitfacet = 0;            /* §670 НК: излучение по-старому, ПО ФАСЕТУ */
+  int xnolim = 0;                /* §677 НК: выключить ограничитель — оператор станет ЛИНЕЙНЫМ */
+  int xunit = 0;                 /* §729: применить оператор к ЕДИНИЧНОМУ состоянию (источники в
+                                  * ноль, φ = bout = sout = 1); всё, что вышло > 1 при альбедо
+                                  * 0.7, — локальный усилитель с адресом. С зеркалами (wall_spec)
+                                  * прокидка состояния незаконна — mspec наружу не выносится
+                                  * (А1108); здесь wall_spec не задаётся вовсе. */
+  int xmatrho = 0, xrho_set = 0; /* §737: материальные альбедо; явный xrho= несовместим */
+  int xnomaxp = 0;               /* §735 НК: выключить принцип максимума — вернуть расходимость */
+  int32_t xchain = -1;           /* §731: трасса цепочки к ячейке — только под xunit: пол
+                                  * обрыва прогулки есть уровень единичного входа */
   int32_t xcelll[4] = {-1, -1, -1, -1}; /* §733: вскрытие обновления, до 4 ячеек */
   int xdir = -1;                        /* §733: направление вскрытия */
   /* §714: альбедо стыка вынесено в ОТДЕЛЬНЫЙ ключ и по умолчанию ВЫКЛЮЧЕНО:
@@ -5539,7 +5540,11 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "xsolidrho=", 10) == 0) xsolidrho = strtod(argv[i] + 10, NULL);
     if (strncmp(argv[i], "xit=", 4) == 0) xit = (int)strtol(argv[i] + 4, NULL, 10);
     if (strncmp(argv[i], "xtol=", 5) == 0) xtol = strtod(argv[i] + 5, NULL);
-    if (strncmp(argv[i], "xrho=", 5) == 0) xrho = strtod(argv[i] + 5, NULL);
+    if (strncmp(argv[i], "xrho=", 5) == 0) {
+      xrho = strtod(argv[i] + 5, NULL);
+      xrho_set = 1;
+    }
+    if (strcmp(argv[i], "xmatrho") == 0) xmatrho = 1;
     if (strcmp(argv[i], "noshift") == 0) g_noshift = 1;
     if (strcmp(argv[i], "raysweep") == 0) g_raysweep = 1;
     if (strncmp(argv[i], "seed=", 5) == 0) g_seed = (int32_t)strtol(argv[i] + 5, NULL, 10);
@@ -6684,6 +6689,23 @@ int main(int argc, char **argv) {
       if (frho == NULL || femit == NULL || sig_t == NULL || sig_s == NULL || phi == NULL) exit(1);
       for (int32_t i = 0; i < ftab.n; i++)
         frho[i] = xrho;
+      /* §737: накопители материального альбедо по фасету (только под xmatrho) */
+      double *frnum = NULL, *frden = NULL, *frmn = NULL, *frmx = NULL;
+      if (xmatrho) {
+        if (xrho_set || xhall) {
+          fprintf(stderr, "xmatrho несовместим с явным xrho= и с xhall\n");
+          exit(1);
+        }
+        frnum = calloc((size_t)ftab.n, sizeof *frnum);
+        frden = calloc((size_t)ftab.n, sizeof *frden);
+        frmn = malloc((size_t)ftab.n * sizeof *frmn);
+        frmx = malloc((size_t)ftab.n * sizeof *frmx);
+        if (frnum == NULL || frden == NULL || frmn == NULL || frmx == NULL) exit(1);
+        for (int32_t i = 0; i < ftab.n; i++) {
+          frmn[i] = 2.0;
+          frmx[i] = -1.0;
+        }
+      }
       double lc[3], lu = 0.0, lv = 0.0;
       for (int k = 0; k < 3; k++)
         lc[k] = 0.5 * (lo[k] + hi[k]);
@@ -6753,6 +6775,20 @@ int main(int argc, char **argv) {
           }
           int32_t mi = m.fm != NULL ? m.fm[ls[0]] : 0;
           if (mi < 0 || mi >= m.nmtl) mi = 0;
+          /* §737: материальное альбедо, площадно-взвешенно ПО ФАСЕТУ. Путь
+           * материала тот же, что у Ke; kd — одноканальное среднее
+           * (scene_obj.h: «перенос считает им»), свип монохромный. Разброс kd
+           * на общем фасете СЧИТАЕТСЯ (А1135 — класс смазки §670). */
+          if (xmatrho && frnum != NULL) {
+            double kd = m.mtl[mi].kd;
+            if (!(kd >= 0.0 && kd <= 1.0)) kd = 0.5; /* как в alb() сбора */
+            int32_t fi2 = cut.se[k].facet;
+            double ar = cut.se[k].area;
+            frnum[fi2] += kd * ar;
+            frden[fi2] += ar;
+            if (kd < frmn[fi2]) frmn[fi2] = kd;
+            if (kd > frmx[fi2]) frmx[fi2] = kd;
+          }
           const double *ke = m.mtl[mi].ke3;
           double e = (ke[0] + ke[1] + ke[2]) / 3.0;
           if (!(e > 0.0)) continue;
@@ -6769,6 +6805,45 @@ int main(int argc, char **argv) {
           nlit++;
         }
       }
+      /* §737: заполнение и печать материального альбедо. Без материала — 0.5,
+       * как в alb() сбора; сводка обязана быть напечатана, иначе сверка с
+       * эталоном останется без знаменателя (А1063). */
+      if (xmatrho && frnum != NULL) {
+        int64_t nsup = 0, nnomat2 = 0, nconfr = 0;
+        double wnum = 0.0, wden = 0.0, spread = 0.0;
+        double *med9 = malloc((size_t)(ftab.n > 0 ? ftab.n : 1) * sizeof *med9);
+        if (med9 == NULL) exit(1);
+        for (int32_t i = 0; i < ftab.n; i++) {
+          if (frden[i] > 0.0) {
+            frho[i] = frnum[i] / frden[i];
+            med9[nsup++] = frho[i];
+            wnum += frnum[i];
+            wden += frden[i];
+            if (frmx[i] - frmn[i] > 0.0) {
+              nconfr++;
+              if (frmx[i] - frmn[i] > spread) spread = frmx[i] - frmn[i];
+            }
+          } else {
+            frho[i] = 0.5;
+            nnomat2++;
+          }
+        }
+        double wavg = wden > 0.0 ? wnum / wden : -1.0;
+        double medv = -1.0;
+        if (nsup > 0) {
+          qsort(med9, (size_t)nsup, sizeof *med9, cmp_dev699);
+          medv = med9[nsup / 2];
+        }
+        printf("   §737 МАТЕРИАЛЬНЫЕ АЛЬБЕДО: фасетов с носителем %lld из %d, без материала %lld "
+               "(-> 0.5); площадь-взвешенное %.4f, медиана %.4f; фасетов с РАЗНЫМИ kd %lld "
+               "(макс разброс %.3f)\n",
+               (long long)nsup, ftab.n, (long long)nnomat2, wavg, medv, (long long)nconfr, spread);
+        free(med9);
+      }
+      free(frnum);
+      free(frden);
+      free(frmn);
+      free(frmx);
       /* ВХОД РАЗВЁРТКИ, А НЕ ТОЛЬКО ЕЁ ВЫХОД (А807). Ложный ноль на выходе
        * неотличим от «источник не задан», пока не напечатан сам источник. */
       /* ВТОРАЯ СУММА СЧИТАЕТСЯ ПО САМОМУ МАССИВУ (§670 Р4), а не повторным

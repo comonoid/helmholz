@@ -827,6 +827,16 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
             }
           }
 
+        /* §733: снимок системы до solve4 — он портит вход. */
+        int isdump = 0;
+        if (p->trace > 0 && cu != NULL && p->dump_dir1 == mm + 1)
+          for (int q = 0; q < 4; q++)
+            if (p->dump_cell1[q] == c + 1) isdump = 1;
+        double Adump[4][4], rdump[4];
+        if (isdump) {
+          memcpy(Adump, A, sizeof Adump);
+          memcpy(rdump, rhs, sizeof rdump);
+        }
         double a0row[4], rhs0 = rhs[0];
         for (int j = 0; j < 4; j++)
           a0row[j] = A[0][j];
@@ -862,6 +872,124 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         }
         for (int j = 0; j < 4; j++)
           L[c * 4 + j] = cf[j];
+
+        /* §733: ПЕЧАТЬ ВСКРЫТИЯ. Раскладка строки 0 (баланс потоков)
+         * пересчитывается повторной прогулкой по граням и элементам — все
+         * данные (L верховых, bout, sout, матрицы) в этой точке ещё живы.
+         * Отношения печатаются и к |rhs0|, и к Σ|влётов| — rhs0 может быть
+         * мал из-за компенсации влётов, и деление на него врёт (А1120). */
+        if (isdump) {
+          printf("    §733 ВСКРЫТИЕ ячейки %d, направление %d (%.3f, %.3f, %.3f), такт %d\n", c, mm,
+                 om[0], om[1], om[2], it);
+          for (int j = 0; j < 4; j++)
+            printf("      §733 A[%d] = %14.6e %14.6e %14.6e %14.6e   rhs[%d] = %14.6e\n", j,
+                   Adump[j][0], Adump[j][1], Adump[j][2], Adump[j][3], j, rdump[j]);
+          double cmin = 1e300, cmax = -1e300;
+          for (int k2 = 0; k2 < 8; k2++) {
+            double v = cf[0];
+            for (int a = 0; a < 3; a++)
+              v += cf[a + 1] * (((k2 >> a) & 1) ? 0.5 : -0.5);
+            if (v < cmin) cmin = v;
+            if (v > cmax) cmax = v;
+          }
+          double r0 = 0.0;
+          for (int i = 0; i < 4; i++)
+            r0 += Adump[0][i] * cf[i];
+          printf("      §733 решение cf = %.6e %.6e %.6e %.6e; κ(A) %.4g; углы полинома мин "
+                 "%.6e макс %.6e; невязка строки 0 %.3e (отн. %.3e)\n",
+                 cf[0], cf[1], cf[2], cf[3], mass_cond(Adump), cmin, cmax, fabs(r0 - rdump[0]),
+                 fabs(rdump[0]) > 0.0 ? fabs(r0 - rdump[0]) / fabs(rdump[0]) : -1.0);
+          double sumin = 0.0, sumout = 0.0, absin = 0.0, maxout = 0.0;
+          for (int32_t k2 = m->fstart[c]; k2 < m->fstart[c + 1]; k2++) {
+            int32_t f = m->flist[k2];
+            int mia = m->f[f].ca == c;
+            double sgn2;
+            if (m->f[f].cb < 0)
+              sgn2 = ((int)(~m->f[f].cb) & 1) ? 1.0 : -1.0;
+            else
+              sgn2 = mia ? 1.0 : -1.0;
+            double on2 = om[m->f[f].axis] * sgn2;
+            if (!(fabs(on2) > 0.0)) continue;
+            const double (*fmine2)[4] = mia ? cu->ffm[f] : cu->ffmb[f];
+            if (on2 > 0.0) {
+              double v0 = 0.0;
+              for (int i = 0; i < 4; i++)
+                v0 += cf[i] * fmine2[i][0];
+              v0 *= on2;
+              int32_t dn = (m->f[f].cb < 0) ? -1 : (mia ? m->f[f].cb : m->f[f].ca);
+              printf("      §733 НИЗОВАЯ  грань %7d ось %d сосед %7d%s: вылет %14.6e\n", f,
+                     m->f[f].axis, dn, dn < 0 ? " (КУБ)" : ((cu->solid[dn]) ? " (СТЫК)" : ""), v0);
+              sumout += v0;
+              if (fabs(v0) > maxout) maxout = fabs(v0);
+            } else {
+              int32_t up2 = (m->f[f].cb < 0) ? -1 : (mia ? m->f[f].cb : m->f[f].ca);
+              double v0 = 0.0;
+              const char *kind = "";
+              if (up2 < 0) {
+                /* куб: на этом стенде wall_rho = NULL и влёт binc; повторяем
+                 * формулу сборки для строки 0 */
+                double s2 = (double)m->csize[c];
+                double cen[3];
+                for (int a = 0; a < 3; a++)
+                  cen[a] = m->fr.o[a] + m->fr.u[a] * ((double)m->clo[c][a] + 0.5 * s2);
+                double lb0 = p->binc0;
+                for (int a = 0; a < 3; a++)
+                  lb0 += p->binc[a] * (cen[a] - p->binx0[a]);
+                double lb[4] = {lb0, 0.0, 0.0, 0.0};
+                for (int a = 0; a < 3; a++)
+                  lb[a + 1] = p->binc[a] * s2 * m->fr.u[a];
+                for (int i = 0; i < 4; i++)
+                  v0 += lb[i] * fmine2[i][0];
+                v0 *= -on2;
+                kind = " (КУБ)";
+              } else if (cu->solid[up2]) {
+                for (int i = 0; i < 4; i++)
+                  v0 += bout[f * 4 + i] * fmine2[i][0];
+                v0 *= -on2;
+                kind = " (СТЫК)";
+              } else {
+                const double (*fx2)[4] = cu->ffmx[f];
+                for (int i = 0; i < 4; i++)
+                  v0 += L[up2 * 4 + i] * (mia ? fx2[0][i] : fx2[i][0]);
+                v0 *= -on2;
+              }
+              printf("      §733 ВЕРХОВАЯ грань %7d ось %d сосед %7d%s: влёт  %14.6e\n", f,
+                     m->f[f].axis, up2, kind, v0);
+              sumin += v0;
+              absin += fabs(v0);
+            }
+          }
+          for (int32_t k2 = cu->sestart[c]; k2 < cu->sestart[c + 1]; k2++) {
+            int32_t e = cu->selist[k2];
+            const tr3_selem *se2 = &cu->se[e];
+            double on2 = om[0] * se2->n[0] + om[1] * se2->n[1] + om[2] * se2->n[2];
+            if (!(fabs(on2) > 0.0)) continue;
+            if (on2 < 0.0) {
+              double v0 = 0.0;
+              for (int i = 0; i < 4; i++)
+                v0 += cf[i] * se2->m[i][0];
+              v0 *= -on2;
+              printf("      §733 ЭЛЕМЕНТ-ВЫТОК %7d (площадь %.3e): вылет %14.6e\n", e, se2->area,
+                     v0);
+              sumout += v0;
+              if (fabs(v0) > maxout) maxout = fabs(v0);
+            } else {
+              double v0 = 0.0;
+              for (int i = 0; i < 4; i++)
+                v0 += sout[e * 4 + i] * se2->m[i][0];
+              v0 *= on2;
+              printf("      §733 ЭЛЕМЕНТ-ВТОК  %7d (площадь %.3e): влёт  %14.6e\n", e, se2->area,
+                     v0);
+              sumin += v0;
+              absin += fabs(v0);
+            }
+          }
+          printf("    §733 СВОДКА ячейки %d: Σвлёт %14.6e, Σвылет %14.6e, Σ|влёт| %14.6e; МАКС "
+                 "|вылет| %14.6e; макс/|rhs0| %.4g; макс/Σ|влёт| %.4g\n",
+                 c, sumin, sumout, absin, maxout,
+                 fabs(rdump[0]) > 0.0 ? maxout / fabs(rdump[0]) : -1.0,
+                 absin > 0.0 ? maxout / absin : -1.0);
+        }
 
         /* облучённость поверхностных элементов — из того же выточного члена */
         if (cu != NULL)

@@ -5470,6 +5470,8 @@ int main(int argc, char **argv) {
                         * (А1108); здесь wall_spec не задаётся вовсе. */
   int32_t xchain = -1; /* §731: трасса цепочки к ячейке — только под xunit: пол
                         * обрыва прогулки есть уровень единичного входа */
+  int32_t xcelll[4] = {-1, -1, -1, -1}; /* §733: вскрытие обновления, до 4 ячеек */
+  int xdir = -1;                        /* §733: направление вскрытия */
   /* §714: альбедо стыка вынесено в ОТДЕЛЬНЫЙ ключ и по умолчанию ВЫКЛЮЧЕНО:
    * условие §707 усиливает (`bout` доходит до `4.9e+34` за один проход), и
    * держать его рабочим путём нельзя, пока не починено. */
@@ -5519,6 +5521,15 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xnolim") == 0) xnolim = 1;
     if (strcmp(argv[i], "xunit") == 0) xunit = 1;
     if (strncmp(argv[i], "xchain=", 7) == 0) xchain = (int32_t)strtol(argv[i] + 7, NULL, 10);
+    if (strncmp(argv[i], "xcell=", 6) == 0) {
+      const char *pl = argv[i] + 6;
+      for (int q = 0; q < 4 && *pl != 0; q++) {
+        char *end;
+        xcelll[q] = (int32_t)strtol(pl, &end, 10);
+        pl = (*end == ',') ? end + 1 : end;
+      }
+    }
+    if (strncmp(argv[i], "xdir=", 5) == 0) xdir = (int)strtol(argv[i] + 5, NULL, 10);
     if (strcmp(argv[i], "xwholemass") == 0) xwholemass = 1;
     if (strcmp(argv[i], "xconst") == 0) xconst = 1;
     if (strncmp(argv[i], "xthin=", 6) == 0) xthin = strtod(argv[i] + 6, NULL);
@@ -6820,6 +6831,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "xchain= требует xunit: пол обрыва трассы — уровень единичного входа\n");
         exit(1);
       }
+      /* §733: вскрытие обновления — предсказания калиброваны единичным входом */
+      if ((xcelll[0] >= 0 || xdir >= 0) && (!xunit || xcelll[0] < 0 || xdir < 0)) {
+        fprintf(stderr, "xcell=/xdir= требуют xunit и друг друга\n");
+        exit(1);
+      }
+      for (int q = 0; q < 4; q++)
+        prob.dump_cell1[q] = xcelll[q] >= 0 ? xcelll[q] + 1 : 0;
+      prob.dump_dir1 = xdir >= 0 ? xdir + 1 : 0;
       tr3_stats st;
       memset(&st, 0, sizeof st);
       double tsw = now_s();

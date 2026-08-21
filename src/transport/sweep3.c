@@ -86,6 +86,18 @@ static int solve4(double a[4][4], double b[4], double x[4]) {
   return 0;
 }
 
+/* §731: ТРАССА ЦЕПОЧКИ — константы прибора.
+ * HZ_CHAIN_MAX: одно направление пересекает не больше 3·2^lev плоскостей сетки
+ * (на lev = 7 это 384); 512 — с запасом, а не подбор.
+ * HZ_CHAIN_FLOOR: пол обрыва прогулки — уровень ЕДИНИЧНОГО входа `xunit`;
+ * ниже него ячейка не усилена, идти дальше нечего (А1114: звено ниже пола
+ * записывается последним, чтобы скачок через пол не потерялся).
+ * HZ_CHAIN_AMP: порог «усиливающего шага» для сводки — здоровый разовый
+ * перелёт DG1 замерен §729 на box: 1.267; 1.5 лежит выше него. */
+#define HZ_CHAIN_MAX 512
+static const double HZ_CHAIN_FLOOR = 1.0;
+static const double HZ_CHAIN_AMP = 1.5;
+
 /* §690: ОБУСЛОВЛЕННОСТЬ МАТРИЦЫ МАСС ЯЧЕЙКИ, `‖M‖_F · ‖M⁻¹‖_F`.
  *
  * Обратная берётся ЧЕТЫРЬМЯ решениями `M x = e_i` тем же `solve4`, каким
@@ -310,6 +322,9 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   double *gdbg = NULL;
   /* §723: обусловленность матрицы обновления ячейки, максимум по направлениям. */
   double *kadbg = NULL;
+  /* §731: трасса цепочки — лучшая (по `|L|` в цели) цепочка такта. */
+  int32_t *chnc = NULL;
+  double *chnl = NULL;
   double *hs_se = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   double *hs_out = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   /* ЭТАП C: ЗЕРКАЛЬНЫЕ ГРАНИ. Индекс `mfid[f]` есть номер грани среди
@@ -353,6 +368,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     free(kadbg);
     free(gdbg);
     free(phiprev_dbg);
+    free(chnc);
+    free(chnl);
     free(hs_se);
     free(hs_out);
     free(bprev);
@@ -522,6 +539,12 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
    * `sweep3.h`). Ограничение про `bout`/`sout` там же. */
   if (p->trace > 0 && nse > 0) gdbg = calloc((size_t)nse, sizeof *gdbg);
   if (p->trace > 0) kadbg = calloc((size_t)nc, sizeof *kadbg);
+  /* §731: цель трассы хранится в задаче со сдвигом +1 (см. sweep3.h) */
+  const int32_t chain_tgt = p->chain_cell1 - 1;
+  if (p->trace > 0 && p->chain_cell1 > 0 && p->chain_cell1 <= nc) {
+    chnc = calloc(HZ_CHAIN_MAX, sizeof *chnc);
+    chnl = calloc(HZ_CHAIN_MAX, sizeof *chnl);
+  }
   if (p->trace > 0) {
     phiprev_dbg = calloc((size_t)nc, sizeof *phiprev_dbg);
     if (phiprev_dbg != NULL)
@@ -558,6 +581,9 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
    * `corner_min < 0` — свойство ПОЛЯ, то есть ПЕРЕКЛЮЧАТЕЛЬ. Пока они считались
    * одним числом, сказать, ЧТО дрожит, было нечем. `_thin` — доля на ЩЕПКАХ. */
   int nfb_fg = 0, nfb_fp = 0, nfb_eg = 0, nfb_ep = 0, nfb_thin = 0;
+  /* §731: лучшая цепочка такта — длина, направление, `|L|` в цели. */
+  int chn_n = 0, chn_mm = -1;
+  double chn_bestlt = -1.0;
   double resid = 0.0;
   /* К81: пол невязки ловится ЗАСТОЕМ, а не порогом на её величину */
   double best = 1e300;
@@ -856,6 +882,52 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       for (int32_t c = 0; c < nc; c++)
         for (int j = 0; j < 4; j++)
           phit[c * 4 + j] += d->w[mm] * L[c * 4 + j];
+      /* §731: ОБРАТНАЯ ПРОГУЛКА ОТ ЦЕЛИ. Угловое поле `L` направления в этой
+       * точке полно; шаг — к наибольшему по `|L|` верховому соседу (прокси
+       * вклада, А1113). Однопоточно, как и весь цикл (nth = 1). */
+      if (chnc != NULL && chnl != NULL && fabs(L[(size_t)chain_tgt * 4]) > chn_bestlt) {
+        chn_bestlt = fabs(L[(size_t)chain_tgt * 4]);
+        chn_mm = mm;
+        int32_t c2 = chain_tgt;
+        int nch = 0;
+        while (nch < HZ_CHAIN_MAX) {
+          chnc[nch] = c2;
+          chnl[nch] = fabs(L[(size_t)c2 * 4]);
+          nch++;
+          int32_t bu = -1;
+          double bl = -1.0;
+          for (int32_t q = m->fstart[c2]; q < m->fstart[c2 + 1]; q++) {
+            int32_t f = m->flist[q];
+            double on = om[m->f[f].axis];
+            int32_t u = -1;
+            if (on > 0.0) {
+              if (m->f[f].cb == c2) u = m->f[f].ca;
+            } else if (on < 0.0) {
+              if (m->f[f].ca == c2) u = m->f[f].cb;
+            }
+            if (u < 0) continue;
+            if (cu != NULL && cu->solid[u]) continue;
+            double lu = fabs(L[(size_t)u * 4]);
+            if (lu > bl) {
+              bl = lu;
+              bu = u;
+            }
+          }
+          if (bu < 0) break;
+          if (bl < HZ_CHAIN_FLOOR) {
+            /* А1114: звено ниже пола записывается последним — скачок ЧЕРЕЗ пол
+             * иначе потерялся бы вместе с обрывом */
+            if (nch < HZ_CHAIN_MAX) {
+              chnc[nch] = bu;
+              chnl[nch] = bl;
+              nch++;
+            }
+            break;
+          }
+          c2 = bu;
+        }
+        chn_n = nch;
+      }
       for (int32_t f = 0; f < m->nf; f++) {
         /* §707: ЭТОТ ЦИКЛ ТЕПЕРЬ ОБСЛУЖИВАЕТ ДВА РОДА ГРАНИЦ, А НЕ ОДИН.
          * Прежде здесь были только грани КУБА (`cb < 0`), а поток, уходивший из
@@ -924,6 +996,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       free(kadbg);
       free(gdbg);
       free(phiprev_dbg);
+      free(chnc);
+      free(chnl);
       free(hs_se);
       free(hs_out);
       free(bprev);
@@ -1154,6 +1228,51 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       double dd = fabs(bout[i] - bprev[i]);
       if (dd > resid) resid = dd;
       bprev[i] = bout[i];
+    }
+    /* §731: ПЕЧАТЬ ТРАССЫ — цепочка направления с максимальным `|L|` в цели.
+     * «Разрезанность» — отношение флюидного объёма к коробке меньше единицы;
+     * страховка 1e-9 покрывает разные порядки умножения при равных величинах. */
+    if (p->trace > 0 && chnc != NULL && chn_n > 0) {
+      const double cuteps = 1e-9;
+      printf("    §731 ТРАССА к ячейке %d (такт %d): направление %d (%.3f, %.3f, %.3f), |L| в "
+             "цели %.4g, звеньев %d\n",
+             chain_tgt, it, chn_mm, d->ox[chn_mm], d->oy[chn_mm], d->oz[chn_mm], chn_bestlt, chn_n);
+      double gmax = -1.0, glogsum = 0.0;
+      int32_t gmaxc = -1;
+      int64_t nratio = 0, namp = 0, namp_cut = 0, ncut_all = 0;
+      for (int k = 0; k < chn_n; k++) {
+        int32_t c2 = chnc[k];
+        double s3 = (double)m->csize[c2];
+        double vcell = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+        double frac = (cu != NULL && vcell > 0.0) ? cu->mvol[c2][0][0] / vcell : 1.0;
+        int iscut = frac < 1.0 - cuteps;
+        if (iscut) ncut_all++;
+        double ratio = (k + 1 < chn_n && chnl[k + 1] > 0.0) ? chnl[k] / chnl[k + 1] : -1.0;
+        printf("      §731 звено %3d: ячейка %7d  размер %3d  доля флюида %.4g  |L| %.6g  "
+               "множитель %.6g\n",
+               k, c2, m->csize[c2], frac, chnl[k], ratio);
+        if (ratio > 0.0) {
+          nratio++;
+          glogsum += log(ratio);
+          if (ratio > gmax) {
+            gmax = ratio;
+            gmaxc = c2;
+          }
+          if (ratio > HZ_CHAIN_AMP) {
+            namp++;
+            if (iscut) namp_cut++;
+          }
+        }
+      }
+      printf("    §731 СВОДКА: звеньев %d; МАКС МНОЖИТЕЛЬ %.6g (ячейка %d); геом. среднее "
+             "%.4g по %lld шагам; шагов > %.2g: %lld, из них РАЗРЕЗАННЫХ %lld; разрезанных "
+             "вдоль всей цепочки %lld из %d\n",
+             chn_n, gmax, gmaxc, nratio > 0 ? exp(glogsum / (double)nratio) : -1.0,
+             (long long)nratio, HZ_CHAIN_AMP, (long long)namp, (long long)namp_cut,
+             (long long)ncut_all, chn_n);
+      chn_bestlt = -1.0;
+      chn_n = 0;
+      chn_mm = -1;
     }
     /* §725: НАБЛЮДАЕМЫЙ КОЭФФИЦИЕНТ УСИЛЕНИЯ ЭЛЕМЕНТА ЗА ТАКТ. Величина уже
      * течёт через развёртку: `sout` этого такта против `sprev` прошлого.
@@ -1775,6 +1894,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   free(kadbg);
   free(gdbg);
   free(phiprev_dbg);
+  free(chnc);
+  free(chnl);
   free(hs_se);
   free(hs_out);
   free(bprev);

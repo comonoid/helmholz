@@ -304,6 +304,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   /* ВЛАДЕНИЕ ОБНУЛЯЕТСЯ ПЕРВОЙ СТРОКОЙ (К30): на путях раннего возврата поля
    * иначе остались бы неинициализированными, и вызывающий освободил бы мусор. */
   st->bout = NULL;
+  st->eirr = NULL;
   st->sout = NULL;
 
   /* ПАРАЛЛЕЛЬНО ПО ОРДИНАТАМ. Внутри одной итерации направления НЕЗАВИСИМЫ:
@@ -2121,6 +2122,14 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   st->nfallback = nfb;
   st->bout = bout;
   st->sout = sout;
+  /* §744: экспорт средней облучённости элементов финального такта — чистая E
+   * без альбедо (sinf0/M00). Финальный такт, не сошедшийся предел (А1152). */
+  if (cu != NULL && nse > 0) {
+    st->eirr = malloc((size_t)nse * sizeof *st->eirr);
+    if (st->eirr != NULL)
+      for (int32_t e = 0; e < nse; e++)
+        st->eirr[e] = cu->se[e].m[0][0] > 0.0 ? sinf[e * 4] / cu->se[e].m[0][0] : 0.0;
+  }
 
   free(Lall);
   free(phinall);

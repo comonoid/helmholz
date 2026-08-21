@@ -2641,6 +2641,16 @@ static double g_hgather = 0.0;
  * слои, которые проект держит порознь сознательно. Индекс — номер узла. */
 static float (*g_indnode)[3];
 static int32_t g_indnode_n;
+
+/* §744: агрегаты свипа для поячеечного сличения с ядром §597. Заполняются в
+ * блоке развёртки (E_ind = полный − прямой, площадно-взвешенно по ячейке),
+ * читаются после ind_core_build. Центры излучающих ячеек — для корзин по
+ * расстоянию. */
+static int32_t g_xcmp_n = 0, g_xcmp_nemit = 0;
+static double *g_xcmp_E = NULL, *g_xcmp_Edir = NULL, *g_xcmp_aw = NULL;
+static int32_t (*g_xcmp_lo)[3] = NULL;
+static int32_t *g_xcmp_sz = NULL;
+static double (*g_xcmp_ec)[3] = NULL;
 /* НК1 §597: прежний путь — сбор в срезе, каждый кадр. */
 static int g_indslice = 0;
 /* НК2 §597: подъём по иерархии выключен. Крупные узлы получают ноль, и крупные
@@ -2877,6 +2887,179 @@ static int32_t ind_lift(const hz_dctree *t, int32_t ni) {
  * фиксированное направление, диагональ сцены и постоянный цвет. А вот
  * `hall_light` ищет потолок полости СПУСКОМ ОТ КАМЕРЫ — с площадным источником
  * ядро несовместимо, и это записанный долг, а не забытое. */
+/* §744: статистика одной пары полей — счётчики по прецеденту §559 (порог от
+ * данных, выброшенное считается, А999), медиана отношения, доля вне ×2 от
+ * медианы, корзины по расстоянию до ближайшего излучателя (кратные листу L —
+ * не подбор), топ-3 расхождений в обе стороны. */
+static void xcmp_stats(const char *tag, const double *A, const double *B, const double (*cen)[3],
+                       int64_t n, double Lh) {
+  double *tmp = malloc((size_t)(n > 0 ? n : 1) * sizeof *tmp);
+  double *rt = malloc((size_t)(n > 0 ? n : 1) * sizeof *rt);
+  double *dst = malloc((size_t)(n > 0 ? n : 1) * sizeof *dst);
+  int64_t *idx = malloc((size_t)(n > 0 ? n : 1) * sizeof *idx);
+  if (tmp == NULL || rt == NULL || dst == NULL || idx == NULL) exit(1);
+  int64_t nb = 0;
+  for (int64_t i = 0; i < n; i++)
+    if (B[i] > 0.0) tmp[nb++] = B[i];
+  if (nb == 0) {
+    printf("   §744 %s: знаменатель пуст, сличать нечего\n", tag);
+    free(tmp);
+    free(rt);
+    free(dst);
+    free(idx);
+    return;
+  }
+  qsort(tmp, (size_t)nb, sizeof *tmp, cmp_d);
+  double thr = 1e-3 * tmp[nb / 2];
+  int64_t nboth0 = 0, ngz = 0, nsz = 0, nuse = 0;
+  for (int64_t i = 0; i < n; i++) {
+    double a = A[i], b = B[i];
+    if (!(a > 0.0) && !(b > thr)) {
+      nboth0++;
+      continue;
+    }
+    if (!(b > thr)) {
+      ngz++;
+      continue;
+    }
+    if (!(a > 0.0)) {
+      nsz++;
+      continue;
+    }
+    rt[nuse] = a / b;
+    /* расстояние до ближайшего излучателя — по центрам излучающих ячеек */
+    double dmin = 1e300;
+    for (int32_t j = 0; j < g_xcmp_nemit; j++) {
+      double d2 = 0.0;
+      for (int k = 0; k < 3; k++) {
+        double dd = cen[i][k] - g_xcmp_ec[j][k];
+        d2 += dd * dd;
+      }
+      if (d2 < dmin) dmin = d2;
+    }
+    dst[nuse] = sqrt(dmin);
+    idx[nuse] = i;
+    nuse++;
+  }
+  if (nuse == 0) {
+    printf("   §744 %s: пар нет (оба нуля %lld, ядро~0 %lld, свип~0 %lld)\n", tag,
+           (long long)nboth0, (long long)ngz, (long long)nsz);
+    free(tmp);
+    free(rt);
+    free(dst);
+    free(idx);
+    return;
+  }
+  memcpy(tmp, rt, (size_t)nuse * sizeof *tmp);
+  qsort(tmp, (size_t)nuse, sizeof *tmp, cmp_d);
+  double med = tmp[nuse / 2], p10 = tmp[(nuse * 10) / 100], p90 = tmp[(nuse * 90) / 100];
+  int64_t nout2 = 0;
+  for (int64_t i = 0; i < nuse; i++)
+    if (rt[i] < 0.5 * med || rt[i] > 2.0 * med) nout2++;
+  printf("   §744 %s: пар %lld (оба нуля %lld, ядро~0 %lld, свип~0 %lld); медиана r %.4g, "
+         "p10 %.4g, p90 %.4g; ВНЕ x2 от медианы: %lld (%.1f %%)\n",
+         tag, (long long)nuse, (long long)nboth0, (long long)ngz, (long long)nsz, med, p10, p90,
+         (long long)nout2, 100.0 * (double)nout2 / (double)nuse);
+  static const double BINL[4] = {2.0, 8.0, 32.0, 1e30};
+  double blo = 0.0;
+  for (int bq = 0; bq < 4; bq++) {
+    double bhi = BINL[bq] < 1e29 ? BINL[bq] * Lh : 1e30;
+    int64_t cnt = 0;
+    for (int64_t i = 0; i < nuse; i++)
+      if (dst[i] >= blo && dst[i] < bhi) tmp[cnt++] = rt[i];
+    if (cnt > 0) {
+      qsort(tmp, (size_t)cnt, sizeof *tmp, cmp_d);
+      char hib[32];
+      if (BINL[bq] < 1e29)
+        snprintf(hib, sizeof hib, "%.1f", bhi);
+      else
+        snprintf(hib, sizeof hib, "inf");
+      printf("      §744 %s корзина [%.1f, %s м): пар %lld, медиана r/med %.3f\n", tag, blo, hib,
+             (long long)cnt, tmp[cnt / 2] / med);
+    }
+    blo = bhi;
+  }
+  for (int side = 0; side < 2; side++) {
+    for (int t3 = 0; t3 < 3; t3++) {
+      double best = -1.0;
+      int64_t bi = -1;
+      /* взятое помечается знаком (rt < 0) и исключается условием rt > 0 */
+      for (int64_t i = 0; i < nuse; i++) {
+        if (!(rt[i] > 0.0)) continue;
+        double v = side == 0 ? rt[i] / med : med / rt[i];
+        if (v > best) {
+          best = v;
+          bi = i;
+        }
+      }
+      if (bi < 0) break;
+      printf("      §744 %s топ-%d %s: r/med %.3g в (%.1f, %.1f, %.1f) м, до излучателя %.1f м\n",
+             tag, t3 + 1, side == 0 ? "ВВЕРХ" : "ВНИЗ", side == 0 ? rt[bi] / med : med / rt[bi],
+             cen[idx[bi]][0], cen[idx[bi]][1], cen[idx[bi]][2], dst[bi]);
+      rt[bi] = -rt[bi]; /* пометка взятого: отрицательное исключается условием rt > 0 */
+    }
+    for (int64_t i = 0; i < nuse; i++)
+      if (rt[i] < 0.0) rt[i] = -rt[i];
+  }
+  free(tmp);
+  free(rt);
+  free(dst);
+  free(idx);
+}
+
+/* §744: мост — ячейки свипа к узлам ядра §597 спуском node_of_cell; три
+ * сличения: главное, тождество (НК-а) и заведомо разные поля (НК-б). */
+static void xcmp_report(const hz_dctree *T, int lev, const frame *fr) {
+  if (g_xcmp_n <= 0 || g_indnode == NULL) return;
+  int32_t nc = g_xcmp_n;
+  double *Esw = malloc((size_t)nc * sizeof *Esw);
+  double *Edir = malloc((size_t)nc * sizeof *Edir);
+  double *Eg = malloc((size_t)nc * sizeof *Eg);
+  double (*cen)[3] = malloc((size_t)nc * sizeof *cen);
+  if (Esw == NULL || Edir == NULL || Eg == NULL || cen == NULL) exit(1);
+  int64_t nv = 0, ndesc = 0, nel = 0;
+  for (int32_t ci = 0; ci < nc; ci++) {
+    if (!(g_xcmp_aw[ci] > 0.0)) continue;
+    nel++;
+    int32_t szc = g_xcmp_sz[ci];
+    int lvl = lev;
+    while (szc > 1) {
+      szc >>= 1;
+      lvl--;
+    }
+    hz_dccell q;
+    memset(&q, 0, sizeof q);
+    q.lvl = (uint8_t)lvl;
+    for (int a = 0; a < 3; a++)
+      q.lo[a] = (uint16_t)g_xcmp_lo[ci][a];
+    int32_t ni = node_of_cell(T, lev, &q);
+    if (ni < 0 || ni >= g_indnode_n) {
+      ndesc++;
+      continue;
+    }
+    double eg = 0.0;
+    for (int a = 0; a < 3; a++)
+      eg += (double)g_indnode[ni][a];
+    Esw[nv] = g_xcmp_E[ci];
+    Edir[nv] = g_xcmp_Edir[ci];
+    Eg[nv] = eg;
+    for (int a = 0; a < 3; a++)
+      cen[nv][a] = fr->org[a] + ((double)g_xcmp_lo[ci][a] + 0.5 * (double)g_xcmp_sz[ci]) * fr->h;
+    nv++;
+  }
+  printf("   §744 МОСТ: ячеек с элементами %lld, отказов спуска %lld (%.2f %%), пар для сличения "
+         "%lld; излучающих ячеек %d\n",
+         (long long)nel, (long long)ndesc, 100.0 * (double)ndesc / (double)(nel > 0 ? nel : 1),
+         (long long)nv, g_xcmp_nemit);
+  xcmp_stats("СВИП/ЯДРО", Esw, Eg, (const double (*)[3])cen, nv, fr->h);
+  xcmp_stats("НК-а ТОЖДЕСТВО", Esw, Esw, (const double (*)[3])cen, nv, fr->h);
+  xcmp_stats("НК-б ПРЯМОЙ/ЯДРО", Edir, Eg, (const double (*)[3])cen, nv, fr->h);
+  free(Esw);
+  free(Edir);
+  free(Eg);
+  free(cen);
+}
+
 static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *fr, const opyr *P,
                            const arealight *AL, const hz_objmesh *m, celltris *CT, int lev,
                            double eps, int blockvis) {
@@ -5472,6 +5655,7 @@ int main(int argc, char **argv) {
   int xmatfar = 0; /* §739 НК: наихудший треугольник по score — мажоранта произвола атрибуции */
   double xrhoscale = 1.0; /* §742: множитель всех альбедо — извлечение ряда отскоков */
   int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
+  int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
   int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
                            * обрыва прогулки есть уровень единичного входа */
   int32_t xcelll[4] = {-1, -1, -1, -1}; /* §733: вскрытие обновления, до 4 ячеек */
@@ -5548,6 +5732,13 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[i], "xmatrho") == 0) xmatrho = 1;
     if (strncmp(argv[i], "xrhoscale=", 10) == 0) xrhoscale = strtod(argv[i] + 10, NULL);
+    if (strcmp(argv[i], "xcmp") == 0) {
+      xcmp = 1;
+      xmatrho = 1;
+      doxfer = 1;
+      dosolid = 1;
+      doxsweep = 1;
+    }
     if (strcmp(argv[i], "xmatfar") == 0) {
       xmatfar = 1;
       xmatrho = 1;
@@ -6986,6 +7177,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "xchain= требует xunit: пол обрыва трассы — уровень единичного входа\n");
         exit(1);
       }
+      /* §744: сличение — рабочий режим, не диагностический */
+      if (xcmp && (xunit || xconst)) {
+        fprintf(stderr, "xcmp несовместим с xunit и xconst\n");
+        exit(1);
+      }
       /* §733: вскрытие обновления — предсказания калиброваны единичным входом */
       if ((xcelll[0] >= 0 || xdir >= 0) && (!xunit || xcelll[0] < 0 || xdir < 0)) {
         fprintf(stderr, "xcell=/xdir= требуют xunit и друг друга\n");
@@ -6996,6 +7192,25 @@ int main(int argc, char **argv) {
       prob.dump_dir1 = xdir >= 0 ? xdir + 1 : 0;
       tr3_stats st;
       memset(&st, 0, sizeof st);
+      /* §744: ПРЯМОЙ прогон (альбедо 0) до полного — E_dir поэлементно для
+       * сличения; полный прогон ниже перезапишет phi (warm_start = 0). */
+      double *eind_dir = NULL;
+      if (xcmp) {
+        double *fz2 = calloc((size_t)ftab.n, sizeof *fz2);
+        if (fz2 == NULL) exit(1);
+        tr3_problem pd = prob;
+        pd.facet_rho = fz2;
+        tr3_stats std;
+        memset(&std, 0, sizeof std);
+        if (tr3_sweep_solve(&pd, xit, xtol, phi, &std) == 0) {
+          eind_dir = std.eirr;
+          std.eirr = NULL;
+        }
+        free(std.bout);
+        free(std.sout);
+        free(std.eirr);
+        free(fz2);
+      }
       double tsw = now_s();
       int src = 0;
       if (!xunit) {
@@ -7257,6 +7472,56 @@ int main(int argc, char **argv) {
       if (st.psin > 0.0 && !xhall)
         printf("      §739 ρ_eff = (psout − эмиссия)/psin = (%.4e − %.4e)/%.4e = %.4f\n", st.psout,
                emitpow2, st.psin, (st.psout - emitpow2) / st.psin);
+      /* §744: агрегаты по ячейкам для сличения с ядром §597 — площадно-
+       * взвешенная косвенная облучённость (полный − прямой) и центры
+       * излучающих ячеек. Читает xcmp_report после ind_core_build. */
+      if (xcmp && st.eirr != NULL && eind_dir != NULL) {
+        g_xcmp_n = mesh.ncell;
+        g_xcmp_E = calloc((size_t)mesh.ncell, sizeof *g_xcmp_E);
+        g_xcmp_Edir = calloc((size_t)mesh.ncell, sizeof *g_xcmp_Edir);
+        g_xcmp_aw = calloc((size_t)mesh.ncell, sizeof *g_xcmp_aw);
+        g_xcmp_lo = malloc((size_t)mesh.ncell * sizeof *g_xcmp_lo);
+        g_xcmp_sz = malloc((size_t)mesh.ncell * sizeof *g_xcmp_sz);
+        unsigned char *em9 = calloc((size_t)mesh.ncell, 1);
+        if (g_xcmp_E == NULL || g_xcmp_Edir == NULL || g_xcmp_aw == NULL || g_xcmp_lo == NULL ||
+            g_xcmp_sz == NULL || em9 == NULL)
+          exit(1);
+        for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+          for (int a = 0; a < 3; a++)
+            g_xcmp_lo[ci][a] = mesh.clo[ci][a];
+          g_xcmp_sz[ci] = mesh.csize[ci];
+        }
+        for (int32_t e = 0; e < cut.nse; e++) {
+          int32_t ci = cut.se[e].cell;
+          double a = cut.se[e].area;
+          if (ci < 0 || ci >= mesh.ncell || !(a > 0.0)) continue;
+          g_xcmp_E[ci] += (st.eirr[e] - eind_dir[e]) * a;
+          g_xcmp_Edir[ci] += eind_dir[e] * a;
+          g_xcmp_aw[ci] += a;
+          if (eemit[e] > 0.0) em9[ci] = 1;
+        }
+        int32_t nem = 0;
+        for (int32_t ci = 0; ci < mesh.ncell; ci++)
+          if (em9[ci]) nem++;
+        g_xcmp_ec = malloc((size_t)(nem > 0 ? nem : 1) * sizeof *g_xcmp_ec);
+        if (g_xcmp_ec == NULL) exit(1);
+        g_xcmp_nemit = 0;
+        for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+          if (g_xcmp_aw[ci] > 0.0) {
+            g_xcmp_E[ci] /= g_xcmp_aw[ci];
+            g_xcmp_Edir[ci] /= g_xcmp_aw[ci];
+          }
+          if (em9[ci]) {
+            for (int a = 0; a < 3; a++)
+              g_xcmp_ec[g_xcmp_nemit][a] =
+                  fr.org[a] + ((double)mesh.clo[ci][a] + 0.5 * (double)mesh.csize[ci]) * fr.h;
+            g_xcmp_nemit++;
+          }
+        }
+        free(em9);
+        printf("   §744 АГРЕГАТЫ СВИПА: ячеек %d, излучающих %d\n", g_xcmp_n, g_xcmp_nemit);
+      }
+      free(eind_dir);
       printf("      ГДЕ МАКСИМУМ: в полости %.4e, вне её %.4e; флюидный объём ячейки с "
              "максимумом %.3e м³ (у целой ячейки %.3e)\n",
              phimax_in, phimax_out, volmin_at_max, pow((double)(1 << (lev - 6)) * fr.h, 3.0));
@@ -7330,6 +7595,7 @@ int main(int argc, char **argv) {
         }
       }
       free(st.bout);
+      free(st.eirr);
       free(st.sout);
       tr3_dirs_free(&dirs);
       free(frho);
@@ -8326,6 +8592,7 @@ int main(int argc, char **argv) {
         arealight ALc;
         hall_light(&ALc, &P, &fr, lo, hi, LL.eye, 0);
         ind_core_build(&T, &ht, &fr, &P, &ALc, &m, &CT, lev, g_hgather, indvis);
+        xcmp_report(&T, lev, &fr);
       }
     }
     int walk_alive = 1;

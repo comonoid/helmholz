@@ -5469,9 +5469,10 @@ int main(int argc, char **argv) {
                                   * прокидка состояния незаконна — mspec наружу не выносится
                                   * (А1108); здесь wall_spec не задаётся вовсе. */
   int xmatrho = 0, xrho_set = 0; /* §737: материальные альбедо; явный xrho= несовместим */
-  int xnomaxp = 0;               /* §735 НК: выключить принцип максимума — вернуть расходимость */
-  int32_t xchain = -1;           /* §731: трасса цепочки к ячейке — только под xunit: пол
-                                  * обрыва прогулки есть уровень единичного входа */
+  int xmatfar = 0;     /* §739 НК: наихудший треугольник по score — мажоранта произвола атрибуции */
+  int xnomaxp = 0;     /* §735 НК: выключить принцип максимума — вернуть расходимость */
+  int32_t xchain = -1; /* §731: трасса цепочки к ячейке — только под xunit: пол
+                        * обрыва прогулки есть уровень единичного входа */
   int32_t xcelll[4] = {-1, -1, -1, -1}; /* §733: вскрытие обновления, до 4 ячеек */
   int xdir = -1;                        /* §733: направление вскрытия */
   /* §714: альбедо стыка вынесено в ОТДЕЛЬНЫЙ ключ и по умолчанию ВЫКЛЮЧЕНО:
@@ -5545,6 +5546,10 @@ int main(int argc, char **argv) {
       xrho_set = 1;
     }
     if (strcmp(argv[i], "xmatrho") == 0) xmatrho = 1;
+    if (strcmp(argv[i], "xmatfar") == 0) {
+      xmatfar = 1;
+      xmatrho = 1;
+    }
     if (strcmp(argv[i], "noshift") == 0) g_noshift = 1;
     if (strcmp(argv[i], "raysweep") == 0) g_raysweep = 1;
     if (strncmp(argv[i], "seed=", 5) == 0) g_seed = (int32_t)strtol(argv[i] + 5, NULL, 10);
@@ -6732,6 +6737,9 @@ int main(int argc, char **argv) {
       lu = 0.25 * (hi[0] - lo[0]);
       lv = 0.25 * (hi[2] - lo[2]);
       int64_t nlit = 0, nconf = 0, nbigcell = 0, nnomat = 0;
+      /* §739: статистика смены kd при атрибуции по близости против ls[0] */
+      int64_t nkchg = 0, nkall = 0;
+      double dksum = 0.0, dkmax = 0.0;
       double emitpow = 0.0;
       if (xhall) {
         /* ПРЕЖНИЙ ИСТОЧНИК (§479): площадка под потолком, найденная спуском ОТ
@@ -6769,7 +6777,8 @@ int main(int argc, char **argv) {
           for (int a = 0; a < 3; a++)
             cellc[a] = mesh.clo[ci][a];
           const int32_t *ls = NULL;
-          if (ct_list(&CT, cellc, &ls) == 0) {
+          int32_t nls = ct_list(&CT, cellc, &ls);
+          if (nls == 0) {
             nnomat++;
             continue;
           }
@@ -6780,8 +6789,63 @@ int main(int argc, char **argv) {
            * (scene_obj.h: «перенос считает им»), свип монохромный. Разброс kd
            * на общем фасете СЧИТАЕТСЯ (А1135 — класс смазки §670). */
           if (xmatrho && frnum != NULL) {
-            double kd = m.mtl[mi].kd;
+            /* §739: материал — треугольник, БЛИЖАЙШИЙ К ПЛОСКОСТИ элемента:
+             * score = dist(центроид, плоскость треугольника) + h·(1−|n_t·n_e|);
+             * при равных (допуск 1e-6·h — плоскостная точность) ближний по
+             * центроиду треугольника (А1141: dist слеп к коллинеарным). Ke-путь
+             * НЕ трогается — точка отсчёта эмиссии §670. `xmatfar` (НК) берёт
+             * НАИХУДШИЙ score — мажоранта произвола атрибуции. */
+            double ec[3] = {0, 0, 0};
+            for (int q2 = 0; q2 < cut.se[k].nv; q2++)
+              for (int a = 0; a < 3; a++)
+                ec[a] += cut.se[k].v[q2][a] / (double)cut.se[k].nv;
+            const double *en = cut.se[k].n;
+            int32_t tbest = ls[0];
+            double sbest = xmatfar ? -1.0 : 1e300, cbest = 1e300;
+            for (int32_t q2 = 0; q2 < nls; q2++) {
+              const double *A3, *B3, *C3;
+              tri_verts(&m, ls[q2], &A3, &B3, &C3);
+              double e1[3], e2[3], nt[3];
+              for (int a = 0; a < 3; a++) {
+                e1[a] = B3[a] - A3[a];
+                e2[a] = C3[a] - A3[a];
+              }
+              nt[0] = e1[1] * e2[2] - e1[2] * e2[1];
+              nt[1] = e1[2] * e2[0] - e1[0] * e2[2];
+              nt[2] = e1[0] * e2[1] - e1[1] * e2[0];
+              double nl = sqrt(nt[0] * nt[0] + nt[1] * nt[1] + nt[2] * nt[2]);
+              if (!(nl > 0.0)) continue;
+              double dist = 0.0, dot = 0.0, cd = 0.0;
+              for (int a = 0; a < 3; a++) {
+                dist += nt[a] / nl * (ec[a] - A3[a]);
+                dot += nt[a] / nl * en[a];
+                double tc = (A3[a] + B3[a] + C3[a]) / 3.0 - ec[a];
+                cd += tc * tc;
+              }
+              double sc = fabs(dist) + fr.h * (1.0 - fabs(dot));
+              if (xmatfar) {
+                if (sc > sbest) {
+                  sbest = sc;
+                  tbest = ls[q2];
+                }
+              } else if (sc < sbest - 1e-6 * fr.h || (sc < sbest + 1e-6 * fr.h && cd < cbest)) {
+                sbest = sc;
+                cbest = cd;
+                tbest = ls[q2];
+              }
+            }
+            int32_t mi2 = m.fm != NULL ? m.fm[tbest] : 0;
+            if (mi2 < 0 || mi2 >= m.nmtl) mi2 = 0;
+            double kd = m.mtl[mi2].kd;
             if (!(kd >= 0.0 && kd <= 1.0)) kd = 0.5; /* как в alb() сбора */
+            double kd0 = m.mtl[mi].kd;
+            if (!(kd0 >= 0.0 && kd0 <= 1.0)) kd0 = 0.5;
+            if (fabs(kd - kd0) > 0.0) {
+              nkchg++;
+              dksum += fabs(kd - kd0);
+              if (fabs(kd - kd0) > dkmax) dkmax = fabs(kd - kd0);
+            }
+            nkall++;
             int32_t fi2 = cut.se[k].facet;
             double ar = cut.se[k].area;
             frnum[fi2] += kd * ar;
@@ -6838,6 +6902,11 @@ int main(int argc, char **argv) {
                "(-> 0.5); площадь-взвешенное %.4f, медиана %.4f; фасетов с РАЗНЫМИ kd %lld "
                "(макс разброс %.3f)\n",
                (long long)nsup, ftab.n, (long long)nnomat2, wavg, medv, (long long)nconfr, spread);
+        printf("   §739 АТРИБУЦИЯ (%s): элементов со сменой kd против ls[0]: %lld из %lld "
+               "(%.2f %%), средний |dkd| %.4f, макс %.4f\n",
+               xmatfar ? "ДАЛЬНИЙ, НК" : "БЛИЖНИЙ", (long long)nkchg, (long long)nkall,
+               100.0 * (double)nkchg / (double)(nkall > 0 ? nkall : 1),
+               nkchg > 0 ? dksum / (double)nkchg : 0.0, dkmax);
         free(med9);
       }
       free(frnum);
@@ -7172,6 +7241,14 @@ int main(int argc, char **argv) {
                "НЕДОСТАЧА %.4e = %.1f %% отданного\n",
                st.pin, st.psout, st.pout, st.pabs, st.psin, st.psolid, lack, 100.0 * lack / den);
       }
+      /* §739: СВЕТО-ВЗВЕШЕННОЕ ЭФФЕКТИВНОЕ АЛЬБЕДО. psout = отражение +
+       * собственное излучение (К40), излучение = Σπ·L·площадь (emitpow2).
+       * Прибор проверен на двух известных точках: 0.6969 при xrho=0.7 и
+       * 0.9973 при xrho=1 (ручной счёт по логам §737). При xhall излучение
+       * задано иначе, и формула не действует. */
+      if (st.psin > 0.0 && !xhall)
+        printf("      §739 ρ_eff = (psout − эмиссия)/psin = (%.4e − %.4e)/%.4e = %.4f\n", st.psout,
+               emitpow2, st.psin, (st.psout - emitpow2) / st.psin);
       printf("      ГДЕ МАКСИМУМ: в полости %.4e, вне её %.4e; флюидный объём ячейки с "
              "максимумом %.3e м³ (у целой ячейки %.3e)\n",
              phimax_in, phimax_out, volmin_at_max, pow((double)(1 << (lev - 6)) * fr.h, 3.0));

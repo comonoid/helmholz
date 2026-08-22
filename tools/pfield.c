@@ -5654,6 +5654,7 @@ int main(int argc, char **argv) {
   int xmatrho = 0, xrho_set = 0; /* §737: материальные альбедо; явный xrho= несовместим */
   int xmatfar = 0; /* §739 НК: наихудший треугольник по score — мажоранта произвола атрибуции */
   double xrhoscale = 1.0; /* §742: множитель всех альбедо — извлечение ряда отскоков */
+  double xrelax = 0.0;    /* §748: демпфирование состояния; 0 — выключено */
   int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
   int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
   int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
@@ -5732,6 +5733,7 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[i], "xmatrho") == 0) xmatrho = 1;
     if (strncmp(argv[i], "xrhoscale=", 10) == 0) xrhoscale = strtod(argv[i] + 10, NULL);
+    if (strncmp(argv[i], "xrelax=", 7) == 0) xrelax = strtod(argv[i] + 7, NULL);
     if (strcmp(argv[i], "xcmp") == 0) {
       xcmp = 1;
       xmatrho = 1;
@@ -7171,6 +7173,7 @@ int main(int argc, char **argv) {
                           .sig_s = sig_s,
                           .limiter = xnolim ? 0 : 1,
                           .maxp_off = xnomaxp,
+                          .relax = xrelax,
                           .chain_cell1 = xchain >= 0 ? xchain + 1 : 0,
                           .trace = xtrace};
       if (xchain >= 0 && !xunit) {

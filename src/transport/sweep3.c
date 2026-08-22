@@ -1486,15 +1486,22 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
      * И ВТОРОЙ ДОВОД, СИЛЬНЕЕ ПЕРВОГО: КАРТИНКА ДЕЛАЕТСЯ ИЗ `bout`/`sout`, а не
      * из `φ`. Критерий, который на них не смотрит, не измеряет то, ради чего
      * решение и считается. */
+    /* §748: демпфирование x ← (1−ω)·x + ω·S(x). Неподвижная точка та же при
+     * любом ω > 0; гасится ПРЕДЕЛЬНЫЙ ЦИКЛ переключателей (диагноз §748:
+     * невязка падала до ~1e-2 и дрожала скачками при nclip, дрожащем
+     * тысячами). Невязка — по НЕДЕМПФИРОВАННОМУ шагу |S(x) − x| (А1164):
+     * старое состояние в момент замера ещё лежит в phi/bprev/sprev/mprev. */
+    const double w748 = p->relax > 0.0 ? p->relax : 1.0;
     resid = 0.0;
     for (int32_t i = 0; i < nc * 4; i++) {
       double dd = fabs(phin[i] - phi[i]);
       if (dd > resid) resid = dd;
-      phi[i] = phin[i];
+      phi[i] = (1.0 - w748) * phi[i] + w748 * phin[i];
     }
     for (int32_t i = 0; i < m->nf * 4; i++) {
       double dd = fabs(bout[i] - bprev[i]);
       if (dd > resid) resid = dd;
+      bout[i] = (1.0 - w748) * bprev[i] + w748 * bout[i];
       bprev[i] = bout[i];
     }
     /* §731: ПЕЧАТЬ ТРАССЫ — цепочка направления с максимальным `|L|` в цели.
@@ -1670,6 +1677,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     for (int32_t i = 0; i < nse * 4; i++) {
       double dd = fabs(sout[i] - sprev[i]);
       if (dd > resid) resid = dd;
+      sout[i] = (1.0 - w748) * sprev[i] + w748 * sout[i]; /* §748 */
       sprev[i] = sout[i];
     }
     /* ЗЕРКАЛЬНОЕ хранимое — тоже часть состояния (К84), и без него критерий
@@ -1677,6 +1685,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     for (int32_t i = 0; i < nmf * nd * 4; i++) {
       double dd = fabs(mspec[i] - mprev[i]);
       if (dd > resid) resid = dd;
+      mspec[i] = (1.0 - w748) * mprev[i] + w748 * mspec[i]; /* §748 */
       mprev[i] = mspec[i];
     }
     /* ИСТОРИЯ НЕВЯЗКИ ПЕЧАТАЕТСЯ ПО ТРЕБОВАНИЮ, И ЭТО НЕ ОТЛАДКА (К38).

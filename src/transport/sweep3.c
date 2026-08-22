@@ -575,15 +575,21 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
    * старт» на сцене с отражением тёплым не является: `bout`/`sout` есть вторая
    * половина состояния итерации, и заводить их из одного излучения значит
    * начинать отражённую часть с нуля. */
-  if (p->bout_in != NULL)
+  if (p->bout_in != NULL) {
     memcpy(bout, p->bout_in, (size_t)m->nf * 4 * sizeof(double));
-  else if (p->wall_rho != NULL)
+    /* §750: при тёплом поверхностном старте ПРОШЛОЕ состояние — прокинутое, а
+     * не ноль: демпфер §748 в первом такте смешивает с bprev, и нулевой bprev
+     * гасил бы (1−ω) состояния к нулю КАЖДЫЙ вызов — прокидка maxit=1 вставала
+     * на ложный пол (замерено: 9.34e-2 у γ=0). То же для sprev ниже. */
+    memcpy(bprev, p->bout_in, (size_t)m->nf * 4 * sizeof(double));
+  } else if (p->wall_rho != NULL)
     for (int32_t f = 0; f < m->nf; f++)
       if (m->f[f].cb < 0)
         bout[f * 4] = p->wall_emit != NULL ? p->wall_emit[(int)(~m->f[f].cb)] : 0.0;
-  if (p->sout_in != NULL && nse > 0)
+  if (p->sout_in != NULL && nse > 0) {
     memcpy(sout, p->sout_in, (size_t)nse * 4 * sizeof(double));
-  else
+    memcpy(sprev, p->sout_in, (size_t)nse * 4 * sizeof(double)); /* §750 */
+  } else
     for (int32_t e = 0; e < nse; e++) {
       /* §670: излучение по ЭЛЕМЕНТУ имеет приоритет; фасетное осталось для
        * воспроизведения прежних прогонов. Оба места (здесь и в рабочем цикле)

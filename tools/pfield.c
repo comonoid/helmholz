@@ -5677,6 +5677,8 @@ int main(int argc, char **argv) {
   double xdsagain = 1.0;  /* §750: множитель поправки; 0 и −1 — НК */
   int xdsagal = 0;        /* §752: галёркинское грубое звено из самого свипа */
   int xdsalev = 5;        /* §752: сторона агрегата 2^N листьев */
+  int xdsadiff = 0;       /* §754: разностные зонды вокруг рабочего поля */
+  double xdsaeps = 1.0;   /* §754: множитель ε (НК: 2) */
   int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
   int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
   int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
@@ -5773,6 +5775,16 @@ int main(int argc, char **argv) {
       doxsweep = 1;
     }
     if (strncmp(argv[i], "xdsalev=", 8) == 0) xdsalev = (int)strtol(argv[i] + 8, NULL, 10);
+    if (strcmp(argv[i], "xdsadiff") == 0) {
+      xdsadiff = 1;
+      xdsagal = 1;
+      xdsa = 1;
+      xmatrho = 1;
+      doxfer = 1;
+      dosolid = 1;
+      doxsweep = 1;
+    }
+    if (strncmp(argv[i], "xdsaeps=", 8) == 0) xdsaeps = strtod(argv[i] + 8, NULL);
     if (strcmp(argv[i], "xcmp") == 0) {
       xcmp = 1;
       xmatrho = 1;
@@ -7283,6 +7295,9 @@ int main(int argc, char **argv) {
         int32_t *aggof_e = NULL, *fagg = NULL, *piv9 = NULL;
         double *aden = NULL, *LU9 = NULL, *cagg = NULL, *dagg = NULL, *ubprev = NULL;
         double *farea = NULL;
+        /* §754: рабочее поле и базовый ответ разностных зондов */
+        double *usB = NULL, *ubB = NULL, *phiB = NULL, *r0agg = NULL;
+        double eps754 = 0.0;
         if (xdsagal) {
           int32_t gside = (1 << lev) >> xdsalev;
           if (gside < 1) gside = 1;
@@ -7345,17 +7360,85 @@ int main(int argc, char **argv) {
           double *ubP = calloc((size_t)mesh.nf * 4, sizeof *ubP);
           double *phi9 = calloc((size_t)mesh.ncell * 4, sizeof *phi9);
           if (usP == NULL || ubP == NULL || phi9 == NULL) exit(1);
-          for (int32_t i = 0; i < nagg; i++) {
-            memset(usP, 0, (size_t)(cut.nse > 0 ? cut.nse : 1) * 4 * sizeof *usP);
-            memset(ubP, 0, (size_t)mesh.nf * 4 * sizeof *ubP);
-            memset(phi9, 0, (size_t)mesh.ncell * 4 * sizeof *phi9);
+          /* §754: РАЗНОСТНЫЕ ЗОНДЫ ВОКРУГ РАБОЧЕГО ПОЛЯ (А1180а). x̄ — после
+           * NBASE демпфированных тактов; столбец = (R·S(x̄+ε·инд) − R·S(x̄))/ε;
+           * эмиссия сокращается разностью точно, клипы — в рабочем режиме.
+           * ε = 0.1·max|sout(x̄)| (десятая масштаба поля) × xdsaeps (НК ×2). */
+
+          if (xdsadiff) {
+            enum { NBASE754 = 8 }; /* рабочая окрестность; выбор — А1182 */
+            phiB = calloc((size_t)mesh.ncell * 4, sizeof *phiB);
+            r0agg = calloc((size_t)nagg, sizeof *r0agg);
+            if (phiB == NULL || r0agg == NULL) exit(1);
+            tr3_problem pdB = prob;
+            pdB.relax = xrelax > 0.0 ? xrelax : 0.7;
+            pdB.warm_start = 1;
+            pdB.trace = 0;
+            for (int k = 0; k < NBASE754; k++) {
+              pdB.bout_in = ubB;
+              pdB.sout_in = usB;
+              tr3_stats stB;
+              memset(&stB, 0, sizeof stB);
+              if (tr3_sweep_solve(&pdB, 1, 0.0, phiB, &stB) != 0) exit(1);
+              free(ubB);
+              free(usB);
+              free(stB.eirr);
+              ubB = stB.bout;
+              usB = stB.sout;
+            }
             for (int32_t e = 0; e < cut.nse; e++)
-              if (aggof_e[e] == i) usP[4 * (size_t)e] = 1.0;
+              if (fabs(usB[4 * (size_t)e]) > eps754) eps754 = fabs(usB[4 * (size_t)e]);
+            eps754 *= 0.1 * xdsaeps;
+            if (!(eps754 > 0.0)) {
+              fprintf(stderr, "xdsadiff: рабочее поле нулевое, ε не определить\n");
+              exit(1);
+            }
+            /* базовый ответ R·S(x̄), ω=1 */
+            tr3_problem pd0 = prob;
+            pd0.relax = 0.0;
+            pd0.warm_start = 1;
+            pd0.trace = 0;
+            pd0.bout_in = ubB;
+            pd0.sout_in = usB;
+            memcpy(phi9, phiB, (size_t)mesh.ncell * 4 * sizeof *phi9);
+            tr3_stats st0;
+            memset(&st0, 0, sizeof st0);
+            if (tr3_sweep_solve(&pd0, 1, 0.0, phi9, &st0) != 0) exit(1);
+            for (int32_t e = 0; e < cut.nse; e++)
+              if (aggof_e[e] >= 0) r0agg[aggof_e[e]] += st0.sout[4 * (size_t)e] * cut.se[e].area;
             for (int32_t f = 0; f < mesh.nf; f++)
-              if (fagg[f] == i) ubP[4 * (size_t)f] = 1.0;
+              if (fagg[f] >= 0) r0agg[fagg[f]] += st0.bout[4 * (size_t)f] * farea[f];
+            free(st0.bout);
+            free(st0.sout);
+            free(st0.eirr);
+            printf("   §754 БАЗА: %d тактов, ε = %.4e (0.1·max|sout| × %.2g)\n", NBASE754, eps754,
+                   xdsaeps);
+          }
+          for (int32_t i = 0; i < nagg; i++) {
+            if (xdsadiff) {
+              memcpy(usP, usB, (size_t)(cut.nse > 0 ? cut.nse : 1) * 4 * sizeof *usP);
+              memcpy(ubP, ubB, (size_t)mesh.nf * 4 * sizeof *ubP);
+              memcpy(phi9, phiB, (size_t)mesh.ncell * 4 * sizeof *phi9);
+              for (int32_t e = 0; e < cut.nse; e++)
+                if (aggof_e[e] == i) usP[4 * (size_t)e] += eps754;
+              for (int32_t f = 0; f < mesh.nf; f++)
+                if (fagg[f] == i) ubP[4 * (size_t)f] += eps754;
+            } else {
+              memset(usP, 0, (size_t)(cut.nse > 0 ? cut.nse : 1) * 4 * sizeof *usP);
+              memset(ubP, 0, (size_t)mesh.nf * 4 * sizeof *ubP);
+              memset(phi9, 0, (size_t)mesh.ncell * 4 * sizeof *phi9);
+              for (int32_t e = 0; e < cut.nse; e++)
+                if (aggof_e[e] == i) usP[4 * (size_t)e] = 1.0;
+              for (int32_t f = 0; f < mesh.nf; f++)
+                if (fagg[f] == i) ubP[4 * (size_t)f] = 1.0;
+            }
             tr3_problem pd9 = prob;
-            pd9.elem_emit = NULL;
-            pd9.facet_emit = NULL;
+            if (!xdsadiff) {
+              /* индикаторные зонды: эмиссия в ноль (разностные сокращают её
+               * разностью и потому идут с ЖИВОЙ эмиссией) */
+              pd9.elem_emit = NULL;
+              pd9.facet_emit = NULL;
+            }
             pd9.relax = 0.0; /* ω=1: зондируется сырой S */
             pd9.warm_start = 1;
             pd9.bout_in = ubP;
@@ -7372,6 +7455,12 @@ int main(int argc, char **argv) {
               if (fagg[f] >= 0)
                 Ac[(size_t)fagg[f] * (size_t)nagg + (size_t)i] +=
                     st9.bout[4 * (size_t)f] * farea[f];
+            /* §754: столбец разностью вокруг базового ответа, до нормировки
+             * на площадь агрегата (r0agg накоплен теми же весами) */
+            if (xdsadiff)
+              for (int32_t j = 0; j < nagg; j++)
+                Ac[(size_t)j * (size_t)nagg + (size_t)i] =
+                    (Ac[(size_t)j * (size_t)nagg + (size_t)i] - r0agg[j]) / eps754;
             free(st9.bout);
             free(st9.sout);
             free(st9.eirr);
@@ -7511,6 +7600,20 @@ int main(int argc, char **argv) {
         prob.warm_start = 1;
         if (!(xrelax > 0.0)) prob.relax = 0.7; /* ω из §749 (А1166) */
         double *ub9 = NULL, *us9 = NULL;
+        if (xdsagal && xdsadiff && usB != NULL) {
+          /* §754: главный цикл ПРОДОЛЖАЕТ с рабочего поля x̄ — базовые такты не
+           * выбрасываются; usprev/ubprev от x̄, чтобы первый δ был мал */
+          ub9 = ubB;
+          us9 = usB;
+          ubB = NULL;
+          usB = NULL;
+          memcpy(phi, phiB, (size_t)mesh.ncell * 4 * sizeof *phi);
+          for (int32_t e = 0; e < cut.nse; e++)
+            usprev[e] = us9[4 * (size_t)e];
+          if (ubprev != NULL)
+            for (int32_t f = 0; f < mesh.nf; f++)
+              ubprev[f] = ub9[4 * (size_t)f];
+        }
         for (int it9 = 0; it9 < xit; it9++) {
           double t9 = now_s();
           prob.bout_in = ub9;
@@ -7646,6 +7749,10 @@ int main(int argc, char **argv) {
         free(cagg);
         free(dagg);
         free(ubprev);
+        free(usB);
+        free(ubB);
+        free(phiB);
+        free(r0agg);
         free(c2s);
         free(bc9);
         free(bn9);

@@ -2641,6 +2641,9 @@ static double g_hgather = 0.0;
  * слои, которые проект держит порознь сознательно. Индекс — номер узла. */
 static float (*g_indnode)[3];
 static int32_t g_indnode_n;
+/* §762: флаг «узел заполнен раскладкой §597 или несёт заполненного потомка» —
+ * различает легальный тёмный ноль от «данных нет» (класс А917). */
+static uint8_t *g_indfill = NULL;
 
 /* §744: агрегаты свипа для поячеечного сличения с ядром §597. Заполняются в
  * блоке развёртки (E_ind = полный − прямой, площадно-взвешенно по ячейке),
@@ -2682,6 +2685,36 @@ static int32_t node_swE_best(const hz_dctree *t, int lev, const hz_dccell *c, in
       if (((int32_t)c->lo[a] >> (lev - 1 - d)) & 1) bit |= 1 << a;
     ni = t->nd[ni].child0 + bit;
     if (g_swEd[ni] > 0.0) {
+      best = ni;
+      bestd = d + 1;
+    }
+  }
+  *uplev = lvl - bestd;
+  return best;
+}
+
+/* §762: подъём флага заполнения предкам и спуск с last-good по флагу. */
+static int fill_lift(const hz_dctree *t, int32_t ni) {
+  int any = g_indfill[ni];
+  if (t->nd[ni].child0 >= 0)
+    for (int k = 0; k < 8; k++)
+      any |= fill_lift(t, t->nd[ni].child0 + k);
+  g_indfill[ni] = (uint8_t)(any ? 1 : 0);
+  return any;
+}
+
+static int32_t node_fill_best(const hz_dctree *t, int lev, const hz_dccell *c, int *uplev) {
+  int lvl = (int)c->lvl;
+  if (lvl < 0 || lvl > lev) return -1;
+  int32_t ni = 0, best = g_indfill != NULL && g_indfill[0] ? 0 : -1;
+  int bestd = 0;
+  for (int d = 0; d < lvl; d++) {
+    if (t->nd[ni].child0 < 0) break;
+    int bit = 0;
+    for (int a = 0; a < 3; a++)
+      if (((int32_t)c->lo[a] >> (lev - 1 - d)) & 1) bit |= 1 << a;
+    ni = t->nd[ni].child0 + bit;
+    if (g_indfill != NULL && g_indfill[ni]) {
       best = ni;
       bestd = d + 1;
     }
@@ -3060,8 +3093,9 @@ static void xcmp_report(const hz_dctree *T, int lev, const frame *fr) {
   double *Edir = malloc((size_t)nc * sizeof *Edir);
   double *Eg = malloc((size_t)nc * sizeof *Eg);
   double (*cen)[3] = malloc((size_t)nc * sizeof *cen);
-  if (Esw == NULL || Edir == NULL || Eg == NULL || cen == NULL) exit(1);
-  int64_t nv = 0, ndesc = 0, nel = 0;
+  int8_t *up = malloc((size_t)nc * sizeof *up); /* §762: глубина подъёма пары */
+  if (Esw == NULL || Edir == NULL || Eg == NULL || cen == NULL || up == NULL) exit(1);
+  int64_t nv = 0, ndesc = 0, nel = 0, nlift = 0;
   for (int32_t ci = 0; ci < nc; ci++) {
     if (!(g_xcmp_aw[ci] > 0.0)) continue;
     nel++;
@@ -3076,7 +3110,11 @@ static void xcmp_report(const hz_dctree *T, int lev, const frame *fr) {
     q.lvl = (uint8_t)lvl;
     for (int a = 0; a < 3; a++)
       q.lo[a] = (uint16_t)g_xcmp_lo[ci][a];
-    int32_t ni = node_of_cell(T, lev, &q);
+    /* §762: спуск с подъёмом к ЗАПОЛНЕННОМУ узлу (мост А1154); прежнее
+     * население (uplev = 0) отделяется — сдвиг от починки не смешивается со
+     * сдвигом населения (А1195/А6). */
+    int uplev = 0;
+    int32_t ni = g_indfill != NULL ? node_fill_best(T, lev, &q, &uplev) : node_of_cell(T, lev, &q);
     if (ni < 0 || ni >= g_indnode_n) {
       ndesc++;
       continue;
@@ -3087,21 +3125,44 @@ static void xcmp_report(const hz_dctree *T, int lev, const frame *fr) {
     Esw[nv] = g_xcmp_E[ci];
     Edir[nv] = g_xcmp_Edir[ci];
     Eg[nv] = eg;
+    up[nv] = (int8_t)(uplev > 3 ? 3 : uplev);
+    if (uplev > 0) nlift++;
     for (int a = 0; a < 3; a++)
       cen[nv][a] = fr->org[a] + ((double)g_xcmp_lo[ci][a] + 0.5 * (double)g_xcmp_sz[ci]) * fr->h;
     nv++;
   }
   printf("   §744 МОСТ: ячеек с элементами %lld, отказов спуска %lld (%.2f %%), пар для сличения "
-         "%lld; излучающих ячеек %d\n",
+         "%lld (из них ПОДНЯТЫХ к заполненному %lld); излучающих ячеек %d\n",
          (long long)nel, (long long)ndesc, 100.0 * (double)ndesc / (double)(nel > 0 ? nel : 1),
-         (long long)nv, g_xcmp_nemit);
-  xcmp_stats("СВИП/ЯДРО", Esw, Eg, (const double (*)[3])cen, nv, fr->h);
+         (long long)nv, (long long)nlift, g_xcmp_nemit);
+  xcmp_stats("СВИП/ЯДРО (все пары)", Esw, Eg, (const double (*)[3])cen, nv, fr->h);
+  /* §762: прежнее население — только точный спуск */
+  {
+    double *E2 = malloc((size_t)(nv > 0 ? nv : 1) * sizeof *E2);
+    double *G2 = malloc((size_t)(nv > 0 ? nv : 1) * sizeof *G2);
+    double (*c2)[3] = malloc((size_t)(nv > 0 ? nv : 1) * sizeof *c2);
+    if (E2 == NULL || G2 == NULL || c2 == NULL) exit(1);
+    int64_t n2 = 0;
+    for (int64_t i = 0; i < nv; i++)
+      if (up[i] == 0) {
+        E2[n2] = Esw[i];
+        G2[n2] = Eg[i];
+        for (int a = 0; a < 3; a++)
+          c2[n2][a] = cen[i][a];
+        n2++;
+      }
+    xcmp_stats("СВИП/ЯДРО (точный спуск)", E2, G2, (const double (*)[3])c2, n2, fr->h);
+    free(E2);
+    free(G2);
+    free(c2);
+  }
   xcmp_stats("НК-а ТОЖДЕСТВО", Esw, Esw, (const double (*)[3])cen, nv, fr->h);
   xcmp_stats("НК-б ПРЯМОЙ/ЯДРО", Edir, Eg, (const double (*)[3])cen, nv, fr->h);
   free(Esw);
   free(Edir);
   free(Eg);
   free(cen);
+  free(up);
 }
 
 static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *fr, const opyr *P,
@@ -3110,6 +3171,8 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
   double t0 = now_s();
   g_indnode_n = T->n;
   g_indnode = calloc((size_t)T->n, sizeof *g_indnode);
+  free(g_indfill);
+  g_indfill = calloc((size_t)T->n, sizeof *g_indfill); /* §762 */
   if (g_indnode == NULL) exit(1);
 
   hz_dcslice SF;
@@ -3274,6 +3337,7 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
     }
     for (int a = 0; a < 3; a++)
       g_indnode[ni][a] = indF[3 * (size_t)i + (size_t)a];
+    g_indfill[ni] = 1; /* §762 */
     nput++;
     for (int a = 0; a < 3; a++) {
       sd += (double)irrF[3 * (size_t)i + (size_t)a];
@@ -3281,6 +3345,7 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
     }
   }
   ind_lift(T, 0);
+  fill_lift(T, 0); /* §762: флаг заполнения — предкам */
   double t_put = now_s() - t4;
 
   /* А1032: ДВОЙНОЙ УЧЁТ ловится ОТНОШЕНИЕМ, а не «стало ярче». На комнате

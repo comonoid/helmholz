@@ -6,6 +6,9 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 /* Базис ячейки: {1, ξ, η, ζ}, ξ = (x_ед − c_ед)/s. Координаты ЕДИНИЧНЫЕ, потому
  * что коробка есть куб именно в них; в мир всё переносится множителями кадра. */
@@ -318,6 +321,13 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
    * независимы, у каждого свой транзиентный массив, — и включается он одной
    * строкой #pragma omp parallel for над циклом по mm. */
   int nth = 1;
+#ifdef _OPENMP
+  /* §770: рабочий путь параллелен по направлениям; диагностика (trace) —
+   * однопоточна и побитово прежняя; зеркала (общий mspin) гоняются серийно
+   * через if-клаузу прагмы ниже. */
+  if (p->trace == 0) nth = omp_get_max_threads();
+  if (nth < 1) nth = 1;
+#endif
   double *Lall = calloc((size_t)nth * (size_t)nc * 4, sizeof(double));
   double *phinall = calloc((size_t)nth * (size_t)nc * 4, sizeof(double));
   int32_t *indegall = calloc((size_t)nth * (size_t)nc, sizeof(int32_t));
@@ -342,6 +352,9 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   /* §746: то же для ГРАНЕЙ (стенки и стык) — граница обновления bout */
   double *bfmax = calloc((size_t)(0 < m->nf ? m->nf : 1), sizeof(double));
   double *semax = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
+  /* §770: per-thread пластины границ — max-гонка была бы злокачественной (А1214) */
+  double *bfmaxall = calloc((size_t)nth * (size_t)(0 < m->nf ? m->nf : 1), sizeof(double));
+  double *semaxall = calloc((size_t)nth * (size_t)(nse > 0 ? nse : 1), sizeof(double));
   double *hs_se = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   double *hs_out = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   /* ЭТАП C: ЗЕРКАЛЬНЫЕ ГРАНИ. Индекс `mfid[f]` есть номер грани среди
@@ -369,7 +382,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   if (Lall == NULL || phinall == NULL || indegall == NULL || orderall == NULL || queueall == NULL ||
       phin == NULL || binfall == NULL || sinfall == NULL || bout == NULL || binf == NULL ||
       sout == NULL || sinf == NULL || hs_se == NULL || hs_out == NULL || semax == NULL ||
-      bfmax == NULL || bprev == NULL || sprev == NULL) {
+      semaxall == NULL || bfmaxall == NULL || bfmax == NULL || bprev == NULL || sprev == NULL) {
     free(Lall);
     free(phinall);
     free(indegall);
@@ -389,6 +402,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     free(chnl);
     free(hs_se);
     free(semax);
+    free(semaxall);
+    free(bfmaxall);
     free(bfmax);
     free(hs_out);
     free(bprev);
@@ -624,8 +639,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     memset(phinall, 0, (size_t)nth * (size_t)nc * 4 * sizeof(double));
     memset(binfall, 0, (size_t)nth * (size_t)m->nf * 4 * sizeof(double));
     memset(sinfall, 0, (size_t)nth * (size_t)(nse > 0 ? nse : 1) * 4 * sizeof(double));
-    memset(semax, 0, (size_t)(nse > 0 ? nse : 1) * sizeof(double));
-    memset(bfmax, 0, (size_t)m->nf * sizeof(double));
+    memset(semaxall, 0, (size_t)nth * (size_t)(nse > 0 ? nse : 1) * sizeof(double));
+    memset(bfmaxall, 0, (size_t)nth * (size_t)m->nf * sizeof(double));
     nclip_last = 0;
     nmaxp_last = 0;
     nmaxpe_last = 0;
@@ -638,9 +653,16 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     double psolid_acc = 0.0;
     int fail = 0;
 
+#pragma omp parallel for schedule(dynamic) if (nth > 1 && nmf == 0)                                \
+    reduction(+ : pin_acc, pout_acc, psolid_acc, nclip_last, nmaxp_last)
     for (int mm = 0; mm < nd; mm++) {
       int tid = 0;
+#ifdef _OPENMP
+      tid = omp_get_thread_num();
+#endif
       double *L = Lall + (size_t)tid * (size_t)nc * 4;
+      double *semaxt = semaxall + (size_t)tid * (size_t)(nse > 0 ? nse : 1);
+      double *bfmaxt = bfmaxall + (size_t)tid * (size_t)m->nf;
       double *phit = phinall + (size_t)tid * (size_t)nc * 4;
       int32_t *indeg = indegall + (size_t)tid * (size_t)nc;
       int32_t *order = orderall + (size_t)tid * (size_t)nc;
@@ -1104,7 +1126,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
             /* §735: граница облучённости — максимум мажоранты ИТОГОВОГО (после
              * клипа) радианса по направлениям, дающим вклад в элемент */
             double cm5 = corner_amax(cf);
-            if (cm5 > semax[e]) semax[e] = cm5;
+            if (cm5 > semaxt[e]) semaxt[e] = cm5; /* §770: пластина потока */
           }
       }
 
@@ -1205,7 +1227,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         /* §746: граница обновления bout — макс мажоранты L вкладчиков (как
          * semax у элементов; однопоточно, nth = 1) */
         double bm7 = corner_amax(&L[c * 4]);
-        if (bm7 > bfmax[f]) bfmax[f] = bm7;
+        if (bm7 > bfmaxt[f]) bfmaxt[f] = bm7; /* §770 */
         /* ЭТАП C: у зеркальной грани копится момент ПО ОРДИНАТЕ, без веса —
          * зеркало не интегрирует по полусфере, оно переставляет направление. */
         if (!at_solid && mfid != NULL && mfid[f] >= 0)
@@ -1233,6 +1255,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       free(chnl);
       free(hs_se);
       free(semax);
+      free(semaxall);
+      free(bfmaxall);
       free(bfmax);
       free(hs_out);
       free(bprev);
@@ -1262,6 +1286,24 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
      * доля `solid_rho` возвращается во флюид и учтена влётом с грани. */
     st->psolid = (1.0 - (p->solid_rho > 0.0 ? p->solid_rho : 0.0)) * psolid_acc;
 
+    /* §770: сведение пластин границ — max по потокам; читают его обновления
+     * стен и элементов ниже. */
+    for (int32_t e = 0; e < nse; e++) {
+      double mx = 0.0;
+      for (int th = 0; th < nth; th++) {
+        double v = semaxall[(size_t)th * (size_t)(nse > 0 ? nse : 1) + (size_t)e];
+        if (v > mx) mx = v;
+      }
+      semax[e] = mx;
+    }
+    for (int32_t f = 0; f < m->nf; f++) {
+      double mx = 0.0;
+      for (int th = 0; th < nth; th++) {
+        double v = bfmaxall[(size_t)th * (size_t)m->nf + (size_t)f];
+        if (v > mx) mx = v;
+      }
+      bfmax[f] = mx;
+    }
     /* --- стенки и поверхности: новый исходящий радианс, DG1 по положению --- */
     if (p->wall_rho != NULL || (cu != NULL && p->solid_rho > 0.0))
       for (int32_t f = 0; f < m->nf; f++) {
@@ -2193,6 +2235,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   free(chnl);
   free(hs_se);
   free(semax);
+  free(semaxall);
+  free(bfmaxall);
   free(bfmax);
   free(hs_out);
   free(bprev);

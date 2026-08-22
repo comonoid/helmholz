@@ -2646,6 +2646,13 @@ static int32_t g_indnode_n;
  * блоке развёртки (E_ind = полный − прямой, площадно-взвешенно по ячейке),
  * читаются после ind_core_build. Центры излучающих ячеек — для корзин по
  * расстоянию. */
+/* §750: живая машинерия ядра §597 для двухсеточного цикла (keep-флаг велит
+ * ind_core_build не освобождать срез, связи и ffv, а отдать сюда). */
+static int g_dsa_keep = 0, g_dsa_ready = 0;
+static hz_dcslice g_dsa_SF;
+static linkcache g_dsa_LC;
+static double *g_dsa_ffv = NULL;
+
 static int32_t g_xcmp_n = 0, g_xcmp_nemit = 0;
 static double *g_xcmp_E = NULL, *g_xcmp_Edir = NULL, *g_xcmp_aw = NULL;
 static int32_t (*g_xcmp_lo)[3] = NULL;
@@ -3178,7 +3185,10 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
              (long long)nlc, (long long)nlink, 100.0 * (double)nlc / (double)(nlink ? nlink : 1),
              (double)nlc * sizeof(glink) / 1073741824.0);
   }
-  lc_free(&LC2);
+  if (g_dsa_keep)
+    g_dsa_LC = LC2; /* §750: связи остаются жить для грубого звена */
+  else
+    lc_free(&LC2);
   /* НАИБОЛЬШЕЕ АЛЬБЕДО СЦЕНЫ — граница сжатия. Без него «больше единицы» не с
    * чем сравнивать: граница есть `ρ_max`, а не `1` (Р3 §607). */
   double rhomax = 0.0;
@@ -3249,7 +3259,15 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
 
   free(irrF);
   free(indF);
-  hz_slice_free(&SF);
+  if (g_dsa_keep) {
+    /* §750: срез и ffv переезжают в статики; освободит их некому — живут до
+     * конца процесса, как g_indnode */
+    g_dsa_SF = SF;
+    g_dsa_ffv = ffv;
+    g_dsa_ready = 1;
+  } else {
+    hz_slice_free(&SF);
+  }
 }
 static int g_dsweep = 0, g_dnmu = 2, g_dnphi = 2, g_dpass = 1, g_dirsall = 0, g_dblkopen = 0;
 /* Ф9. (§536): замер границы узости доли; `dlobeflat` — негативный контроль. */
@@ -5655,6 +5673,8 @@ int main(int argc, char **argv) {
   int xmatfar = 0; /* §739 НК: наихудший треугольник по score — мажоранта произвола атрибуции */
   double xrhoscale = 1.0; /* §742: множитель всех альбедо — извлечение ряда отскоков */
   double xrelax = 0.0;    /* §748: демпфирование состояния; 0 — выключено */
+  int xdsa = 0;           /* §750: двухсеточный цикл — грубое звено из ядра §597 */
+  double xdsagain = 1.0;  /* §750: множитель поправки; 0 и −1 — НК */
   int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
   int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
   int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
@@ -5734,6 +5754,14 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xmatrho") == 0) xmatrho = 1;
     if (strncmp(argv[i], "xrhoscale=", 10) == 0) xrhoscale = strtod(argv[i] + 10, NULL);
     if (strncmp(argv[i], "xrelax=", 7) == 0) xrelax = strtod(argv[i] + 7, NULL);
+    if (strcmp(argv[i], "xdsa") == 0) {
+      xdsa = 1;
+      xmatrho = 1;
+      doxfer = 1;
+      dosolid = 1;
+      doxsweep = 1;
+    }
+    if (strncmp(argv[i], "xdsagain=", 9) == 0) xdsagain = strtod(argv[i] + 9, NULL);
     if (strcmp(argv[i], "xcmp") == 0) {
       xcmp = 1;
       xmatrho = 1;
@@ -7181,6 +7209,10 @@ int main(int argc, char **argv) {
         exit(1);
       }
       /* §744: сличение — рабочий режим, не диагностический */
+      if (xdsa && (xunit || xconst || xcmp)) {
+        fprintf(stderr, "xdsa несовместим с xunit/xconst/xcmp\n");
+        exit(1);
+      }
       if (xcmp && (xunit || xconst)) {
         fprintf(stderr, "xcmp несовместим с xunit и xconst\n");
         exit(1);
@@ -7219,7 +7251,152 @@ int main(int argc, char **argv) {
       }
       double tsw = now_s();
       int src = 0;
-      if (!xunit) {
+      if (xdsa) {
+        /* §750: ДВУХСЕТОЧНЫЙ ЦИКЛ. Такт развёртки (прокидка К76) → приращение
+         * sout ограничивается на срез ядра §597 → хвост ряда добирается
+         * грубым оператором (etree_build + gather_apply по хранимым связям) →
+         * поправка продлевается в sout. Единицы моста: радиосити B = π·радианс
+         * (перевод расчётный, γ по умолчанию 1 и НЕ подгоняется — А1170). */
+        if (!g_keonly || !(g_hgather > 0.0)) {
+          fprintf(stderr, "xdsa требует keonly и hgather=\n");
+          exit(1);
+        }
+        arealight AL9;
+        memset(&AL9, 0, sizeof AL9); /* keonly: AL ядром не читается */
+        g_dsa_keep = 1;
+        ind_core_build(&T, &ht, &fr, &P, &AL9, &m, &CT, lev, g_hgather, indvis);
+        g_dsa_keep = 0;
+        if (!g_dsa_ready) exit(1);
+        int32_t NS = g_dsa_SF.n;
+        /* мосты: узел -> срез, ячейка меша -> срез; отказы — счётчиками (А891) */
+        int32_t *n2s = malloc((size_t)T.n * sizeof *n2s);
+        int32_t *c2s = malloc((size_t)mesh.ncell * sizeof *c2s);
+        if (n2s == NULL || c2s == NULL) exit(1);
+        for (int32_t i = 0; i < T.n; i++)
+          n2s[i] = -1;
+        for (int32_t i = 0; i < NS; i++) {
+          int32_t ni = node_of_cell(&T, lev, &g_dsa_SF.c[i]);
+          if (ni >= 0 && ni < T.n) n2s[ni] = i;
+        }
+        for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+          int32_t szc = mesh.csize[ci];
+          int lvl9 = lev;
+          while (szc > 1) {
+            szc >>= 1;
+            lvl9--;
+          }
+          hz_dccell q9;
+          memset(&q9, 0, sizeof q9);
+          q9.lvl = (uint8_t)lvl9;
+          for (int a = 0; a < 3; a++)
+            q9.lo[a] = (uint16_t)mesh.clo[ci][a];
+          int32_t ni = node_of_cell(&T, lev, &q9);
+          c2s[ci] = (ni >= 0 && ni < T.n) ? n2s[ni] : -1;
+        }
+        double acov = 0.0, atot = 0.0;
+        for (int32_t e = 0; e < cut.nse; e++) {
+          double a = cut.se[e].area;
+          if (!(a > 0.0)) continue;
+          atot += a;
+          int32_t ci = cut.se[e].cell;
+          if (ci >= 0 && ci < mesh.ncell && c2s[ci] >= 0) acov += a;
+        }
+        printf("   §750 МОСТ: покрытие элементов срезом %.1f %% площади\n",
+               100.0 * acov / (atot > 0.0 ? atot : 1.0));
+        float *bc9 = malloc(3 * (size_t)NS * sizeof *bc9);
+        float *bn9 = malloc(3 * (size_t)NS * sizeof *bn9);
+        double *cslice = calloc((size_t)NS, sizeof *cslice);
+        double *dnum = calloc((size_t)NS, sizeof *dnum);
+        double *dden = calloc((size_t)NS, sizeof *dden);
+        double *usprev = calloc((size_t)(cut.nse > 0 ? cut.nse : 1), sizeof *usprev);
+        if (bc9 == NULL || bn9 == NULL || cslice == NULL || dnum == NULL || dden == NULL ||
+            usprev == NULL)
+          exit(1);
+        prob.warm_start = 1;
+        if (!(xrelax > 0.0)) prob.relax = 0.7; /* ω из §749 (А1166) */
+        double *ub9 = NULL, *us9 = NULL;
+        for (int it9 = 0; it9 < xit; it9++) {
+          double t9 = now_s();
+          prob.bout_in = ub9;
+          prob.sout_in = us9;
+          memset(&st, 0, sizeof st);
+          src = tr3_sweep_solve(&prob, 1, 0.0, phi, &st);
+          if (src != 0) break;
+          /* приращение -> срез (площадно-взвешенно, радиосити = π·радианс) */
+          memset(dnum, 0, (size_t)NS * sizeof *dnum);
+          memset(dden, 0, (size_t)NS * sizeof *dden);
+          for (int32_t e = 0; e < cut.nse; e++) {
+            double a = cut.se[e].area;
+            int32_t ci = cut.se[e].cell;
+            if (!(a > 0.0) || ci < 0 || ci >= mesh.ncell || c2s[ci] < 0) continue;
+            dnum[c2s[ci]] += (st.sout[4 * (size_t)e] - usprev[e]) * a;
+            dden[c2s[ci]] += a;
+          }
+          for (int32_t s = 0; s < NS; s++)
+            dnum[s] = dden[s] > 0.0 ? 3.14159265358979323846 * dnum[s] / dden[s] : 0.0;
+          /* грубое звено: c <- A(delta + c), тёплый старт с прошлого такта;
+           * остановка — сжатие грубой невязки 10x либо потолок 30 (из плана) */
+          int mco = 0;
+          double cr0 = -1.0, crn = -1.0;
+          for (; mco < 30; mco++) {
+            for (int32_t s = 0; s < NS; s++) {
+              float v = (float)(dnum[s] + cslice[s]);
+              bc9[3 * (size_t)s] = v;
+              bc9[3 * (size_t)s + 1] = v;
+              bc9[3 * (size_t)s + 2] = v;
+            }
+            etree ET9;
+            memset(&ET9, 0, sizeof ET9);
+            etree_build(&ET9, &g_dsa_SF, &fr, bc9, &m, 0, NS, 0, lev);
+            gather_apply(&g_dsa_LC, &ET9, &g_dsa_SF, &m, g_dsa_ffv, bn9);
+            etree_free(&ET9);
+            double dr = 0.0;
+            for (int32_t s = 0; s < NS; s++) {
+              double nv9 = ((double)bn9[3 * (size_t)s] + (double)bn9[3 * (size_t)s + 1] +
+                            (double)bn9[3 * (size_t)s + 2]) /
+                           3.0;
+              double dd = fabs(nv9 - cslice[s]);
+              if (dd > dr) dr = dd;
+              cslice[s] = nv9;
+            }
+            if (mco == 0) cr0 = dr;
+            crn = dr;
+            if (crn <= 0.1 * cr0) {
+              mco++;
+              break;
+            }
+          }
+          /* продление поправки в sout (нулевой коэффициент) */
+          double cmx9 = 0.0;
+          for (int32_t e = 0; e < cut.nse; e++) {
+            int32_t ci = cut.se[e].cell;
+            if (ci < 0 || ci >= mesh.ncell || c2s[ci] < 0) continue;
+            double dc = xdsagain * cslice[c2s[ci]] / 3.14159265358979323846;
+            st.sout[4 * (size_t)e] += dc;
+            if (fabs(dc) > cmx9) cmx9 = fabs(dc);
+          }
+          for (int32_t e = 0; e < cut.nse; e++)
+            usprev[e] = st.sout[4 * (size_t)e];
+          printf("   §750 такт %2d: resid %.3e; грубое звено %d итер (%.2e -> %.2e); "
+                 "max|поправка| %.3e; %.1f с\n",
+                 it9, st.resid, mco, cr0, crn, cmx9, now_s() - t9);
+          free(ub9);
+          free(us9);
+          free(st.eirr);
+          st.eirr = NULL;
+          ub9 = st.bout;
+          us9 = st.sout;
+          if (st.resid < xtol && it9 > 2) break;
+        }
+        free(n2s);
+        free(c2s);
+        free(bc9);
+        free(bn9);
+        free(cslice);
+        free(dnum);
+        free(dden);
+        free(usprev);
+      } else if (!xunit) {
         src = tr3_sweep_solve(&prob, xit, xtol, phi, &st);
       } else {
         /* §729: ПРИМЕНИТЬ ОПЕРАТОР К ЕДИНИЧНОМУ СОСТОЯНИЮ. Источники в ноль,

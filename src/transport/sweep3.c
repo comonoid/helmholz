@@ -1410,7 +1410,10 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       }
     for (int32_t e = 0; e < nse; e++) {
       const tr3_selem *se = &cu->se[e];
-      double rho = (p->facet_rho != NULL && se->facet < p->nfacet) ? p->facet_rho[se->facet] : 0.0;
+      double rho =
+          p->elem_rho != NULL /* §768 */
+              ? p->elem_rho[e]
+              : ((p->facet_rho != NULL && se->facet < p->nfacet) ? p->facet_rho[se->facet] : 0.0);
       double em =
           p->elem_emit != NULL
               ? p->elem_emit[e]

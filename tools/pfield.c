@@ -3369,6 +3369,7 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
     g_dsa_ready = 1;
   } else {
     hz_slice_free(&SF);
+    free(ffv); /* утечка была всегда; вскрыта анализатором при §750-ветвлении */
   }
 }
 static int g_dsweep = 0, g_dnmu = 2, g_dnphi = 2, g_dpass = 1, g_dirsall = 0, g_dblkopen = 0;
@@ -5783,6 +5784,7 @@ int main(int argc, char **argv) {
   double xdsaeps = 1.0;   /* §754: множитель ε (НК: 2) */
   int xdsasplit = 0;      /* §756: элементы и стык — раздельные грубые переменные */
   int xframe = 0;         /* §758: кадр развёрткой — свиповое поле вместо ядра в irr */
+  int xcontrib = 0;       /* §768: прибор вклада — перевозмущения ρ→0 по классам */
   int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
   int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
   int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
@@ -5889,6 +5891,13 @@ int main(int argc, char **argv) {
       doxsweep = 1;
     }
     if (strncmp(argv[i], "xdsaeps=", 8) == 0) xdsaeps = strtod(argv[i] + 8, NULL);
+    if (strcmp(argv[i], "xcontrib") == 0) {
+      xcontrib = 1;
+      xmatrho = 1;
+      doxfer = 1;
+      dosolid = 1;
+      doxsweep = 1;
+    }
     if (strcmp(argv[i], "xframe") == 0) {
       xframe = 1;
       xmatrho = 1;
@@ -8140,6 +8149,100 @@ int main(int argc, char **argv) {
       if (st.psin > 0.0 && !xhall)
         printf("      §739 ρ_eff = (psout − эмиссия)/psin = (%.4e − %.4e)/%.4e = %.4f\n", st.psout,
                emitpow2, st.psin, (st.psout - emitpow2) / st.psin);
+      /* §768: ПРИБОР ВКЛАДА — перевозмущение. Выключаем отражение класса
+       * поверхностей (ρ→0 поэлементно; заслон сохраняется — А1210) и меряем
+       * изменение поля E в БЛИЖНЕЙ ЛИЦЕВОЙ зоне (прокси видимого: < 15 м от
+       * камеры, нормаль к камере; заслонённость не учитывается — А1209,
+       * смещение консервативно). Эмиссия не выключается (А1211). */
+      if (xcontrib && st.eirr != NULL) {
+        double *rbase = malloc((size_t)(cut.nse > 0 ? cut.nse : 1) * sizeof *rbase);
+        double *rkill = malloc((size_t)(cut.nse > 0 ? cut.nse : 1) * sizeof *rkill);
+        double *phic = malloc((size_t)mesh.ncell * 4 * sizeof *phic);
+        double (*ecen)[3] = malloc((size_t)(cut.nse > 0 ? cut.nse : 1) * sizeof *ecen);
+        double *edist = malloc((size_t)(cut.nse > 0 ? cut.nse : 1) * sizeof *edist);
+        unsigned char *zone = malloc((size_t)(cut.nse > 0 ? cut.nse : 1));
+        unsigned char *eback = malloc((size_t)(cut.nse > 0 ? cut.nse : 1));
+        if (rbase == NULL || rkill == NULL || phic == NULL || ecen == NULL || edist == NULL ||
+            zone == NULL || eback == NULL)
+          exit(1);
+        for (int32_t e = 0; e < cut.nse; e++) {
+          rbase[e] = (frho != NULL && cut.se[e].facet < ftab.n) ? frho[cut.se[e].facet] : 0.0;
+          double c9[3] = {0, 0, 0};
+          for (int q2 = 0; q2 < cut.se[e].nv; q2++)
+            for (int a = 0; a < 3; a++)
+              c9[a] += cut.se[e].v[q2][a] / (double)(cut.se[e].nv > 0 ? cut.se[e].nv : 1);
+          double d2 = 0.0, dot = 0.0;
+          for (int a = 0; a < 3; a++) {
+            ecen[e][a] = c9[a];
+            double dd = c9[a] - g_eye[a];
+            d2 += dd * dd;
+            dot += cut.se[e].n[a] * dd; /* > 0: нормаль ОТ камеры (обратная) */
+          }
+          edist[e] = sqrt(d2);
+          eback[e] = dot > 0.0 ? 1 : 0;
+          /* зона: ближняя (< 15 м — четверть габарита сцены) и лицевая */
+          zone[e] = (edist[e] < 15.0 && !eback[e]) ? 1 : 0;
+        }
+        double zden = 0.0, tden = 0.0;
+        int64_t nzone = 0;
+        for (int32_t e = 0; e < cut.nse; e++) {
+          double w = st.eirr[e] * cut.se[e].area;
+          tden += fabs(w);
+          if (zone[e]) {
+            zden += fabs(w);
+            nzone++;
+          }
+        }
+        printf("   §768 ЗОНА (< 15 м, лицевые): элементов %lld из %d; Σ|E·area| зоны %.4g, всей "
+               "сцены %.4g\n",
+               (long long)nzone, cut.nse, zden, tden);
+        static const double KD[6] = {40.0, 20.0, 10.0, -1.0 /* back */, -2.0 /* inf НК */, 0};
+        for (int kv = 0; kv < 5; kv++) {
+          int64_t nkill = 0;
+          for (int32_t e = 0; e < cut.nse; e++) {
+            int kill = 0;
+            if (KD[kv] > 0.0)
+              kill = edist[e] > KD[kv];
+            else if (KD[kv] < -1.5)
+              kill = 0; /* НК: никого */
+            else
+              kill = eback[e]; /* обратные */
+            rkill[e] = kill ? 0.0 : rbase[e];
+            if (kill) nkill++;
+          }
+          tr3_problem pk = prob;
+          pk.elem_rho = rkill;
+          memset(phic, 0, (size_t)mesh.ncell * 4 * sizeof *phic);
+          tr3_stats stk;
+          memset(&stk, 0, sizeof stk);
+          if (tr3_sweep_solve(&pk, xit, xtol, phic, &stk) != 0) exit(1);
+          double zsum = 0.0, tsum = 0.0;
+          int bit = 1;
+          if (stk.eirr != NULL)
+            for (int32_t e = 0; e < cut.nse; e++) {
+              double dw = (stk.eirr[e] - st.eirr[e]) * cut.se[e].area;
+              tsum += fabs(dw);
+              if (zone[e]) zsum += fabs(dw);
+              if (memcmp(&stk.eirr[e], &st.eirr[e], sizeof(double)) != 0) bit = 0;
+            }
+          const char *nm = KD[kv] > 0.0 ? "ДАЛЬШЕ" : (KD[kv] < -1.5 ? "НИКОГО (НК)" : "ОБРАТНЫЕ");
+          printf("   §768 KILL %s %s%.0f м: выключено %lld элементов; Δ в ближней лицевой зоне "
+                 "%.4g (%.2f %% от Σ зоны); Δ всюду %.2f %%; побитово с базой: %s\n",
+                 nm, KD[kv] > 0.0 ? "> " : "", KD[kv] > 0.0 ? KD[kv] : 0.0, (long long)nkill, zsum,
+                 100.0 * zsum / (zden > 0.0 ? zden : 1.0), 100.0 * tsum / (tden > 0.0 ? tden : 1.0),
+                 bit ? "ДА" : "нет");
+          free(stk.bout);
+          free(stk.sout);
+          free(stk.eirr);
+        }
+        free(rbase);
+        free(rkill);
+        free(phic);
+        free(ecen);
+        free(edist);
+        free(zone);
+        free(eback);
+      }
       /* §758: свиповое поле на узлы — для кадра развёрткой. E = eirr
        * (входящая облучённость финального такта, А1187), вес — площадь. */
       if (xframe && st.eirr != NULL) {

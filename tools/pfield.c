@@ -2667,6 +2667,29 @@ static void swE_lift(const hz_dctree *t, int32_t ni) {
   }
 }
 
+/* §760: спуск с запоминанием ГЛУБОЧАЙШЕГО предка, чьё поддерево несёт
+ * свиповое поле; uplev — на сколько уровней выше запрошенного взято (0 —
+ * дыры не было). Лечит и оборванные спуски. */
+static int32_t node_swE_best(const hz_dctree *t, int lev, const hz_dccell *c, int *uplev) {
+  int lvl = (int)c->lvl;
+  if (lvl < 0 || lvl > lev) return -1;
+  int32_t ni = 0, best = g_swEd[0] > 0.0 ? 0 : -1;
+  int bestd = 0;
+  for (int d = 0; d < lvl; d++) {
+    if (t->nd[ni].child0 < 0) break;
+    int bit = 0;
+    for (int a = 0; a < 3; a++)
+      if (((int32_t)c->lo[a] >> (lev - 1 - d)) & 1) bit |= 1 << a;
+    ni = t->nd[ni].child0 + bit;
+    if (g_swEd[ni] > 0.0) {
+      best = ni;
+      bestd = d + 1;
+    }
+  }
+  *uplev = lvl - bestd;
+  return best;
+}
+
 static int32_t g_xcmp_n = 0, g_xcmp_nemit = 0;
 static double *g_xcmp_E = NULL, *g_xcmp_Edir = NULL, *g_xcmp_aw = NULL;
 static int32_t (*g_xcmp_lo)[3] = NULL;
@@ -9406,14 +9429,28 @@ int main(int argc, char **argv) {
         float *swv = malloc(3 * (size_t)S.n * sizeof *swv);
         if (rt8 == NULL || tmp8 == NULL || swv == NULL) exit(1);
         int64_t nb8 = 0;
+        /* §760: дыры закрываются глубочайшим предком с полем; распределение
+         * глубины подъёма — встроенный НК (подъём к корню = заливка) */
+        int64_t nup1 = 0, nup2 = 0, nup3 = 0, nuproot = 0, nupall = 0;
         for (int32_t i = 0; i < S.n; i++) {
-          int32_t ni = node_of_cell(&T, lev, &S.c[i]);
-          double Ei = (ni >= 0 && ni < T.n && g_swEd[ni] > 0.0) ? g_swEn[ni] / g_swEd[ni] : -1.0;
+          int uplev8 = 0;
+          int32_t ni = node_swE_best(&T, lev, &S.c[i], &uplev8);
+          double Ei = (ni >= 0) ? g_swEn[ni] / g_swEd[ni] : -1.0;
           if (Ei < 0.0) {
             nmiss8++;
             for (int k = 0; k < 3; k++)
               swv[3 * (size_t)i + (size_t)k] = 0.0f;
             continue;
+          }
+          if (uplev8 > 0) {
+            nupall++;
+            if (uplev8 == 1)
+              nup1++;
+            else if (uplev8 == 2)
+              nup2++;
+            else
+              nup3++;
+            if (uplev8 >= (int)S.c[i].lvl - 2) nuproot++;
           }
           ncov8++;
           const double *ke8 = m.mtl[S.c[i].mat < m.nmtl ? S.c[i].mat : 0].ke3;
@@ -9455,6 +9492,11 @@ int main(int argc, char **argv) {
                  tmp8[(nuse8 * 10) / 100], tmp8[(nuse8 * 90) / 100], (long long)nout8,
                  100.0 * (double)nout8 / (double)nuse8);
         }
+        printf("   §760 ДЫРЫ: закрыто подъёмом %lld (1 ур. %lld, 2 ур. %lld, 3+ %lld; с "
+               "почти-корня %lld = %.1f %% дыр); осталось непокрытых %lld\n",
+               (long long)nupall, (long long)nup1, (long long)nup2, (long long)nup3,
+               (long long)nuproot, 100.0 * (double)nuproot / (double)(nupall > 0 ? nupall : 1),
+               (long long)nmiss8);
         memcpy(irr, swv, 3 * (size_t)S.n * sizeof *irr);
         free(rt8);
         free(tmp8);

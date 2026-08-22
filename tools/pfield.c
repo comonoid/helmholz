@@ -5679,6 +5679,7 @@ int main(int argc, char **argv) {
   int xdsalev = 5;        /* §752: сторона агрегата 2^N листьев */
   int xdsadiff = 0;       /* §754: разностные зонды вокруг рабочего поля */
   double xdsaeps = 1.0;   /* §754: множитель ε (НК: 2) */
+  int xdsasplit = 0;      /* §756: элементы и стык — раздельные грубые переменные */
   int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
   int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
   int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
@@ -5785,6 +5786,16 @@ int main(int argc, char **argv) {
       doxsweep = 1;
     }
     if (strncmp(argv[i], "xdsaeps=", 8) == 0) xdsaeps = strtod(argv[i] + 8, NULL);
+    if (strcmp(argv[i], "xdsasplit") == 0) {
+      xdsasplit = 1;
+      xdsadiff = 1;
+      xdsagal = 1;
+      xdsa = 1;
+      xmatrho = 1;
+      doxfer = 1;
+      dosolid = 1;
+      doxsweep = 1;
+    }
     if (strcmp(argv[i], "xcmp") == 0) {
       xcmp = 1;
       xmatrho = 1;
@@ -7301,7 +7312,7 @@ int main(int argc, char **argv) {
         if (xdsagal) {
           int32_t gside = (1 << lev) >> xdsalev;
           if (gside < 1) gside = 1;
-          int32_t ngrid = gside * gside * gside;
+          int32_t ngrid = 2 * gside * gside * gside; /* §756: два слота на коробку при xdsasplit */
           int32_t *gid = malloc((size_t)ngrid * sizeof *gid);
           if (gid == NULL) exit(1);
           for (int32_t i = 0; i < ngrid; i++)
@@ -7322,7 +7333,7 @@ int main(int argc, char **argv) {
             int32_t ci = cut.se[e].cell;
             aggof_e[e] = -2;
             if (ci < 0 || ci >= mesh.ncell || !(cut.se[e].area > 0.0)) continue;
-            int32_t r = craw[ci];
+            int32_t r = xdsasplit ? 2 * craw[ci] : craw[ci]; /* §756 */
             if (gid[r] < 0) gid[r] = nagg++;
             aggof_e[e] = gid[r];
           }
@@ -7334,7 +7345,7 @@ int main(int argc, char **argv) {
             int32_t cf9 = as9 ? mesh.f[f].cb : mesh.f[f].ca;
             farea[f] = cut.ffm[f][0][0] > 0.0 ? cut.ffm[f][0][0] : cut.ffmb[f][0][0];
             if (!(farea[f] > 0.0)) continue;
-            int32_t r = craw[cf9];
+            int32_t r = xdsasplit ? 2 * craw[cf9] + 1 : craw[cf9]; /* §756: стык — свой слот */
             if (gid[r] < 0) gid[r] = nagg++;
             fagg[f] = gid[r];
           }

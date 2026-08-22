@@ -5675,6 +5675,8 @@ int main(int argc, char **argv) {
   double xrelax = 0.0;    /* §748: демпфирование состояния; 0 — выключено */
   int xdsa = 0;           /* §750: двухсеточный цикл — грубое звено из ядра §597 */
   double xdsagain = 1.0;  /* §750: множитель поправки; 0 и −1 — НК */
+  int xdsagal = 0;        /* §752: галёркинское грубое звено из самого свипа */
+  int xdsalev = 5;        /* §752: сторона агрегата 2^N листьев */
   int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
   int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
   int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
@@ -5762,6 +5764,15 @@ int main(int argc, char **argv) {
       doxsweep = 1;
     }
     if (strncmp(argv[i], "xdsagain=", 9) == 0) xdsagain = strtod(argv[i] + 9, NULL);
+    if (strcmp(argv[i], "xdsagal") == 0) {
+      xdsagal = 1;
+      xdsa = 1;
+      xmatrho = 1;
+      doxfer = 1;
+      dosolid = 1;
+      doxsweep = 1;
+    }
+    if (strncmp(argv[i], "xdsalev=", 8) == 0) xdsalev = (int)strtol(argv[i] + 8, NULL, 10);
     if (strcmp(argv[i], "xcmp") == 0) {
       xcmp = 1;
       xmatrho = 1;
@@ -7257,17 +7268,201 @@ int main(int argc, char **argv) {
          * грубым оператором (etree_build + gather_apply по хранимым связям) →
          * поправка продлевается в sout. Единицы моста: радиосити B = π·радианс
          * (перевод расчётный, γ по умолчанию 1 и НЕ подгоняется — А1170). */
-        if (!g_keonly || !(g_hgather > 0.0)) {
-          fprintf(stderr, "xdsa требует keonly и hgather=\n");
+        if (!xdsagal && (!g_keonly || !(g_hgather > 0.0))) {
+          fprintf(stderr, "xdsa требует keonly и hgather= (или xdsagal)\n");
           exit(1);
         }
-        arealight AL9;
-        memset(&AL9, 0, sizeof AL9); /* keonly: AL ядром не читается */
-        g_dsa_keep = 1;
-        ind_core_build(&T, &ht, &fr, &P, &AL9, &m, &CT, lev, g_hgather, indvis);
-        g_dsa_keep = 0;
-        if (!g_dsa_ready) exit(1);
-        int32_t NS = g_dsa_SF.n;
+        /* §752: ГАЛЁРКИНСКОЕ ГРУБОЕ ЗВЕНО ИЗ САМОГО СВИПА. Агрегаты — коробки
+         * октодерева стороной 2^xdsalev листьев; грубая переменная — площадно-
+         * взвешенная исходящая радиансность агрегата (элементы + стык-грани,
+         * А1172). A_c = R·S·P зондами: индикатор на агрегат, один такт (ω=1,
+         * эмиссия 0), ограничение ответа — столбец. Единицы по построению
+         * (радианс туда и обратно, А1170 исчезает). Клипы однородны, но не
+         * аддитивны — A_c есть линеаризация вокруг индикаторов (А1176). */
+        int32_t nagg = 0;
+        int32_t *aggof_e = NULL, *fagg = NULL, *piv9 = NULL;
+        double *aden = NULL, *LU9 = NULL, *cagg = NULL, *dagg = NULL, *ubprev = NULL;
+        double *farea = NULL;
+        if (xdsagal) {
+          int32_t gside = (1 << lev) >> xdsalev;
+          if (gside < 1) gside = 1;
+          int32_t ngrid = gside * gside * gside;
+          int32_t *gid = malloc((size_t)ngrid * sizeof *gid);
+          if (gid == NULL) exit(1);
+          for (int32_t i = 0; i < ngrid; i++)
+            gid[i] = -1;
+          aggof_e = malloc((size_t)(cut.nse > 0 ? cut.nse : 1) * sizeof *aggof_e);
+          fagg = malloc((size_t)mesh.nf * sizeof *fagg);
+          farea = calloc((size_t)mesh.nf, sizeof *farea);
+          if (aggof_e == NULL || fagg == NULL || farea == NULL) exit(1);
+          /* raw-номер агрегата ячейки */
+          int32_t *craw = malloc((size_t)mesh.ncell * sizeof *craw);
+          if (craw == NULL) exit(1);
+          for (int32_t ci = 0; ci < mesh.ncell; ci++) {
+            int32_t gx = mesh.clo[ci][0] >> xdsalev, gy = mesh.clo[ci][1] >> xdsalev,
+                    gz = mesh.clo[ci][2] >> xdsalev;
+            craw[ci] = (gz * gside + gy) * gside + gx;
+          }
+          for (int32_t e = 0; e < cut.nse; e++) {
+            int32_t ci = cut.se[e].cell;
+            aggof_e[e] = -2;
+            if (ci < 0 || ci >= mesh.ncell || !(cut.se[e].area > 0.0)) continue;
+            int32_t r = craw[ci];
+            if (gid[r] < 0) gid[r] = nagg++;
+            aggof_e[e] = gid[r];
+          }
+          for (int32_t f = 0; f < mesh.nf; f++) {
+            fagg[f] = -2;
+            if (mesh.f[f].cb < 0) continue;
+            int as9 = cut.solid[mesh.f[f].ca] ? 1 : 0, bs9 = cut.solid[mesh.f[f].cb] ? 1 : 0;
+            if (as9 == bs9) continue; /* не стык */
+            int32_t cf9 = as9 ? mesh.f[f].cb : mesh.f[f].ca;
+            farea[f] = cut.ffm[f][0][0] > 0.0 ? cut.ffm[f][0][0] : cut.ffmb[f][0][0];
+            if (!(farea[f] > 0.0)) continue;
+            int32_t r = craw[cf9];
+            if (gid[r] < 0) gid[r] = nagg++;
+            fagg[f] = gid[r];
+          }
+          free(craw);
+          free(gid);
+          if (nagg < 2 || nagg > 2048) {
+            fprintf(stderr, "xdsagal: агрегатов %d — вне [2, 2048]\n", nagg);
+            exit(1);
+          }
+          aden = calloc((size_t)nagg, sizeof *aden);
+          double *Ac = calloc((size_t)nagg * (size_t)nagg, sizeof *Ac);
+          cagg = calloc((size_t)nagg, sizeof *cagg);
+          dagg = calloc((size_t)nagg, sizeof *dagg);
+          ubprev = calloc((size_t)mesh.nf, sizeof *ubprev);
+          if (aden == NULL || Ac == NULL || cagg == NULL || dagg == NULL || ubprev == NULL) exit(1);
+          for (int32_t e = 0; e < cut.nse; e++)
+            if (aggof_e[e] >= 0) aden[aggof_e[e]] += cut.se[e].area;
+          for (int32_t f = 0; f < mesh.nf; f++)
+            if (fagg[f] >= 0) aden[fagg[f]] += farea[f];
+          /* зонды */
+          double tprobe = now_s();
+          double *usP = calloc((size_t)(cut.nse > 0 ? cut.nse : 1) * 4, sizeof *usP);
+          double *ubP = calloc((size_t)mesh.nf * 4, sizeof *ubP);
+          double *phi9 = calloc((size_t)mesh.ncell * 4, sizeof *phi9);
+          if (usP == NULL || ubP == NULL || phi9 == NULL) exit(1);
+          for (int32_t i = 0; i < nagg; i++) {
+            memset(usP, 0, (size_t)(cut.nse > 0 ? cut.nse : 1) * 4 * sizeof *usP);
+            memset(ubP, 0, (size_t)mesh.nf * 4 * sizeof *ubP);
+            memset(phi9, 0, (size_t)mesh.ncell * 4 * sizeof *phi9);
+            for (int32_t e = 0; e < cut.nse; e++)
+              if (aggof_e[e] == i) usP[4 * (size_t)e] = 1.0;
+            for (int32_t f = 0; f < mesh.nf; f++)
+              if (fagg[f] == i) ubP[4 * (size_t)f] = 1.0;
+            tr3_problem pd9 = prob;
+            pd9.elem_emit = NULL;
+            pd9.facet_emit = NULL;
+            pd9.relax = 0.0; /* ω=1: зондируется сырой S */
+            pd9.warm_start = 1;
+            pd9.bout_in = ubP;
+            pd9.sout_in = usP;
+            pd9.trace = 0;
+            tr3_stats st9;
+            memset(&st9, 0, sizeof st9);
+            if (tr3_sweep_solve(&pd9, 1, 0.0, phi9, &st9) != 0) exit(1);
+            for (int32_t e = 0; e < cut.nse; e++)
+              if (aggof_e[e] >= 0)
+                Ac[(size_t)aggof_e[e] * (size_t)nagg + (size_t)i] +=
+                    st9.sout[4 * (size_t)e] * cut.se[e].area;
+            for (int32_t f = 0; f < mesh.nf; f++)
+              if (fagg[f] >= 0)
+                Ac[(size_t)fagg[f] * (size_t)nagg + (size_t)i] +=
+                    st9.bout[4 * (size_t)f] * farea[f];
+            free(st9.bout);
+            free(st9.sout);
+            free(st9.eirr);
+          }
+          for (int32_t j = 0; j < nagg; j++)
+            for (int32_t i = 0; i < nagg; i++)
+              Ac[(size_t)j * (size_t)nagg + (size_t)i] /= aden[j] > 0.0 ? aden[j] : 1.0;
+          free(usP);
+          free(ubP);
+          free(phi9);
+          /* спектр A_c степенной итерацией — ключевой тест согласованности */
+          double rho9 = 0.0;
+          {
+            double *v9 = malloc((size_t)nagg * sizeof *v9);
+            double *w9v = malloc((size_t)nagg * sizeof *w9v);
+            if (v9 == NULL || w9v == NULL) exit(1);
+            for (int32_t i = 0; i < nagg; i++)
+              v9[i] = 1.0;
+            for (int itp = 0; itp < 100; itp++) {
+              double nn = 0.0;
+              for (int32_t j = 0; j < nagg; j++) {
+                double s9 = 0.0;
+                for (int32_t i = 0; i < nagg; i++)
+                  s9 += Ac[(size_t)j * (size_t)nagg + (size_t)i] * v9[i];
+                w9v[j] = s9;
+                nn += s9 * s9;
+              }
+              nn = sqrt(nn);
+              rho9 = nn / sqrt((double)nagg);
+              if (nn > 0.0)
+                for (int32_t j = 0; j < nagg; j++)
+                  v9[j] = w9v[j] / nn;
+              double vn = 0.0;
+              for (int32_t j = 0; j < nagg; j++)
+                vn += v9[j] * v9[j];
+              rho9 = nn; /* после нормировки v: ‖A v‖ при ‖v‖=1 */
+              (void)vn;
+            }
+            free(v9);
+            free(w9v);
+          }
+          /* LU (I − A_c) с частичным выбором */
+          LU9 = malloc((size_t)nagg * (size_t)nagg * sizeof *LU9);
+          piv9 = malloc((size_t)nagg * sizeof *piv9);
+          if (LU9 == NULL || piv9 == NULL) exit(1);
+          for (int32_t j = 0; j < nagg; j++)
+            for (int32_t i = 0; i < nagg; i++)
+              LU9[(size_t)j * (size_t)nagg + (size_t)i] =
+                  (i == j ? 1.0 : 0.0) - Ac[(size_t)j * (size_t)nagg + (size_t)i];
+          for (int32_t k = 0; k < nagg; k++) {
+            int32_t bp = k;
+            for (int32_t j = k + 1; j < nagg; j++)
+              if (fabs(LU9[(size_t)j * (size_t)nagg + (size_t)k]) >
+                  fabs(LU9[(size_t)bp * (size_t)nagg + (size_t)k]))
+                bp = j;
+            piv9[k] = bp;
+            if (bp != k)
+              for (int32_t i = 0; i < nagg; i++) {
+                double t9s = LU9[(size_t)k * (size_t)nagg + (size_t)i];
+                LU9[(size_t)k * (size_t)nagg + (size_t)i] =
+                    LU9[(size_t)bp * (size_t)nagg + (size_t)i];
+                LU9[(size_t)bp * (size_t)nagg + (size_t)i] = t9s;
+              }
+            double pv9 = LU9[(size_t)k * (size_t)nagg + (size_t)k];
+            if (!(fabs(pv9) > 0.0)) {
+              fprintf(stderr, "xdsagal: вырождение LU на шаге %d\n", k);
+              exit(1);
+            }
+            for (int32_t j = k + 1; j < nagg; j++) {
+              double m9 = LU9[(size_t)j * (size_t)nagg + (size_t)k] / pv9;
+              LU9[(size_t)j * (size_t)nagg + (size_t)k] = m9;
+              for (int32_t i = k + 1; i < nagg; i++)
+                LU9[(size_t)j * (size_t)nagg + (size_t)i] -=
+                    m9 * LU9[(size_t)k * (size_t)nagg + (size_t)i];
+            }
+          }
+          free(Ac);
+          printf("   §752 ГАЛЁРКИН: агрегатов %d (коробка %d листьев), зонды %.1f с; "
+                 "ρ(A_c) = %.4f\n",
+                 nagg, 1 << xdsalev, now_s() - tprobe, rho9);
+        }
+        int32_t NS = 0;
+        if (!xdsagal) {
+          arealight AL9;
+          memset(&AL9, 0, sizeof AL9); /* keonly: AL ядром не читается */
+          g_dsa_keep = 1;
+          ind_core_build(&T, &ht, &fr, &P, &AL9, &m, &CT, lev, g_hgather, indvis);
+          g_dsa_keep = 0;
+          if (!g_dsa_ready) exit(1);
+          NS = g_dsa_SF.n;
+        }
         /* мосты: узел -> срез, ячейка меша -> срез; отказы — счётчиками (А891) */
         int32_t *n2s = malloc((size_t)T.n * sizeof *n2s);
         int32_t *c2s = malloc((size_t)mesh.ncell * sizeof *c2s);
@@ -7301,13 +7496,14 @@ int main(int argc, char **argv) {
           int32_t ci = cut.se[e].cell;
           if (ci >= 0 && ci < mesh.ncell && c2s[ci] >= 0) acov += a;
         }
-        printf("   §750 МОСТ: покрытие элементов срезом %.1f %% площади\n",
-               100.0 * acov / (atot > 0.0 ? atot : 1.0));
-        float *bc9 = malloc(3 * (size_t)NS * sizeof *bc9);
-        float *bn9 = malloc(3 * (size_t)NS * sizeof *bn9);
-        double *cslice = calloc((size_t)NS, sizeof *cslice);
-        double *dnum = calloc((size_t)NS, sizeof *dnum);
-        double *dden = calloc((size_t)NS, sizeof *dden);
+        if (!xdsagal)
+          printf("   §750 МОСТ: покрытие элементов срезом %.1f %% площади\n",
+                 100.0 * acov / (atot > 0.0 ? atot : 1.0));
+        float *bc9 = malloc(3 * (size_t)(NS > 0 ? NS : 1) * sizeof *bc9);
+        float *bn9 = malloc(3 * (size_t)(NS > 0 ? NS : 1) * sizeof *bn9);
+        double *cslice = calloc((size_t)(NS > 0 ? NS : 1), sizeof *cslice);
+        double *dnum = calloc((size_t)(NS > 0 ? NS : 1), sizeof *dnum);
+        double *dden = calloc((size_t)(NS > 0 ? NS : 1), sizeof *dden);
         double *usprev = calloc((size_t)(cut.nse > 0 ? cut.nse : 1), sizeof *usprev);
         if (bc9 == NULL || bn9 == NULL || cslice == NULL || dnum == NULL || dden == NULL ||
             usprev == NULL)
@@ -7322,6 +7518,58 @@ int main(int argc, char **argv) {
           memset(&st, 0, sizeof st);
           src = tr3_sweep_solve(&prob, 1, 0.0, phi, &st);
           if (src != 0) break;
+          /* §752: галёркинское звено — δ по агрегатам (sout И стык-bout),
+           * деление на ω (демпфированное приращение = ω·(S−x)), плотное LU,
+           * продление кусочно-постоянно в оба носителя. */
+          if (xdsagal) {
+            double w9 = prob.relax > 0.0 ? prob.relax : 1.0;
+            memset(dagg, 0, (size_t)nagg * sizeof *dagg);
+            for (int32_t e = 0; e < cut.nse; e++)
+              if (aggof_e[e] >= 0)
+                dagg[aggof_e[e]] += (st.sout[4 * (size_t)e] - usprev[e]) * cut.se[e].area;
+            for (int32_t f = 0; f < mesh.nf; f++)
+              if (fagg[f] >= 0) dagg[fagg[f]] += (st.bout[4 * (size_t)f] - ubprev[f]) * farea[f];
+            for (int32_t j = 0; j < nagg; j++)
+              dagg[j] /= (aden[j] > 0.0 ? aden[j] : 1.0) * w9;
+            /* LU-решение (I − A_c)·c = δ */
+            for (int32_t k = 0; k < nagg; k++) {
+              if (piv9[k] != k) {
+                double t9s = dagg[k];
+                dagg[k] = dagg[piv9[k]];
+                dagg[piv9[k]] = t9s;
+              }
+              for (int32_t j = k + 1; j < nagg; j++)
+                dagg[j] -= LU9[(size_t)j * (size_t)nagg + (size_t)k] * dagg[k];
+            }
+            for (int32_t k = nagg - 1; k >= 0; k--) {
+              for (int32_t i = k + 1; i < nagg; i++)
+                dagg[k] -= LU9[(size_t)k * (size_t)nagg + (size_t)i] * cagg[i];
+              cagg[k] = dagg[k] / LU9[(size_t)k * (size_t)nagg + (size_t)k];
+            }
+            double cmx9 = 0.0;
+            for (int32_t e = 0; e < cut.nse; e++)
+              if (aggof_e[e] >= 0) {
+                double dc = xdsagain * cagg[aggof_e[e]];
+                st.sout[4 * (size_t)e] += dc;
+                if (fabs(dc) > cmx9) cmx9 = fabs(dc);
+              }
+            for (int32_t f = 0; f < mesh.nf; f++)
+              if (fagg[f] >= 0) st.bout[4 * (size_t)f] += xdsagain * cagg[fagg[f]];
+            for (int32_t e = 0; e < cut.nse; e++)
+              usprev[e] = st.sout[4 * (size_t)e];
+            for (int32_t f = 0; f < mesh.nf; f++)
+              ubprev[f] = st.bout[4 * (size_t)f];
+            printf("   §752 такт %2d: resid %.3e; max|поправка| %.3e; %.1f с\n", it9, st.resid,
+                   cmx9, now_s() - t9);
+            free(ub9);
+            free(us9);
+            free(st.eirr);
+            st.eirr = NULL;
+            ub9 = st.bout;
+            us9 = st.sout;
+            if (st.resid < xtol && it9 > 2) break;
+            continue;
+          }
           /* приращение -> срез (площадно-взвешенно, радиосити = π·радианс) */
           memset(dnum, 0, (size_t)NS * sizeof *dnum);
           memset(dden, 0, (size_t)NS * sizeof *dden);
@@ -7389,6 +7637,15 @@ int main(int argc, char **argv) {
           if (st.resid < xtol && it9 > 2) break;
         }
         free(n2s);
+        free(aggof_e);
+        free(fagg);
+        free(farea);
+        free(aden);
+        free(LU9);
+        free(piv9);
+        free(cagg);
+        free(dagg);
+        free(ubprev);
         free(c2s);
         free(bc9);
         free(bn9);

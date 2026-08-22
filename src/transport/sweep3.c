@@ -339,6 +339,8 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   int32_t *chnc = NULL;
   double *chnl = NULL;
   /* §735: макс мажоранты L по направлениям на элемент — граница облучённости */
+  /* §746: то же для ГРАНЕЙ (стенки и стык) — граница обновления bout */
+  double *bfmax = calloc((size_t)(0 < m->nf ? m->nf : 1), sizeof(double));
   double *semax = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   double *hs_se = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
   double *hs_out = calloc((size_t)(nse > 0 ? nse : 1), sizeof(double));
@@ -367,7 +369,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   if (Lall == NULL || phinall == NULL || indegall == NULL || orderall == NULL || queueall == NULL ||
       phin == NULL || binfall == NULL || sinfall == NULL || bout == NULL || binf == NULL ||
       sout == NULL || sinf == NULL || hs_se == NULL || hs_out == NULL || semax == NULL ||
-      bprev == NULL || sprev == NULL) {
+      bfmax == NULL || bprev == NULL || sprev == NULL) {
     free(Lall);
     free(phinall);
     free(indegall);
@@ -387,6 +389,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     free(chnl);
     free(hs_se);
     free(semax);
+    free(bfmax);
     free(hs_out);
     free(bprev);
     free(sprev);
@@ -593,7 +596,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
 
   int nclip_last = 0, it = 0, nfb = 0;
   /* §735: счётчики клипа принципа максимума — ячейки и элементы */
-  int nmaxp_last = 0, nmaxpe_last = 0;
+  int nmaxp_last = 0, nmaxpe_last = 0, nmaxpf_last = 0;
   /* §677: ОТКАТ РАСЩЕПЛЁН НА ЧЕТЫРЕ. К86 говорит, что условий два и природа у
    * них разная: вырождение элемента — свойство ГЕОМЕТРИИ (множество постоянно),
    * `corner_min < 0` — свойство ПОЛЯ, то есть ПЕРЕКЛЮЧАТЕЛЬ. Пока они считались
@@ -616,9 +619,11 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     memset(binfall, 0, (size_t)nth * (size_t)m->nf * 4 * sizeof(double));
     memset(sinfall, 0, (size_t)nth * (size_t)(nse > 0 ? nse : 1) * 4 * sizeof(double));
     memset(semax, 0, (size_t)(nse > 0 ? nse : 1) * sizeof(double));
+    memset(bfmax, 0, (size_t)m->nf * sizeof(double));
     nclip_last = 0;
     nmaxp_last = 0;
     nmaxpe_last = 0;
+    nmaxpf_last = 0;
     nfb = 0;
     nfb_fg = nfb_fp = nfb_eg = nfb_ep = nfb_thin = 0;
     st->pin = st->pout = st->pabs = 0.0;
@@ -1191,6 +1196,10 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
           pout_acc += on * d->w[mm] * accj[0]; /* вышло ИЗ ОБЛАСТИ */
         for (int j = 0; j < 4; j++)
           binft[f * 4 + j] += on * d->w[mm] * accj[j];
+        /* §746: граница обновления bout — макс мажоранты L вкладчиков (как
+         * semax у элементов; однопоточно, nth = 1) */
+        double bm7 = corner_amax(&L[c * 4]);
+        if (bm7 > bfmax[f]) bfmax[f] = bm7;
         /* ЭТАП C: у зеркальной грани копится момент ПО ОРДИНАТЕ, без веса —
          * зеркало не интегрирует по полусфере, оно переставляет направление. */
         if (!at_solid && mfid != NULL && mfid[f] >= 0)
@@ -1218,6 +1227,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       free(chnl);
       free(hs_se);
       free(semax);
+      free(bfmax);
       free(hs_out);
       free(bprev);
       free(sprev);
@@ -1322,6 +1332,25 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
            * константа, представимая в любом случае. Порога в критерии нет. */
           ee[0] = binf[f * 4] / fmm[0][0];
           ee[1] = ee[2] = ee[3] = 0.0;
+        }
+        /* §746: ПРИНЦИП МАКСИМУМА ДЛЯ ГРАНИ — та же граница, что у элементов
+         * (§735): E(x) ≤ hsum·max|L| по вкладчикам (bfmax). Проекция DG1 на
+         * грани не ограничена так же, как на элементах; взрыв §714 (bout до
+         * 4.9e+34) жил здесь. Форма непрерывная (А1125/А1128). */
+        if (!p->maxp_off) {
+          double bnd = bfmax[f] * hsum[wall] * HZ_MAXP_TOL;
+          double S3 = 0.5 * (fabs(ee[1]) + fabs(ee[2]) + fabs(ee[3]));
+          if (fabs(ee[0]) + S3 > bnd) {
+            if (fabs(ee[0]) < bnd && S3 > 0.0) {
+              double t3 = (bnd - fabs(ee[0])) / S3;
+              for (int j = 1; j < 4; j++)
+                ee[j] *= t3;
+            } else {
+              ee[0] = binf[f * 4] / fmm[0][0];
+              ee[1] = ee[2] = ee[3] = 0.0;
+            }
+            nmaxpf_last++;
+          }
         }
         for (int j = 0; j < 4; j++)
           bout[f * 4 + j] = (hsum[wall] > 0.0 ? rho_w * ee[j] / hsum[wall] : 0.0);
@@ -1663,10 +1692,10 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
      * если невязка стоит, а эти два числа МЕНЯЮТСЯ — это переключатель, а не
      * скорость, и лечится оно не разгоном. */
     if (p->trace > 0 && (it % p->trace == 0 || resid < tol))
-      printf("    it %5d  resid %.3e  nclip %d  maxp %d+%d  nfb %d = грани(геом %d, поле %d) + "
+      printf("    it %5d  resid %.3e  nclip %d  maxp %d+%d+%d  nfb %d = грани(геом %d, поле %d) + "
              "элементы(геом %d, поле %d); из полевых на ЩЕПКАХ %d\n",
-             it, resid, nclip_last, nmaxp_last, nmaxpe_last, nfb, nfb_fg, nfb_fp, nfb_eg, nfb_ep,
-             nfb_thin);
+             it, resid, nclip_last, nmaxp_last, nmaxpe_last, nmaxpf_last, nfb, nfb_fg, nfb_fp,
+             nfb_eg, nfb_ep, nfb_thin);
     /* §693: РОСТ КАК ФУНКЦИЯ ДОЛИ ФЛЮИДА, БЕЗ ПОРОГОВ. Декада — способ показать
      * кривую: каждая ячейка попадает ровно в одну, ни одна не отбрасывается.
      * Печатается медиана (а не среднее — А1090), p99 и максимум. */
@@ -2146,6 +2175,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   free(chnl);
   free(hs_se);
   free(semax);
+  free(bfmax);
   free(hs_out);
   free(bprev);
   free(sprev);

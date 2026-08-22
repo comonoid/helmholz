@@ -7200,6 +7200,9 @@ int main(int argc, char **argv) {
         if (fz2 == NULL) exit(1);
         tr3_problem pd = prob;
         pd.facet_rho = fz2;
+        /* §746: «прямой» обязан быть прямым — стык-отскоки принадлежат
+         * КОСВЕННОМУ, каким бы ни был ключ xsolidrho */
+        pd.solid_rho = 0.0;
         tr3_stats std;
         memset(&std, 0, sizeof std);
         if (tr3_sweep_solve(&pd, xit, xtol, phi, &std) == 0) {

@@ -86,6 +86,11 @@ typedef struct {
  * попадает вовсе (Г38 как раз про то, что «ноль отобранных» у полной и у пустой
  * ячейки выглядит одинаково). Пропустить её значит пустить свет НАСКВОЗЬ ТЕЛА —
  * измерено: объём материала вышел 29.4 вместо 164.6. */
+/* §772: сбор ссылок поддерева и флюидный объём резом — для предиката огрубления */
+int tr3_cut_subtree_refs(const hz_octree *t, const hz_cutmap *cm, int32_t ni, int32_t *refs,
+                         int max);
+double tr3_cut_refs_fluid_vol(const hz_frame *fr, const hz_facettab *ft, const int32_t *refs,
+                              int nrefs, const int32_t lo[3], int32_t size);
 int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const hz_cutmap *cm,
                   const uint8_t *solid_in);
 void tr3_cut_free(tr3_cut *cu);

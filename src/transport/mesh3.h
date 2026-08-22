@@ -51,6 +51,12 @@ typedef struct {
 } tr3_mesh;
 
 int tr3_mesh_build(tr3_mesh *m, const hz_octree *t, const hz_frame *fr);
+/* §772: строитель с ПРЕДИКАТОМ остановки спуска: для ВНУТРЕННЕГО узла вернуть
+ * 1 — взять узел ячейкой (огрубление), 0 — спускаться дальше. NULL — прежнее
+ * поведение побитово (полные листья). */
+typedef int (*tr3_mesh_stop_fn)(void *ctx, int32_t ni, const int32_t lo[3], int32_t size);
+int tr3_mesh_build_lod(tr3_mesh *m, const hz_octree *t, const hz_frame *fr, tr3_mesh_stop_fn stop,
+                       void *ctx);
 void tr3_mesh_free(tr3_mesh *m);
 
 /* Четыре вершины грани в МИРОВЫХ координатах, обходом ПРОТИВ ЧАСОВОЙ, если

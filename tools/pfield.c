@@ -2693,6 +2693,98 @@ static int32_t node_swE_best(const hz_dctree *t, int lev, const hz_dccell *c, in
   return best;
 }
 
+/* §772: ПРЕДИКАТ ОГРУБЛЕНИЯ ПРИЁМНИКОВ — лестница L = εR с fail-closed к
+ * тонкому. Узел размера S листов берётся ячейкой, если он дальше D0·S от
+ * глаза, его плоскости влезают в бюджет и ОБЪЁМНАЯ СВЕРКА сходится: флюид
+ * грубого реза равен сумме листовых (невыпуклый материал в коробке даёт
+ * макроскопическое расхождение и узел остаётся тонким). */
+typedef struct {
+  const hz_octree *t;
+  const hz_cutmap *cm;
+  const hz_facettab *ft;
+  const hz_frame *fr;
+  const unsigned char *occ;
+  const uint8_t *smask;
+  int occn, innerfluid;
+  double eye[3], d0;
+  int64_t nacc, nacc_empty, nrej_budget, nrej_core, nrej_vol;
+} c772;
+
+static double c772_leafvol(c772 *cx, int32_t ni, const int32_t lo[3], int32_t size) {
+  const hz_cutrec *r = hz_cutmap_find(cx->cm, ni);
+  if (r != NULL) {
+    int32_t refs[HZ_P3_MAXH];
+    int nr = tr3_cut_subtree_refs(cx->t, cx->cm, ni, refs, HZ_P3_MAXH);
+    if (nr < 0) return -1.0;
+    return tr3_cut_refs_fluid_vol(cx->fr, cx->ft, refs, nr, lo, size);
+  }
+  /* без разреза: флюид весь бокс либо ноль — та же логика, что маска solid */
+  size_t k = hz_occ_index(cx->occn, lo[0], lo[1], lo[2]);
+  unsigned cls = cx->smask != NULL ? cx->smask[k] : 1u;
+  int solid =
+      cx->smask != NULL && (cls == 0u || (cls == 2u && !cx->innerfluid)) && !hz_occ_get(cx->occ, k);
+  if (solid) return 0.0;
+  return tr3_cut_refs_fluid_vol(cx->fr, cx->ft, NULL, 0, lo, size);
+}
+
+static double c772_subvol(c772 *cx, int32_t ni, const int32_t lo[3], int32_t size) {
+  if (cx->t->nodes[ni].child0 < 0) return c772_leafvol(cx, ni, lo, size);
+  int32_t half = size / 2;
+  double v = 0.0;
+  for (int i = 0; i < 8; i++) {
+    int32_t clo[3] = {lo[0] + ((i & 1) ? half : 0), lo[1] + ((i & 2) ? half : 0),
+                      lo[2] + ((i & 4) ? half : 0)};
+    double dv = c772_subvol(cx, cx->t->nodes[ni].child0 + i, clo, half);
+    if (dv < 0.0) return -1.0;
+    v += dv;
+  }
+  return v;
+}
+
+static int c772_stop(void *vc, int32_t ni, const int32_t lo[3], int32_t size) {
+  c772 *cx = vc;
+  double dmin2 = 0.0;
+  for (int a = 0; a < 3; a++) {
+    double blo = cx->fr->o[a] + cx->fr->u[a] * (double)lo[a];
+    double bhi = cx->fr->o[a] + cx->fr->u[a] * (double)(lo[a] + size);
+    double d = cx->eye[a] < blo ? blo - cx->eye[a] : (cx->eye[a] > bhi ? cx->eye[a] - bhi : 0.0);
+    dmin2 += d * d;
+  }
+  if (sqrt(dmin2) < cx->d0 * (double)size) return 0; /* близко — спуск, не отказ */
+  enum { C772_BUDGET = HZ_P3_MAXH - 8 };             /* запас на грани коробки */
+  int32_t refs[HZ_P3_MAXH];
+  int nr = tr3_cut_subtree_refs(cx->t, cx->cm, ni, refs, C772_BUDGET);
+  if (nr < 0) {
+    cx->nrej_budget++;
+    return 0;
+  }
+  if (nr == 0) {
+    cx->nacc_empty++;
+    cx->nacc++;
+    return 1; /* поверхности нет — грубим свободно */
+  }
+  double vc9 = tr3_cut_refs_fluid_vol(cx->fr, cx->ft, refs, nr, lo, size);
+  if (vc9 < 0.0) {
+    cx->nrej_core++;
+    return 0;
+  }
+  double vf = c772_subvol(cx, ni, lo, size);
+  if (vf < 0.0) {
+    cx->nrej_core++;
+    return 0;
+  }
+  double vbox =
+      (double)size * (double)size * (double)size * cx->fr->u[0] * cx->fr->u[1] * cx->fr->u[2];
+  /* допуск 1e-6·Vbox: плавающая сумма кусков против одного реза; невыпуклость
+   * материала даёт МАКРОСКОПИЧЕСКОЕ расхождение, не 1e-6 */
+  if (fabs(vc9 - vf) > 1e-6 * vbox) {
+    cx->nrej_vol++;
+    return 0;
+  }
+  cx->nacc++;
+  return 1;
+}
+
 /* §762: подъём флага заполнения предкам и спуск с last-good по флагу. */
 static int fill_lift(const hz_dctree *t, int32_t ni) {
   int any = g_indfill[ni];
@@ -5785,6 +5877,7 @@ int main(int argc, char **argv) {
   int xdsasplit = 0;      /* §756: элементы и стык — раздельные грубые переменные */
   int xframe = 0;         /* §758: кадр развёрткой — свиповое поле вместо ядра в irr */
   int xcontrib = 0;       /* §768: прибор вклада — перевозмущения ρ→0 по классам */
+  double xcoarse = 0.0;   /* §772: метров дальности на лист размера; 0 — выключено */
   int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
   int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
   int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
@@ -5891,6 +5984,7 @@ int main(int argc, char **argv) {
       doxsweep = 1;
     }
     if (strncmp(argv[i], "xdsaeps=", 8) == 0) xdsaeps = strtod(argv[i] + 8, NULL);
+    if (strncmp(argv[i], "xcoarse=", 8) == 0) xcoarse = strtod(argv[i] + 8, NULL);
     if (strcmp(argv[i], "xcontrib") == 0) {
       xcontrib = 1;
       xmatrho = 1;
@@ -6852,7 +6946,29 @@ int main(int argc, char **argv) {
     oct_by_occ(&ot, &P, lev, 0, 0, 0, fr.n);
     hz_frame ofr = {{fr.org[0], fr.org[1], fr.org[2]}, {fr.h, fr.h, fr.h}};
     tr3_mesh mesh;
-    if (tr3_mesh_build(&mesh, &ot, &ofr) != 0) exit(1);
+    c772 cx772;
+    memset(&cx772, 0, sizeof cx772);
+    if (xcoarse > 0.0) {
+      /* §772: огрубление приёмников — узел размера S листов с дальности D0·S */
+      cx772.t = &ot;
+      cx772.cm = &cmap;
+      cx772.ft = &ftab;
+      cx772.fr = &ofr;
+      cx772.occ = P.b[lev];
+      cx772.smask = solidmask;
+      cx772.occn = fr.n;
+      cx772.innerfluid = xinnerfluid;
+      for (int a = 0; a < 3; a++)
+        cx772.eye[a] = g_eye[a];
+      cx772.d0 = xcoarse;
+      if (tr3_mesh_build_lod(&mesh, &ot, &ofr, c772_stop, &cx772) != 0) exit(1);
+      printf("   §772 ОГРУБЛЕНИЕ (D0 = %.1f м/лист): принято %lld узлов (из них пустых %lld); "
+             "отказы: бюджет %lld, ядро %lld, ОБЪЁМНАЯ СВЕРКА %lld; ячеек сетки %d\n",
+             xcoarse, (long long)cx772.nacc, (long long)cx772.nacc_empty,
+             (long long)cx772.nrej_budget, (long long)cx772.nrej_core, (long long)cx772.nrej_vol,
+             mesh.ncell);
+    } else if (tr3_mesh_build(&mesh, &ot, &ofr) != 0)
+      exit(1);
     double t_mesh = now_s() - tx;
     /* МАСКА ПОЛНЫХ ЯЧЕЕК — из заливки. У листа с поверхностью размер 1, у
      * пустого — класс однороден по построению, поэтому хватает ОДНОЙ пробы в

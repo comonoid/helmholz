@@ -11,6 +11,79 @@
  * ВНУТРЕННИЕ (по ту сторону — другой кусок той же флюидной области), а
  * перевёрнутая — как поверхность. Диапазоны не пересекаются с ~(0..5) у коробки. */
 #define CUT3_INNER (-1000)
+
+/* §772: уникальные ссылки плоскостей ПОДДЕРЕВА узла. Обе ориентации одной
+ * плоскости ЛЕГАЛЬНЫ (материал-слэб тонкой стены выпукл); невыпуклый материал
+ * ловится не здесь, а объёмной сверкой в предикате огрубления. Возврат: число
+ * ссылок; −1 — не влезло в max (кандидат не грубится). */
+int tr3_cut_subtree_refs(const hz_octree *t, const hz_cutmap *cm, int32_t ni, int32_t *refs,
+                         int max) {
+  /* стек: 7·глубина + 1 ≤ 7·16 + 1 = 113 при пределе решётки uint16 */
+  int32_t stack[128];
+  int sp = 0, n = 0;
+  stack[sp++] = ni;
+  while (sp > 0) {
+    int32_t cur = stack[--sp];
+    const hz_cutrec *r = hz_cutmap_find(cm, cur);
+    if (r != NULL)
+      for (int32_t j = 0; j < r->nf; j++) {
+        int32_t ref = cm->fref[r->f0 + j];
+        int dup = 0;
+        for (int q = 0; q < n; q++)
+          if (refs[q] == ref) {
+            dup = 1;
+            break;
+          }
+        if (dup) continue;
+        if (n >= max) return -1;
+        refs[n++] = ref;
+      }
+    if (t->nodes[cur].child0 >= 0) {
+      if (sp + 8 > (int)(sizeof stack / sizeof stack[0])) return -1;
+      for (int k = 0; k < 8; k++)
+        stack[sp++] = t->nodes[cur].child0 + k;
+    }
+  }
+  return n;
+}
+
+/* §772: флюидный объём коробки узла, резанной набором ссылок — тем же
+ * дополнением, что рабочий путь сборки. Пустой набор — объём коробки тем же
+ * ядром (одна арифметика на обе стороны сверки). Возврат < 0 — отказ ядра. */
+double tr3_cut_refs_fluid_vol(const hz_frame *fr, const hz_facettab *ft, const int32_t *refs,
+                              int nrefs, const int32_t lo[3], int32_t size) {
+  int32_t hi[3] = {lo[0] + size, lo[1] + size, lo[2] + size};
+  if (nrefs > HZ_P3_MAXH || nrefs < 0) return -1.0;
+  if (nrefs == 0) {
+    hz_poly3 box;
+    if (hz_poly3_cut(&box, lo, hi, NULL, NULL, 0) != HZ_P3_OK) return -1.0;
+    return hz_poly3_volume(&box, fr);
+  }
+  hz_hspace h[HZ_P3_MAXH];
+  int32_t hid[HZ_P3_MAXH], hflip[HZ_P3_MAXH];
+  for (int j = 0; j < nrefs; j++) {
+    int32_t ref = refs[j], fi = ref >= 0 ? ref : ~ref;
+    if (fi < 0 || fi >= ft->n) return -1.0;
+    const hz_facet *f = &ft->f[fi];
+    for (int a = 0; a < 3; a++)
+      h[j].n[a] = ref >= 0 ? f->n[a] : -f->n[a];
+    h[j].off = ref >= 0 ? f->off : -f->off;
+    hid[j] = CUT3_INNER;
+    hflip[j] = CUT3_INNER;
+  }
+  hz_poly3 *pieces = calloc((size_t)nrefs, sizeof(hz_poly3));
+  if (pieces == NULL) return -1.0;
+  int npc = 0;
+  if (hz_poly3_complement(pieces, nrefs, &npc, lo, hi, h, hid, hflip, nrefs) != HZ_P3_OK) {
+    free(pieces);
+    return -1.0;
+  }
+  double v = 0.0;
+  for (int p = 0; p < npc; p++)
+    v += hz_poly3_volume(&pieces[p], fr);
+  free(pieces);
+  return v;
+}
 #define CUT3_SURF0 (1000)
 
 void tr3_cut_free(tr3_cut *cu) {
@@ -131,10 +204,30 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
   /* --- ячейки с границей: флюидная часть и поверхностные элементы --- */
   for (int32_t c = 0; c < m->ncell; c++) {
     const hz_cutrec *rec = hz_cutmap_find(cm, m->node[c]);
-    if (rec == NULL) continue;
+    int32_t refs772[HZ_P3_MAXH]; /* §772: ссылки грубой ячейки — элементам нужен фасет */
     hz_hspace h[HZ_P3_MAXH];
     int32_t hid[HZ_P3_MAXH], hflip[HZ_P3_MAXH];
-    int nh = hz_cutmap_hspaces(ft, cm, rec, h, hid, hflip, HZ_P3_MAXH);
+    int nh = 0;
+    if (rec != NULL) {
+      nh = hz_cutmap_hspaces(ft, cm, rec, h, hid, hflip, HZ_P3_MAXH);
+    } else if (m->tree->nodes[m->node[c]].child0 >= 0) {
+      /* §772: ГРУБАЯ ячейка (внутренний узел без своей записи) — плоскости
+       * собираются с ПОДДЕРЕВА; выпуклость материала обеспечена предикатом
+       * огрубления (объёмная сверка), сюда доходят только принятые узлы. */
+      int nr = tr3_cut_subtree_refs(m->tree, cm, m->node[c], refs772, HZ_P3_MAXH);
+      for (int j = 0; j < (nr > 0 ? nr : 0); j++) {
+        int32_t ref = refs772[j], fi2 = ref >= 0 ? ref : ~ref;
+        if (fi2 < 0 || fi2 >= ft->n) {
+          nr = 0;
+          break;
+        }
+        const hz_facet *fp = &ft->f[fi2];
+        for (int a = 0; a < 3; a++)
+          h[j].n[a] = ref >= 0 ? fp->n[a] : -fp->n[a];
+        h[j].off = ref >= 0 ? fp->off : -fp->off;
+      }
+      nh = nr > 0 ? nr : 0;
+    }
     if (nh <= 0) continue;
     /* УСЛОВИЕ 1:1 (записано в заголовке): грань сетки у разрезанной ячейки
      * обязана совпадать с гранью коробки, иначе флюидную часть пришлось бы ещё
@@ -215,7 +308,7 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
           tr3_selem se;
           memset(&se, 0, sizeof se);
           se.cell = c;
-          int32_t ref = cm->fref[rec->f0 + src];
+          int32_t ref = rec != NULL ? cm->fref[rec->f0 + src] : refs772[src]; /* §772 */
           se.facet = ref >= 0 ? ref : ~ref;
           se.area = poly_mass2(m, vw, (int)nv, c, c, se.m);
           if (!(se.area > 0.0)) continue;

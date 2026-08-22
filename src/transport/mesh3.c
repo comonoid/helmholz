@@ -18,13 +18,15 @@ void tr3_mesh_free(tr3_mesh *m) {
 
 /* --- перечисление листьев --------------------------------------------------- */
 
-static void leaves_rec(tr3_mesh *m, int32_t ni, const int32_t lo[3], int32_t size) {
-  if (m->tree->nodes[ni].child0 >= 0) {
+static void leaves_rec(tr3_mesh *m, int32_t ni, const int32_t lo[3], int32_t size,
+                       tr3_mesh_stop_fn stop, void *ctx) {
+  if (m->tree->nodes[ni].child0 >= 0 &&
+      !(stop != NULL && stop(ctx, ni, lo, size) != 0) /* §772: огрубление */) {
     int32_t half = size / 2;
     for (int i = 0; i < 8; i++) {
       int32_t clo[3] = {lo[0] + ((i & 1) ? half : 0), lo[1] + ((i & 2) ? half : 0),
                         lo[2] + ((i & 4) ? half : 0)};
-      leaves_rec(m, m->tree->nodes[ni].child0 + i, clo, half);
+      leaves_rec(m, m->tree->nodes[ni].child0 + i, clo, half, stop, ctx);
     }
     return;
   }
@@ -36,13 +38,15 @@ static void leaves_rec(tr3_mesh *m, int32_t ni, const int32_t lo[3], int32_t siz
   m->csize[c] = size;
 }
 
-/* Листья, пересекающие коробку [blo, bhi). Собираются в out. */
-static void collect_rec(const hz_octree *t, int32_t ni, const int32_t nlo[3], int32_t size,
+/* ЯЧЕЙКИ СЕТКИ, пересекающие коробку [blo, bhi). Собираются в out. §772:
+ * остановка не только на листе, но и на узле-ЯЧЕЙКЕ (cellof ≥ 0) — иначе
+ * грубый сосед не находился бы и грань «тонкая—грубая» пропадала. */
+static void collect_rec(const tr3_mesh *m, int32_t ni, const int32_t nlo[3], int32_t size,
                         const int32_t blo[3], const int32_t bhi[3], int32_t *out, int32_t *n,
                         int32_t max) {
   for (int a = 0; a < 3; a++)
     if (nlo[a] + size <= blo[a] || bhi[a] <= nlo[a]) return;
-  if (t->nodes[ni].child0 < 0) {
+  if (m->tree->nodes[ni].child0 < 0 || m->cellof[ni] >= 0) {
     if (*n < max) out[(*n)++] = ni;
     return;
   }
@@ -50,7 +54,7 @@ static void collect_rec(const hz_octree *t, int32_t ni, const int32_t nlo[3], in
   for (int i = 0; i < 8; i++) {
     int32_t clo[3] = {nlo[0] + ((i & 1) ? half : 0), nlo[1] + ((i & 2) ? half : 0),
                       nlo[2] + ((i & 4) ? half : 0)};
-    collect_rec(t, t->nodes[ni].child0 + i, clo, half, blo, bhi, out, n, max);
+    collect_rec(m, m->tree->nodes[ni].child0 + i, clo, half, blo, bhi, out, n, max);
   }
 }
 
@@ -78,6 +82,11 @@ static int push_face(tr3_mesh *m, int32_t ca, int32_t cb, int axis, int32_t pos,
 }
 
 int tr3_mesh_build(tr3_mesh *m, const hz_octree *t, const hz_frame *fr) {
+  return tr3_mesh_build_lod(m, t, fr, NULL, NULL);
+}
+
+int tr3_mesh_build_lod(tr3_mesh *m, const hz_octree *t, const hz_frame *fr, tr3_mesh_stop_fn stop,
+                       void *ctx) {
   memset(m, 0, sizeof *m);
   m->tree = t;
   m->fr = *fr;
@@ -94,7 +103,7 @@ int tr3_mesh_build(tr3_mesh *m, const hz_octree *t, const hz_frame *fr) {
   for (int32_t i = 0; i < t->n; i++)
     m->cellof[i] = -1;
   int32_t zero[3] = {0, 0, 0};
-  leaves_rec(m, 0, zero, n);
+  leaves_rec(m, 0, zero, n, stop, ctx);
 
   m->fcap = 64;
   m->f = calloc((size_t)m->fcap, sizeof(tr3_face));
@@ -149,7 +158,7 @@ int tr3_mesh_build(tr3_mesh *m, const hz_octree *t, const hz_frame *fr) {
       blo[a] = pos;
       bhi[a] = pos + 1;
       int32_t nb = 0;
-      collect_rec(t, 0, zero, n, blo, bhi, buf, &nb, t->n);
+      collect_rec(m, 0, zero, n, blo, bhi, buf, &nb, t->n);
       for (int32_t i = 0; i < nb; i++) {
         int32_t cb = m->cellof[buf[i]];
         if (cb < 0) continue;

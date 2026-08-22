@@ -2653,6 +2653,20 @@ static hz_dcslice g_dsa_SF;
 static linkcache g_dsa_LC;
 static double *g_dsa_ffv = NULL;
 
+/* §758: свиповое поле на УЗЛАХ дерева для кадра — num/den (E·площадь и
+ * площадь), подъём суммами поддеревьев: кадровый срез с LOD читает любой
+ * уровень как площадно-взвешенное среднее поддерева. */
+static double *g_swEn = NULL, *g_swEd = NULL;
+static void swE_lift(const hz_dctree *t, int32_t ni) {
+  if (t->nd[ni].child0 < 0) return;
+  for (int k = 0; k < 8; k++) {
+    int32_t c = t->nd[ni].child0 + k;
+    swE_lift(t, c);
+    g_swEn[ni] += g_swEn[c];
+    g_swEd[ni] += g_swEd[c];
+  }
+}
+
 static int32_t g_xcmp_n = 0, g_xcmp_nemit = 0;
 static double *g_xcmp_E = NULL, *g_xcmp_Edir = NULL, *g_xcmp_aw = NULL;
 static int32_t (*g_xcmp_lo)[3] = NULL;
@@ -5680,6 +5694,7 @@ int main(int argc, char **argv) {
   int xdsadiff = 0;       /* §754: разностные зонды вокруг рабочего поля */
   double xdsaeps = 1.0;   /* §754: множитель ε (НК: 2) */
   int xdsasplit = 0;      /* §756: элементы и стык — раздельные грубые переменные */
+  int xframe = 0;         /* §758: кадр развёрткой — свиповое поле вместо ядра в irr */
   int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
   int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
   int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
@@ -5786,6 +5801,13 @@ int main(int argc, char **argv) {
       doxsweep = 1;
     }
     if (strncmp(argv[i], "xdsaeps=", 8) == 0) xdsaeps = strtod(argv[i] + 8, NULL);
+    if (strcmp(argv[i], "xframe") == 0) {
+      xframe = 1;
+      xmatrho = 1;
+      doxfer = 1;
+      dosolid = 1;
+      doxsweep = 1;
+    }
     if (strcmp(argv[i], "xdsasplit") == 0) {
       xdsasplit = 1;
       xdsadiff = 1;
@@ -8030,6 +8052,39 @@ int main(int argc, char **argv) {
       if (st.psin > 0.0 && !xhall)
         printf("      §739 ρ_eff = (psout − эмиссия)/psin = (%.4e − %.4e)/%.4e = %.4f\n", st.psout,
                emitpow2, st.psin, (st.psout - emitpow2) / st.psin);
+      /* §758: свиповое поле на узлы — для кадра развёрткой. E = eirr
+       * (входящая облучённость финального такта, А1187), вес — площадь. */
+      if (xframe && st.eirr != NULL) {
+        g_swEn = calloc((size_t)T.n, sizeof *g_swEn);
+        g_swEd = calloc((size_t)T.n, sizeof *g_swEd);
+        if (g_swEn == NULL || g_swEd == NULL) exit(1);
+        int64_t nmiss758 = 0;
+        for (int32_t e = 0; e < cut.nse; e++) {
+          double a = cut.se[e].area;
+          int32_t ci = cut.se[e].cell;
+          if (!(a > 0.0) || ci < 0 || ci >= mesh.ncell) continue;
+          int32_t szc = mesh.csize[ci];
+          int lvl8 = lev;
+          while (szc > 1) {
+            szc >>= 1;
+            lvl8--;
+          }
+          hz_dccell q8;
+          memset(&q8, 0, sizeof q8);
+          q8.lvl = (uint8_t)lvl8;
+          for (int a2 = 0; a2 < 3; a2++)
+            q8.lo[a2] = (uint16_t)mesh.clo[ci][a2];
+          int32_t ni = node_of_cell(&T, lev, &q8);
+          if (ni < 0 || ni >= T.n) {
+            nmiss758++;
+            continue;
+          }
+          g_swEn[ni] += st.eirr[e] * a;
+          g_swEd[ni] += a;
+        }
+        swE_lift(&T, 0);
+        printf("   §758 СВИП->УЗЛЫ: элементов без узла %lld\n", (long long)nmiss758);
+      }
       /* §744: агрегаты по ячейкам для сличения с ядром §597 — площадно-
        * взвешенная косвенная облучённость (полный − прямой) и центры
        * излучающих ячеек. Читает xcmp_report после ind_core_build. */
@@ -9340,6 +9395,70 @@ int main(int argc, char **argv) {
                  "Σ E_ind / Σ E_dir = %.4f\n",
                  t_ind * 1e3, S.n, (long long)nindbad, s_ind / (s_dir > 0.0 ? s_dir : 1.0));
         }
+      }
+      /* §758: КАДР РАЗВЁРТКОЙ. Сличение ДО растра в линейном пространстве
+       * кадрового среза (мера кадровая — А1188), затем ПОДМЕНА irr на
+       * свиповое E·alb + Ke. Покрытие и отказы — счётчиками (А891). */
+      if (xframe && g_swEn != NULL) {
+        int64_t ncov8 = 0, nmiss8 = 0, nz8 = 0, nuse8 = 0, nout8 = 0;
+        double *rt8 = malloc((size_t)S.n * sizeof *rt8);
+        double *tmp8 = malloc((size_t)S.n * sizeof *tmp8);
+        float *swv = malloc(3 * (size_t)S.n * sizeof *swv);
+        if (rt8 == NULL || tmp8 == NULL || swv == NULL) exit(1);
+        int64_t nb8 = 0;
+        for (int32_t i = 0; i < S.n; i++) {
+          int32_t ni = node_of_cell(&T, lev, &S.c[i]);
+          double Ei = (ni >= 0 && ni < T.n && g_swEd[ni] > 0.0) ? g_swEn[ni] / g_swEd[ni] : -1.0;
+          if (Ei < 0.0) {
+            nmiss8++;
+            for (int k = 0; k < 3; k++)
+              swv[3 * (size_t)i + (size_t)k] = 0.0f;
+            continue;
+          }
+          ncov8++;
+          const double *ke8 = m.mtl[S.c[i].mat < m.nmtl ? S.c[i].mat : 0].ke3;
+          double bsum = 0.0;
+          for (int k = 0; k < 3; k++) {
+            double v = Ei * alb(&m, S.c[i].mat, k) + (!g_nokemit ? ke8[k] : 0.0);
+            swv[3 * (size_t)i + (size_t)k] = (float)v;
+            bsum += v;
+          }
+          if (bsum > 0.0) tmp8[nb8++] = bsum;
+        }
+        double thr8 = 0.0;
+        if (nb8 > 0) {
+          qsort(tmp8, (size_t)nb8, sizeof *tmp8, cmp_d);
+          thr8 = 1e-3 * tmp8[nb8 / 2]; /* порог от данных, §559 */
+        }
+        for (int32_t i = 0; i < S.n; i++) {
+          double a8 = 0.0, b8 = 0.0;
+          for (int k = 0; k < 3; k++) {
+            a8 += (double)irr[3 * (size_t)i + (size_t)k];
+            b8 += (double)swv[3 * (size_t)i + (size_t)k];
+          }
+          if (!(b8 > thr8)) {
+            if (a8 > 0.0) nz8++;
+            continue;
+          }
+          rt8[nuse8++] = a8 / b8;
+        }
+        if (nuse8 > 0) {
+          memcpy(tmp8, rt8, (size_t)nuse8 * sizeof *tmp8);
+          qsort(tmp8, (size_t)nuse8, sizeof *tmp8, cmp_d);
+          double med8 = tmp8[nuse8 / 2];
+          for (int64_t q8i = 0; q8i < nuse8; q8i++)
+            if (rt8[q8i] < 0.5 * med8 || rt8[q8i] > 2.0 * med8) nout8++;
+          printf("   §758 КАДР-СЛИЧЕНИЕ (ядро/свип, полный свет, кадровый срез): покрытие %lld "
+                 "из %d (отказов %lld, свип~0 при ядре>0: %lld); пар %lld, медиана %.4g, p10 "
+                 "%.4g, p90 %.4g; ВНЕ x2: %lld (%.1f %%)\n",
+                 (long long)ncov8, S.n, (long long)nmiss8, (long long)nz8, (long long)nuse8, med8,
+                 tmp8[(nuse8 * 10) / 100], tmp8[(nuse8 * 90) / 100], (long long)nout8,
+                 100.0 * (double)nout8 / (double)nuse8);
+        }
+        memcpy(irr, swv, 3 * (size_t)S.n * sizeof *irr);
+        free(rt8);
+        free(tmp8);
+        free(swv);
       }
       /* ---- ДИАГНОСТИКА КАДРА: ВСЁ, ЧТО НИЖЕ, К КАРТИНКЕ НЕ ОТНОСИТСЯ (§589) ----
        * Свип, арбитр-марш, эталоны, поячеечные сличения, иерархический отскок —
@@ -11130,7 +11249,8 @@ int main(int argc, char **argv) {
                     (unsigned char)((s4 + 2u) / 4u);
               }
         }
-        snprintf(path, sizeof path, "img/pfield_lit_L%d_%dx%d.ppm", lev, outw, outh);
+        snprintf(path, sizeof path, "img/pfield_lit_L%d_%dx%d%s.ppm", lev, outw, outh,
+                 xframe ? "_sweep" : ""); /* §758 */
         /* В ХОДЬБЕ КАДР НЕ ПИШЕТСЯ НА ДИСК: `786` КБ на кадр — это и лишняя
          * работа, и мусор в `img/`. Снимок делает отдельный запуск без `walk`. */
         int prc = g_walk ? 0 : hz_ppm_write_rgb(path, outrgb, outw, outh);

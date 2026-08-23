@@ -8054,9 +8054,16 @@ int main(int argc, char **argv) {
             sphiB += fabs(phiB4[i]);
             if (fabs(phiB4[i]) > mphiB) mphiB = fabs(phiB4[i]);
           }
+          /* счётчик отрицательных eirr БАЗЫ: без него отрицательные лестницы
+           * неатрибуируемы — замыкание против исходного состояния (А11-класс) */
+          int64_t nnegB = 0;
+          if (stB4.eirr != NULL)
+            for (int32_t e = 0; e < cut.nse; e++)
+              if (stB4.eirr[e] < 0.0) nnegB++;
           printf("   §774 БАЗА (xit=%d, xtol=%.1e): итераций %d, невязка %.3e, psin %.6g, "
-                 "%.2f с; слепок Σ|φ| %.17g, max|φ| %.17g\n",
-                 xit, xtol, stB4.iters, stB4.resid, stB4.psin, now_s() - tb0, sphiB, mphiB);
+                 "%.2f с; слепок Σ|φ| %.17g, max|φ| %.17g; eirr < 0 у %lld из %d\n",
+                 xit, xtol, stB4.iters, stB4.resid, stB4.psin, now_s() - tb0, sphiB, mphiB,
+                 (long long)nnegB, cut.nse);
           eirrB = stB4.eirr;
           psinB = stB4.psin;
           free(stB4.bout);

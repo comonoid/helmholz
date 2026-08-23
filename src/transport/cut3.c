@@ -598,7 +598,9 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
       }
     }
 
-    for (int pi = 0; pi < npc; pi++) {
+    /* явный гейт по over8/aggr8 — при них npc == 0 всегда, но анализатор
+     * строит ложный путь чтения pieces за границей calloc(1) */
+    for (int pi = 0; pi < npc && !over8 && !aggr8; pi++) {
       hz_poly3 *p = &pieces[pi];
       double mm[4][4];
       if (tr3_mass_matrix(p, &m->fr, c3, hh, mm) == 0)

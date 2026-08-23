@@ -5193,6 +5193,18 @@ static void lit_tri(litctx *L, const double p[3][3], const double col[3][3], con
  * `HZ_GAMN` — размер таблицы, а не порог: он назван здесь, потому что от него
  * зависит точность, и негативный контроль (`gam16`) её ломает нарочно. */
 #define HZ_GAMN 4096
+/* §791: предвычисленные данные треугольника КЛЕТКИ для surf-uv резолва.
+ * Соседние пиксели строки почти всегда падают в ту же клетку — нормали,
+ * барицентрические скаляры и uv-плотность считаются один раз на смену
+ * клетки, а не на каждый пиксель × каждый треугольник (замерено §790-доп:
+ * 98 % растра сидело именно здесь, texflat 8998 → 197 мс). */
+typedef struct {
+  double n[3], A[3], e1[3], e2[3];
+  double d11, d12, d22, dn3;
+  int32_t q0, q1, q2, mt;
+  double uvdens;
+} uvtri791;
+
 static void lit_resolve(litctx *L, int gamn) {
   /* БЕЛАЯ ТОЧКА — СВОЙСТВО КАДРА, А НЕ СЦЕНЫ (08-12). Прежде она бралась
    * перцентилем по ВСЕМ ячейкам среза, включая невидимые и залитые солнцем
@@ -5228,140 +5240,190 @@ static void lit_resolve(litctx *L, int gamn) {
    * в §575 и платится сознательно.
    * `v` растёт вверх в OBJ и вниз в изображении — отсюда `1 − v`. */
   if (L->texrgb != NULL && L->defuv != NULL) {
-    for (size_t k = 0; k < npx; k++) {
-      if (L->z[k] >= 1e299) continue;
-      int mt = L->defmat[k];
-      double uu = (double)L->defuv[2 * k + 0], vv0 = (double)L->defuv[2 * k + 1];
-      double uvdens = 0.0;
-      /* КООРДИНАТА БЕРЁТСЯ С САМОЙ ПОВЕРХНОСТИ, А НЕ С НАШЕГО МНОГОУГОЛЬНИКА
-       * (замечание пользователя 08-12). Прежде `uv` считалось ОДНОЙ точкой на
-       * ячейку среза и интерполировалось по DC-многоугольнику; соседние ячейки
-       * берут координату с РАЗНЫХ исходных треугольников, и на швах выходил
-       * мусор. Здесь по глубине восстанавливается мировая точка пикселя, по ней
-       * находится ЯЧЕЙКА ПОЛЯ и её список треугольников, а координата берётся
-       * барицентрикой у ТОГО треугольника, к плоскости которого точка ближе
-       * всего. Это и есть «накладывать на поверхность»: DC-представление в
-       * выборку не входит вовсе. */
-      if (L->mesh != NULL && L->ct != NULL) {
-        int px2 = (int)(k % (size_t)L->w), py2 = (int)(k / (size_t)L->w);
-        const tr3_camera *cm2 = L->cam;
-        double ax = ((double)px2 + 0.5) / (double)L->w * 2.0 - 1.0;
-        double ay = 1.0 - ((double)py2 + 0.5) / (double)L->h * 2.0;
-        double dr[3], wp[3];
-        for (int c = 0; c < 3; c++)
-          dr[c] = cm2->fwd[c] + cm2->right[c] * ax * cm2->tanx + cm2->up[c] * ay * cm2->tany;
-        for (int c = 0; c < 3; c++)
-          wp[c] = cm2->eye[c] + dr[c] * L->z[k];
-        int32_t cl3[3];
-        int ok3 = 1;
-        for (int c = 0; c < 3; c++) {
-          double f3 = floor((wp[c] - L->fr->org[c]) / L->fr->h);
-          if (!(f3 >= 0.0) || !(f3 < (double)L->fr->n)) ok3 = 0;
-          cl3[c] = ok3 ? (int32_t)f3 : 0;
-        }
-        const int32_t *ls3 = NULL;
-        int32_t nls = ok3 ? ct_list(L->ct, cl3, &ls3) : 0;
-        double bestd3 = 1e300;
-        for (int32_t t3 = 0; t3 < nls; t3++) {
-          const double *A3, *B3, *C3;
-          tri_verts(L->mesh, ls3[t3], &A3, &B3, &C3);
-          double e1[3], e2[3], nn3[3];
-          for (int c = 0; c < 3; c++) {
-            e1[c] = B3[c] - A3[c];
-            e2[c] = C3[c] - A3[c];
-          }
-          nn3[0] = e1[1] * e2[2] - e1[2] * e2[1];
-          nn3[1] = e1[2] * e2[0] - e1[0] * e2[2];
-          nn3[2] = e1[0] * e2[1] - e1[1] * e2[0];
-          double nl3 = sqrt(nn3[0] * nn3[0] + nn3[1] * nn3[1] + nn3[2] * nn3[2]);
-          if (!(nl3 > 0.0)) continue;
-          double dd3 =
-              fabs((wp[0] - A3[0]) * nn3[0] + (wp[1] - A3[1]) * nn3[1] + (wp[2] - A3[2]) * nn3[2]) /
-              nl3;
-          if (dd3 >= bestd3) continue;
-          const int32_t *ft3 = L->mesh->ft;
-          if (ft3 == NULL) continue;
-          int32_t q0 = ft3[3 * (size_t)ls3[t3] + 0], q1 = ft3[3 * (size_t)ls3[t3] + 1],
-                  q2 = ft3[3 * (size_t)ls3[t3] + 2];
-          if (q0 < 0 || q1 < 0 || q2 < 0) continue;
-          double d11 = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
-          double d12 = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
-          double d22 = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
-          double vp[3];
-          for (int c = 0; c < 3; c++)
-            vp[c] = wp[c] - A3[c];
-          double dp1 = vp[0] * e1[0] + vp[1] * e1[1] + vp[2] * e1[2];
-          double dp2 = vp[0] * e2[0] + vp[1] * e2[1] + vp[2] * e2[2];
-          double dn3 = d11 * d22 - d12 * d12;
-          if (!(fabs(dn3) > 0.0)) continue;
-          double bu = (d22 * dp1 - d12 * dp2) / dn3, bv = (d11 * dp2 - d12 * dp1) / dn3;
-          bestd3 = dd3;
-          uu = L->mesh->vt[2 * (size_t)q0 + 0] +
-               bu * (L->mesh->vt[2 * (size_t)q1 + 0] - L->mesh->vt[2 * (size_t)q0 + 0]) +
-               bv * (L->mesh->vt[2 * (size_t)q2 + 0] - L->mesh->vt[2 * (size_t)q0 + 0]);
-          vv0 = L->mesh->vt[2 * (size_t)q0 + 1] +
-                bu * (L->mesh->vt[2 * (size_t)q1 + 1] - L->mesh->vt[2 * (size_t)q0 + 1]) +
-                bv * (L->mesh->vt[2 * (size_t)q2 + 1] - L->mesh->vt[2 * (size_t)q0 + 1]);
-          mt = L->mesh->fm != NULL ? L->mesh->fm[ls3[t3]] : mt;
-          if (mt < 0 || mt >= L->nmtl) mt = L->defmat[k];
-          /* ПЛОТНОСТЬ ТЕКСЕЛЕЙ НА МЕТР — у ТОГО ЖЕ треугольника: отношение
-           * площади в координатах текстуры к площади в мире. Отсюда след
-           * пикселя в текселях, отсюда уровень пирамиды. Ни одного подобранного
-           * числа: `z·pxrad` есть ширина пикселя на этой глубине по построению
-           * камеры. */
-          double au = L->mesh->vt[2 * (size_t)q1 + 0] - L->mesh->vt[2 * (size_t)q0 + 0];
-          double av = L->mesh->vt[2 * (size_t)q1 + 1] - L->mesh->vt[2 * (size_t)q0 + 1];
-          double bu2 = L->mesh->vt[2 * (size_t)q2 + 0] - L->mesh->vt[2 * (size_t)q0 + 0];
-          double bv2 = L->mesh->vt[2 * (size_t)q2 + 1] - L->mesh->vt[2 * (size_t)q0 + 1];
-          double auv = fabs(au * bv2 - av * bu2);       /* площадь в uv (×2) */
-          double aw3 = sqrt(d11 * d22 - d12 * d12);     /* площадь в мире (×2) */
-          uvdens = (aw3 > 0.0) ? sqrt(auv / aw3) : 0.0; /* текселей(долей) на метр */
-        }
-        if (bestd3 < 1e299) L->nsurfuv++;
-      }
-      if (L->texrgb[mt] == NULL) continue;
-      double vv = 1.0 - vv0;
-      /* УРОВЕНЬ ПИРАМИДЫ по следу пикселя в текселях. Ширина пикселя на глубине
-       * `z` есть `z·pxrad`; умноженная на плотность текселей и на размер
-       * текстуры, она даёт след. `log2` от него — уровень. */
-      double lodf = 0.0;
-      if (!L->nomip && uvdens > 0.0 && L->pxrad > 0.0) {
-        double foot = L->z[k] * L->pxrad * uvdens * (double)L->texw[mt];
-        if (foot > 1.0) lodf = log2(foot);
-      }
-      int nl4 = L->nmip[mt] > 0 ? L->nmip[mt] : 1;
-      if (lodf > (double)(nl4 - 1)) lodf = (double)(nl4 - 1);
-      int l0 = (int)lodf, l1 = l0 + 1 < nl4 ? l0 + 1 : l0;
-      double fl = lodf - (double)l0;
-      /* ТРИЛИНЕЙНО: билинейно внутри двух уровней и линейно между ними. Без
-       * межуровневой части на границах уровней видны ступени. */
-      double acc3[3] = {0.0, 0.0, 0.0};
-      for (int s6 = 0; s6 < 2; s6++) {
-        int lv = s6 ? l1 : l0;
-        double wl = s6 ? fl : 1.0 - fl;
-        if (!(wl > 0.0)) continue;
-        const unsigned char *tx = L->texmip[mt][lv];
-        int tw = L->mipw[mt][lv], th = L->miph[mt][lv];
-        double fu = uu - floor(uu), fv = vv - floor(vv);
-        double gx = fu * (double)tw - 0.5, gy = fv * (double)th - 0.5;
-        int x0 = (int)floor(gx), y0 = (int)floor(gy);
-        double tx0 = gx - (double)x0, ty0 = gy - (double)y0;
-        for (int dy = 0; dy < 2; dy++)
-          for (int dx = 0; dx < 2; dx++) {
-            int xx = x0 + dx, yy = y0 + dy;
-            /* Повтор по краю: текстуры сцены тайловые, обрезка дала бы шов. */
-            xx = ((xx % tw) + tw) % tw;
-            yy = ((yy % th) + th) % th;
-            double wq = (dx ? tx0 : 1.0 - tx0) * (dy ? ty0 : 1.0 - ty0) * wl;
-            const unsigned char *px = tx + 3 * ((size_t)yy * (size_t)tw + (size_t)xx);
+    int64_t nsurf791 = 0, ntex791 = 0;
+#pragma omp parallel reduction(+ : nsurf791, ntex791)
+    {
+      /* §791: кэш треугольников ТЕКУЩЕЙ КЛЕТКИ потока — соседние пиксели
+       * строки почти всегда в той же клетке; пересборка только на смене. */
+      int32_t ccl[3] = {0, 0, 0};
+      int cvalid = 0, cnt791 = 0, ccap = 0;
+      uvtri791 *ctri = NULL;
+#pragma omp for schedule(static)
+      for (int py2 = 0; py2 < L->h; py2++) {
+        for (int px2 = 0; px2 < L->w; px2++) {
+          size_t k = (size_t)py2 * (size_t)L->w + (size_t)px2;
+          if (L->z[k] >= 1e299) continue;
+          int mt = L->defmat[k];
+          double uu = (double)L->defuv[2 * k + 0], vv0 = (double)L->defuv[2 * k + 1];
+          double uvdens = 0.0;
+          /* КООРДИНАТА БЕРЁТСЯ С САМОЙ ПОВЕРХНОСТИ, А НЕ С НАШЕГО МНОГОУГОЛЬНИКА
+           * (замечание пользователя 08-12): по глубине восстанавливается мировая
+           * точка пикселя, по ней — ЯЧЕЙКА ПОЛЯ и её треугольники, uv — у того,
+           * к чьей плоскости точка ближе. §791: та же семантика argmin, но
+           * пер-треугольная тригонометрия предвычислена на клетку, барицентрика
+           * считается только победителю. */
+          if (L->mesh != NULL && L->ct != NULL) {
+            const tr3_camera *cm2 = L->cam;
+            double ax = ((double)px2 + 0.5) / (double)L->w * 2.0 - 1.0;
+            double ay = 1.0 - ((double)py2 + 0.5) / (double)L->h * 2.0;
+            double dr[3], wp[3];
             for (int c = 0; c < 3; c++)
-              acc3[c] += wq * (double)px[c];
+              dr[c] = cm2->fwd[c] + cm2->right[c] * ax * cm2->tanx + cm2->up[c] * ay * cm2->tany;
+            for (int c = 0; c < 3; c++)
+              wp[c] = cm2->eye[c] + dr[c] * L->z[k];
+            int32_t cl3[3] = {0, 0, 0}; /* явный ноль: анализатор не видит
+                                         * заполнения через тернарник ok3 */
+            int ok3 = 1;
+            for (int c = 0; c < 3; c++) {
+              double f3 = floor((wp[c] - L->fr->org[c]) / L->fr->h);
+              if (!(f3 >= 0.0) || !(f3 < (double)L->fr->n)) ok3 = 0;
+              cl3[c] = ok3 ? (int32_t)f3 : 0;
+            }
+            if (ok3 && (!cvalid || cl3[0] != ccl[0] || cl3[1] != ccl[1] || cl3[2] != ccl[2])) {
+              const int32_t *ls3 = NULL;
+              int32_t nls = ct_list(L->ct, cl3, &ls3);
+              cnt791 = 0;
+              for (int32_t t3 = 0; t3 < nls; t3++) {
+                const double *A3, *B3, *C3;
+                tri_verts(L->mesh, ls3[t3], &A3, &B3, &C3);
+                double e1[3], e2[3], nn3[3];
+                for (int c = 0; c < 3; c++) {
+                  e1[c] = B3[c] - A3[c];
+                  e2[c] = C3[c] - A3[c];
+                }
+                nn3[0] = e1[1] * e2[2] - e1[2] * e2[1];
+                nn3[1] = e1[2] * e2[0] - e1[0] * e2[2];
+                nn3[2] = e1[0] * e2[1] - e1[1] * e2[0];
+                double nl3 = sqrt(nn3[0] * nn3[0] + nn3[1] * nn3[1] + nn3[2] * nn3[2]);
+                if (!(nl3 > 0.0)) continue; /* вырожденный: плоскости нет */
+                const int32_t *ft3 = L->mesh->ft;
+                if (ft3 == NULL) continue;
+                int32_t q0 = ft3[3 * (size_t)ls3[t3] + 0], q1 = ft3[3 * (size_t)ls3[t3] + 1],
+                        q2 = ft3[3 * (size_t)ls3[t3] + 2];
+                if (q0 < 0 || q1 < 0 || q2 < 0) continue;
+                double d11 = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
+                double d12 = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
+                double d22 = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
+                double dn3 = d11 * d22 - d12 * d12;
+                if (!(fabs(dn3) > 0.0)) continue;
+                if (cnt791 >= ccap) {
+                  ccap = ccap ? ccap * 2 : 64;
+                  uvtri791 *nc9 = realloc(ctri, (size_t)ccap * sizeof *nc9);
+                  if (nc9 == NULL) exit(1);
+                  ctri = nc9;
+                }
+                uvtri791 *u9 = &ctri[cnt791++];
+                for (int c = 0; c < 3; c++) {
+                  u9->n[c] = nn3[c] / nl3;
+                  u9->A[c] = A3[c];
+                  u9->e1[c] = e1[c];
+                  u9->e2[c] = e2[c];
+                }
+                u9->d11 = d11;
+                u9->d12 = d12;
+                u9->d22 = d22;
+                u9->dn3 = dn3;
+                u9->q0 = q0;
+                u9->q1 = q1;
+                u9->q2 = q2;
+                u9->mt = L->mesh->fm != NULL ? L->mesh->fm[ls3[t3]] : -1;
+                /* ПЛОТНОСТЬ ТЕКСЕЛЕЙ НА МЕТР — константа треугольника: отношение
+                 * площади в uv к площади в мире; предвычисляется здесь же. */
+                double au = L->mesh->vt[2 * (size_t)q1 + 0] - L->mesh->vt[2 * (size_t)q0 + 0];
+                double av = L->mesh->vt[2 * (size_t)q1 + 1] - L->mesh->vt[2 * (size_t)q0 + 1];
+                double bu2 = L->mesh->vt[2 * (size_t)q2 + 0] - L->mesh->vt[2 * (size_t)q0 + 0];
+                double bv2 = L->mesh->vt[2 * (size_t)q2 + 1] - L->mesh->vt[2 * (size_t)q0 + 1];
+                double auv = fabs(au * bv2 - av * bu2);
+                double aw3 = sqrt(dn3);
+                u9->uvdens = (aw3 > 0.0) ? sqrt(auv / aw3) : 0.0;
+              }
+              ccl[0] = cl3[0];
+              ccl[1] = cl3[1];
+              ccl[2] = cl3[2];
+              cvalid = 1;
+            }
+            int best9 = -1;
+            double bestd3 = 1e300;
+            if (ok3 && cvalid)
+              for (int j9 = 0; j9 < cnt791; j9++) {
+                const uvtri791 *u8 = &ctri[j9];
+                double dd3 = fabs((wp[0] - u8->A[0]) * u8->n[0] + (wp[1] - u8->A[1]) * u8->n[1] +
+                                  (wp[2] - u8->A[2]) * u8->n[2]);
+                if (dd3 < bestd3) {
+                  bestd3 = dd3;
+                  best9 = j9;
+                }
+              }
+            if (best9 >= 0) { /* барицентрика — ТОЛЬКО победителю */
+              const uvtri791 *u9 = &ctri[best9];
+              double vp[3];
+              for (int c = 0; c < 3; c++)
+                vp[c] = wp[c] - u9->A[c];
+              double dp1 = vp[0] * u9->e1[0] + vp[1] * u9->e1[1] + vp[2] * u9->e1[2];
+              double dp2 = vp[0] * u9->e2[0] + vp[1] * u9->e2[1] + vp[2] * u9->e2[2];
+              double bu = (u9->d22 * dp1 - u9->d12 * dp2) / u9->dn3;
+              double bv = (u9->d11 * dp2 - u9->d12 * dp1) / u9->dn3;
+              uu =
+                  L->mesh->vt[2 * (size_t)u9->q0 + 0] +
+                  bu * (L->mesh->vt[2 * (size_t)u9->q1 + 0] - L->mesh->vt[2 * (size_t)u9->q0 + 0]) +
+                  bv * (L->mesh->vt[2 * (size_t)u9->q2 + 0] - L->mesh->vt[2 * (size_t)u9->q0 + 0]);
+              vv0 =
+                  L->mesh->vt[2 * (size_t)u9->q0 + 1] +
+                  bu * (L->mesh->vt[2 * (size_t)u9->q1 + 1] - L->mesh->vt[2 * (size_t)u9->q0 + 1]) +
+                  bv * (L->mesh->vt[2 * (size_t)u9->q2 + 1] - L->mesh->vt[2 * (size_t)u9->q0 + 1]);
+              mt = u9->mt;
+              if (mt < 0 || mt >= L->nmtl) mt = L->defmat[k];
+              uvdens = u9->uvdens;
+              nsurf791++;
+            }
           }
+          if (L->texrgb[mt] == NULL) continue;
+          double vv = 1.0 - vv0;
+          /* УРОВЕНЬ ПИРАМИДЫ по следу пикселя в текселях. Ширина пикселя на
+           * глубине z есть z·pxrad; умноженная на плотность текселей и размер
+           * текстуры, она даёт след; log2 — уровень. */
+          double lodf = 0.0;
+          if (!L->nomip && uvdens > 0.0 && L->pxrad > 0.0) {
+            double foot = L->z[k] * L->pxrad * uvdens * (double)L->texw[mt];
+            if (foot > 1.0) lodf = log2(foot);
+          }
+          int nl4 = L->nmip[mt] > 0 ? L->nmip[mt] : 1;
+          if (lodf > (double)(nl4 - 1)) lodf = (double)(nl4 - 1);
+          int l0 = (int)lodf, l1 = l0 + 1 < nl4 ? l0 + 1 : l0;
+          double fl = lodf - (double)l0;
+          /* ТРИЛИНЕЙНО: билинейно внутри двух уровней и линейно между ними. */
+          double acc3[3] = {0.0, 0.0, 0.0};
+          for (int s6 = 0; s6 < 2; s6++) {
+            int lv = s6 ? l1 : l0;
+            double wl = s6 ? fl : 1.0 - fl;
+            if (!(wl > 0.0)) continue;
+            const unsigned char *tx = L->texmip[mt][lv];
+            int tw = L->mipw[mt][lv], th = L->miph[mt][lv];
+            double fu = uu - floor(uu), fv = vv - floor(vv);
+            double gx = fu * (double)tw - 0.5, gy = fv * (double)th - 0.5;
+            int x0 = (int)floor(gx), y0 = (int)floor(gy);
+            double tx0 = gx - (double)x0, ty0 = gy - (double)y0;
+            for (int dy = 0; dy < 2; dy++)
+              for (int dx = 0; dx < 2; dx++) {
+                int xx = x0 + dx, yy = y0 + dy;
+                /* Повтор по краю: текстуры тайловые, обрезка дала бы шов. */
+                xx = ((xx % tw) + tw) % tw;
+                yy = ((yy % th) + th) % th;
+                double wq = (dx ? tx0 : 1.0 - tx0) * (dy ? ty0 : 1.0 - ty0) * wl;
+                const unsigned char *px = tx + 3 * ((size_t)yy * (size_t)tw + (size_t)xx);
+                for (int c = 0; c < 3; c++)
+                  acc3[c] += wq * (double)px[c];
+              }
+          }
+          for (int c = 0; c < 3; c++)
+            L->defcol[3 * k + (size_t)c] *= (float)(acc3[c] / 255.0);
+          ntex791++;
+        }
       }
-      for (int c = 0; c < 3; c++)
-        L->defcol[3 * k + (size_t)c] *= (float)(acc3[c] / 255.0);
-      L->ntexpx++;
+      free(ctri);
     }
+    L->nsurfuv += nsurf791;
+    L->ntexpx += ntex791;
   }
   unsigned char *lut = malloc((size_t)gamn);
   if (lut == NULL) exit(1);

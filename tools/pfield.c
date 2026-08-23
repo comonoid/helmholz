@@ -5878,6 +5878,9 @@ int main(int argc, char **argv) {
   int xframe = 0;         /* §758: кадр развёрткой — свиповое поле вместо ядра в irr */
   int xcontrib = 0;       /* §768: прибор вклада — перевозмущения ρ→0 по классам */
   double xcoarse = 0.0;   /* §772: метров дальности на лист размера; 0 — выключено */
+  int xbounce = 0;        /* §774: лестница N прокидок-отскоков; 0 — выключено */
+  double xtailq = -1.0;   /* §774: q хвоста: <0 — измерить, 0 — усечение, >0 — НК */
+  int xbcmp774 = 0;       /* §774: базовый прогон и сравнение в одном процессе */
   int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
   int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
   int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
@@ -5985,6 +5988,9 @@ int main(int argc, char **argv) {
     }
     if (strncmp(argv[i], "xdsaeps=", 8) == 0) xdsaeps = strtod(argv[i] + 8, NULL);
     if (strncmp(argv[i], "xcoarse=", 8) == 0) xcoarse = strtod(argv[i] + 8, NULL);
+    if (strncmp(argv[i], "xbounce=", 8) == 0) xbounce = (int)strtol(argv[i] + 8, NULL, 10);
+    if (strncmp(argv[i], "xtailq=", 7) == 0) xtailq = strtod(argv[i] + 7, NULL);
+    if (strcmp(argv[i], "xbcmp") == 0) xbcmp774 = 1;
     if (strcmp(argv[i], "xcontrib") == 0) {
       xcontrib = 1;
       xmatrho = 1;
@@ -7486,6 +7492,12 @@ int main(int argc, char **argv) {
         fprintf(stderr, "xcmp несовместим с xunit и xconst\n");
         exit(1);
       }
+      /* §774: лестница отскоков — рабочий режим поверх обычной задачи; с
+       * приборными и двухсеточными режимами не совмещается сознательно. */
+      if (xbounce > 0 && (xdsa || xunit || xconst || xcmp || xcontrib)) {
+        fprintf(stderr, "xbounce= несовместим с xdsa/xunit/xconst/xcmp/xcontrib\n");
+        exit(1);
+      }
       /* §733: вскрытие обновления — предсказания калиброваны единичным входом */
       if ((xcelll[0] >= 0 || xdir >= 0) && (!xunit || xcelll[0] < 0 || xdir < 0)) {
         fprintf(stderr, "xcell=/xdir= требуют xunit и друг друга\n");
@@ -8006,6 +8018,235 @@ int main(int argc, char **argv) {
         free(dnum);
         free(dden);
         free(usprev);
+      } else if (xbounce > 0) {
+        /* §774: ОГРУБЛЕНИЕ ЧАСТОТЫ ОТСКОКОВ. Отскоки 1…N считаются точно —
+         * N прокидок К76 (такт = отскок, А1222: внутри такта марш переносит
+         * эмиссию через весь домен, поверхности обновляются после цикла
+         * направлений); все поздние отскоки — одним агрегатом, геометрическим
+         * замыканием хвоста: x_inf ≈ x_N + Δ_N·q̂/(1−q̂), где q̂ измеряется
+         * скалярным произведением двух последних приращений объединённого
+         * состояния (φ, bout, sout). Замыкаются состояние, eirr и скаляры К40
+         * (все — линейные функционалы поля такта). Клип замыкания не ставится
+         * (А1227): отрицательные eirr печатаются счётчиком, а не прячутся. */
+        /* Потолок q̂ — выше замеренного диапазона сжатия 0.61…0.89
+         * (§735/§741): при q → 1 замыкание умножает шум последнего
+         * приращения как 1/(1−q), и такой хвост доверия не заслуживает. */
+        static const double HZ_TAILQ_MAX = 0.95;
+        /* Минимум тактов для оценки q̂: нужны ДВА приращения, причём
+         * приращение такта 1 — весь прямой свет от нуля, вне геометрического
+         * режима ряда отражений. */
+        static const int HZ_TAILN_MIN = 3;
+        const int32_t nse4 = cut.nse > 0 ? cut.nse : 1;
+        const size_t nph = (size_t)mesh.ncell * 4, nbo = (size_t)mesh.nf * 4,
+                     nso = (size_t)nse4 * 4;
+        /* базовый прогон для сравнения — в том же процессе (xbcmp) */
+        double *phiB4 = NULL, *eirrB = NULL;
+        double psinB = 0.0;
+        if (xbcmp774) {
+          phiB4 = calloc(nph, sizeof *phiB4);
+          if (phiB4 == NULL) exit(1);
+          tr3_stats stB4;
+          memset(&stB4, 0, sizeof stB4);
+          double tb0 = now_s();
+          if (tr3_sweep_solve(&prob, xit, xtol, phiB4, &stB4) != 0) exit(1);
+          double sphiB = 0.0, mphiB = 0.0;
+          for (size_t i = 0; i < nph; i += 4) {
+            sphiB += fabs(phiB4[i]);
+            if (fabs(phiB4[i]) > mphiB) mphiB = fabs(phiB4[i]);
+          }
+          printf("   §774 БАЗА (xit=%d, xtol=%.1e): итераций %d, невязка %.3e, psin %.6g, "
+                 "%.2f с; слепок Σ|φ| %.17g, max|φ| %.17g\n",
+                 xit, xtol, stB4.iters, stB4.resid, stB4.psin, now_s() - tb0, sphiB, mphiB);
+          eirrB = stB4.eirr;
+          psinB = stB4.psin;
+          free(stB4.bout);
+          free(stB4.sout);
+        }
+        double *pphi = calloc(nph, sizeof *pphi); /* состояние такта t−1 */
+        double *pbo = calloc(nbo, sizeof *pbo);
+        double *pso = calloc(nso, sizeof *pso);
+        double *dpphi = calloc(nph, sizeof *dpphi); /* приращение такта t−1 */
+        double *dpbo = calloc(nbo, sizeof *dpbo);
+        double *dpso = calloc(nso, sizeof *dpso);
+        double *peirr = calloc((size_t)nse4, sizeof *peirr); /* eirr такта t−1 */
+        if (pphi == NULL || pbo == NULL || pso == NULL || dpphi == NULL || dpbo == NULL ||
+            dpso == NULL || peirr == NULL)
+          exit(1);
+        double *ubL = NULL, *usL = NULL; /* прокидка К76 */
+        double q_num = 0.0, q_den = 0.0, denprev = 0.0;
+        double sc_prev[6] = {0, 0, 0, 0, 0, 0}; /* скаляры К40 такта N−1 */
+        tr3_stats stfin;
+        memset(&stfin, 0, sizeof stfin);
+        double tlad = now_s();
+        for (int t = 1; t <= xbounce; t++) {
+          tr3_problem pl = prob;
+          tr3_stats stt;
+          memset(&stt, 0, sizeof stt);
+          if (t > 1) {
+            pl.warm_start = 1;
+            pl.bout_in = ubL;
+            pl.sout_in = usL;
+          }
+          double tt0 = now_s();
+          if (tr3_sweep_solve(&pl, 1, 0.0, phi, &stt) != 0) exit(1);
+          /* приращение такта, его норма и скалярные произведения с прошлым */
+          double dmaxphi = 0.0, dmaxso = 0.0, num_t = 0.0, dencur = 0.0;
+          for (size_t i = 0; i < nph; i++) {
+            double dc = phi[i] - pphi[i];
+            if (fabs(dc) > dmaxphi) dmaxphi = fabs(dc);
+            num_t += dc * dpphi[i];
+            dencur += dc * dc;
+            dpphi[i] = dc;
+            pphi[i] = phi[i];
+          }
+          for (size_t i = 0; i < nbo; i++) {
+            double dc = stt.bout[i] - pbo[i];
+            num_t += dc * dpbo[i];
+            dencur += dc * dc;
+            dpbo[i] = dc;
+            pbo[i] = stt.bout[i];
+          }
+          for (size_t i = 0; i < nso; i++) {
+            double dc = stt.sout[i] - pso[i];
+            if (fabs(dc) > dmaxso) dmaxso = fabs(dc);
+            num_t += dc * dpso[i];
+            dencur += dc * dc;
+            dpso[i] = dc;
+            pso[i] = stt.sout[i];
+          }
+          if (t > 1) {
+            q_num = num_t;
+            q_den = denprev;
+          }
+          denprev = dencur;
+          printf("   §774 такт %2d: |Δφ|∞ %.3e, |Δsout|∞ %.3e, psin %.6g, %.2f с\n", t, dmaxphi,
+                 dmaxso, stt.psin, now_s() - tt0);
+          free(ubL); /* состояние t−1 больше не нужно: копии лежат в pbo/pso */
+          free(usL);
+          ubL = stt.bout;
+          usL = stt.sout;
+          if (t < xbounce) {
+            if (stt.eirr != NULL)
+              for (int32_t e = 0; e < cut.nse; e++)
+                peirr[e] = stt.eirr[e];
+            sc_prev[0] = stt.pin;
+            sc_prev[1] = stt.pout;
+            sc_prev[2] = stt.pabs;
+            sc_prev[3] = stt.psin;
+            sc_prev[4] = stt.psout;
+            sc_prev[5] = stt.psolid;
+            free(stt.eirr);
+          } else
+            stfin = stt; /* bout/sout = ubL/usL, освобождает общий путь */
+        }
+        st = stfin;
+        printf("   §774 ЛЕСТНИЦА: %d тактов за %.2f с\n", xbounce, now_s() - tlad);
+        /* замыкание хвоста */
+        double qhat = -1.0;
+        if (xtailq > 0.0)
+          qhat = xtailq; /* НК: форсированный множитель */
+        else if (xtailq < 0.0 && xbounce >= HZ_TAILN_MIN && q_den > 0.0)
+          qhat = q_num / q_den;
+        if (qhat > 0.0 && qhat <= HZ_TAILQ_MAX) {
+          double mult = qhat / (1.0 - qhat);
+          double psin_raw = st.psin;
+          for (size_t i = 0; i < nph; i++)
+            phi[i] += mult * dpphi[i];
+          for (size_t i = 0; i < nbo; i++)
+            st.bout[i] += mult * dpbo[i];
+          for (size_t i = 0; i < nso; i++)
+            st.sout[i] += mult * dpso[i];
+          int64_t nneg = 0;
+          if (st.eirr != NULL)
+            for (int32_t e = 0; e < cut.nse; e++) {
+              st.eirr[e] += mult * (st.eirr[e] - peirr[e]);
+              if (st.eirr[e] < 0.0) nneg++;
+            }
+          st.pin += mult * (st.pin - sc_prev[0]);
+          st.pout += mult * (st.pout - sc_prev[1]);
+          st.pabs += mult * (st.pabs - sc_prev[2]);
+          st.psin += mult * (st.psin - sc_prev[3]);
+          st.psout += mult * (st.psout - sc_prev[4]);
+          st.psolid += mult * (st.psolid - sc_prev[5]);
+          printf("   §774 ЗАМЫКАНИЕ: q̂ %.4f (%s), множитель %.3f; psin %.6g -> %.6g; "
+                 "eirr < 0 у %lld элементов из %d\n",
+                 qhat, xtailq > 0.0 ? "ФОРСИРОВАН — НК" : "измерен", mult, psin_raw, st.psin,
+                 (long long)nneg, cut.nse);
+        } else if (qhat > HZ_TAILQ_MAX)
+          printf("   §774 замыкание ПРОПУЩЕНО: q̂ %.4f вне (0, %.2f] — ЧИСТОЕ УСЕЧЕНИЕ "
+                 "(fail closed)\n",
+                 qhat, HZ_TAILQ_MAX);
+        else
+          printf("   §774 замыкание ВЫКЛЮЧЕНО (%s) — ЧИСТОЕ УСЕЧЕНИЕ\n",
+                 xtailq < 0.0 ? "тактов меньше минимума либо нулевое приращение"
+                              : "xtailq=0 по ключу");
+        {
+          double sphiL = 0.0, mphiL = 0.0;
+          for (size_t i = 0; i < nph; i += 4) {
+            sphiL += fabs(phi[i]);
+            if (fabs(phi[i]) > mphiL) mphiL = fabs(phi[i]);
+          }
+          printf("   §774 СЛЕПОК: Σ|φ| %.17g, max|φ| %.17g\n", sphiL, mphiL);
+        }
+        /* сравнение с базой того же процесса */
+        if (xbcmp774) {
+          int bitphi = memcmp(phi, phiB4, nph * sizeof(double)) == 0;
+          int biteirr = eirrB != NULL && st.eirr != NULL &&
+                        memcmp(st.eirr, eirrB, (size_t)cut.nse * sizeof(double)) == 0;
+          double dps = psinB > 0.0 ? (st.psin - psinB) / psinB : 0.0;
+          /* зона §768: < 15 м от глаза, лицевые; предикат тот же, что у
+           * прибора вклада — сравнение читается против А1212 */
+          double zb = 0.0, zl = 0.0, tb = 0.0, tl = 0.0;
+          int64_t nzone = 0, nuse = 0, nneg2 = 0;
+          double *rel = malloc((size_t)nse4 * sizeof *rel);
+          if (rel == NULL) exit(1);
+          for (int32_t e = 0; e < cut.nse && eirrB != NULL && st.eirr != NULL; e++) {
+            double c9[3] = {0, 0, 0};
+            for (int q2 = 0; q2 < cut.se[e].nv; q2++)
+              for (int a = 0; a < 3; a++)
+                c9[a] += cut.se[e].v[q2][a] / (double)(cut.se[e].nv > 0 ? cut.se[e].nv : 1);
+            double d2 = 0.0, dot = 0.0;
+            for (int a = 0; a < 3; a++) {
+              double dd = c9[a] - g_eye[a];
+              d2 += dd * dd;
+              dot += cut.se[e].n[a] * dd;
+            }
+            int inzone = sqrt(d2) < 15.0 && !(dot > 0.0);
+            double wb = eirrB[e] * cut.se[e].area, wl = st.eirr[e] * cut.se[e].area;
+            tb += fabs(wb);
+            tl += fabs(wl);
+            if (inzone) {
+              zb += fabs(wb);
+              zl += fabs(wl);
+              nzone++;
+            }
+            if (fabs(eirrB[e]) > 0.0) rel[nuse++] = fabs(st.eirr[e] - eirrB[e]) / fabs(eirrB[e]);
+            if (st.eirr[e] < 0.0) nneg2++;
+          }
+          printf("   §774 СРАВНЕНИЕ С БАЗОЙ: Δpsin %+.3f %%; Σ|E·area| зоны (<15 м, лицевые, "
+                 "%lld элементов) %.6g против %.6g (Δ %+.3f %%); всей сцены %.6g против %.6g "
+                 "(Δ %+.3f %%); ПОБИТОВО φ: %s, eirr: %s\n",
+                 100.0 * dps, (long long)nzone, zl, zb, 100.0 * (zl - zb) / (zb > 0.0 ? zb : 1.0),
+                 tl, tb, 100.0 * (tl - tb) / (tb > 0.0 ? tb : 1.0), bitphi ? "ДА" : "нет",
+                 biteirr ? "ДА" : "нет");
+          if (nuse > 0) {
+            qsort(rel, (size_t)nuse, sizeof *rel, cmp_dev699);
+            printf("   §774 ПОЭЛЕМЕНТНО |Δeirr|/eirr (покрытие %lld из %d, база > 0): медиана "
+                   "%.4g, p90 %.4g, p99 %.4g, макс %.4g; eirr < 0 после замыкания: %lld\n",
+                   (long long)nuse, cut.nse, rel[nuse / 2], rel[(nuse * 9) / 10],
+                   rel[(nuse * 99) / 100], rel[nuse - 1], (long long)nneg2);
+          }
+          free(rel);
+          free(phiB4);
+          free(eirrB);
+        }
+        free(pphi);
+        free(pbo);
+        free(pso);
+        free(dpphi);
+        free(dpbo);
+        free(dpso);
+        free(peirr);
       } else if (!xunit) {
         src = tr3_sweep_solve(&prob, xit, xtol, phi, &st);
       } else {

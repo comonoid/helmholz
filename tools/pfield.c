@@ -5286,7 +5286,10 @@ static void lit_resolve(litctx *L, int gamn) {
               for (int32_t t3 = 0; t3 < nls; t3++) {
                 const double *A3, *B3, *C3;
                 tri_verts(L->mesh, ls3[t3], &A3, &B3, &C3);
-                double e1[3], e2[3], nn3[3];
+                /* нулевая инициализация — ложный класс gcc-analyzer: внутри
+                 * omp-региона он теряет безусловное присваивание через
+                 * указатели tri_verts (CLAUDE.md, класс diam 07-24) */
+                double e1[3] = {0, 0, 0}, e2[3] = {0, 0, 0}, nn3[3];
                 for (int c = 0; c < 3; c++) {
                   e1[c] = B3[c] - A3[c];
                   e2[c] = C3[c] - A3[c];

@@ -2785,6 +2785,53 @@ static int c772_stop(void *vc, int32_t ni, const int32_t lo[3], int32_t size) {
   return 1;
 }
 
+/* §778: клип треугольника к коробке — Сазерленд–Ходжман по шести полуплоскостям.
+ * ДИАГНОСТИКА (ключ xleak): эталон покрытия, независимый от рабочего пути cut3;
+ * плавучка здесь законна — рабочая геометрия этим не пользуется. */
+static int leak_clip_ax(const double (*in)[3], int nin, double (*out)[3], int ax, double val,
+                        int keep_less) {
+  int nout = 0;
+  for (int i = 0; i < nin; i++) {
+    const double *a = in[i], *b = in[(i + 1) % nin];
+    double da = keep_less ? val - a[ax] : a[ax] - val;
+    double db = keep_less ? val - b[ax] : b[ax] - val;
+    if (da >= 0.0) memcpy(out[nout++], a, 3 * sizeof(double));
+    if ((da >= 0.0) != (db >= 0.0)) {
+      double t = da / (da - db);
+      for (int k = 0; k < 3; k++)
+        out[nout][k] = a[k] + t * (b[k] - a[k]);
+      nout++;
+    }
+  }
+  return nout;
+}
+
+/* Площадь куска треугольника в коробке [lo, hi]. Ёмкость 16: выпуклый клип
+ * добавляет не больше одной вершины на полуплоскость, 3 + 6 = 9. */
+static double leak_tri_box_area(const double tri[3][3], const double lo[3], const double hi[3]) {
+  double A[16][3], B[16][3];
+  memcpy(A, tri, 9 * sizeof(double));
+  int n = 3;
+  for (int ax = 0; ax < 3; ax++) {
+    n = leak_clip_ax((const double (*)[3])A, n, B, ax, lo[ax], 0);
+    if (n < 3) return 0.0;
+    n = leak_clip_ax((const double (*)[3])B, n, A, ax, hi[ax], 1);
+    if (n < 3) return 0.0;
+  }
+  double sx = 0.0, sy = 0.0, sz = 0.0;
+  for (int i = 1; i + 1 < n; i++) {
+    double u[3], w[3];
+    for (int k = 0; k < 3; k++) {
+      u[k] = A[i][k] - A[0][k];
+      w[k] = A[i + 1][k] - A[0][k];
+    }
+    sx += u[1] * w[2] - u[2] * w[1];
+    sy += u[2] * w[0] - u[0] * w[2];
+    sz += u[0] * w[1] - u[1] * w[0];
+  }
+  return 0.5 * sqrt(sx * sx + sy * sy + sz * sz);
+}
+
 /* §762: подъём флага заполнения предкам и спуск с last-good по флагу. */
 static int fill_lift(const hz_dctree *t, int32_t ni) {
   int any = g_indfill[ni];
@@ -5881,6 +5928,7 @@ int main(int argc, char **argv) {
   int xbounce = 0;        /* §774: лестница N прокидок-отскоков; 0 — выключено */
   double xtailq = -1.0;   /* §774: q хвоста: <0 — измерить, 0 — усечение, >0 — НК */
   int xbcmp774 = 0;       /* §774: базовый прогон и сравнение в одном процессе */
+  int xleak = 0;          /* §778: диагностический клип покрытия — адреса дыр */
   int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
   int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
   int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
@@ -5991,6 +6039,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "xbounce=", 8) == 0) xbounce = (int)strtol(argv[i] + 8, NULL, 10);
     if (strncmp(argv[i], "xtailq=", 7) == 0) xtailq = strtod(argv[i] + 7, NULL);
     if (strcmp(argv[i], "xbcmp") == 0) xbcmp774 = 1;
+    if (strcmp(argv[i], "xleak") == 0) xleak = 1;
     if (strcmp(argv[i], "xcontrib") == 0) {
       xcontrib = 1;
       xmatrho = 1;
@@ -7030,6 +7079,219 @@ int main(int argc, char **argv) {
                  (long long)nb3, 100.0 * (double)nb3 / (double)na);
         }
         free(ar);
+        /* §778: ПОКРЫТИЕ ПОВЕРХНОСТИ ЭЛЕМЕНТАМИ — дыры покрытия есть канал
+         * протечки (§767). Эталон Σ tri.area из OBJ; Σ se.area — ДО фильтра
+         * xsemin: фильтр в разложении утечки идёт отдельной осью. */
+        {
+          double atri778 = 0.0;
+          for (int32_t t9 = 0; t9 < m.nt; t9++) {
+            double u[3], w[3], cx9[3];
+            const double *va = m.v + 3 * (size_t)m.f[3 * (size_t)t9];
+            const double *vb = m.v + 3 * (size_t)m.f[3 * (size_t)t9 + 1];
+            const double *vc = m.v + 3 * (size_t)m.f[3 * (size_t)t9 + 2];
+            for (int k = 0; k < 3; k++) {
+              u[k] = vb[k] - va[k];
+              w[k] = vc[k] - va[k];
+            }
+            cx9[0] = u[1] * w[2] - u[2] * w[1];
+            cx9[1] = u[2] * w[0] - u[0] * w[2];
+            cx9[2] = u[0] * w[1] - u[1] * w[0];
+            atri778 += 0.5 * sqrt(cx9[0] * cx9[0] + cx9[1] * cx9[1] + cx9[2] * cx9[2]);
+          }
+          int64_t nz778 = 0;
+          for (int32_t k = 0; k < cut.nse; k++)
+            if (!(cut.se[k].area > 0.0)) nz778++;
+          printf("   §778 ПОКРЫТИЕ: Σ tri.area %.6f, Σ se.area %.6f, ДЕФИЦИТ %.4f %%; "
+                 "элементов с area <= 0: %lld из %d\n",
+                 atri778, atot0, 100.0 * (1.0 - atot0 / (atri778 > 0.0 ? atri778 : 1.0)),
+                 (long long)nz778, cut.nse);
+          if (xleak) {
+            /* §778 Р2: эталон по клеткам листовой решётки независимым клипом;
+             * невязка (ref − se) с обоими хвостами: дыры И избыток (А1239 —
+             * дубли прятали бы дефицит, их выдаёт отрицательный хвост). */
+            size_t ng9 = (size_t)fr.n * (size_t)fr.n * (size_t)fr.n;
+            double *refA = calloc(ng9, sizeof *refA);
+            double *seA = calloc(ng9, sizeof *seA);
+            if (refA == NULL || seA == NULL) exit(1);
+            for (int32_t t9 = 0; t9 < m.nt; t9++) {
+              double tri[3][3];
+              for (int q = 0; q < 3; q++)
+                for (int k = 0; k < 3; k++)
+                  tri[q][k] = m.v[3 * (size_t)m.f[3 * (size_t)t9 + (size_t)q] + (size_t)k];
+              int lo9[3], hi9[3];
+              for (int a = 0; a < 3; a++) {
+                double bl = tri[0][a], bh = tri[0][a];
+                for (int q = 1; q < 3; q++) {
+                  if (tri[q][a] < bl) bl = tri[q][a];
+                  if (tri[q][a] > bh) bh = tri[q][a];
+                }
+                lo9[a] = (int)floor((bl - ofr.o[a]) / ofr.u[a]);
+                hi9[a] = (int)floor((bh - ofr.o[a]) / ofr.u[a]);
+                if (lo9[a] < 0) lo9[a] = 0;
+                if (hi9[a] > fr.n - 1) hi9[a] = fr.n - 1;
+              }
+              for (int iz = lo9[2]; iz <= hi9[2]; iz++)
+                for (int iy = lo9[1]; iy <= hi9[1]; iy++)
+                  for (int ix = lo9[0]; ix <= hi9[0]; ix++) {
+                    double blo[3] = {ofr.o[0] + ofr.u[0] * (double)ix,
+                                     ofr.o[1] + ofr.u[1] * (double)iy,
+                                     ofr.o[2] + ofr.u[2] * (double)iz};
+                    double bhi[3] = {blo[0] + ofr.u[0], blo[1] + ofr.u[1], blo[2] + ofr.u[2]};
+                    double a9 = leak_tri_box_area((const double (*)[3])tri, blo, bhi);
+                    if (a9 > 0.0) refA[hz_occ_index(fr.n, ix, iy, iz)] += a9;
+                  }
+            }
+            int64_t nbig9 = 0;
+            for (int32_t k = 0; k < cut.nse; k++) {
+              if (!(cut.se[k].area > 0.0)) continue;
+              int32_t c9 = cut.se[k].cell;
+              if (mesh.csize[c9] != 1) {
+                nbig9++; /* элементов в КРУПНЫХ ячейках быть не должно — счёт */
+                continue;
+              }
+              seA[hz_occ_index(fr.n, mesh.clo[c9][0], mesh.clo[c9][1], mesh.clo[c9][2])] +=
+                  cut.se[k].area;
+            }
+            /* допуск невязки клетки: плавучка двух клипов на площади ~h² */
+            const double eps9 = 1e-9;
+            double reftot = 0.0, refcut = 0.0, secut = 0.0, possum = 0.0, negsum = 0.0;
+            int64_t ncut9 = 0, npos = 0, nneg9 = 0;
+            enum { NT9 = 10 };
+            double tdev[NT9];
+            size_t tg[NT9];
+            int tn = 0;
+            double ndev[3] = {0, 0, 0};
+            size_t ngc[3] = {0, 0, 0};
+            int nn9 = 0;
+            for (size_t g = 0; g < ng9; g++) {
+              reftot += refA[g];
+              if (!(refA[g] > 0.0) && !(seA[g] > 0.0)) continue;
+              ncut9++;
+              refcut += refA[g];
+              secut += seA[g];
+              double dv = refA[g] - seA[g];
+              if (dv > eps9) {
+                possum += dv;
+                npos++;
+                int j = tn < NT9 ? tn : NT9 - 1;
+                if (tn < NT9 || dv > tdev[NT9 - 1]) {
+                  while (j > 0 && tdev[j - 1] < dv) {
+                    tdev[j] = tdev[j - 1];
+                    tg[j] = tg[j - 1];
+                    j--;
+                  }
+                  tdev[j] = dv;
+                  tg[j] = g;
+                  if (tn < NT9) tn++;
+                }
+              } else if (dv < -eps9) {
+                negsum -= dv;
+                nneg9++;
+                int j = nn9 < 3 ? nn9 : 2;
+                if (nn9 < 3 || -dv > ndev[2]) {
+                  while (j > 0 && ndev[j - 1] < -dv) {
+                    ndev[j] = ndev[j - 1];
+                    ngc[j] = ngc[j - 1];
+                    j--;
+                  }
+                  ndev[j] = -dv;
+                  ngc[j] = g;
+                  if (nn9 < 3) nn9++;
+                }
+              }
+            }
+            printf("   §778 КЛИП: Σ ref %.6f (самопроверка против Σ tri.area: Δ %.2e отн.); "
+                   "клеток с поверхностью %lld; ДЫРЫ Σ(ref−se)+ %.6f (%.3f %% от ref) в %lld "
+                   "клетках; ИЗБЫТОК Σ(se−ref)+ %.6f в %lld клетках; se в крупных ячейках %lld\n",
+                   reftot, fabs(reftot - atri778) / (atri778 > 0.0 ? atri778 : 1.0),
+                   (long long)ncut9, possum, 100.0 * possum / (refcut > 0.0 ? refcut : 1.0),
+                   (long long)npos, negsum, (long long)nneg9, (long long)nbig9);
+            /* Гистограмма дыр по ЧИСЛУ ФАСЕТОВ записи и по КЛАССУ реза —
+             * атрибуция классом, а не десятью топ-клетками (А11-класс). */
+            {
+              int32_t *cellat = malloc(ng9 * sizeof *cellat);
+              if (cellat != NULL) {
+                for (size_t g = 0; g < ng9; g++)
+                  cellat[g] = -1;
+                for (int32_t c9 = 0; c9 < mesh.ncell; c9++)
+                  if (mesh.csize[c9] == 1)
+                    cellat[hz_occ_index(fr.n, mesh.clo[c9][0], mesh.clo[c9][1], mesh.clo[c9][2])] =
+                        c9;
+                double hnf[4] = {0, 0, 0, 0}; /* nf: 0-1 / 2-3 / 4-7 / >=8 */
+                /* рез: пустой / полный / частичный / нет ячейки / СПЛОШНАЯ —
+                 * у сплошной ref есть, а элементов нет НАМЕРЕННО (внутренность
+                 * тела); её «дыра» ложная и из суммы механизма исключается */
+                double hfr[5] = {0, 0, 0, 0, 0};
+                double vb9 = ofr.u[0] * ofr.u[1] * ofr.u[2];
+                /* допуск класса реза: 1e-9 объёма коробки — тот же класс, что
+                 * у объёмной сверки §772 (макроскопика против плавучки) */
+                const double veps = 1e-9 * vb9;
+                for (size_t g = 0; g < ng9; g++) {
+                  double dv = refA[g] - seA[g];
+                  if (!(dv > eps9)) continue;
+                  int32_t cm9 = cellat[g];
+                  if (cm9 < 0) {
+                    hfr[3] += dv;
+                    continue;
+                  }
+                  if (cut.solid[cm9]) {
+                    hfr[4] += dv;
+                    continue;
+                  }
+                  const hz_cutrec *r9 = hz_cutmap_find(&cmap, mesh.node[cm9]);
+                  int nf9 = r9 != NULL ? (int)r9->nf : 0;
+                  hnf[nf9 <= 1 ? 0 : (nf9 <= 3 ? 1 : (nf9 <= 7 ? 2 : 3))] += dv;
+                  double vf9 = cut.mvol[cm9][0][0];
+                  hfr[vf9 < veps ? 0 : (vf9 > vb9 - veps ? 1 : 2)] += dv;
+                }
+                printf("   §778 ДЫРЫ ПО ФАСЕТАМ ЗАПИСИ (без сплошных): 0-1: %.4f, 2-3: %.4f, "
+                       "4-7: %.4f, >=8: %.4f; ПО КЛАССУ РЕЗА: пустой %.4f, полный %.4f, "
+                       "частичный %.4f, без ячейки %.4f, СПЛОШНАЯ (ложная дыра) %.4f\n",
+                       hnf[0], hnf[1], hnf[2], hnf[3], hfr[0], hfr[1], hfr[2], hfr[3], hfr[4]);
+                free(cellat);
+              }
+            }
+            for (int i = 0; i < tn; i++) {
+              size_t g = tg[i];
+              int32_t ix = (int32_t)(g % (size_t)fr.n);
+              int32_t iy = (int32_t)((g / (size_t)fr.n) % (size_t)fr.n);
+              int32_t iz = (int32_t)(g / ((size_t)fr.n * (size_t)fr.n));
+              int32_t cm9 = -1;
+              for (int32_t c9 = 0; c9 < mesh.ncell; c9++)
+                if (mesh.csize[c9] == 1 && mesh.clo[c9][0] == ix && mesh.clo[c9][1] == iy &&
+                    mesh.clo[c9][2] == iz) {
+                  cm9 = c9;
+                  break;
+                }
+              int64_t nse9 = 0;
+              if (cm9 >= 0)
+                for (int32_t k = 0; k < cut.nse; k++)
+                  if (cut.se[k].cell == cm9 && cut.se[k].area > 0.0) nse9++;
+              int nf9 = -1;
+              double ffr9 = -1.0;
+              if (cm9 >= 0) {
+                const hz_cutrec *r9 = hz_cutmap_find(&cmap, mesh.node[cm9]);
+                nf9 = r9 != NULL ? (int)r9->nf : 0;
+                double vb9 = ofr.u[0] * ofr.u[1] * ofr.u[2];
+                ffr9 = vb9 > 0.0 ? cut.mvol[cm9][0][0] / vb9 : -1.0;
+              }
+              printf("      §778 дыра %2d: клетка (%d,%d,%d) мир (%.3f, %.3f, %.3f); потеря "
+                     "%.6f (ref %.6f, se %.6f); элементов %lld, фасетов записи %d, доля флюида "
+                     "%.3f; ячейка сетки %s\n",
+                     i, ix, iy, iz, ofr.o[0] + ofr.u[0] * ((double)ix + 0.5),
+                     ofr.o[1] + ofr.u[1] * ((double)iy + 0.5),
+                     ofr.o[2] + ofr.u[2] * ((double)iz + 0.5), tdev[i], refA[g], seA[g],
+                     (long long)nse9, nf9, ffr9, cm9 >= 0 ? "есть" : "НЕТ");
+            }
+            for (int i = 0; i < nn9; i++) {
+              size_t g = ngc[i];
+              printf("      §778 избыток %d: клетка g=%zu, se−ref %.6f (ref %.6f, se %.6f)\n", i, g,
+                     ndev[i], refA[g], seA[g]);
+            }
+            free(refA);
+            free(seA);
+          }
+        }
         if (xsemin > 0.0) {
           int64_t nrem = 0;
           double arem = 0.0;

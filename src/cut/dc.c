@@ -1379,17 +1379,107 @@ typedef struct {
 
 typedef struct {
   hz_facettab *ft;
+  const hz_dctree *t; /* Р-8: раздача по куску спускается по дереву */
   cellfacet *pair;
   int32_t np, cap;
-  int32_t nbad; /* плоскость, отсекающая ячейку целиком: несогласованность */
+  int32_t nbad;   /* плоскость, отсекающая ячейку целиком: несогласованность */
+  int bounded;    /* Р-8: раздача по КУСКУ (иначе — по плоскости, как прежде) */
+  int32_t *dropc; /* Р-8/Г60: ячейки пар, отброшенных кусочным отбором */
+  int32_t nd, dcap;
   int rc;
 } facetctx;
+
+static int push_pair(facetctx *fc, int32_t cell, int32_t fref) {
+  if (fc->np >= fc->cap) {
+    int32_t nc = fc->cap * 2;
+    cellfacet *np2 = realloc(fc->pair, (size_t)nc * sizeof(cellfacet));
+    if (np2 == NULL) {
+      fc->rc = HZ_DC_ENOMEM;
+      return 1;
+    }
+    fc->pair = np2;
+    fc->cap = nc;
+  }
+  fc->pair[fc->np].cell = cell;
+  fc->pair[fc->np].fref = fref;
+  fc->np++;
+  return 0;
+}
+
+/* Р-8: счётчики раздачи — читаются потребителем после hz_dc_facets (стиль
+ * hz_dc_walk_memo_*): молча сузившаяся раздача неотличима от бага (Г58/Г60). */
+static long long g_fc_pairs = 0, g_fc_dropped = 0, g_fc_empty = 0;
+long long hz_dc_facets_pairs(void) {
+  return g_fc_pairs;
+}
+long long hz_dc_facets_dropped(void) {
+  return g_fc_dropped;
+}
+long long hz_dc_facets_empty(void) {
+  return g_fc_empty;
+}
+
+/* Р-8: пересекает ли ТРЕУГОЛЬНИК коробку [lo, lo+size) — SAT Акенина-Мёллера.
+ * НЕСТРОГИЕ сравнения сознательно (Г59): касание = пересечение; ложное «да»
+ * безвредно (рез даст пустую грань), ложное «нет» — потерянный кусок = дыра. */
+static int tri_box_overlap(const double v0[3], const double v1[3], const double v2[3],
+                           const int32_t lo[3], int32_t size) {
+  double h = 0.5 * (double)size;
+  double a[3][3];
+  for (int k = 0; k < 3; k++) {
+    double c = (double)lo[k] + h;
+    a[0][k] = v0[k] - c;
+    a[1][k] = v1[k] - c;
+    a[2][k] = v2[k] - c;
+  }
+  for (int k = 0; k < 3; k++) { /* оси коробки */
+    double mn = a[0][k], mx = a[0][k];
+    for (int i = 1; i < 3; i++) {
+      if (a[i][k] < mn) mn = a[i][k];
+      if (a[i][k] > mx) mx = a[i][k];
+    }
+    if (mn > h || mx < -h) return 0;
+  }
+  double e[3][3], nn[3];
+  for (int k = 0; k < 3; k++) {
+    e[0][k] = a[1][k] - a[0][k];
+    e[1][k] = a[2][k] - a[1][k];
+    e[2][k] = a[0][k] - a[2][k];
+  }
+  nn[0] = e[0][1] * e[1][2] - e[0][2] * e[1][1]; /* нормаль треугольника */
+  nn[1] = e[0][2] * e[1][0] - e[0][0] * e[1][2];
+  nn[2] = e[0][0] * e[1][1] - e[0][1] * e[1][0];
+  {
+    double d = nn[0] * a[0][0] + nn[1] * a[0][1] + nn[2] * a[0][2];
+    double r = h * (fabs(nn[0]) + fabs(nn[1]) + fabs(nn[2]));
+    if (d > r || d < -r) return 0;
+  }
+  for (int i = 0; i < 3; i++) /* девять осей ребро × орт */
+    for (int k = 0; k < 3; k++) {
+      double ax[3] = {0.0, 0.0, 0.0};
+      ax[(k + 1) % 3] = e[i][(k + 2) % 3];
+      ax[(k + 2) % 3] = -e[i][(k + 1) % 3];
+      double p0 = ax[0] * a[0][0] + ax[1] * a[0][1] + ax[2] * a[0][2];
+      double p1 = ax[0] * a[1][0] + ax[1] * a[1][1] + ax[2] * a[1][2];
+      double p2 = ax[0] * a[2][0] + ax[1] * a[2][1] + ax[2] * a[2][2];
+      double mn = p0 < p1 ? (p0 < p2 ? p0 : p2) : (p1 < p2 ? p1 : p2);
+      double mx = p0 > p1 ? (p0 > p2 ? p0 : p2) : (p1 > p2 ? p1 : p2);
+      double r = h * (fabs(ax[0]) + fabs(ax[1]) + fabs(ax[2]));
+      if (mn > r || mx < -r) return 0;
+    }
+  return 1;
+}
 
 static int pair_cmp(const void *a, const void *b) {
   const cellfacet *x = a, *y = b;
   if (x->cell != y->cell) return x->cell < y->cell ? -1 : 1;
   if (x->fref != y->fref) return x->fref < y->fref ? -1 : 1;
   return 0;
+}
+
+static int pair_cmp_i32(const void *a, const void *b) {
+  int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
+  return x < y ? -1 : (x > y ? 1 : 0);
 }
 
 /* Режет ли полуплоскость {n·x <= off} коробку. Тот же ТОЧНЫЙ отбор по опорной
@@ -1406,6 +1496,30 @@ static int plane_cuts_box(const double nn[3], double off, const int32_t lo[3], i
   *outside = vmin > off;
   if (*outside) return 0;
   return vmax > off;
+}
+
+/* Р-8: спуск по дереву — пара (лист, фасет) каждому листу, чей бокс пересекает
+ * кусок. SAT консервативен (Г59), спуск отсекает поддеревья без пересечения.
+ * Возврат 1 — ошибка памяти (rc уже выставлен push_pair). */
+static int piece_pairs_rec(facetctx *fc, int32_t ni, const int32_t lo[3], int32_t size,
+                           const double *a, const double *b, const double *c, int32_t fi) {
+  if (!tri_box_overlap(a, b, c, lo, size)) return 0;
+  if (fc->t->nd[ni].child0 < 0) {
+    /* Пары — только ЛИСТЬЯМ ДНА: поверхность живёт на самом мелком уровне
+     * (условие 1:1 cut3), а крупный лист занятости в сетке переноса нумеруется
+     * иначе — запись на нём потерялась бы (замерено: room, se в «крупных»
+     * 18 751 при раздаче любым листьям). Крупный лист сюда попадает только
+     * КАСАНИЕМ границы (консервативный SAT), и пара ему не нужна. */
+    if (size == 1) return push_pair(fc, ni, fi);
+    return 0;
+  }
+  int32_t half = size / 2;
+  for (int i = 0; i < 8; i++) {
+    int32_t clo[3] = {lo[0] + ((i & 1) ? half : 0), lo[1] + ((i & 2) ? half : 0),
+                      lo[2] + ((i & 4) ? half : 0)};
+    if (piece_pairs_rec(fc, fc->t->nd[ni].child0 + i, clo, half, a, b, c, fi)) return 1;
+  }
+  return 0;
 }
 
 static int facet_emit(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv) {
@@ -1428,10 +1542,30 @@ static int facet_emit(void *ctx, const hz_dcref *ref, const double (*v)[3], int 
     double off = nn[0] * a[0] + nn[1] * a[1] + nn[2] * a[2];
     /* Г44: dmax НЕ ВЫЧИСЛЕН и ноль сюда ставить нельзя — невязка QEF есть
      * среднеквадратичное на образцах, а не максимум смещения по фасету. */
-    int32_t fi = hz_facettab_add_units(fc->ft, nn, off, -1, HZ_FACET_DMAX_UNKNOWN);
+    int32_t fi;
+    if (fc->bounded) { /* Р-8: фасет несёт свой кусок */
+      double tv8[3][3];
+      for (int k = 0; k < 3; k++) {
+        tv8[0][k] = a[k];
+        tv8[1][k] = b[k];
+        tv8[2][k] = c[k];
+      }
+      fi = hz_facettab_add_units_piece(fc->ft, nn, off, -1, HZ_FACET_DMAX_UNKNOWN,
+                                       (const double (*)[3])tv8);
+    } else
+      fi = hz_facettab_add_units(fc->ft, nn, off, -1, HZ_FACET_DMAX_UNKNOWN);
     if (fi < 0) {
       fc->rc = HZ_DC_ENOMEM;
       return 1;
+    }
+    if (fc->bounded) {
+      /* Р-8 (вторая редакция раздачи): кусок раздаётся ВСЕМ ЛИСТЬЯМ, чей бокс
+       * он пересекает, — спуском по дереву с SAT-отсечением. Раздача только по
+       * ячейкам ВЕРШИН полигона теряла клетки, сквозь которые кусок проходит:
+       * замерено §778 на room — 99.7 из 102.7 дыр в клетках БЕЗ записи. */
+      int32_t rlo[3] = {0, 0, 0};
+      if (piece_pairs_rec(fc, 0, rlo, (int32_t)1 << fc->t->log2size, a, b, c, fi)) return 1;
+      continue;
     }
     /* Плоскость раздаётся ВСЕМ ячейкам полигона, а не только вершинам этого
      * треугольника: веер вокруг вершины ячейки обязан быть полным (Г10). */
@@ -1441,34 +1575,38 @@ static int facet_emit(void *ctx, const hz_dcref *ref, const double (*v)[3], int 
         if (outside) fc->nbad++;
         continue;
       }
-      if (fc->np >= fc->cap) {
-        int32_t nc = fc->cap * 2;
-        cellfacet *np2 = realloc(fc->pair, (size_t)nc * sizeof(cellfacet));
-        if (np2 == NULL) {
-          fc->rc = HZ_DC_ENOMEM;
-          return 1;
-        }
-        fc->pair = np2;
-        fc->cap = nc;
-      }
-      fc->pair[fc->np].cell = ref[k].ni;
-      fc->pair[fc->np].fref = fi;
-      fc->np++;
+      if (push_pair(fc, ref[k].ni, fi)) return 1;
     }
   }
   return 0;
 }
 
-int hz_dc_facets(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_facettab *ft, hz_cutmap *cm) {
-  facetctx fc = {ft, NULL, 0, 256, 0, HZ_DC_OK};
+int hz_dc_facets2(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_facettab *ft, hz_cutmap *cm,
+                  int bounded) {
+  facetctx fc;
+  memset(&fc, 0, sizeof fc);
+  fc.ft = ft;
+  fc.t = t;
+  fc.cap = 256;
+  fc.bounded = bounded;
+  fc.dcap = 256;
+  fc.rc = HZ_DC_OK;
+  g_fc_pairs = g_fc_dropped = g_fc_empty = 0;
   fc.pair = calloc((size_t)fc.cap, sizeof(cellfacet));
-  if (fc.pair == NULL) return HZ_DC_ENOMEM;
+  fc.dropc = calloc((size_t)fc.dcap, sizeof(int32_t));
+  if (fc.pair == NULL || fc.dropc == NULL) {
+    free(fc.pair);
+    free(fc.dropc);
+    return HZ_DC_ENOMEM;
+  }
   int rc = hz_dc_walk(t, stop, sctx, facet_emit, &fc);
   if (rc == HZ_DC_OK) rc = fc.rc;
   if (rc != HZ_DC_OK) {
     free(fc.pair);
+    free(fc.dropc);
     return rc;
   }
+  g_fc_pairs = fc.np;
   /* Г45: ОБХОД ВЫДАЁТ ЯЧЕЙКИ В ПОРЯДКЕ ДЕРЕВА, а hz_cutmap требует строго
    * возрастающего ключа и вернул бы 2. Пересортировка обязательна, и её код
    * возврата проверяется — молча потерянные фасеты дали бы ячейку без границы,
@@ -1491,10 +1629,28 @@ int hz_dc_facets(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_facettab *f
     }
     if (hz_cutmap_add(cm, cell, buf, nf) != 0) {
       free(fc.pair);
+      free(fc.dropc);
       return HZ_DC_ETOPO;
     }
     i = j;
   }
+  /* Г60: записи, ОПУСТЕВШИЕ после кусочного отбора, — ячейки с отброшенными
+   * парами и без единой принятой. Молчаливое исчезновение неотличимо от бага
+   * раздачи, поэтому считается и отдаётся счётчиком. */
+  if (fc.nd > 0) {
+    qsort(fc.dropc, (size_t)fc.nd, sizeof(int32_t), pair_cmp_i32);
+    for (int32_t d = 0; d < fc.nd; d++) {
+      if (d > 0 && fc.dropc[d] == fc.dropc[d - 1]) continue;
+      if (hz_cutmap_find(cm, fc.dropc[d]) == NULL) g_fc_empty++;
+    }
+  }
   free(fc.pair);
+  free(fc.dropc);
   return HZ_DC_OK;
+}
+
+int hz_dc_facets(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_facettab *ft, hz_cutmap *cm) {
+  /* Р-8: раздача по КУСКУ — рабочее умолчание; прежнее поведение (бесконечные
+   * плоскости) остаётся негативным контролем через hz_dc_facets2(..., 0). */
+  return hz_dc_facets2(t, stop, sctx, ft, cm, 1);
 }

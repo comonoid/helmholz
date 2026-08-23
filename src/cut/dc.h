@@ -397,5 +397,15 @@ long long hz_dc_walk_memo_flips(void);
  * невязка ноль, а смещение от истинной кривой поверхности нулю не равно.
  * Волновая линия по Г25 обязана отказаться; переносу они законны (Г9). */
 int hz_dc_facets(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_facettab *ft, hz_cutmap *cm);
+/* Р-8: тот же мост с явным режимом. bounded = 1 — фасеты несут КУСОК
+ * (треугольник) и раздача отбирает по куску (умолчание hz_dc_facets);
+ * bounded = 0 — прежние бесконечные плоскости (негативный контроль). */
+int hz_dc_facets2(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_facettab *ft, hz_cutmap *cm,
+                  int bounded);
+/* Р-8: счётчики последней раздачи — пар всего, отброшено кусочным отбором,
+ * записей опустело целиком (Г58/Г60: молчаливое сужение неотличимо от бага). */
+long long hz_dc_facets_pairs(void);
+long long hz_dc_facets_dropped(void);
+long long hz_dc_facets_empty(void);
 
 #endif

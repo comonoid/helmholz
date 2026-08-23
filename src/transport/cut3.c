@@ -86,6 +86,60 @@ double tr3_cut_refs_fluid_vol(const hz_frame *fr, const hz_facettab *ft, const i
 }
 #define CUT3_SURF0 (1000)
 
+/* Р-8 (Д3): клип многоугольника элемента РЕБЁРНЫМИ полуплоскостями куска.
+ * Кусок — треугольник фасета (единицы кадра), клип идёт В МИРЕ; сторона
+ * каждой ребёрной полуплоскости берётся по третьей вершине (знак, не допуск —
+ * порога здесь нет). Точки ровно на ребре держат обе смежные полуплоскости:
+ * перекрытие меры нуль, а щель не возникает (Г61: биты не обещаются, площади
+ * складываются в кусок с плавучей точностью). Ёмкость CUT3_CLIPV: вход ≤ 32,
+ * каждая из трёх полуплоскостей добавляет ≤ 1 вершину. */
+#define CUT3_CLIPV 16
+/* Р-8 (Д3, вторая редакция): элемент bounded-фасета = КУСОК ∩ КОРОБКА, прямым
+ * клипом в МИРЕ. Первая редакция клиповала куском грань «материального
+ * многогранника» — у тонкой поверхности материал вырожден, его грани стоят не
+ * там (класс «избыток» §779), и пересечение с куском исчезало (замерено:
+ * дефицит 98.7 % на cavity). Чужие полуплоскости элементу с куском не нужны:
+ * кусок сам несёт свои границы, а покрытие «кусок ∩ коробка» точно по
+ * построению (куски поверхности не перекрываются, коробки — разбиение).
+ * Ёмкость: треугольник × 6 полуплоскостей ≤ 3 + 6 вершин. */
+static int cut3_piece_in_box(const tr3_mesh *m, const hz_facet *fp, const int32_t lo[3],
+                             const int32_t hi[3], double (*vw)[3]) {
+  double buf[2][CUT3_CLIPV][3];
+  for (int i = 0; i < 3; i++)
+    for (int a = 0; a < 3; a++)
+      buf[0][i][a] = m->fr.o[a] + m->fr.u[a] * fp->tv[i][a];
+  int cur = 0, ncp = 3;
+  for (int ax = 0; ax < 3 && ncp >= 3; ax++)
+    for (int side = 0; side < 2 && ncp >= 3; side++) {
+      double lim = m->fr.o[ax] + m->fr.u[ax] * (double)(side ? hi[ax] : lo[ax]);
+      double sgn = side ? -1.0 : 1.0; /* внутри: sgn·(x − lim) ≥ 0 */
+      int oth = 1 - cur, nxt = 0;
+      for (int e = 0; e < ncp; e++) {
+        const double *P = buf[cur][e], *Q = buf[cur][(e + 1) % ncp];
+        double dp = sgn * (P[ax] - lim), dq = sgn * (Q[ax] - lim);
+        if (dp >= 0.0 && nxt < CUT3_CLIPV) {
+          /* поэлементно, не memcpy: cur != oth, но анализатор связи не видит */
+          for (int a = 0; a < 3; a++)
+            buf[oth][nxt][a] = P[a];
+          nxt++;
+        }
+        if ((dp > 0.0 && dq < 0.0) || (dp < 0.0 && dq > 0.0)) {
+          double t = dp / (dp - dq);
+          if (nxt < CUT3_CLIPV) {
+            for (int a = 0; a < 3; a++)
+              buf[oth][nxt][a] = P[a] + t * (Q[a] - P[a]);
+            nxt++;
+          }
+        }
+      }
+      cur = oth;
+      ncp = nxt;
+    }
+  if (ncp < 3) return 0;
+  memcpy(vw, buf[cur], (size_t)ncp * 3 * sizeof(double));
+  return ncp;
+}
+
 void tr3_cut_free(tr3_cut *cu) {
   free(cu->mvol);
   free(cu->ffm);
@@ -255,8 +309,39 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
     }
     int npc = 0;
     if (hz_poly3_complement(pieces, nh, &npc, lo, hi, h, hid, hflip, nh) != HZ_P3_OK) npc = 0;
-    if (npc == 0) { /* флюида нет: ячейка целиком в материале */
-      cu->solid[c] = 1;
+    /* Р-8: запись целиком из ОГРАНИЧЕННЫХ кусков? (нужно ниже дважды) */
+    int allb8 = nh > 0 ? 1 : 0;
+    for (int j8 = 0; j8 < nh && allb8; j8++) {
+      int32_t r8 = rec != NULL ? cm->fref[rec->f0 + j8] : refs772[j8];
+      int32_t f8 = r8 >= 0 ? r8 : ~r8;
+      if (!(f8 >= 0 && f8 < ft->n && ft->f[f8].bounded)) allb8 = 0;
+    }
+    int degen8 = 0;
+    if (npc == 0) {
+      if (allb8 && (solid_in == NULL || !solid_in[c])) {
+        /* Р-8: union-рез КУСОЧНОЙ записи съел коробку целиком — у кусков
+         * объёма нет, «сплошная» здесь ложь того же класса, что дыры §779
+         * (замерено: топ-дыры cavity с долей флюида ровно 0.000). Ячейка
+         * остаётся ПОЛНОЙ коробкой (дефолты mvol/ffm не перезаписываются),
+         * элементы кусков строятся ниже. Толстые тела сюда не попадают —
+         * их метит solid_in. */
+        degen8 = 1;
+      } else { /* флюида нет: ячейка целиком в материале */
+        cu->solid[c] = 1;
+        memset(cu->mvol[c], 0, 16 * sizeof(double));
+        for (int32_t k = m->fstart[c]; k < m->fstart[c + 1]; k++) {
+          int32_t fi = m->flist[k];
+          cu->farea[fi] = 0.0;
+          memset(cu->ffm[fi], 0, 16 * sizeof(double));
+          memset(cu->ffmb[fi], 0, 16 * sizeof(double));
+          memset(cu->ffmx[fi], 0, 16 * sizeof(double));
+        }
+        free(pieces);
+        continue;
+      }
+    }
+
+    if (!degen8) {
       memset(cu->mvol[c], 0, 16 * sizeof(double));
       for (int32_t k = m->fstart[c]; k < m->fstart[c + 1]; k++) {
         int32_t fi = m->flist[k];
@@ -265,17 +350,6 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
         memset(cu->ffmb[fi], 0, 16 * sizeof(double));
         memset(cu->ffmx[fi], 0, 16 * sizeof(double));
       }
-      free(pieces);
-      continue;
-    }
-
-    memset(cu->mvol[c], 0, 16 * sizeof(double));
-    for (int32_t k = m->fstart[c]; k < m->fstart[c + 1]; k++) {
-      int32_t fi = m->flist[k];
-      cu->farea[fi] = 0.0;
-      memset(cu->ffm[fi], 0, 16 * sizeof(double));
-      memset(cu->ffmb[fi], 0, 16 * sizeof(double));
-      memset(cu->ffmx[fi], 0, 16 * sizeof(double));
     }
 
     double c3[3];
@@ -301,15 +375,19 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
           if (src < 0) continue; /* грань коробки: это не поверхность */
           int32_t b0 = mat.floff[fj], nv = mat.floff[fj + 1] - b0;
           if (nv < 3 || nv > 32) continue;
-          double vw[32][3];
+          double vw[CUT3_CLIPV][3];
           for (int32_t e = 0; e < nv; e++)
             for (int a = 0; a < 3; a++)
               vw[e][a] = m->fr.o[a] + m->fr.u[a] * mat.v[mat.fl[b0 + e]][a];
+          int32_t ref = rec != NULL ? cm->fref[rec->f0 + src] : refs772[src]; /* §772 */
+          int32_t fidx = ref >= 0 ? ref : ~ref;
+          /* Р-8 (Д3): элементы bounded-фасетов строятся ПРЯМЫМ клипом куска к
+           * коробке (цикл ниже) — грань вырожденного материала пропускается */
+          if (fidx >= 0 && fidx < ft->n && ft->f[fidx].bounded) continue;
           tr3_selem se;
           memset(&se, 0, sizeof se);
           se.cell = c;
-          int32_t ref = rec != NULL ? cm->fref[rec->f0 + src] : refs772[src]; /* §772 */
-          se.facet = ref >= 0 ? ref : ~ref;
+          se.facet = fidx;
           se.area = poly_mass2(m, vw, (int)nv, c, c, se.m);
           if (!(se.area > 0.0)) continue;
           /* вершины — проекционному сбору; переполнение ПОМЕЧАЕТСЯ, а не режется */
@@ -345,6 +423,57 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
             return 1;
           }
         }
+      }
+    }
+
+    /* Р-8 (Д3): элементы ОГРАНИЧЕННЫХ кусков — прямым клипом куска к коробке.
+     * Дубль фасета в записи (обе ориентации, §772-слэб) даёт ОДИН элемент. */
+    for (int j8 = 0; j8 < nh; j8++) {
+      int32_t ref8 = rec != NULL ? cm->fref[rec->f0 + j8] : refs772[j8];
+      int32_t fi8 = ref8 >= 0 ? ref8 : ~ref8;
+      if (fi8 < 0 || fi8 >= ft->n || !ft->f[fi8].bounded) continue;
+      int dup8 = 0;
+      for (int q8 = 0; q8 < j8 && !dup8; q8++) {
+        int32_t r2 = rec != NULL ? cm->fref[rec->f0 + q8] : refs772[q8];
+        if ((r2 >= 0 ? r2 : ~r2) == fi8) dup8 = 1;
+      }
+      if (dup8) continue;
+      double vw8[CUT3_CLIPV][3];
+      int nv8 = cut3_piece_in_box(m, &ft->f[fi8], lo, hi, vw8);
+      if (nv8 < 3) continue;
+      tr3_selem se;
+      memset(&se, 0, sizeof se);
+      se.cell = c;
+      se.facet = fi8;
+      se.area = poly_mass2(m, vw8, nv8, c, c, se.m);
+      if (!(se.area > 0.0)) continue;
+      if (nv8 <= TR3_SE_MAXV) {
+        se.nv = nv8;
+        for (int e = 0; e < nv8; e++)
+          for (int a = 0; a < 3; a++)
+            se.v[e][a] = vw8[e][a];
+      } else {
+        se.nv = 0;
+        cu->nsebig++;
+      }
+      /* нулевой вектор и нормаль — как у прежнего пути, из h[j8] (К39/Г21) */
+      se.nul[0] = -h[j8].off;
+      for (int a = 0; a < 3; a++) {
+        se.nul[0] += h[j8].n[a] * ((double)m->clo[c][a] + 0.5 * hh);
+        se.nul[a + 1] = hh * h[j8].n[a];
+      }
+      double nw8[3], nm8 = 0.0;
+      for (int a = 0; a < 3; a++) {
+        nw8[a] = h[j8].n[a] / m->fr.u[a];
+        nm8 += nw8[a] * nw8[a];
+      }
+      nm8 = sqrt(nm8);
+      for (int a = 0; a < 3; a++)
+        se.n[a] = nw8[a] / nm8;
+      if (push_se(cu, &se)) {
+        free(pieces);
+        tr3_cut_free(cu);
+        return 1;
       }
     }
 

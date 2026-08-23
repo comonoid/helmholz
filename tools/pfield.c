@@ -5929,6 +5929,7 @@ int main(int argc, char **argv) {
   double xtailq = -1.0;   /* §774: q хвоста: <0 — измерить, 0 — усечение, >0 — НК */
   int xbcmp774 = 0;       /* §774: базовый прогон и сравнение в одном процессе */
   int xleak = 0;          /* §778: диагностический клип покрытия — адреса дыр */
+  int xnopiece = 0;       /* §780 НК: раздача и рез бесконечными плоскостями, как до Р-8 */
   int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
   int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
   int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
@@ -6040,6 +6041,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "xtailq=", 7) == 0) xtailq = strtod(argv[i] + 7, NULL);
     if (strcmp(argv[i], "xbcmp") == 0) xbcmp774 = 1;
     if (strcmp(argv[i], "xleak") == 0) xleak = 1;
+    if (strcmp(argv[i], "xnopiece") == 0) xnopiece = 1;
     if (strcmp(argv[i], "xcontrib") == 0) {
       xcontrib = 1;
       xmatrho = 1;
@@ -6952,7 +6954,13 @@ int main(int argc, char **argv) {
     hz_facettab ftab;
     hz_cutmap cmap;
     if (hz_facettab_init(&ftab) != 0 || hz_cutmap_init(&cmap) != 0) exit(1);
-    int frc = hz_dc_facets(&T, NULL, NULL, &ftab, &cmap);
+    /* Р-8: рабочий путь — раздача по КУСКУ; xnopiece — прежние бесконечные
+     * плоскости (негативный контроль §780). */
+    int frc = hz_dc_facets2(&T, NULL, NULL, &ftab, &cmap, xnopiece ? 0 : 1);
+    printf("   Р-8 РАЗДАЧА (%s): пар %lld, отброшено кусочным отбором %lld, записей опустело "
+           "%lld\n",
+           xnopiece ? "ПЛОСКОСТИ — НК" : "куски", hz_dc_facets_pairs(), hz_dc_facets_dropped(),
+           hz_dc_facets_empty());
     /* Р-7а (§Р-7а): ЗАМЕР КВАНТОВАНИЯ ПЛОСКОСТИ. Вклад в `dmax` считается на
      * ВСЕХ фасетах сцены, радиус — половина диагонали ЕДИНИЧНОЙ ячейки
      * (разрезанная ячейка всегда самого мелкого уровня, условие 1:1). Отдельно

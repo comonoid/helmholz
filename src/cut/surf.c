@@ -61,7 +61,20 @@ int32_t hz_facettab_add_units(hz_facettab *t, const double n[3], double off, int
   f->off = off;
   f->surf = surf;
   f->dmax = dmax;
+  /* Р-8: явный ноль обязателен — расширение realloc не обнулено, и мусор в
+   * bounded читался бы как «кусок есть» с мусорными вершинами. */
+  f->bounded = 0;
+  memset(f->tv, 0, sizeof f->tv);
   return t->n++;
+}
+
+int32_t hz_facettab_add_units_piece(hz_facettab *t, const double n[3], double off, int32_t surf,
+                                    double dmax, const double tv[3][3]) {
+  int32_t fi = hz_facettab_add_units(t, n, off, surf, dmax);
+  if (fi < 0) return fi;
+  t->f[fi].bounded = 1;
+  memcpy(t->f[fi].tv, tv, sizeof t->f[fi].tv);
+  return fi;
 }
 
 int32_t hz_facettab_add_plane(hz_facettab *t, const hz_frame *fr, const double n[3], double off,

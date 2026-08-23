@@ -408,4 +408,11 @@ long long hz_dc_facets_pairs(void);
 long long hz_dc_facets_dropped(void);
 long long hz_dc_facets_empty(void);
 
+/* §794: куски из ТРЕУГОЛЬНИКОВ СЦЕНЫ (авторские нормали, dmax = 0 точно).
+ * Провайдер отдаёт вершины В ЕДИНИЦАХ кадра; возврат 0 — пропустить. DC
+ * остаётся кадру/срезу — этот мост даёт переносу поверхность сцены как есть. */
+typedef int (*hz_dc_tri_get)(void *ctx, int32_t i, double tv[3][3]);
+int hz_dc_facets_tris(const hz_dctree *t, hz_dc_tri_get get, void *gctx, int32_t ntri,
+                      hz_facettab *ft, hz_cutmap *cm);
+
 #endif

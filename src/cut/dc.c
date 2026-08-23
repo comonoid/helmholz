@@ -1581,6 +1581,54 @@ static int facet_emit(void *ctx, const hz_dcref *ref, const double (*v)[3], int 
   return 0;
 }
 
+/* Общий финал раздачи (§794): сорт пар, дедуп, cmap, счётчик Г60. Буфер
+ * записи ДИНАМИЧЕСКИЙ (А1280): OBJ-куски дают вееры плотных клеток (листва)
+ * много больше HZ_P3_MAXH — предел здесь был бы ETOPO на первой же кроне;
+ * предел РЕЗА живёт в cut3 и разводится там (§794 Р2). */
+static int facets_finish(facetctx *fc, hz_cutmap *cm) {
+  g_fc_pairs = fc->np;
+  /* Г45: обход выдаёт ячейки в порядке дерева, hz_cutmap требует возрастания */
+  if (fc->np > 1) qsort(fc->pair, (size_t)fc->np, sizeof(cellfacet), pair_cmp);
+  int32_t bcap = 256;
+  int32_t *buf = malloc((size_t)bcap * sizeof *buf);
+  if (buf == NULL) return HZ_DC_ENOMEM;
+  int32_t i = 0;
+  while (i < fc->np) {
+    int32_t cell = fc->pair[i].cell, nf = 0;
+    int32_t j = i;
+    while (j < fc->np && fc->pair[j].cell == cell) {
+      if (j == i || fc->pair[j].fref != fc->pair[j - 1].fref) {
+        if (nf >= bcap) {
+          bcap *= 2;
+          int32_t *nb = realloc(buf, (size_t)bcap * sizeof *nb);
+          if (nb == NULL) {
+            free(buf);
+            return HZ_DC_ENOMEM;
+          }
+          buf = nb;
+        }
+        buf[nf++] = fc->pair[j].fref;
+      }
+      j++;
+    }
+    if (hz_cutmap_add(cm, cell, buf, nf) != 0) {
+      free(buf);
+      return HZ_DC_ETOPO;
+    }
+    i = j;
+  }
+  free(buf);
+  /* Г60: опустевшие после отбора записи — счётчиком, не молчанием */
+  if (fc->nd > 0) {
+    qsort(fc->dropc, (size_t)fc->nd, sizeof(int32_t), pair_cmp_i32);
+    for (int32_t d = 0; d < fc->nd; d++) {
+      if (d > 0 && fc->dropc[d] == fc->dropc[d - 1]) continue;
+      if (hz_cutmap_find(cm, fc->dropc[d]) == NULL) g_fc_empty++;
+    }
+  }
+  return HZ_DC_OK;
+}
+
 int hz_dc_facets2(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_facettab *ft, hz_cutmap *cm,
                   int bounded) {
   facetctx fc;
@@ -1606,51 +1654,74 @@ int hz_dc_facets2(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_facettab *
     free(fc.dropc);
     return rc;
   }
-  g_fc_pairs = fc.np;
-  /* Г45: ОБХОД ВЫДАЁТ ЯЧЕЙКИ В ПОРЯДКЕ ДЕРЕВА, а hz_cutmap требует строго
-   * возрастающего ключа и вернул бы 2. Пересортировка обязательна, и её код
-   * возврата проверяется — молча потерянные фасеты дали бы ячейку без границы,
-   * а сумма объёмов при этом всё равно сошлась бы. */
-  if (fc.np > 1) qsort(fc.pair, (size_t)fc.np, sizeof(cellfacet), pair_cmp);
-  int32_t i = 0;
-  int32_t buf[HZ_P3_MAXH];
-  while (i < fc.np) {
-    int32_t cell = fc.pair[i].cell, nf = 0;
-    int32_t j = i;
-    while (j < fc.np && fc.pair[j].cell == cell) {
-      if (j == i || fc.pair[j].fref != fc.pair[j - 1].fref) {
-        if (nf >= HZ_P3_MAXH) {
-          free(fc.pair);
-          return HZ_DC_ETOPO; /* веер не влез в ядро — предел HZ_P3_MAXH, Г34 */
-        }
-        buf[nf++] = fc.pair[j].fref;
-      }
-      j++;
-    }
-    if (hz_cutmap_add(cm, cell, buf, nf) != 0) {
-      free(fc.pair);
-      free(fc.dropc);
-      return HZ_DC_ETOPO;
-    }
-    i = j;
-  }
-  /* Г60: записи, ОПУСТЕВШИЕ после кусочного отбора, — ячейки с отброшенными
-   * парами и без единой принятой. Молчаливое исчезновение неотличимо от бага
-   * раздачи, поэтому считается и отдаётся счётчиком. */
-  if (fc.nd > 0) {
-    qsort(fc.dropc, (size_t)fc.nd, sizeof(int32_t), pair_cmp_i32);
-    for (int32_t d = 0; d < fc.nd; d++) {
-      if (d > 0 && fc.dropc[d] == fc.dropc[d - 1]) continue;
-      if (hz_cutmap_find(cm, fc.dropc[d]) == NULL) g_fc_empty++;
-    }
-  }
+  int frc = facets_finish(&fc, cm);
   free(fc.pair);
   free(fc.dropc);
-  return HZ_DC_OK;
+  return frc;
 }
 
 int hz_dc_facets(const hz_dctree *t, hz_dc_stop stop, void *sctx, hz_facettab *ft, hz_cutmap *cm) {
   /* Р-8: раздача по КУСКУ — рабочее умолчание; прежнее поведение (бесконечные
    * плоскости) остаётся негативным контролем через hz_dc_facets2(..., 0). */
   return hz_dc_facets2(t, stop, sctx, ft, cm, 1);
+}
+
+/* §794: КУСКИ ИЗ ТРЕУГОЛЬНИКОВ СЦЕНЫ. Провайдер отдаёт вершины В ЕДИНИЦАХ
+ * кадра (0 — треугольник пропустить); плоскость строится из вершин, кусок —
+ * сам треугольник, раздача — тем же SAT-спуском по листьям дна. Ориентация:
+ * авторская нормаль наружу материала → материал {n·x <= off} (fref >= 0);
+ * двусторонний лист даёт слэб нулевой меры → материал пуст (корректно). */
+int hz_dc_facets_tris(const hz_dctree *t, hz_dc_tri_get get, void *gctx, int32_t ntri,
+                      hz_facettab *ft, hz_cutmap *cm) {
+  facetctx fc;
+  memset(&fc, 0, sizeof fc);
+  fc.ft = ft;
+  fc.t = t;
+  fc.cap = 256;
+  fc.bounded = 1;
+  fc.dcap = 256;
+  fc.rc = HZ_DC_OK;
+  g_fc_pairs = g_fc_dropped = g_fc_empty = 0;
+  fc.pair = calloc((size_t)fc.cap, sizeof(cellfacet));
+  fc.dropc = calloc((size_t)fc.dcap, sizeof(int32_t));
+  if (fc.pair == NULL || fc.dropc == NULL) {
+    free(fc.pair);
+    free(fc.dropc);
+    return HZ_DC_ENOMEM;
+  }
+  int rc = HZ_DC_OK;
+  for (int32_t i = 0; i < ntri && rc == HZ_DC_OK; i++) {
+    double tv[3][3];
+    if (!get(gctx, i, tv)) continue;
+    double e1[3], e2[3], nn[3];
+    for (int k = 0; k < 3; k++) {
+      e1[k] = tv[1][k] - tv[0][k];
+      e2[k] = tv[2][k] - tv[0][k];
+    }
+    nn[0] = e1[1] * e2[2] - e1[2] * e2[1];
+    nn[1] = e1[2] * e2[0] - e1[0] * e2[2];
+    nn[2] = e1[0] * e2[1] - e1[1] * e2[0];
+    double mlen = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+    if (!(mlen > 0.0)) continue; /* вырожденный: плоскости нет */
+    for (int k = 0; k < 3; k++)
+      nn[k] /= mlen;
+    double off = nn[0] * tv[0][0] + nn[1] * tv[0][1] + nn[2] * tv[0][2];
+    /* dmax = 0 ТОЧНО, а не UNKNOWN: фасет И ЕСТЬ поверхность (§794) —
+     * Г44-класс покидает перенос. */
+    int32_t fi = hz_facettab_add_units_piece(ft, nn, off, -1, 0.0, (const double (*)[3])tv);
+    if (fi < 0) {
+      rc = HZ_DC_ENOMEM;
+      break;
+    }
+    int32_t rlo[3] = {0, 0, 0};
+    if (piece_pairs_rec(&fc, 0, rlo, (int32_t)1 << t->log2size, tv[0], tv[1], tv[2], fi)) {
+      rc = fc.rc;
+      break;
+    }
+  }
+  if (rc == HZ_DC_OK) rc = fc.rc;
+  if (rc == HZ_DC_OK) rc = facets_finish(&fc, cm);
+  free(fc.pair);
+  free(fc.dropc);
+  return rc;
 }

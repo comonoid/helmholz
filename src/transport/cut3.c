@@ -343,9 +343,19 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
     int32_t refs772[HZ_P3_MAXH]; /* §772: ссылки грубой ячейки — элементам нужен фасет */
     hz_hspace h[HZ_P3_MAXH];
     int32_t hid[HZ_P3_MAXH], hflip[HZ_P3_MAXH];
-    int nh = 0, aggr8 = 0;
+    int nh = 0, aggr8 = 0, over8 = 0;
     if (rec != NULL) {
       nh = hz_cutmap_hspaces(ft, cm, rec, h, hid, hflip, HZ_P3_MAXH);
+      if (nh < 0) {
+        /* §794: веер записи больше предела ЯДРА (листва OBJ-кусков) — рез
+         * невозможен; «первые 96» не режутся (неверный рез хуже полного
+         * флюида), элементы строятся ниже ПО ЗАПИСИ без предела. Ячейка
+         * остаётся полной коробкой; сплошную решает solid_in. Считается. */
+        over8 = 1;
+        nh = 0;
+        cu->nrezover++;
+        if (solid_in != NULL && solid_in[c]) continue; /* сплошная остаётся */
+      }
     } else if (m->tree->nodes[m->node[c]].child0 >= 0) {
       /* §772/§782: ГРУБАЯ ячейка (внутренний узел без своей записи) — куски
        * собираются с ПОДДЕРЕВА; при заданном leaf_solid объём считается
@@ -365,7 +375,7 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
       nh = nr > 0 ? nr : 0;
       aggr8 = leaf_solid != NULL && nh > 0;
     }
-    if (nh <= 0) continue;
+    if (nh <= 0 && !over8) continue;
     /* УСЛОВИЕ 1:1 (записано в заголовке): грань сетки у разрезанной ячейки
      * обязана совпадать с гранью коробки, иначе флюидную часть пришлось бы ещё
      * и обрезать прямоугольником. Проверяется, а не предполагается. */
@@ -385,7 +395,10 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
       hi[a] = lo[a] + m->csize[c];
     }
     /* ФЛЮИД = ДОПОЛНЕНИЕ материала, точное разбиение на выпуклые куски */
-    hz_poly3 *pieces = calloc((size_t)nh, sizeof(hz_poly3));
+    hz_poly3 *pieces = calloc(
+        (size_t)(nh > 0 ? nh : 1),
+        sizeof(
+            hz_poly3)); /* nh=0 при over8: не нулевой буфер — анализатор строил ложный over-read */
     if (pieces == NULL) {
       tr3_cut_free(cu);
       return 1;
@@ -408,8 +421,12 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
       }
     }
     int npc = 0;
-    if (!aggr8 && hz_poly3_complement(pieces, nh, &npc, lo, hi, h, hid, hflip, nh) != HZ_P3_OK)
+    if (!aggr8 && !over8 &&
+        hz_poly3_complement(pieces, nh, &npc, lo, hi, h, hid, hflip, nh) != HZ_P3_OK)
       npc = 0;
+    if (npc > nh)
+      npc = 0; /* невозможно по контракту complement (max = nh);
+                * страховка от ложного over-read анализатора */
     /* Р-8: запись целиком из ОГРАНИЧЕННЫХ кусков? (нужно ниже дважды) */
     int allb8 = nh > 0 ? 1 : 0;
     for (int j8 = 0; j8 < nh && allb8; j8++) {
@@ -418,7 +435,7 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
       if (!(f8 >= 0 && f8 < ft->n && ft->f[f8].bounded)) allb8 = 0;
     }
     int degen8 = 0;
-    if (!aggr8 && npc == 0) {
+    if (!aggr8 && !over8 && npc == 0) {
       if (allb8 && (solid_in == NULL || !solid_in[c])) {
         /* Р-8: union-рез КУСОЧНОЙ записи съел коробку целиком — у кусков
          * объёма нет, «сплошная» здесь ложь того же класса, что дыры §779
@@ -442,7 +459,7 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
       }
     }
 
-    if (!degen8 && !aggr8) {
+    if (!degen8 && !aggr8 && !over8) {
       memset(cu->mvol[c], 0, 16 * sizeof(double));
       for (int32_t k = m->fstart[c]; k < m->fstart[c + 1]; k++) {
         int32_t fi = m->flist[k];
@@ -460,7 +477,7 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
      * поверхности выходила завышенной: замкнутость флюида ломалась на 9.9 при
      * площади грани порядка 1. Материал же даёт свои грани прямо: у hz_poly3_cut
      * грань с fsrc >= 0 И ЕСТЬ кусок фасета. */
-    if (!aggr8) { /* §782: у агрегата все фасеты кусочные — mat-путь пуст */
+    if (!aggr8 && !over8) { /* §782: у агрегата все фасеты кусочные — mat-путь пуст */
       hz_poly3 mat;
       int32_t hid2[HZ_P3_MAXH] = {0};
       for (int j = 0; j < nh; j++)
@@ -523,13 +540,17 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
     }
 
     /* Р-8 (Д3): элементы ОГРАНИЧЕННЫХ кусков — прямым клипом куска к коробке.
-     * Дубль фасета в записи (обе ориентации, §772-слэб) даёт ОДИН элемент. */
-    for (int j8 = 0; j8 < nh; j8++) {
+     * Дубль фасета в записи (обе ориентации, §772-слэб) даёт ОДИН элемент.
+     * §794: цикл идёт ПО ЗАПИСИ (не по h[]) — предела HZ_P3_MAXH у элементов
+     * нет; ориентированные нормаль и нулевой вектор строятся из ФАСЕТА той же
+     * формулой, что hz_cutmap_hspaces (К39/Г21). */
+    int32_t nref8 = rec != NULL ? rec->nf : nh;
+    for (int32_t j8 = 0; j8 < nref8; j8++) {
       int32_t ref8 = rec != NULL ? cm->fref[rec->f0 + j8] : refs772[j8];
       int32_t fi8 = ref8 >= 0 ? ref8 : ~ref8;
       if (fi8 < 0 || fi8 >= ft->n || !ft->f[fi8].bounded) continue;
       int dup8 = 0;
-      for (int q8 = 0; q8 < j8 && !dup8; q8++) {
+      for (int32_t q8 = 0; q8 < j8 && !dup8; q8++) {
         int32_t r2 = rec != NULL ? cm->fref[rec->f0 + q8] : refs772[q8];
         if ((r2 >= 0 ? r2 : ~r2) == fi8) dup8 = 1;
       }
@@ -552,15 +573,19 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
         se.nv = 0;
         cu->nsebig++;
       }
-      /* нулевой вектор и нормаль — как у прежнего пути, из h[j8] (К39/Г21) */
-      se.nul[0] = -h[j8].off;
+      double hn8[3] = {0, 0, 0}, hoff8; /* нули — ложный класс анализатора (тернарник в цикле) */
+      const hz_facet *fp8 = &ft->f[fi8];
+      for (int a = 0; a < 3; a++)
+        hn8[a] = ref8 >= 0 ? fp8->n[a] : -fp8->n[a];
+      hoff8 = ref8 >= 0 ? fp8->off : -fp8->off;
+      se.nul[0] = -hoff8;
       for (int a = 0; a < 3; a++) {
-        se.nul[0] += h[j8].n[a] * ((double)m->clo[c][a] + 0.5 * hh);
-        se.nul[a + 1] = hh * h[j8].n[a];
+        se.nul[0] += hn8[a] * ((double)m->clo[c][a] + 0.5 * hh);
+        se.nul[a + 1] = hh * hn8[a];
       }
       double nw8[3], nm8 = 0.0;
       for (int a = 0; a < 3; a++) {
-        nw8[a] = h[j8].n[a] / m->fr.u[a];
+        nw8[a] = hn8[a] / m->fr.u[a];
         nm8 += nw8[a] * nw8[a];
       }
       nm8 = sqrt(nm8);

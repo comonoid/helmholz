@@ -2747,6 +2747,25 @@ static int c772_stop(void *vc, int32_t ni, const int32_t lo[3], int32_t size) {
   return 1;
 }
 
+/* §794: провайдер треугольников сцены для hz_dc_facets_tris — перевод вершин
+ * из мира в ЕДИНИЦЫ кадра; вырожденные отсеет сам мост (нулевая нормаль). */
+typedef struct {
+  const hz_objmesh *om;
+  const frame *fr;
+} otri794;
+
+static int otri_get794(void *vc, int32_t i, double tv[3][3]) {
+  otri794 *c = vc;
+  const double *A, *B, *C;
+  tri_verts(c->om, i, &A, &B, &C);
+  for (int k = 0; k < 3; k++) {
+    tv[0][k] = (A[k] - c->fr->org[k]) / c->fr->h;
+    tv[1][k] = (B[k] - c->fr->org[k]) / c->fr->h;
+    tv[2][k] = (C[k] - c->fr->org[k]) / c->fr->h;
+  }
+  return 1;
+}
+
 /* §778: клип треугольника к коробке — Сазерленд–Ходжман по шести полуплоскостям.
  * ДИАГНОСТИКА (ключ xleak): эталон покрытия, независимый от рабочего пути cut3;
  * плавучка здесь законна — рабочая геометрия этим не пользуется. */
@@ -5957,6 +5976,7 @@ int main(int argc, char **argv) {
   int xbcmp774 = 0;       /* §774: базовый прогон и сравнение в одном процессе */
   int xleak = 0;          /* §778: диагностический клип покрытия — адреса дыр */
   int xnopiece = 0;       /* §780 НК: раздача и рез бесконечными плоскостями, как до Р-8 */
+  int xobjpiece = 0;      /* §794: куски из ТРЕУГОЛЬНИКОВ СЦЕНЫ (авторские нормали) */
   int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
   int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
   int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
@@ -6069,6 +6089,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xbcmp") == 0) xbcmp774 = 1;
     if (strcmp(argv[i], "xleak") == 0) xleak = 1;
     if (strcmp(argv[i], "xnopiece") == 0) xnopiece = 1;
+    if (strcmp(argv[i], "xobjpiece") == 0) xobjpiece = 1;
     if (strcmp(argv[i], "xcontrib") == 0) {
       xcontrib = 1;
       xmatrho = 1;
@@ -6981,13 +7002,19 @@ int main(int argc, char **argv) {
     hz_facettab ftab;
     hz_cutmap cmap;
     if (hz_facettab_init(&ftab) != 0 || hz_cutmap_init(&cmap) != 0) exit(1);
-    /* Р-8: рабочий путь — раздача по КУСКУ; xnopiece — прежние бесконечные
-     * плоскости (негативный контроль §780). */
-    int frc = hz_dc_facets2(&T, NULL, NULL, &ftab, &cmap, xnopiece ? 0 : 1);
+    /* Р-8/§794: рабочий путь — раздача по КУСКУ (источник кусков: DC-полигоны
+     * либо, при xobjpiece, ТРЕУГОЛЬНИКИ СЦЕНЫ — авторские нормали, dmax = 0);
+     * xnopiece — прежние бесконечные плоскости (негативный контроль §780). */
+    int frc;
+    if (xobjpiece) {
+      otri794 otc = {&m, &fr};
+      frc = hz_dc_facets_tris(&T, otri_get794, &otc, m.nt, &ftab, &cmap);
+    } else
+      frc = hz_dc_facets2(&T, NULL, NULL, &ftab, &cmap, xnopiece ? 0 : 1);
     printf("   Р-8 РАЗДАЧА (%s): пар %lld, отброшено кусочным отбором %lld, записей опустело "
            "%lld\n",
-           xnopiece ? "ПЛОСКОСТИ — НК" : "куски", hz_dc_facets_pairs(), hz_dc_facets_dropped(),
-           hz_dc_facets_empty());
+           xobjpiece ? "OBJ-куски §794" : (xnopiece ? "ПЛОСКОСТИ — НК" : "DC-куски"),
+           hz_dc_facets_pairs(), hz_dc_facets_dropped(), hz_dc_facets_empty());
     /* Р-7а (§Р-7а): ЗАМЕР КВАНТОВАНИЯ ПЛОСКОСТИ. Вклад в `dmax` считается на
      * ВСЕХ фасетах сцены, радиус — половина диагонали ЕДИНИЧНОЙ ячейки
      * (разрезанная ячейка всегда самого мелкого уровня, условие 1:1). Отдельно
@@ -7479,8 +7506,9 @@ int main(int argc, char **argv) {
            mesh.ncell, (long long)nsolid, mesh.nf, t_mesh, t_cut, crc);
     if (crc == 0)
       printf("      nbad %d (нарушивших 1:1), nse %d (поверхностных элементов), nsebig %d "
-             "(многоугольник не поместился); ОБЪЁМ: куб %.3f, ФЛЮИД %.3f, материал %.3f м³%s\n",
-             cut.nbad, cut.nse, cut.nsebig, vbox, vfl, vbox - vfl,
+             "(многоугольник не поместился), РЕЗ ОТКАЗАН (веер > %d) у %d клеток; ОБЪЁМ: куб "
+             "%.3f, ФЛЮИД %.3f, материал %.3f м³%s\n",
+             cut.nbad, cut.nse, cut.nsebig, HZ_P3_MAXH, cut.nrezover, vbox, vfl, vbox - vfl,
              xfernosolid ? "   [БЕЗ МАСКИ — НК]" : "");
     /* ---- РАЗВЁРТКА ПО ОРДИНАТАМ (Ш14, §482) ---- */
     /* ИСТОЧНИК — САМ ПОТОЛОК, А НЕ ОТДЕЛЬНОЕ ТЕЛО. Лампа в `pfield` есть

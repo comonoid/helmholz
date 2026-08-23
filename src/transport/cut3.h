@@ -93,6 +93,13 @@ double tr3_cut_refs_fluid_vol(const hz_frame *fr, const hz_facettab *ft, const i
                               int nrefs, const int32_t lo[3], int32_t size);
 int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const hz_cutmap *cm,
                   const uint8_t *solid_in);
+/* §782: листовая сплошность для АГРЕГАЦИИ грубой ячейки — 1, если лист
+ * [lo, lo+size) целиком в материале. Обязана быть ТОЙ ЖЕ логикой, что маска
+ * заливки у вызывающего (А1253 — рассинхрон = двойной учёт объёма). NULL —
+ * прежний путь грубых ячеек (union-рез поддерева, предел §773). */
+typedef int (*tr3_leaf_solid_fn)(void *ctx, const int32_t lo[3], int32_t size);
+int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const hz_cutmap *cm,
+                   const uint8_t *solid_in, tr3_leaf_solid_fn leaf_solid, void *lsctx);
 void tr3_cut_free(tr3_cut *cu);
 
 #endif

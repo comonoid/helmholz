@@ -211,8 +211,90 @@ static int push_se(tr3_cut *cu, const tr3_selem *e) {
   return 0;
 }
 
+/* §782: mvol ГРУБОЙ ячейки — ТОЧНОЙ АГРЕГАЦИЕЙ по листьям поддерева: моменты
+ * аддитивны, интегралы листовых кусков берутся сразу в базисе грубой ячейки
+ * (центр c3 и размер hh — параметры tr3_mass_matrix, пересчёта матриц нет).
+ * Лист без записи — полный бокс либо ноль по листовой сплошности. Вырожденный
+ * листовой рез (union съел лист) у кусочной записи без сплошности — полный
+ * бокс, ровно правило degen8 листовой сетки (§781). Внутренний узел с записью
+ * нарушает контракт Р-8 (записи — листьям дна) и считается в nbad. */
+static int aggr_mvol_rec(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const hz_cutmap *cm,
+                         tr3_leaf_solid_fn leaf_solid, void *lsctx, int32_t ni, const int32_t lo[3],
+                         int32_t size, const double c3[3], double hh, int32_t c) {
+  if (m->tree->nodes[ni].child0 >= 0) {
+    if (hz_cutmap_find(cm, ni) != NULL) {
+      cu->nbad++;
+      return 0;
+    }
+    int32_t half = size / 2;
+    for (int i = 0; i < 8; i++) {
+      int32_t clo[3] = {lo[0] + ((i & 1) ? half : 0), lo[1] + ((i & 2) ? half : 0),
+                        lo[2] + ((i & 4) ? half : 0)};
+      if (aggr_mvol_rec(cu, m, ft, cm, leaf_solid, lsctx, m->tree->nodes[ni].child0 + i, clo, half,
+                        c3, hh, c))
+        return 1;
+    }
+    return 0;
+  }
+  int32_t hi2[3] = {lo[0] + size, lo[1] + size, lo[2] + size};
+  const hz_cutrec *r = hz_cutmap_find(cm, ni);
+  double mm[4][4];
+  if (r == NULL) {
+    if (leaf_solid(lsctx, lo, size)) return 0;
+    hz_poly3 box;
+    if (hz_poly3_cut(&box, lo, hi2, NULL, NULL, 0) != HZ_P3_OK) return 1;
+    if (tr3_mass_matrix(&box, &m->fr, c3, hh, mm) == 0)
+      for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+          cu->mvol[c][i][j] += mm[i][j];
+    return 0;
+  }
+  hz_hspace h2[HZ_P3_MAXH];
+  int32_t hid2[HZ_P3_MAXH], hfl2[HZ_P3_MAXH];
+  int nh2 = hz_cutmap_hspaces(ft, cm, r, h2, hid2, hfl2, HZ_P3_MAXH);
+  if (nh2 <= 0) return 0; /* как в листовом пути: ячейка остаётся полной */
+  for (int j = 0; j < nh2; j++) {
+    hid2[j] = CUT3_INNER;
+    hfl2[j] = CUT3_INNER;
+  }
+  hz_poly3 *pcs = calloc((size_t)nh2, sizeof(hz_poly3));
+  if (pcs == NULL) return 1;
+  int np2 = 0;
+  if (hz_poly3_complement(pcs, nh2, &np2, lo, hi2, h2, hid2, hfl2, nh2) != HZ_P3_OK) np2 = 0;
+  if (np2 == 0) {
+    int allb = 1;
+    for (int32_t j = 0; j < r->nf && allb; j++) {
+      int32_t rf = cm->fref[r->f0 + j];
+      int32_t fi2 = rf >= 0 ? rf : ~rf;
+      if (!(fi2 >= 0 && fi2 < ft->n && ft->f[fi2].bounded)) allb = 0;
+    }
+    if (allb && !leaf_solid(lsctx, lo, size)) {
+      hz_poly3 box;
+      if (hz_poly3_cut(&box, lo, hi2, NULL, NULL, 0) == HZ_P3_OK &&
+          tr3_mass_matrix(&box, &m->fr, c3, hh, mm) == 0)
+        for (int i = 0; i < 4; i++)
+          for (int j = 0; j < 4; j++)
+            cu->mvol[c][i][j] += mm[i][j];
+    }
+    free(pcs);
+    return 0;
+  }
+  for (int p = 0; p < np2; p++)
+    if (tr3_mass_matrix(&pcs[p], &m->fr, c3, hh, mm) == 0)
+      for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++)
+          cu->mvol[c][i][j] += mm[i][j];
+  free(pcs);
+  return 0;
+}
+
 int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const hz_cutmap *cm,
                   const uint8_t *solid_in) {
+  return tr3_cut_build2(cu, m, ft, cm, solid_in, NULL, NULL);
+}
+
+int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const hz_cutmap *cm,
+                   const uint8_t *solid_in, tr3_leaf_solid_fn leaf_solid, void *lsctx) {
   memset(cu, 0, sizeof *cu);
   cu->m = m;
   cu->mvol = calloc((size_t)m->ncell, sizeof(double[4][4]));
@@ -261,13 +343,13 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
     int32_t refs772[HZ_P3_MAXH]; /* §772: ссылки грубой ячейки — элементам нужен фасет */
     hz_hspace h[HZ_P3_MAXH];
     int32_t hid[HZ_P3_MAXH], hflip[HZ_P3_MAXH];
-    int nh = 0;
+    int nh = 0, aggr8 = 0;
     if (rec != NULL) {
       nh = hz_cutmap_hspaces(ft, cm, rec, h, hid, hflip, HZ_P3_MAXH);
     } else if (m->tree->nodes[m->node[c]].child0 >= 0) {
-      /* §772: ГРУБАЯ ячейка (внутренний узел без своей записи) — плоскости
-       * собираются с ПОДДЕРЕВА; выпуклость материала обеспечена предикатом
-       * огрубления (объёмная сверка), сюда доходят только принятые узлы. */
+      /* §772/§782: ГРУБАЯ ячейка (внутренний узел без своей записи) — куски
+       * собираются с ПОДДЕРЕВА; при заданном leaf_solid объём считается
+       * АГРЕГАЦИЕЙ по листьям, union-рез большой коробки не гоняется. */
       int nr = tr3_cut_subtree_refs(m->tree, cm, m->node[c], refs772, HZ_P3_MAXH);
       for (int j = 0; j < (nr > 0 ? nr : 0); j++) {
         int32_t ref = refs772[j], fi2 = ref >= 0 ? ref : ~ref;
@@ -281,6 +363,7 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
         h[j].off = ref >= 0 ? fp->off : -fp->off;
       }
       nh = nr > 0 ? nr : 0;
+      aggr8 = leaf_solid != NULL && nh > 0;
     }
     if (nh <= 0) continue;
     /* УСЛОВИЕ 1:1 (записано в заголовке): грань сетки у разрезанной ячейки
@@ -307,8 +390,26 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
       tr3_cut_free(cu);
       return 1;
     }
+    double c3[3];
+    for (int a = 0; a < 3; a++)
+      c3[a] = (double)m->clo[c][a] + 0.5 * (double)m->csize[c];
+    double hh = (double)m->csize[c];
+    if (aggr8) {
+      /* §782: ОБЪЁМ ГРУБОЙ ЯЧЕЙКИ — ТОЧНОЙ АГРЕГАЦИЕЙ по листьям; грани
+       * остаются ПОЛНЫМИ (дефолт — упрощение §782, названо в плане: листовая
+       * флюидная обрезка граней не агрегируется, вклад дальней зоны < 0.01 %
+       * по А1212). Элементы кусков строит piece-цикл ниже; union-рез большой
+       * коробки не гоняется вовсе (предел §773). */
+      memset(cu->mvol[c], 0, 16 * sizeof(double));
+      if (aggr_mvol_rec(cu, m, ft, cm, leaf_solid, lsctx, m->node[c], lo, m->csize[c], c3, hh, c)) {
+        free(pieces);
+        tr3_cut_free(cu);
+        return 1;
+      }
+    }
     int npc = 0;
-    if (hz_poly3_complement(pieces, nh, &npc, lo, hi, h, hid, hflip, nh) != HZ_P3_OK) npc = 0;
+    if (!aggr8 && hz_poly3_complement(pieces, nh, &npc, lo, hi, h, hid, hflip, nh) != HZ_P3_OK)
+      npc = 0;
     /* Р-8: запись целиком из ОГРАНИЧЕННЫХ кусков? (нужно ниже дважды) */
     int allb8 = nh > 0 ? 1 : 0;
     for (int j8 = 0; j8 < nh && allb8; j8++) {
@@ -317,7 +418,7 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
       if (!(f8 >= 0 && f8 < ft->n && ft->f[f8].bounded)) allb8 = 0;
     }
     int degen8 = 0;
-    if (npc == 0) {
+    if (!aggr8 && npc == 0) {
       if (allb8 && (solid_in == NULL || !solid_in[c])) {
         /* Р-8: union-рез КУСОЧНОЙ записи съел коробку целиком — у кусков
          * объёма нет, «сплошная» здесь ложь того же класса, что дыры §779
@@ -341,7 +442,7 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
       }
     }
 
-    if (!degen8) {
+    if (!degen8 && !aggr8) {
       memset(cu->mvol[c], 0, 16 * sizeof(double));
       for (int32_t k = m->fstart[c]; k < m->fstart[c + 1]; k++) {
         int32_t fi = m->flist[k];
@@ -352,11 +453,6 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
       }
     }
 
-    double c3[3];
-    for (int a = 0; a < 3; a++)
-      c3[a] = (double)m->clo[c][a] + 0.5 * (double)m->csize[c];
-    double hh = (double)m->csize[c];
-
     /* ПОВЕРХНОСТЬ БЕРЁТСЯ ИЗ САМОГО МАТЕРИАЛА, А НЕ ИЗ ДОПОЛНЕНИЯ. Это правка по
      * измерению: грань куска j дополнения лежит на плоскости h_j, но граничит
      * она с множеством {h_0..h_j}, куда входят и ПОЗДНИЕ куски дополнения, а не
@@ -364,7 +460,7 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
      * поверхности выходила завышенной: замкнутость флюида ломалась на 9.9 при
      * площади грани порядка 1. Материал же даёт свои грани прямо: у hz_poly3_cut
      * грань с fsrc >= 0 И ЕСТЬ кусок фасета. */
-    {
+    if (!aggr8) { /* §782: у агрегата все фасеты кусочные — mat-путь пуст */
       hz_poly3 mat;
       int32_t hid2[HZ_P3_MAXH] = {0};
       for (int j = 0; j < nh; j++)

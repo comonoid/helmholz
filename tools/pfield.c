@@ -2707,40 +2707,25 @@ typedef struct {
   const uint8_t *smask;
   int occn, innerfluid;
   double eye[3], d0;
-  int64_t nacc, nacc_empty, nrej_budget, nrej_core, nrej_vol;
+  int64_t nacc, nacc_empty, nrej_budget;
 } c772;
 
-static double c772_leafvol(c772 *cx, int32_t ni, const int32_t lo[3], int32_t size) {
-  const hz_cutrec *r = hz_cutmap_find(cx->cm, ni);
-  if (r != NULL) {
-    int32_t refs[HZ_P3_MAXH];
-    int nr = tr3_cut_subtree_refs(cx->t, cx->cm, ni, refs, HZ_P3_MAXH);
-    if (nr < 0) return -1.0;
-    return tr3_cut_refs_fluid_vol(cx->fr, cx->ft, refs, nr, lo, size);
-  }
-  /* без разреза: флюид весь бокс либо ноль — та же логика, что маска solid */
+/* §782: листовая сплошность для агрегации грубой ячейки — ТА ЖЕ логика, что
+ * маска solid у заливки (А1253: рассинхрон = двойной учёт объёма). Класс
+ * однороден по листу — хватает одной пробы (§772-прецедент). */
+static int c772_leaf_solid(void *vc, const int32_t lo[3], int32_t size) {
+  c772 *cx = vc;
+  (void)size;
   size_t k = hz_occ_index(cx->occn, lo[0], lo[1], lo[2]);
   unsigned cls = cx->smask != NULL ? cx->smask[k] : 1u;
-  int solid =
-      cx->smask != NULL && (cls == 0u || (cls == 2u && !cx->innerfluid)) && !hz_occ_get(cx->occ, k);
-  if (solid) return 0.0;
-  return tr3_cut_refs_fluid_vol(cx->fr, cx->ft, NULL, 0, lo, size);
+  return cx->smask != NULL && (cls == 0u || (cls == 2u && !cx->innerfluid)) &&
+         !hz_occ_get(cx->occ, k);
 }
 
-static double c772_subvol(c772 *cx, int32_t ni, const int32_t lo[3], int32_t size) {
-  if (cx->t->nodes[ni].child0 < 0) return c772_leafvol(cx, ni, lo, size);
-  int32_t half = size / 2;
-  double v = 0.0;
-  for (int i = 0; i < 8; i++) {
-    int32_t clo[3] = {lo[0] + ((i & 1) ? half : 0), lo[1] + ((i & 2) ? half : 0),
-                      lo[2] + ((i & 4) ? half : 0)};
-    double dv = c772_subvol(cx, cx->t->nodes[ni].child0 + i, clo, half);
-    if (dv < 0.0) return -1.0;
-    v += dv;
-  }
-  return v;
-}
-
+/* §782: предикат огрубления похудел до ДАЛЬНОСТИ и БЮДЖЕТА КУСКОВ: объёмная
+ * сверка §772 (пробный union-рез) не нужна — объём грубой ячейки собирается
+ * ТОЧНОЙ агрегацией по листьям в cut3, предел §773 обойдён кусками Р-8.
+ * Fail closed остаётся на бюджете: не влезли куски — спуск. */
 static int c772_stop(void *vc, int32_t ni, const int32_t lo[3], int32_t size) {
   c772 *cx = vc;
   double dmin2 = 0.0;
@@ -2751,36 +2736,13 @@ static int c772_stop(void *vc, int32_t ni, const int32_t lo[3], int32_t size) {
     dmin2 += d * d;
   }
   if (sqrt(dmin2) < cx->d0 * (double)size) return 0; /* близко — спуск, не отказ */
-  enum { C772_BUDGET = HZ_P3_MAXH - 8 };             /* запас на грани коробки */
   int32_t refs[HZ_P3_MAXH];
-  int nr = tr3_cut_subtree_refs(cx->t, cx->cm, ni, refs, C772_BUDGET);
+  int nr = tr3_cut_subtree_refs(cx->t, cx->cm, ni, refs, HZ_P3_MAXH);
   if (nr < 0) {
     cx->nrej_budget++;
     return 0;
   }
-  if (nr == 0) {
-    cx->nacc_empty++;
-    cx->nacc++;
-    return 1; /* поверхности нет — грубим свободно */
-  }
-  double vc9 = tr3_cut_refs_fluid_vol(cx->fr, cx->ft, refs, nr, lo, size);
-  if (vc9 < 0.0) {
-    cx->nrej_core++;
-    return 0;
-  }
-  double vf = c772_subvol(cx, ni, lo, size);
-  if (vf < 0.0) {
-    cx->nrej_core++;
-    return 0;
-  }
-  double vbox =
-      (double)size * (double)size * (double)size * cx->fr->u[0] * cx->fr->u[1] * cx->fr->u[2];
-  /* допуск 1e-6·Vbox: плавающая сумма кусков против одного реза; невыпуклость
-   * материала даёт МАКРОСКОПИЧЕСКОЕ расхождение, не 1e-6 */
-  if (fabs(vc9 - vf) > 1e-6 * vbox) {
-    cx->nrej_vol++;
-    return 0;
-  }
+  if (nr == 0) cx->nacc_empty++;
   cx->nacc++;
   return 1;
 }
@@ -7025,11 +6987,10 @@ int main(int argc, char **argv) {
         cx772.eye[a] = g_eye[a];
       cx772.d0 = xcoarse;
       if (tr3_mesh_build_lod(&mesh, &ot, &ofr, c772_stop, &cx772) != 0) exit(1);
-      printf("   §772 ОГРУБЛЕНИЕ (D0 = %.1f м/лист): принято %lld узлов (из них пустых %lld); "
-             "отказы: бюджет %lld, ядро %lld, ОБЪЁМНАЯ СВЕРКА %lld; ячеек сетки %d\n",
+      printf("   §772/§782 ОГРУБЛЕНИЕ (D0 = %.1f м/лист): принято %lld узлов (из них пустых "
+             "%lld); отказы бюджета %lld; ячеек сетки %d\n",
              xcoarse, (long long)cx772.nacc, (long long)cx772.nacc_empty,
-             (long long)cx772.nrej_budget, (long long)cx772.nrej_core, (long long)cx772.nrej_vol,
-             mesh.ncell);
+             (long long)cx772.nrej_budget, mesh.ncell);
     } else if (tr3_mesh_build(&mesh, &ot, &ofr) != 0)
       exit(1);
     double t_mesh = now_s() - tx;
@@ -7040,20 +7001,35 @@ int main(int argc, char **argv) {
     if (solid == NULL) exit(1);
     int64_t nsolid = 0;
     for (int32_t ci = 0; ci < mesh.ncell; ci++) {
-      size_t k = hz_occ_index(fr.n, mesh.clo[ci][0], mesh.clo[ci][1], mesh.clo[ci][2]);
       /* Ш16 (§486): НАРУЖНОЕ тоже сплошное. Снаружи замкнутой комнаты свету
        * взяться неоткуда, а флюид там даёт 458 м³ бесполезной работы и щепки с
-       * φ = 1.9e+05. Это утверждение о СЦЕНЕ, а не приближение. */
-      int cls = solidmask != NULL ? solidmask[k] : 1u;
-      if (solidmask != NULL && (cls == 0u || (cls == 2u && !xinnerfluid)) &&
-          !hz_occ_get(P.b[lev], k)) {
+       * φ = 1.9e+05. Это утверждение о СЦЕНЕ, а не приближение.
+       * §782: у ГРУБОЙ ячейки одной пробы угла МАЛО — узел с поверхностью
+       * внутри метился сплошным целиком (замерено: недостача К40 4.6 % на
+       * D0=10). Сплошная = ВСЕ листовые клетки сплошные; ранний выход на
+       * первом флюиде держит цену (сплошные крупные однородны). */
+      int32_t s9 = mesh.csize[ci];
+      int allsolid = solidmask != NULL;
+      for (int32_t iz = 0; iz < s9 && allsolid; iz++)
+        for (int32_t iy = 0; iy < s9 && allsolid; iy++)
+          for (int32_t ix = 0; ix < s9 && allsolid; ix++) {
+            size_t k = hz_occ_index(fr.n, mesh.clo[ci][0] + ix, mesh.clo[ci][1] + iy,
+                                    mesh.clo[ci][2] + iz);
+            int cls = solidmask[k];
+            if (!((cls == 0u || (cls == 2u && !xinnerfluid)) && !hz_occ_get(P.b[lev], k)))
+              allsolid = 0;
+          }
+      if (allsolid) {
         solid[ci] = 1u;
         nsolid++;
       }
     }
     tx = now_s();
     tr3_cut cut;
-    int crc = tr3_cut_build(&cut, &mesh, &ftab, &cmap, xfernosolid ? NULL : solid);
+    /* §782: листовой каллбэк — только при огрублении (иначе NULL: прежний
+     * путь побитово, и НК xcoarse=1e9 остаётся честным) */
+    int crc = tr3_cut_build2(&cut, &mesh, &ftab, &cmap, xfernosolid ? NULL : solid,
+                             xcoarse > 0.0 ? c772_leaf_solid : NULL, &cx772);
     /* §717: ПЛОЩАДИ ЭЛЕМЕНТОВ И УДАЛЕНИЕ ВЫРОЖДЕННЫХ. Элемент есть сечение
      * коробки плоскостью; у плоскости, чуть задевшей угол, площадь исчезающе
      * мала, а исходящий радианс считается делением на его матрицу масс — тот же
@@ -7536,16 +7512,61 @@ int main(int argc, char **argv) {
          * одна плоскость может нести и вывеску, и тёмную стену. Берётся
          * МАКСИМУМ, а число расхождений СЧИТАЕТСЯ и печатается — приближение
          * обязано быть числом, а не умолчанием. */
+        /* §782: буфер объединения ct-списков для ГРУБОЙ ячейки — треугольники
+         * собираются по листовым клеткам BBOX КУСКА элемента, а не по одному
+         * угловому листу (А1217: с угла терялась Ke-эмиссия — замерено −31 %
+         * эмиссии на D0=10). Ёмкость: bbox куска ~ листовой масштаб. */
+        enum { LS782 = 4096 };
+        int32_t ls782[LS782];
+        int64_t nlsclip782 = 0;
         for (int32_t k = 0; k < cut.nse; k++) {
           if (cut.se[k].nv <= 0) continue;
           int32_t ci = cut.se[k].cell;
           if (ci < 0 || ci >= mesh.ncell) continue;
-          if (mesh.csize[ci] > 1) nbigcell++;
-          int32_t cellc[3];
-          for (int a = 0; a < 3; a++)
-            cellc[a] = mesh.clo[ci][a];
           const int32_t *ls = NULL;
-          int32_t nls = ct_list(&CT, cellc, &ls);
+          int32_t nls = 0;
+          if (mesh.csize[ci] > 1 && cut.se[k].facet >= 0 && cut.se[k].facet < ftab.n &&
+              ftab.f[cut.se[k].facet].bounded) {
+            nbigcell++;
+            const hz_facet *fp8 = &ftab.f[cut.se[k].facet];
+            int32_t blo8[3], bhi8[3];
+            for (int a = 0; a < 3; a++) {
+              double mn = fp8->tv[0][a], mx = fp8->tv[0][a];
+              for (int q2 = 1; q2 < 3; q2++) {
+                if (fp8->tv[q2][a] < mn) mn = fp8->tv[q2][a];
+                if (fp8->tv[q2][a] > mx) mx = fp8->tv[q2][a];
+              }
+              /* кламп — к РЕШЁТКЕ, а не к коробке ячейки: кусок у края ячейки
+               * держит треугольники-источники в соседней клетке, и кламп к
+               * коробке терял их материал/Ke (часть −8.3 % эмиссии D0=10) */
+              blo8[a] = (int32_t)floor(mn);
+              bhi8[a] = (int32_t)floor(mx);
+              if (blo8[a] < 0) blo8[a] = 0;
+              if (bhi8[a] > fr.n - 1) bhi8[a] = fr.n - 1;
+            }
+            int32_t nu = 0;
+            for (int32_t iz = blo8[2]; iz <= bhi8[2]; iz++)
+              for (int32_t iy = blo8[1]; iy <= bhi8[1]; iy++)
+                for (int32_t ix = blo8[0]; ix <= bhi8[0]; ix++) {
+                  int32_t cl8[3] = {ix, iy, iz};
+                  const int32_t *l2 = NULL;
+                  int32_t n2 = ct_list(&CT, cl8, &l2);
+                  for (int32_t q2 = 0; q2 < n2; q2++) {
+                    if (nu >= LS782) {
+                      nlsclip782++;
+                      break;
+                    }
+                    ls782[nu++] = l2[q2];
+                  }
+                }
+            ls = ls782;
+            nls = nu;
+          } else {
+            int32_t cellc[3];
+            for (int a = 0; a < 3; a++)
+              cellc[a] = mesh.clo[ci][a];
+            nls = ct_list(&CT, cellc, &ls);
+          }
           if (nls == 0) {
             nnomat++;
             continue;
@@ -8783,6 +8804,34 @@ int main(int argc, char **argv) {
       if (st.psin > 0.0 && !xhall)
         printf("      §739 ρ_eff = (psout − эмиссия)/psin = (%.4e − %.4e)/%.4e = %.4f\n", st.psout,
                emitpow2, st.psin, (st.psout - emitpow2) / st.psin);
+      /* §782: Σ|E·area| БЛИЖНЕЙ ЛИЦЕВОЙ ЗОНЫ — приёмочная величина политики
+       * огрубления (тот же предикат, что §768/§774): дальняя зона грубится,
+       * и её ошибка не должна доносить сюда (А1212). Печатается всегда. */
+      if (st.eirr != NULL) {
+        double zs2 = 0.0, ts2 = 0.0;
+        int64_t nz2 = 0;
+        for (int32_t e = 0; e < cut.nse; e++) {
+          double c9[3] = {0, 0, 0};
+          for (int q2 = 0; q2 < cut.se[e].nv; q2++)
+            for (int a = 0; a < 3; a++)
+              c9[a] += cut.se[e].v[q2][a] / (double)(cut.se[e].nv > 0 ? cut.se[e].nv : 1);
+          double d2 = 0.0, dot = 0.0;
+          for (int a = 0; a < 3; a++) {
+            double dd = c9[a] - g_eye[a];
+            d2 += dd * dd;
+            dot += cut.se[e].n[a] * dd;
+          }
+          double w = st.eirr[e] * cut.se[e].area;
+          ts2 += fabs(w);
+          if (cut.se[e].nv > 0 && sqrt(d2) < 15.0 && !(dot > 0.0)) {
+            zs2 += fabs(w);
+            nz2++;
+          }
+        }
+        printf("      §782 ЗОНА (<15 м, лицевые): элементов %lld, Σ|E·area| %.6g; всей сцены "
+               "%.6g\n",
+               (long long)nz2, zs2, ts2);
+      }
       /* §768: ПРИБОР ВКЛАДА — перевозмущение. Выключаем отражение класса
        * поверхностей (ρ→0 поэлементно; заслон сохраняется — А1210) и меряем
        * изменение поля E в БЛИЖНЕЙ ЛИЦЕВОЙ зоне (прокси видимого: < 15 м от

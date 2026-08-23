@@ -7632,12 +7632,6 @@ int main(int argc, char **argv) {
             double kd = m.mtl[mi2].kd;
             if (!(kd >= 0.0 && kd <= 1.0)) kd = 0.5; /* как в alb() сбора */
             double kd0 = m.mtl[mi].kd;
-            /* §784-доп: Ke — от ТОГО ЖЕ ближайшего треугольника, что kd
-             * (mi перезаписывается ПОСЛЕ снятия kd0 — статистика смены §739
-             * остаётся честной). Прежний ls[0]-путь терял стринги полностью
-             * (Ke провода) и раздавал Ke стекла чужим элементам (×18 перебор
-             * Focus_Glass); замерено прибором §784. НК xmatfar действует. */
-            mi = mi2;
             if (!(kd0 >= 0.0 && kd0 <= 1.0)) kd0 = 0.5;
             if (fabs(kd - kd0) > 0.0) {
               nkchg++;
@@ -7652,21 +7646,93 @@ int main(int argc, char **argv) {
             if (kd < frmn[fi2]) frmn[fi2] = kd;
             if (kd > frmx[fi2]) frmx[fi2] = kd;
           }
-          const double *ke = m.mtl[mi].ke3;
-          double e = (ke[0] + ke[1] + ke[2]) / 3.0;
-          if (!(e > 0.0)) continue;
-          int32_t fi = cut.se[k].facet;
-          if (femit[fi] > 0.0 && fabs(femit[fi] - e) > 0.0) nconf++;
-          if (e > femit[fi]) femit[fi] = e;
-          /* §670: ЕДИНИЦА. `Ke` хранится излучённой РАДИОСНОСТЬЮ (`scene_obj.h`),
-           * а развёртка складывает величину с ИСХОДЯЩИМ РАДИАНСОМ. Для
-           * ламбертова излучателя `B = π·L`, поэтому делим на `π` — это перевод
-           * единиц, а не подгонка множителя. Проверяется точно: при `ρ = 0`
-           * исходящая мощность обязана совпасть с `Σ Ke·площадь`. */
-          eemit[k] = e / 3.14159265358979323846;
-          emitpow += e * cut.se[k].area;
-          emat784[mi] += e * cut.se[k].area; /* §784 */
-          nlit++;
+          (void)mi; /* материал ls[0] нужен только статистике смены kd */
+        }
+        /* §786: ПЛОЩАДНАЯ РАЗДАЧА Ke (А1261). Атрибуция «весь элемент от
+         * одного треугольника» давала нули у субвоксельных ламп и переборы
+         * ×18…×21 (замерено §784/§785). Здесь энергия ЯЧЕЙКИ считается
+         * ТОЧНЫМ клипом треугольников к листовым клеткам (машинерия §778) и
+         * раздаётся элементам ячейки по площадям: Σ мощностей = энергии
+         * ячейки точно. СЕМАНТИКА ДВУСТОРОННОСТИ — СОХРАНЕНИЕ ЭНЕРГИИ:
+         * DC-лист двуслойной шторы несёт сумму обеих сторон (§786).
+         * Энергия клеток без элементов НЕ раздаётся и печатается (плафон в
+         * сплошном — потеря по-имени, не молчание). §670-единица прежняя:
+         * Ke — радиосность, радианс = E/(π·Σ area). */
+        {
+          double tke0 = now_s();
+          int32_t *cellat6 = malloc((size_t)fr.n * (size_t)fr.n * (size_t)fr.n * sizeof *cellat6);
+          double *Ecell6 = calloc((size_t)mesh.ncell, sizeof *Ecell6);
+          double *Sarea6 = calloc((size_t)mesh.ncell, sizeof *Sarea6);
+          if (cellat6 == NULL || Ecell6 == NULL || Sarea6 == NULL) exit(1);
+          for (size_t g = 0; g < (size_t)fr.n * (size_t)fr.n * (size_t)fr.n; g++)
+            cellat6[g] = -1;
+          for (int32_t ci = 0; ci < mesh.ncell; ci++)
+            for (int32_t iz = 0; iz < mesh.csize[ci]; iz++)
+              for (int32_t iy = 0; iy < mesh.csize[ci]; iy++)
+                for (int32_t ix = 0; ix < mesh.csize[ci]; ix++)
+                  cellat6[hz_occ_index(fr.n, mesh.clo[ci][0] + ix, mesh.clo[ci][1] + iy,
+                                       mesh.clo[ci][2] + iz)] = ci;
+          for (int32_t k = 0; k < cut.nse; k++)
+            if (cut.se[k].area > 0.0) Sarea6[cut.se[k].cell] += cut.se[k].area;
+          double elost_ne = 0.0, elost_nc = 0.0, etri_tot = 0.0;
+          for (int32_t t9 = 0; t9 < m.nt; t9++) {
+            int32_t mt = m.fm != NULL ? m.fm[t9] : 0;
+            if (mt < 0 || mt >= m.nmtl) mt = 0;
+            const double *ke3 = m.mtl[mt].ke3;
+            double ke = (ke3[0] + ke3[1] + ke3[2]) / 3.0;
+            if (!(ke > 0.0)) continue;
+            double tri[3][3];
+            for (int q2 = 0; q2 < 3; q2++)
+              for (int a = 0; a < 3; a++)
+                tri[q2][a] = m.v[3 * (size_t)m.f[3 * (size_t)t9 + (size_t)q2] + (size_t)a];
+            int32_t blo9[3], bhi9[3];
+            for (int a = 0; a < 3; a++) {
+              double mn = tri[0][a], mx = tri[0][a];
+              for (int q2 = 1; q2 < 3; q2++) {
+                if (tri[q2][a] < mn) mn = tri[q2][a];
+                if (tri[q2][a] > mx) mx = tri[q2][a];
+              }
+              blo9[a] = (int32_t)floor((mn - ofr.o[a]) / ofr.u[a]);
+              bhi9[a] = (int32_t)floor((mx - ofr.o[a]) / ofr.u[a]);
+              if (blo9[a] < 0) blo9[a] = 0;
+              if (bhi9[a] > fr.n - 1) bhi9[a] = fr.n - 1;
+            }
+            for (int32_t iz = blo9[2]; iz <= bhi9[2]; iz++)
+              for (int32_t iy = blo9[1]; iy <= bhi9[1]; iy++)
+                for (int32_t ix = blo9[0]; ix <= bhi9[0]; ix++) {
+                  double blo[3] = {ofr.o[0] + ofr.u[0] * (double)ix,
+                                   ofr.o[1] + ofr.u[1] * (double)iy,
+                                   ofr.o[2] + ofr.u[2] * (double)iz};
+                  double bhi[3] = {blo[0] + ofr.u[0], blo[1] + ofr.u[1], blo[2] + ofr.u[2]};
+                  double A = leak_tri_box_area((const double (*)[3])tri, blo, bhi);
+                  if (!(A > 0.0)) continue;
+                  etri_tot += ke * A;
+                  int32_t ci = cellat6[hz_occ_index(fr.n, ix, iy, iz)];
+                  if (ci < 0) {
+                    elost_nc += ke * A;
+                  } else if (!(Sarea6[ci] > 0.0)) {
+                    elost_ne += ke * A;
+                  } else {
+                    Ecell6[ci] += ke * A;
+                    emat784[mt] += ke * A;
+                  }
+                }
+          }
+          for (int32_t k = 0; k < cut.nse; k++) {
+            int32_t ci = cut.se[k].cell;
+            if (!(cut.se[k].area > 0.0) || !(Ecell6[ci] > 0.0)) continue;
+            eemit[k] = Ecell6[ci] / (3.14159265358979323846 * Sarea6[ci]);
+            emitpow += Ecell6[ci] * cut.se[k].area / Sarea6[ci];
+            double b6 = 3.14159265358979323846 * eemit[k];
+            if (b6 > femit[cut.se[k].facet]) femit[cut.se[k].facet] = b6;
+            nlit++;
+          }
+          printf("   §786 РАЗДАЧА Ke: Σ по треугольникам %.4f = роздано %.4f + потеряно (клетки "
+                 "без элементов) %.4f + (вне ячеек) %.4f; %.2f с\n",
+                 etri_tot, etri_tot - elost_ne - elost_nc, elost_ne, elost_nc, now_s() - tke0);
+          free(cellat6);
+          free(Ecell6);
+          free(Sarea6);
         }
         /* §784: печать раскладки — доля печатается от СВОЕЙ суммы прибора;
          * сверка с OBJ-аналитикой (awk) идёт по ИМЕНИ (А1260). */

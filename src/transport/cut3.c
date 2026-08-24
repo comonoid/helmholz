@@ -105,10 +105,13 @@ double tr3_cut_refs_fluid_vol(const hz_frame *fr, const hz_facettab *ft, const i
 static int cut3_piece_in_box(const tr3_mesh *m, const hz_facet *fp, const int32_t lo[3],
                              const int32_t hi[3], double (*vw)[3]) {
   double buf[2][CUT3_CLIPV][3];
-  for (int i = 0; i < 3; i++)
+  /* §800: кусок — полигон tnv вершин (3 у Р-8/§794-писателей); ёмкость клипа
+   * держит HZ_FACET_TVMAX + 6 = 14 <= 16 по построению. */
+  int ntv = fp->tnv >= 3 && fp->tnv <= HZ_FACET_TVMAX ? fp->tnv : 3;
+  for (int i = 0; i < ntv; i++)
     for (int a = 0; a < 3; a++)
       buf[0][i][a] = m->fr.o[a] + m->fr.u[a] * fp->tv[i][a];
-  int cur = 0, ncp = 3;
+  int cur = 0, ncp = ntv;
   for (int ax = 0; ax < 3 && ncp >= 3; ax++)
     for (int side = 0; side < 2 && ncp >= 3; side++) {
       double lim = m->fr.o[ax] + m->fr.u[ax] * (double)(side ? hi[ax] : lo[ax]);

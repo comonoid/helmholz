@@ -415,4 +415,11 @@ typedef int (*hz_dc_tri_get)(void *ctx, int32_t i, double tv[3][3]);
 int hz_dc_facets_tris(const hz_dctree *t, hz_dc_tri_get get, void *gctx, int32_t ntri,
                       hz_facettab *ft, hz_cutmap *cm);
 
+/* §800: куски-ПОЛИГОНЫ (кластеризация А1285). Провайдер пишет до
+ * HZ_FACET_TVMAX вершин (единицы кадра) и dmax в МЕТРАХ (фактическое
+ * отклонение вершин от плоскости куска, А1315); возврат — nv, 0 — пропустить. */
+typedef int (*hz_dc_poly_get)(void *ctx, int32_t i, double pv[][3], double *dmax);
+int hz_dc_facets_polys(const hz_dctree *t, hz_dc_poly_get get, void *gctx, int32_t npoly,
+                       hz_facettab *ft, hz_cutmap *cm);
+
 #endif

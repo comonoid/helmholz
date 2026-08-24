@@ -2777,6 +2777,262 @@ static int otri_get794(void *vc, int32_t i, double tv[3][3]) {
   return 1;
 }
 
+/* ---- §800: КЛАСТЕРИЗАЦИЯ КУСКОВ (А1285) -----------------------------------
+ *
+ * Жадное слияние смежных треугольников сцены в ВЫПУКЛЫЕ копланарные
+ * куски-полигоны (≤ HZ_FACET_TVMAX вершин). Критерий слияния ОДИН и связывает
+ * нормаль с офсетом (урок §5.1): все вершины кандидата в пределах δ от
+ * плоскости СЕМЕНИ; плюс сонаправленность нормалей (двусторонние листы не
+ * сливаются с изнанкой) и выпуклость в проекции на доминантную ось — знаком,
+ * БЕЗ допуска (А1317). dmax куска — ФАКТИЧЕСКИЙ максимум |отклонения| (А1315).
+ * Смежность — по ИНДЕКСАМ вершин OBJ; дубли вершин и T-стыки рвут её и режут
+ * сжатие (А1316) — доля рёбер без пары печатается. */
+
+/* δ по умолчанию, МЕТРЫ: на три порядка меньше листа lev=7 (0.9 м) и на
+ * порядок больше float-шума вершин (~1e-5 м на сцене 115 м). Ключ xclustol=. */
+#define HZ_CLUS_TOL 1e-4
+
+typedef struct {
+  uint64_t key; /* (min(u,v) << 32) | max(u,v) */
+  int32_t tri;
+  int32_t e;
+} cedge800;
+
+static int cmp_cedge800(const void *a, const void *b) {
+  const cedge800 *x = a, *y = b;
+  if (x->key != y->key) return x->key < y->key ? -1 : 1;
+  if (x->tri != y->tri) return x->tri < y->tri ? -1 : 1;
+  return (x->e > y->e) - (x->e < y->e);
+}
+
+typedef struct {
+  int32_t *pv;  /* [np][HZ_FACET_TVMAX] индексы вершин сцены */
+  int8_t *pnv;  /* [np] */
+  float *pdmax; /* [np] метры */
+  int32_t np;
+} clus800;
+
+/* выпуклость кандидата в проекции на доминантную ось нормали: все повороты
+ * одного знака со знаком n[d] либо ровно ноль (коллинеарные вершины законны) */
+static int clus800_convex(const hz_objmesh *om, const int32_t *vi, int nv, const double n[3]) {
+  int d = 0;
+  for (int a = 1; a < 3; a++)
+    if (fabs(n[a]) > fabs(n[d])) d = a;
+  int a1 = (d + 1) % 3, a2 = (d + 2) % 3;
+  double sgn = n[d] > 0.0 ? 1.0 : -1.0;
+  for (int j = 0; j < nv; j++) {
+    const double *p0 = &om->v[3 * (size_t)vi[j]];
+    const double *p1 = &om->v[3 * (size_t)vi[(j + 1) % nv]];
+    const double *p2 = &om->v[3 * (size_t)vi[(j + 2) % nv]];
+    double cr = (p1[a1] - p0[a1]) * (p2[a2] - p1[a2]) - (p1[a2] - p0[a2]) * (p2[a1] - p1[a1]);
+    if (sgn * cr < 0.0) return 0;
+  }
+  return 1;
+}
+
+/* поворот в вершине j: 0.0 — битовая коллинеарность (кандидат на удаление) */
+static double clus800_turn(const hz_objmesh *om, const int32_t *vi, int nv, const double n[3],
+                           int j) {
+  int d = 0;
+  for (int a = 1; a < 3; a++)
+    if (fabs(n[a]) > fabs(n[d])) d = a;
+  int a1 = (d + 1) % 3, a2 = (d + 2) % 3;
+  const double *p0 = &om->v[3 * (size_t)vi[(j + nv - 1) % nv]];
+  const double *p1 = &om->v[3 * (size_t)vi[j]];
+  const double *p2 = &om->v[3 * (size_t)vi[(j + 1) % nv]];
+  return (p1[a1] - p0[a1]) * (p2[a2] - p1[a2]) - (p1[a2] - p0[a2]) * (p2[a1] - p1[a1]);
+}
+
+static void clus800_build(const hz_objmesh *om, double tol, clus800 *cl) {
+  double t0 = now_s();
+  int32_t nt = om->nt;
+  cedge800 *ed = malloc(3 * (size_t)nt * sizeof *ed);
+  int32_t *adj = malloc(3 * (size_t)nt * sizeof *adj);
+  double *tn = malloc(3 * (size_t)nt * sizeof *tn);
+  uint8_t *used = calloc((size_t)nt, 1);
+  cl->pv = malloc((size_t)nt * HZ_FACET_TVMAX * sizeof *cl->pv);
+  cl->pnv = malloc((size_t)nt * sizeof *cl->pnv);
+  cl->pdmax = malloc((size_t)nt * sizeof *cl->pdmax);
+  cl->np = 0;
+  if (ed == NULL || adj == NULL || tn == NULL || used == NULL || cl->pv == NULL ||
+      cl->pnv == NULL || cl->pdmax == NULL)
+    exit(1);
+  /* нормали (единичные) и рёбра; вырожденные помечаются использованными */
+  for (int32_t t = 0; t < nt; t++) {
+    const double *A = &om->v[3 * (size_t)om->f[3 * (size_t)t]];
+    const double *B = &om->v[3 * (size_t)om->f[3 * (size_t)t + 1]];
+    const double *C = &om->v[3 * (size_t)om->f[3 * (size_t)t + 2]];
+    double e1[3], e2[3], nn[3];
+    for (int k = 0; k < 3; k++) {
+      e1[k] = B[k] - A[k];
+      e2[k] = C[k] - A[k];
+    }
+    nn[0] = e1[1] * e2[2] - e1[2] * e2[1];
+    nn[1] = e1[2] * e2[0] - e1[0] * e2[2];
+    nn[2] = e1[0] * e2[1] - e1[1] * e2[0];
+    double ml = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+    if (!(ml > 0.0)) used[t] = 1;
+    for (int k = 0; k < 3; k++)
+      tn[3 * (size_t)t + (size_t)k] = ml > 0.0 ? nn[k] / ml : 0.0;
+    for (int e = 0; e < 3; e++) {
+      int32_t u = om->f[3 * (size_t)t + (size_t)e];
+      int32_t v = om->f[3 * (size_t)t + (size_t)((e + 1) % 3)];
+      uint64_t lo9 = (uint64_t)(uint32_t)(u < v ? u : v), hi9 = (uint64_t)(uint32_t)(u < v ? v : u);
+      ed[3 * (size_t)t + (size_t)e].key = (lo9 << 32) | hi9;
+      ed[3 * (size_t)t + (size_t)e].tri = t;
+      ed[3 * (size_t)t + (size_t)e].e = e;
+      adj[3 * (size_t)t + (size_t)e] = -1;
+    }
+  }
+  qsort(ed, 3 * (size_t)nt, sizeof *ed, cmp_cedge800);
+  int64_t nopen = 0, nnonm = 0;
+  {
+    int64_t i = 0, n3 = 3 * (int64_t)nt;
+    while (i < n3) {
+      int64_t j = i;
+      while (j < n3 && ed[j].key == ed[i].key)
+        j++;
+      if (j - i == 2) {
+        adj[3 * (size_t)ed[i].tri + (size_t)ed[i].e] = ed[i + 1].tri;
+        adj[3 * (size_t)ed[i + 1].tri + (size_t)ed[i + 1].e] = ed[i].tri;
+      } else if (j - i == 1)
+        nopen++;
+      else
+        nnonm += j - i;
+      i = j;
+    }
+  }
+  free(ed);
+  /* жадный рост: полигон = список индексов вершин + владелец каждого
+   * граничного ребра (tri*4 + e; −1 — ребро закрыто удалением коллинеарной) */
+  int64_t nvhist[HZ_FACET_TVMAX + 1];
+  memset(nvhist, 0, sizeof nvhist);
+  double dmx_all = 0.0;
+  int64_t nmerged = 0;
+  for (int32_t t = 0; t < nt; t++) {
+    if (used[t]) continue;
+    used[t] = 1;
+    int32_t vi[HZ_FACET_TVMAX];
+    int64_t own[HZ_FACET_TVMAX];
+    int nv = 3;
+    for (int e = 0; e < 3; e++) {
+      vi[e] = om->f[3 * (size_t)t + (size_t)e];
+      own[e] = 4 * (int64_t)t + e;
+    }
+    const double *n0 = &tn[3 * (size_t)t];
+    double off0 = n0[0] * om->v[3 * (size_t)vi[0]] + n0[1] * om->v[3 * (size_t)vi[0] + 1] +
+                  n0[2] * om->v[3 * (size_t)vi[0] + 2];
+    double dmx = 0.0;
+    int progress = 1;
+    while (progress && nv < HZ_FACET_TVMAX) {
+      progress = 0;
+      for (int j = 0; j < nv; j++) {
+        if (own[j] < 0) continue;
+        int32_t ot = (int32_t)(own[j] >> 2);
+        int oe = (int)(own[j] & 3);
+        int32_t nb = adj[3 * (size_t)ot + (size_t)oe];
+        if (nb < 0 || used[nb]) continue;
+        const double *nnb = &tn[3 * (size_t)nb];
+        if (!(nnb[0] * n0[0] + nnb[1] * n0[1] + nnb[2] * n0[2] > 0.0)) continue;
+        /* ребро полигона (u, v); у согласованно обмотанного соседа оно (v, u) */
+        int32_t u = vi[j], v = vi[(j + 1) % nv];
+        int enb = -1;
+        for (int e = 0; e < 3; e++)
+          if (om->f[3 * (size_t)nb + (size_t)e] == v &&
+              om->f[3 * (size_t)nb + (size_t)((e + 1) % 3)] == u)
+            enb = e;
+        if (enb < 0) continue; /* несогласованная обмотка — не сливать */
+        int32_t w = om->f[3 * (size_t)nb + (size_t)((enb + 2) % 3)];
+        int dup = 0;
+        for (int q = 0; q < nv; q++)
+          if (vi[q] == w) dup = 1;
+        if (dup) continue; /* не-простой полигон */
+        double dw = fabs(n0[0] * om->v[3 * (size_t)w] + n0[1] * om->v[3 * (size_t)w + 1] +
+                         n0[2] * om->v[3 * (size_t)w + 2] - off0);
+        if (!(dw <= tol)) continue;
+        int32_t cand[HZ_FACET_TVMAX + 1];
+        for (int q = 0; q <= j; q++)
+          cand[q] = vi[q];
+        cand[j + 1] = w;
+        for (int q = j + 1; q < nv; q++)
+          cand[q + 1] = vi[q];
+        if (!clus800_convex(om, cand, nv + 1, n0)) continue;
+        /* принять: w после j; владельцы новых рёбер — два других ребра nb */
+        for (int q = nv; q > j + 1; q--) {
+          vi[q] = vi[q - 1];
+          own[q] = own[q - 1];
+        }
+        vi[j + 1] = w;
+        own[j] = 4 * (int64_t)nb + ((enb + 1) % 3);     /* (u, w) */
+        own[j + 1] = 4 * (int64_t)nb + ((enb + 2) % 3); /* (w, v) */
+        nv++;
+        used[nb] = 1;
+        nmerged++;
+        if (dw > dmx) dmx = dw;
+        /* битово-коллинеарные вершины выбрасываются (страйпы не упираются в
+         * потолок вершин); ребро слитого отрезка закрывается (own = −1) —
+         * смежность через него в сетке не существует (А1317) */
+        for (int q = 0; q < nv && nv > 3; q++) {
+          /* битовый ноль поворота — без ==: гейт запрещает равенство плавучих */
+          if (fabs(clus800_turn(om, vi, nv, n0, q)) > 0.0) continue;
+          int p = (q + nv - 1) % nv;
+          for (int r = q; r < nv - 1; r++) {
+            vi[r] = vi[r + 1];
+            own[r] = own[r + 1];
+          }
+          nv--;
+          own[p >= nv ? nv - 1 : p] = -1;
+          q--;
+        }
+        progress = 1;
+        break;
+      }
+    }
+    int32_t *dst = &cl->pv[(size_t)cl->np * HZ_FACET_TVMAX];
+    for (int q = 0; q < nv; q++)
+      dst[q] = vi[q];
+    cl->pnv[cl->np] = (int8_t)nv;
+    cl->pdmax[cl->np] = (float)dmx;
+    cl->np++;
+    nvhist[nv]++;
+    if (dmx > dmx_all) dmx_all = dmx;
+  }
+  free(adj);
+  free(tn);
+  free(used);
+  printf("   §800 КЛАСТЕРЫ: %d треугольников -> %d кусков (×%.2f, поглощено %lld); nv: ", om->nt,
+         cl->np, (double)om->nt / (double)(cl->np > 0 ? cl->np : 1), (long long)nmerged);
+  for (int q = 3; q <= HZ_FACET_TVMAX; q++)
+    printf("%d:%lld ", q, (long long)nvhist[q]);
+  printf("; dmax макс %.3e м (допуск %.1e); рёбер без пары %lld, немногообразных %lld; %.2f с\n",
+         dmx_all, tol, (long long)nopen, (long long)nnonm, now_s() - t0);
+}
+
+static void clus800_free(clus800 *cl) {
+  free(cl->pv);
+  free(cl->pnv);
+  free(cl->pdmax);
+  memset(cl, 0, sizeof *cl);
+}
+
+/* провайдер полигонов для hz_dc_facets_polys: мир -> единицы кадра */
+typedef struct {
+  const hz_objmesh *om;
+  const frame *fr;
+  const clus800 *cl;
+} opoly800;
+
+static int opoly_get800(void *vc, int32_t i, double pv[][3], double *dmax) {
+  opoly800 *c = vc;
+  int nv = c->cl->pnv[i];
+  const int32_t *vi = &c->cl->pv[(size_t)i * HZ_FACET_TVMAX];
+  for (int q = 0; q < nv; q++)
+    for (int k = 0; k < 3; k++)
+      pv[q][k] = (c->om->v[3 * (size_t)vi[q] + (size_t)k] - c->fr->org[k]) / c->fr->h;
+  *dmax = (double)c->cl->pdmax[i];
+  return nv;
+}
+
 /* §778: клип треугольника к коробке — Сазерленд–Ходжман по шести полуплоскостям.
  * ДИАГНОСТИКА (ключ xleak): эталон покрытия, независимый от рабочего пути cut3;
  * плавучка здесь законна — рабочая геометрия этим не пользуется. */
@@ -6212,18 +6468,20 @@ int main(int argc, char **argv) {
    * fc осталась), и переворачивать канон под несработавшее лечение нельзя —
    * ключ остаётся исследовательским до вердикта (класс А1287/xobjpiece). */
   int xfc = 0;
-  int xfcelem = 0;      /* §798 НК: прямой канал кадра по-старому — агрегат E_fc+хвост
-                         * по ЭЛЕМЕНТАМ на узлах свипа (§796), ядровый канал не строится */
-  int hcontrib_set = 0; /* §796: задан ли hcontrib= явно (для fc-умолчания) */
-  double xtailq = -1.0; /* §774: q хвоста: <0 — измерить, 0 — усечение, >0 — НК */
-  int xbcmp774 = 0;     /* §774: базовый прогон и сравнение в одном процессе */
-  int xleak = 0;        /* §778: диагностический клип покрытия — адреса дыр */
-  int xnopiece = 0;     /* §780 НК: раздача и рез бесконечными плоскостями, как до Р-8 */
-  int xobjpiece = 0;    /* §794: куски из ТРЕУГОЛЬНИКОВ СЦЕНЫ (авторские нормали) */
-  int xnomaxp = 0;      /* §735 НК: выключить принцип максимума — вернуть расходимость */
-  int xcmp = 0;         /* §744: поячеечное сличение свипа с ядром §597 */
-  int32_t xchain = -1;  /* §731: трасса цепочки к ячейке — только под xunit: пол
-                         * обрыва прогулки есть уровень единичного входа */
+  int xfcelem = 0;        /* §798 НК: прямой канал кадра по-старому — агрегат E_fc+хвост
+                           * по ЭЛЕМЕНТАМ на узлах свипа (§796), ядровый канал не строится */
+  int hcontrib_set = 0;   /* §796: задан ли hcontrib= явно (для fc-умолчания) */
+  double xtailq = -1.0;   /* §774: q хвоста: <0 — измерить, 0 — усечение, >0 — НК */
+  int xbcmp774 = 0;       /* §774: базовый прогон и сравнение в одном процессе */
+  int xleak = 0;          /* §778: диагностический клип покрытия — адреса дыр */
+  int xnopiece = 0;       /* §780 НК: раздача и рез бесконечными плоскостями, как до Р-8 */
+  int xobjpiece = 0;      /* §794: куски из ТРЕУГОЛЬНИКОВ СЦЕНЫ (авторские нормали) */
+  int xclus = 0;          /* §800: кластеризованные OBJ-куски (полигоны, А1285) */
+  double xclustol = -1.0; /* §800: δ слияния, м; <0 — умолчание HZ_CLUS_TOL */
+  int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
+  int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
+  int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
+                           * обрыва прогулки есть уровень единичного входа */
   int32_t xcelll[4] = {-1, -1, -1, -1}; /* §733: вскрытие обновления, до 4 ячеек */
   int xdir = -1;                        /* §733: направление вскрытия */
   /* §714: альбедо стыка вынесено в ОТДЕЛЬНЫЙ ключ и по умолчанию ВЫКЛЮЧЕНО:
@@ -6335,6 +6593,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xleak") == 0) xleak = 1;
     if (strcmp(argv[i], "xnopiece") == 0) xnopiece = 1;
     if (strcmp(argv[i], "xobjpiece") == 0) xobjpiece = 1;
+    if (strcmp(argv[i], "xclus") == 0) xclus = 1;
+    if (strncmp(argv[i], "xclustol=", 9) == 0) xclustol = strtod(argv[i] + 9, NULL);
     if (strcmp(argv[i], "xcontrib") == 0) {
       xcontrib = 1;
       xmatrho = 1;
@@ -7254,14 +7514,26 @@ int main(int argc, char **argv) {
      * либо, при xobjpiece, ТРЕУГОЛЬНИКИ СЦЕНЫ — авторские нормали, dmax = 0);
      * xnopiece — прежние бесконечные плоскости (негативный контроль §780). */
     int frc;
-    if (xobjpiece) {
+    if ((xclus && xobjpiece) || ((xclus || xobjpiece) && xnopiece)) {
+      fprintf(stderr, "xclus/xobjpiece/xnopiece взаимоисключающие\n");
+      exit(1);
+    }
+    if (xclus) {
+      /* §800: кластеризованные куски-полигоны из треугольников сцены */
+      clus800 CL;
+      clus800_build(&m, xclustol >= 0.0 ? xclustol : HZ_CLUS_TOL, &CL);
+      opoly800 opc = {&m, &fr, &CL};
+      frc = hz_dc_facets_polys(&T, opoly_get800, &opc, CL.np, &ftab, &cmap);
+      clus800_free(&CL); /* вершины скопированы в ftab при добавлении */
+    } else if (xobjpiece) {
       otri794 otc = {&m, &fr};
       frc = hz_dc_facets_tris(&T, otri_get794, &otc, m.nt, &ftab, &cmap);
     } else
       frc = hz_dc_facets2(&T, NULL, NULL, &ftab, &cmap, xnopiece ? 0 : 1);
     printf("   Р-8 РАЗДАЧА (%s): пар %lld, отброшено кусочным отбором %lld, записей опустело "
            "%lld\n",
-           xobjpiece ? "OBJ-куски §794" : (xnopiece ? "ПЛОСКОСТИ — НК" : "DC-куски"),
+           xclus ? "КЛАСТЕРЫ §800"
+                 : (xobjpiece ? "OBJ-куски §794" : (xnopiece ? "ПЛОСКОСТИ — НК" : "DC-куски")),
            hz_dc_facets_pairs(), hz_dc_facets_dropped(), hz_dc_facets_empty());
     /* Р-7а (§Р-7а): ЗАМЕР КВАНТОВАНИЯ ПЛОСКОСТИ. Вклад в `dmax` считается на
      * ВСЕХ фасетах сцены, радиус — половина диагонали ЕДИНИЧНОЙ ячейки
@@ -7875,9 +8147,11 @@ int main(int argc, char **argv) {
             nbigcell++;
             const hz_facet *fp8 = &ftab.f[cut.se[k].facet];
             int32_t blo8[3], bhi8[3];
+            /* §800: bbox куска — по всем tnv вершинам полигона */
+            int ntv8 = fp8->tnv >= 3 && fp8->tnv <= HZ_FACET_TVMAX ? fp8->tnv : 3;
             for (int a = 0; a < 3; a++) {
               double mn = fp8->tv[0][a], mx = fp8->tv[0][a];
-              for (int q2 = 1; q2 < 3; q2++) {
+              for (int q2 = 1; q2 < ntv8; q2++) {
                 if (fp8->tv[q2][a] < mn) mn = fp8->tv[q2][a];
                 if (fp8->tv[q2][a] > mx) mx = fp8->tv[q2][a];
               }

@@ -1725,3 +1725,65 @@ int hz_dc_facets_tris(const hz_dctree *t, hz_dc_tri_get get, void *gctx, int32_t
   free(fc.dropc);
   return rc;
 }
+
+/* §800: КУСКИ-ПОЛИГОНЫ (кластеризация А1285). Провайдер отдаёт выпуклый
+ * полигон в ЕДИНИЦАХ кадра (nv вершин, обход согласован с авторской нормалью;
+ * 0 — пропустить) и dmax В МЕТРАХ — фактическое отклонение вершин от
+ * заявляемой плоскости (А1315: ноль означает «точен»). Плоскость — по Ньюэллу
+ * из всех вершин (устойчивее пары рёбер у почти-коллинеарных углов); раздача —
+ * тем же SAT-спуском ВЕЕРОМ треугольников полигона: дубликаты пар (клетка,
+ * фасет) снимает дедуп facets_finish. */
+int hz_dc_facets_polys(const hz_dctree *t, hz_dc_poly_get get, void *gctx, int32_t npoly,
+                       hz_facettab *ft, hz_cutmap *cm) {
+  facetctx fc;
+  memset(&fc, 0, sizeof fc);
+  fc.ft = ft;
+  fc.t = t;
+  fc.cap = 256;
+  fc.bounded = 1;
+  fc.dcap = 256;
+  fc.rc = HZ_DC_OK;
+  g_fc_pairs = g_fc_dropped = g_fc_empty = 0;
+  fc.pair = calloc((size_t)fc.cap, sizeof(cellfacet));
+  fc.dropc = calloc((size_t)fc.dcap, sizeof(int32_t));
+  if (fc.pair == NULL || fc.dropc == NULL) {
+    free(fc.pair);
+    free(fc.dropc);
+    return HZ_DC_ENOMEM;
+  }
+  int rc = HZ_DC_OK;
+  for (int32_t i = 0; i < npoly && rc == HZ_DC_OK; i++) {
+    double pv[HZ_FACET_TVMAX][3];
+    double dmax = 0.0;
+    int nv = get(gctx, i, pv, &dmax);
+    if (nv < 3 || nv > HZ_FACET_TVMAX) continue;
+    /* Ньюэлл: n_x = Σ (y_j − y_k)(z_j + z_k) и циклически */
+    double nn[3] = {0, 0, 0};
+    for (int j = 0; j < nv; j++) {
+      const double *a = pv[j], *b = pv[(j + 1) % nv];
+      nn[0] += (a[1] - b[1]) * (a[2] + b[2]);
+      nn[1] += (a[2] - b[2]) * (a[0] + b[0]);
+      nn[2] += (a[0] - b[0]) * (a[1] + b[1]);
+    }
+    double mlen = sqrt(nn[0] * nn[0] + nn[1] * nn[1] + nn[2] * nn[2]);
+    if (!(mlen > 0.0)) continue; /* вырожденный: плоскости нет */
+    for (int k = 0; k < 3; k++)
+      nn[k] /= mlen;
+    double off = nn[0] * pv[0][0] + nn[1] * pv[0][1] + nn[2] * pv[0][2];
+    int32_t fi = hz_facettab_add_units_poly(ft, nn, off, -1, dmax, (const double (*)[3])pv, nv);
+    if (fi < 0) {
+      rc = HZ_DC_ENOMEM;
+      break;
+    }
+    int32_t rlo[3] = {0, 0, 0};
+    for (int e = 1; e + 1 < nv && rc == HZ_DC_OK; e++)
+      if (piece_pairs_rec(&fc, 0, rlo, (int32_t)1 << t->log2size, pv[0], pv[e], pv[e + 1], fi))
+        rc = fc.rc;
+    if (rc != HZ_DC_OK) break;
+  }
+  if (rc == HZ_DC_OK) rc = fc.rc;
+  if (rc == HZ_DC_OK) rc = facets_finish(&fc, cm);
+  free(fc.pair);
+  free(fc.dropc);
+  return rc;
+}

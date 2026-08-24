@@ -8158,6 +8158,8 @@ int main(int argc, char **argv) {
                "точное решение φ = 4π·влёт = %.6f\n",
                bconst, 4.0 * 3.14159265358979323846 * bconst);
       }
+      tr3_dirs dirs;
+      if (tr3_dirs_product(&dirs, nmu, nmu) != 0) exit(1);
       /* ---- §796: FIRST-COLLISION SOURCE — инъекция первым отражением ----
        * Прямой свет от eemit-ламп собирается непрерывным механизмом (efc_*),
        * elem_emit подменяется на ρ·E_fc/hsum; Ke в свип не инъецируется.
@@ -8220,7 +8222,18 @@ int main(int argc, char **argv) {
             if (!(efc796[k] > 0.0)) nz6++;
             double rho6 =
                 (cut.se[k].facet >= 0 && cut.se[k].facet < ftab.n) ? frho[cut.se[k].facet] : 0.0;
-            if (cut.se[k].hsum > 0.0) einj796[k] = rho6 * efc796[k] / cut.se[k].hsum;
+            /* К29-нормировка Σ_{ω·n>0} w(ω·n) считается ЗДЕСЬ по набору
+             * ординат (поле se.hsum в cut3 не заполняется — мёртвое, А1294;
+             * поймано первым же прогоном: инъекция выходила нулевой). Деление
+             * на неё, а не на π, делает инъецированную мощность В ЕДИНИЦАХ
+             * СХЕМЫ равной ρ·E_fc·area точно. */
+            double hs6 = 0.0;
+            for (int mm = 0; mm < dirs.n; mm++) {
+              double on6 = dirs.ox[mm] * cut.se[k].n[0] + dirs.oy[mm] * cut.se[k].n[1] +
+                           dirs.oz[mm] * cut.se[k].n[2];
+              if (on6 > 0.0) hs6 += dirs.w[mm] * on6;
+            }
+            if (hs6 > 0.0) einj796[k] = rho6 * efc796[k] / hs6;
             injpow796 += rho6 * efc796[k] * cut.se[k].area;
           }
           printf("   §796 FIRST-COLLISION: излучателей %d, излучено %.6e, ПЕРЕХВАЧЕНО %.6e "
@@ -8232,8 +8245,6 @@ int main(int argc, char **argv) {
                  100.0 * (double)nz6 / (double)(nrc6 > 0 ? nrc6 : 1), now_s() - tfc0);
         }
       }
-      tr3_dirs dirs;
-      if (tr3_dirs_product(&dirs, nmu, nmu) != 0) exit(1);
       tr3_problem prob = {.m = &mesh,
                           .d = &dirs,
                           .cut = &cut,

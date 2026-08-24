@@ -2662,23 +2662,32 @@ static double *g_dsa_ffv = NULL;
  * площадь), подъём суммами поддеревьев: кадровый срез с LOD читает любой
  * уровень как площадно-взвешенное среднее поддерева. */
 static double *g_swEn = NULL, *g_swEd = NULL;
-static void swE_lift(const hz_dctree *t, int32_t ni) {
+/* §798: второй узловой канал кадра — ПРЯМОЙ свет из ядрового сбора (гибрид
+ * К-а §797); num/den той же механики, что g_swEn/g_swEd. */
+static double *g_fcdn = NULL, *g_fcdd = NULL;
+/* §798: режим прямого канала кадра для печатей: 0 — без fc, 1 — xfcelem
+ * (прямой из элементов, §796), 2 — гибрид (прямой из ядрового сбора). */
+static int g_fcmode = 0;
+/* §798: подъём и спуск обобщены МАССИВАМИ — каналов стало два, а механика
+ * (суммы поддеревьев, спуск к глубочайшему заполненному предку) одна. */
+static void swE_lift(const hz_dctree *t, int32_t ni, double *En, double *Ed) {
   if (t->nd[ni].child0 < 0) return;
   for (int k = 0; k < 8; k++) {
     int32_t c = t->nd[ni].child0 + k;
-    swE_lift(t, c);
-    g_swEn[ni] += g_swEn[c];
-    g_swEd[ni] += g_swEd[c];
+    swE_lift(t, c, En, Ed);
+    En[ni] += En[c];
+    Ed[ni] += Ed[c];
   }
 }
 
 /* §760: спуск с запоминанием ГЛУБОЧАЙШЕГО предка, чьё поддерево несёт
  * свиповое поле; uplev — на сколько уровней выше запрошенного взято (0 —
  * дыры не было). Лечит и оборванные спуски. */
-static int32_t node_swE_best(const hz_dctree *t, int lev, const hz_dccell *c, int *uplev) {
+static int32_t node_swE_best(const hz_dctree *t, int lev, const hz_dccell *c, int *uplev,
+                             const double *Ed) {
   int lvl = (int)c->lvl;
   if (lvl < 0 || lvl > lev) return -1;
-  int32_t ni = 0, best = g_swEd[0] > 0.0 ? 0 : -1;
+  int32_t ni = 0, best = Ed[0] > 0.0 ? 0 : -1;
   int bestd = 0;
   for (int d = 0; d < lvl; d++) {
     if (t->nd[ni].child0 < 0) break;
@@ -2686,7 +2695,7 @@ static int32_t node_swE_best(const hz_dctree *t, int lev, const hz_dccell *c, in
     for (int a = 0; a < 3; a++)
       if (((int32_t)c->lo[a] >> (lev - 1 - d)) & 1) bit |= 1 << a;
     ni = t->nd[ni].child0 + bit;
-    if (g_swEd[ni] > 0.0) {
+    if (Ed[ni] > 0.0) {
       best = ni;
       bestd = d + 1;
     }
@@ -6203,6 +6212,8 @@ int main(int argc, char **argv) {
    * fc осталась), и переворачивать канон под несработавшее лечение нельзя —
    * ключ остаётся исследовательским до вердикта (класс А1287/xobjpiece). */
   int xfc = 0;
+  int xfcelem = 0;      /* §798 НК: прямой канал кадра по-старому — агрегат E_fc+хвост
+                         * по ЭЛЕМЕНТАМ на узлах свипа (§796), ядровый канал не строится */
   int hcontrib_set = 0; /* §796: задан ли hcontrib= явно (для fc-умолчания) */
   double xtailq = -1.0; /* §774: q хвоста: <0 — измерить, 0 — усечение, >0 — НК */
   int xbcmp774 = 0;     /* §774: базовый прогон и сравнение в одном процессе */
@@ -6318,6 +6329,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "xcoarse=", 8) == 0) xcoarse = strtod(argv[i] + 8, NULL);
     if (strncmp(argv[i], "xbounce=", 8) == 0) xbounce = (int)strtol(argv[i] + 8, NULL, 10);
     if (strcmp(argv[i], "xfc") == 0) xfc = 1;
+    if (strcmp(argv[i], "xfcelem") == 0) xfcelem = 1;
     if (strncmp(argv[i], "xtailq=", 7) == 0) xtailq = strtod(argv[i] + 7, NULL);
     if (strcmp(argv[i], "xbcmp") == 0) xbcmp774 = 1;
     if (strcmp(argv[i], "xleak") == 0) xleak = 1;
@@ -9578,13 +9590,120 @@ int main(int argc, char **argv) {
             nmiss758++;
             continue;
           }
-          /* §796: кадр читает ПОЛНУЮ облучённость — прямая E_fc плюс
-           * рассеянный хвост свипа; при старой инъекции — прежнее eirr */
-          g_swEn[ni] += (efc796 != NULL ? st.eirr[e] + efc796[e] : st.eirr[e]) * a;
+          /* §796/§798: под гибридом узлы свипа несут ТОЛЬКО хвост (прямой
+           * идёт вторым каналом из ядрового сбора); под xfcelem (НК §798) —
+           * §796-агрегат E_fc + хвост; при старой инъекции — прежнее eirr */
+          double ev8 = st.eirr[e];
+          if (efc796 != NULL && xfcelem) ev8 += efc796[e];
+          g_swEn[ni] += ev8 * a;
           g_swEd[ni] += a;
         }
-        swE_lift(&T, 0);
+        g_fcmode = efc796 == NULL ? 0 : (xfcelem ? 1 : 2);
+        swE_lift(&T, 0, g_swEn, g_swEd);
         printf("   §758 СВИП->УЗЛЫ: элементов без узла %lld\n", (long long)nmiss758);
+      }
+      /* ---- §798: ПРЯМОЙ КАНАЛ КАДРА ИЗ ЯДРОВОГО СБОРА (гибрид К-а §797) --
+       * Приёмники — ячейки СРЕЗА ПОЛНОЙ ГЛУБИНЫ (одна DC-нормаль на ячейку,
+       * двусторонний агрегат А1192 не возникает); b0 — скалярное среднее Ke
+       * материала (монохромная семантика свипа §667); сбор hgather_rec с
+       * заслонами, БЕЗ альбедо приёмника — узлы получают ОБЛУЧЁННОСТЬ E_dir.
+       * Кадр читает сумму двух каналов. Перенос не тронут. */
+      if (xframe && st.eirr != NULL && efc796 != NULL && !xfcelem) {
+        double tdc0 = now_s();
+        hz_dcslice SD;
+        if (hz_slice_init(&SD, lev) != HZ_DC_OK) exit(1);
+        if (hz_slice_build(&SD, &T, &ht, NULL, NULL) != HZ_DC_OK) exit(1);
+        int64_t nmatd = slice_assign_mat(&SD, &CT, &fr, &m);
+        float *b0d = calloc(3 * (size_t)(SD.n > 0 ? SD.n : 1), sizeof *b0d);
+        double *edir8 = calloc((size_t)(SD.n > 0 ? SD.n : 1), sizeof *edir8);
+        if (b0d == NULL || edir8 == NULL) exit(1);
+        int64_t nlitd = 0;
+        for (int32_t i = 0; i < SD.n; i++) {
+          const double *ke = m.mtl[SD.c[i].mat < m.nmtl ? SD.c[i].mat : 0].ke3;
+          double kem = (ke[0] + ke[1] + ke[2]) / 3.0;
+          if (!(kem > 0.0)) continue;
+          for (int k = 0; k < 3; k++)
+            b0d[3 * (size_t)i + (size_t)k] = (float)kem;
+          nlitd++;
+        }
+        etree ETD;
+        memset(&ETD, 0, sizeof ETD);
+        etree_build(&ETD, &SD, &fr, b0d, &m, 0, SD.n, 0, lev);
+        /* порог вклада — как у fc-сбора §796 (канон ядра, hcontrib= перебивает) */
+        double hcd = hcontrib_set ? g_hcontrib : HZ_FC_CONTRIB;
+        double bsumd = 0.0, asumd = 0.0;
+        for (int k = 0; k < ETD.e[0].nb; k++) {
+          const ebin *rb = &ETD.b[ETD.e[0].b0 + k];
+          asumd += (double)rb->area;
+          for (int c = 0; c < 3; c++)
+            bsumd += (double)rb->flux[c] / 3.0;
+        }
+        double taud = hcd * (asumd > 0.0 ? bsumd / asumd : 0.0);
+        int nthd = g_omp1 ? 1 : omp_get_max_threads();
+        int64_t *pld = calloc((size_t)nthd, sizeof *pld);
+        double *ptd = calloc((size_t)nthd, sizeof *ptd);
+        double *pad = calloc((size_t)nthd, sizeof *pad);
+        int64_t *pmd = calloc((size_t)nthd, sizeof *pmd);
+        if (pld == NULL || ptd == NULL || pad == NULL || pmd == NULL) exit(1);
+#pragma omp parallel for schedule(dynamic, 64) if (!g_omp1)
+        for (int32_t i = 0; i < SD.n; i++) {
+          int th = g_omp1 ? 0 : omp_get_thread_num();
+          double pi[3] = {0, 0, 0}, nn2[3] = {0, 0, 0};
+          hz_slice_vertex(&SD, i, pi);
+          for (int k = 0; k < 3; k++)
+            pi[k] = fr.org[k] + pi[k] * fr.h;
+          hz_slice_normal(&SD, i, nn2);
+          double rrecv = fr.h * (double)((int32_t)1 << (lev - (int)SD.c[i].lvl));
+          double acc[3] = {0, 0, 0}, ffacc = 0.0;
+          for (int q2 = 0; q2 < 6; q2++)
+            hgather_rec(&ETD, 0, q2, pi, nn2, HZ_FC_EPS, taud, rrecv, &P, &fr, 1, acc, &pld[th],
+                        &ptd[th], &pad[th], NULL, &ffacc, NULL, 0, &pmd[th]);
+          double fnorm = (!g_gnonorm && ffacc > 1.0) ? 1.0 / ffacc : 1.0;
+          edir8[i] = acc[0] * fnorm; /* каналы равны: b0 скалярный */
+        }
+        int64_t nld = 0, nmd = 0;
+        double alld = 0.0, thrd = 0.0;
+        for (int t = 0; t < nthd; t++) {
+          nld += pld[t];
+          alld += pad[t];
+          thrd += ptd[t];
+          nmd += pmd[t];
+        }
+        free(pld);
+        free(ptd);
+        free(pad);
+        free(pmd);
+        etree_free(&ETD);
+        free(b0d);
+        /* раскладка на узлы: срез полной глубины — ячейка ↔ узел 1:1; отказы
+         * спуска считаются (А1029/А1305), непокрытый узел ≠ тёмный ноль */
+        g_fcdn = calloc((size_t)T.n, sizeof *g_fcdn);
+        g_fcdd = calloc((size_t)T.n, sizeof *g_fcdd);
+        if (g_fcdn == NULL || g_fcdd == NULL) exit(1);
+        int64_t nputd = 0, nbadd = 0, nzd = 0;
+        double sed8 = 0.0;
+        for (int32_t i = 0; i < SD.n; i++) {
+          int32_t ni = node_of_cell(&T, lev, &SD.c[i]);
+          if (ni < 0 || ni >= T.n) {
+            nbadd++;
+            continue;
+          }
+          g_fcdn[ni] += edir8[i];
+          g_fcdd[ni] += 1.0;
+          nputd++;
+          sed8 += edir8[i];
+          if (!(edir8[i] > 0.0)) nzd++;
+        }
+        swE_lift(&T, 0, g_fcdn, g_fcdd);
+        printf("   §798 ПРЯМОЙ КАНАЛ (ядровый сбор): ячеек среза %d (материал %lld, светящихся "
+               "%lld), связей %lld (заслонённого потока %.1f %%), маршей %lld; узлов заполнено "
+               "%lld, отказов %lld; Σ E_dir %.6e, E_dir = 0 у %lld (%.1f %%); %.2f с\n",
+               SD.n, (long long)nmatd, (long long)nlitd, (long long)nld,
+               100.0 * thrd / (alld > 0.0 ? alld : 1.0), (long long)nmd, (long long)nputd,
+               (long long)nbadd, sed8, (long long)nzd,
+               100.0 * (double)nzd / (double)(nputd > 0 ? nputd : 1), now_s() - tdc0);
+        free(edir8);
+        hz_slice_free(&SD);
       }
       /* §744: агрегаты по ячейкам для сличения с ядром §597 — площадно-
        * взвешенная косвенная облучённость (полный − прямой) и центры
@@ -10912,10 +11031,21 @@ int main(int argc, char **argv) {
         /* §760: дыры закрываются глубочайшим предком с полем; распределение
          * глубины подъёма — встроенный НК (подъём к корню = заливка) */
         int64_t nup1 = 0, nup2 = 0, nup3 = 0, nuproot = 0, nupall = 0;
+        /* §798: читаемое Ei (до альбедо) запоминается для прибора кадровой
+         * чешуи; −1 — непокрыто */
+        double *eall8 = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *eall8);
+        if (eall8 == NULL) exit(1);
         for (int32_t i = 0; i < S.n; i++) {
           int uplev8 = 0;
-          int32_t ni = node_swE_best(&T, lev, &S.c[i], &uplev8);
+          int32_t ni = node_swE_best(&T, lev, &S.c[i], &uplev8, g_swEd);
           double Ei = (ni >= 0) ? g_swEn[ni] / g_swEd[ni] : -1.0;
+          /* §798: гибрид — прямой свет ВТОРЫМ каналом из ядрового сбора */
+          if (g_fcdn != NULL) {
+            int updir8 = 0;
+            int32_t nd8 = node_swE_best(&T, lev, &S.c[i], &updir8, g_fcdd);
+            if (nd8 >= 0) Ei = (Ei > 0.0 ? Ei : 0.0) + g_fcdn[nd8] / g_fcdd[nd8];
+          }
+          eall8[i] = Ei;
           if (Ei < 0.0) {
             nmiss8++;
             for (int k = 0; k < 3; k++)
@@ -10977,6 +11107,73 @@ int main(int argc, char **argv) {
                (long long)nupall, (long long)nup1, (long long)nup2, (long long)nup3,
                (long long)nuproot, 100.0 * (double)nuproot / (double)(nupall > 0 ? nupall : 1),
                (long long)nmiss8);
+        /* ---- §798: ПРИБОР КАДРОВОЙ ЧЕШУИ — CV читаемого Ei по квантованным
+         * плоскостям КАДРОВОГО среза (группировка и константы §796-прибора;
+         * значение — Ei до альбедо, канал монохромный). Печатается во всех
+         * xframe-режимах, метка называет источник прямого канала. */
+        {
+          enum { HZ_CV_NQ = 4, HZ_CV_OFFH = 4, HZ_CV_MIN = 8 };
+          cvpair796 *cp8 = malloc((size_t)(S.n > 0 ? S.n : 1) * sizeof *cp8);
+          if (cp8 == NULL) exit(1);
+          int32_t ncp8 = 0;
+          for (int32_t i = 0; i < S.n; i++) {
+            if (!(eall8[i] >= 0.0)) continue;
+            double pw8[3], nn8[3];
+            hz_slice_vertex(&S, i, pw8);
+            for (int a = 0; a < 3; a++)
+              pw8[a] = fr.org[a] + pw8[a] * fr.h;
+            hz_slice_normal(&S, i, nn8);
+            double off = 0.0;
+            uint64_t kq = 0;
+            for (int a = 0; a < 3; a++) {
+              long qn = lround(nn8[a] * (double)HZ_CV_NQ);
+              kq = (kq << 8) | (uint64_t)(uint8_t)(qn + 16);
+              off += nn8[a] * pw8[a];
+            }
+            long ob = (long)floor(off / ((double)HZ_CV_OFFH * fr.h));
+            cp8[ncp8].key = (kq << 32) | (uint64_t)(uint32_t)(int32_t)ob;
+            cp8[ncp8].e = i;
+            ncp8++;
+          }
+          qsort(cp8, (size_t)ncp8, sizeof *cp8, cmp_cvpair796);
+          double *cvv8 = malloc((size_t)(ncp8 > 0 ? ncp8 : 1) * sizeof *cvv8);
+          if (cvv8 == NULL) exit(1);
+          int32_t ng8 = 0, ngb8 = 0;
+          int32_t i0 = 0;
+          while (i0 < ncp8) {
+            int32_t i1 = i0;
+            while (i1 < ncp8 && cp8[i1].key == cp8[i0].key)
+              i1++;
+            ng8++;
+            if (i1 - i0 >= HZ_CV_MIN) {
+              double s1 = 0.0, s2 = 0.0;
+              for (int32_t j = i0; j < i1; j++) {
+                double v = eall8[cp8[j].e];
+                s1 += v;
+                s2 += v * v;
+              }
+              double nn6 = (double)(i1 - i0);
+              double mean = s1 / nn6;
+              double var = s2 / nn6 - mean * mean;
+              if (mean > 0.0 && var > 0.0) cvv8[ngb8++] = sqrt(var) / mean;
+            }
+            i0 = i1;
+          }
+          if (ngb8 > 0) {
+            qsort(cvv8, (size_t)ngb8, sizeof *cvv8, cmp_dev699);
+            printf("   §798 ЧЕШУЯ КАДРА (%s): групп %d (с >=%d ячейками %d); CV p50 %.4f, "
+                   "p90 %.4f, макс %.4f\n",
+                   g_fcmode == 2 ? "гибрид: прямой из ядра"
+                                 : (g_fcmode == 1 ? "xfcelem: прямой из элементов" : "без fc"),
+                   ng8, (int)HZ_CV_MIN, ngb8, cvv8[ngb8 / 2],
+                   cvv8[(int32_t)((int64_t)ngb8 * 9 / 10)], cvv8[ngb8 - 1]);
+          } else
+            printf("   §798 ЧЕШУЯ КАДРА: групп с >=%d ячейками НЕТ (%d групп)\n", (int)HZ_CV_MIN,
+                   ng8);
+          free(cvv8);
+          free(cp8);
+        }
+        free(eall8);
         memcpy(irr, swv, 3 * (size_t)S.n * sizeof *irr);
         free(rt8);
         free(tmp8);

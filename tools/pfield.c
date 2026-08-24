@@ -2976,8 +2976,9 @@ static void gather_apply(const linkcache *lc, const etree *T, const hz_dcslice *
  * ρ·E_fc/hsum; свип разносит только рассеянный хвост. Лечение А1286: «чешуя»
  * кадра L9 — ray effect дискретных ординат (компактная лампа рисует звёзды по
  * ND направлениям); у сбора направления непрерывны, и класс уходит на ЛЮБЫХ
- * кусках, включая дешёвые DC. Ключ `xnofc` возвращает прежнюю инъекцию
- * эмиссией ПОСИМВОЛЬНО (негативный контроль §796).
+ * кусках, включая дешёвые DC. Включается КЛЮЧОМ `xfc` (исследовательский:
+ * приёмка §796-П3 провалена — чешуя при fc осталась, УБИВАЕТ сработал);
+ * без ключа — прежняя инъекция эмиссией ПОСИМВОЛЬНО (НК §796).
  *
  * Марши заслона fc-сбора НЕ попадают в `g_march_steps` (А1290): та строка
  * §620 принадлежит ядру §597, и смешение изменило бы её в комбинированных
@@ -6197,17 +6198,21 @@ int main(int argc, char **argv) {
   int xcontrib = 0;       /* §768: прибор вклада — перевозмущения ρ→0 по классам */
   double xcoarse = 0.0;   /* §772: метров дальности на лист размера; 0 — выключено */
   int xbounce = 0;        /* §774: лестница N прокидок-отскоков; 0 — выключено */
-  int xnofc = 0;          /* §796 НК: инъекция эмиссией, как до first-collision */
-  int hcontrib_set = 0;   /* §796: задан ли hcontrib= явно (для fc-умолчания) */
-  double xtailq = -1.0;   /* §774: q хвоста: <0 — измерить, 0 — усечение, >0 — НК */
-  int xbcmp774 = 0;       /* §774: базовый прогон и сравнение в одном процессе */
-  int xleak = 0;          /* §778: диагностический клип покрытия — адреса дыр */
-  int xnopiece = 0;       /* §780 НК: раздача и рез бесконечными плоскостями, как до Р-8 */
-  int xobjpiece = 0;      /* §794: куски из ТРЕУГОЛЬНИКОВ СЦЕНЫ (авторские нормали) */
-  int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
-  int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
-  int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
-                           * обрыва прогулки есть уровень единичного входа */
+  /* §796: first-collision source — ПО КЛЮЧУ, а не умолчанием. План §796 менял
+   * умолчание (прецедент §780), но приёмка П3 провалена (УБИВАЕТ: чешуя при
+   * fc осталась), и переворачивать канон под несработавшее лечение нельзя —
+   * ключ остаётся исследовательским до вердикта (класс А1287/xobjpiece). */
+  int xfc = 0;
+  int hcontrib_set = 0; /* §796: задан ли hcontrib= явно (для fc-умолчания) */
+  double xtailq = -1.0; /* §774: q хвоста: <0 — измерить, 0 — усечение, >0 — НК */
+  int xbcmp774 = 0;     /* §774: базовый прогон и сравнение в одном процессе */
+  int xleak = 0;        /* §778: диагностический клип покрытия — адреса дыр */
+  int xnopiece = 0;     /* §780 НК: раздача и рез бесконечными плоскостями, как до Р-8 */
+  int xobjpiece = 0;    /* §794: куски из ТРЕУГОЛЬНИКОВ СЦЕНЫ (авторские нормали) */
+  int xnomaxp = 0;      /* §735 НК: выключить принцип максимума — вернуть расходимость */
+  int xcmp = 0;         /* §744: поячеечное сличение свипа с ядром §597 */
+  int32_t xchain = -1;  /* §731: трасса цепочки к ячейке — только под xunit: пол
+                         * обрыва прогулки есть уровень единичного входа */
   int32_t xcelll[4] = {-1, -1, -1, -1}; /* §733: вскрытие обновления, до 4 ячеек */
   int xdir = -1;                        /* §733: направление вскрытия */
   /* §714: альбедо стыка вынесено в ОТДЕЛЬНЫЙ ключ и по умолчанию ВЫКЛЮЧЕНО:
@@ -6312,7 +6317,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "xdsaeps=", 8) == 0) xdsaeps = strtod(argv[i] + 8, NULL);
     if (strncmp(argv[i], "xcoarse=", 8) == 0) xcoarse = strtod(argv[i] + 8, NULL);
     if (strncmp(argv[i], "xbounce=", 8) == 0) xbounce = (int)strtol(argv[i] + 8, NULL, 10);
-    if (strcmp(argv[i], "xnofc") == 0) xnofc = 1;
+    if (strcmp(argv[i], "xfc") == 0) xfc = 1;
     if (strncmp(argv[i], "xtailq=", 7) == 0) xtailq = strtod(argv[i] + 7, NULL);
     if (strcmp(argv[i], "xbcmp") == 0) xbcmp774 = 1;
     if (strcmp(argv[i], "xleak") == 0) xleak = 1;
@@ -8173,14 +8178,14 @@ int main(int argc, char **argv) {
       /* ---- §796: FIRST-COLLISION SOURCE — инъекция первым отражением ----
        * Прямой свет от eemit-ламп собирается непрерывным механизмом (efc_*),
        * elem_emit подменяется на ρ·E_fc/hsum; Ke в свип не инъецируется.
-       * Пути со СТАРОЙ семантикой инъекции сохраняют её сами: xnofc (НК),
+       * Пути со СТАРОЙ семантикой инъекции сохраняют её и под ключом:
        * xhall/xemitfacet (elem_emit там NULL), xconst (печь, eemit = 0),
        * xunit (источники в ноль), xcmp (мост к ядру считает прямой свипом),
        * xcontrib (перевозмущение ρ→0 обязано гасить и первый отскок),
        * xdsa (закрытая линия §757 со старыми единицами моста). */
       double *efc796 = NULL, *einj796 = NULL;
       double injpow796 = 0.0;
-      int fcold = xnofc || xhall || xemitfacet || xconst || xunit || xcmp || xcontrib || xdsa;
+      int fcold = !xfc || xhall || xemitfacet || xconst || xunit || xcmp || xcontrib || xdsa;
       if (!fcold) {
         double tfc0 = now_s();
         int32_t nsrc = 0;
@@ -9328,7 +9333,7 @@ int main(int argc, char **argv) {
           }
           /* §796: зона меряет ПОЛНУЮ облучённость E_fc + рассеянное; при
            * старой инъекции — прежнее eirr (ветвь, не «+0», ради посимвольной
-           * воспроизводимости xnofc-мира). */
+           * воспроизводимости мира без ключа). */
           double e796 = efc796 != NULL ? st.eirr[e] + efc796[e] : st.eirr[e];
           double w = e796 * cut.se[e].area;
           ts2 += fabs(w);
@@ -9375,8 +9380,10 @@ int main(int argc, char **argv) {
         }
         qsort(cp, (size_t)ncp, sizeof *cp, cmp_cvpair796);
         double *cvv = malloc((size_t)(ncp > 0 ? ncp : 1) * sizeof *cvv);
-        if (cvv == NULL) exit(1);
-        int32_t ng = 0, ngbig = 0;
+        double *cvf6 = malloc((size_t)(ncp > 0 ? ncp : 1) * sizeof *cvf6);
+        double *cvt6 = malloc((size_t)(ncp > 0 ? ncp : 1) * sizeof *cvt6);
+        if (cvv == NULL || cvf6 == NULL || cvt6 == NULL) exit(1);
+        int32_t ng = 0, ngbig = 0, nf6 = 0, nt6 = 0;
         int32_t i0 = 0;
         while (i0 < ncp) {
           int32_t i1 = i0;
@@ -9384,17 +9391,31 @@ int main(int argc, char **argv) {
             i1++;
           ng++;
           if (i1 - i0 >= HZ_CV_MIN) {
-            double s1 = 0.0, s2 = 0.0;
+            /* три канала: полный свет, прямой E_fc, рассеянный хвост —
+             * компонентная атрибуция ряби (какое поле пятнисто) */
+            double s1 = 0.0, s2 = 0.0, f1 = 0.0, f2 = 0.0, t1 = 0.0, t2 = 0.0;
             for (int32_t j = i0; j < i1; j++) {
               int32_t e = cp[j].e;
-              double v = efc796 != NULL ? st.eirr[e] + efc796[e] : st.eirr[e];
+              double vf = efc796 != NULL ? efc796[e] : 0.0;
+              double vt = st.eirr[e];
+              double v = vf + vt;
               s1 += v;
               s2 += v * v;
+              f1 += vf;
+              f2 += vf * vf;
+              t1 += vt;
+              t2 += vt * vt;
             }
             double nn6 = (double)(i1 - i0);
             double mean = s1 / nn6;
             double var = s2 / nn6 - mean * mean;
             if (mean > 0.0 && var > 0.0) cvv[ngbig++] = sqrt(var) / mean;
+            if (efc796 != NULL) {
+              double mf = f1 / nn6, vfv = f2 / nn6 - mf * mf;
+              double mt = t1 / nn6, vtv = t2 / nn6 - mt * mt;
+              if (mf > 0.0 && vfv > 0.0) cvf6[nf6++] = sqrt(vfv) / mf;
+              if (mt > 0.0 && vtv > 0.0) cvt6[nt6++] = sqrt(vtv) / mt;
+            }
           }
           i0 = i1;
         }
@@ -9416,13 +9437,23 @@ int main(int argc, char **argv) {
           qsort(cvv, (size_t)ngbig, sizeof *cvv, cmp_dev699);
           printf("   §796 ЧЕШУЯ (%s): групп плоскостей %d (с ≥%d элементами %d); CV p50 %.4f, "
                  "p90 %.4f, макс %.4f; населённость фасетов: p50 %.0f, p90 %.0f, макс %d\n",
-                 efc796 != NULL ? "fc" : "xnofc", ng, (int)HZ_CV_MIN, ngbig, cvv[ngbig / 2],
+                 efc796 != NULL ? "fc" : "без fc", ng, (int)HZ_CV_MIN, ngbig, cvv[ngbig / 2],
                  cvv[(int32_t)((int64_t)ngbig * 9 / 10)], cvv[ngbig - 1], fp50, fp90, fpmax);
+          if (nf6 > 0 && nt6 > 0) {
+            qsort(cvf6, (size_t)nf6, sizeof *cvf6, cmp_dev699);
+            qsort(cvt6, (size_t)nt6, sizeof *cvt6, cmp_dev699);
+            printf("   §796 ЧЕШУЯ ПО КОМПОНЕНТАМ: ПРЯМОЙ E_fc CV p50 %.4f, p90 %.4f (групп %d); "
+                   "ХВОСТ свипа CV p50 %.4f, p90 %.4f (групп %d)\n",
+                   cvf6[nf6 / 2], cvf6[(int32_t)((int64_t)nf6 * 9 / 10)], nf6, cvt6[nt6 / 2],
+                   cvt6[(int32_t)((int64_t)nt6 * 9 / 10)], nt6);
+          }
         } else
           printf("   §796 ЧЕШУЯ: групп с ≥%d элементами НЕТ (плоскостных групп %d) — прибор "
                  "пуст, приёмка только глазами\n",
                  (int)HZ_CV_MIN, ng);
         free(cvv);
+        free(cvf6);
+        free(cvt6);
         free(cp);
         free(fpop);
       }

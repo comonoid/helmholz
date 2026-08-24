@@ -3113,11 +3113,17 @@ static int efc_center(const tr3_cut *cu, const tr3_mesh *ms, const frame *fr, in
  * рабочее у ядра §597 (`hgather=0.5`, канон §793). */
 #define HZ_FC_EPS 0.5
 
+/* Порог вклада fc-сбора, доля средней радиосити ламп (§621). Умолчание —
+ * КАНОН ядра §597 (`hcontrib=1e-1`, §793/§650-команды): при общем умолчании
+ * 1e-3 сбор на конвейере D0=10 стоил 9.35 с (замерено §796, 168 М связей);
+ * явный `hcontrib=` его перебивает. */
+#define HZ_FC_CONTRIB 1e-1
+
 /* Сбор E_fc по всем элементам. Возвращает счётчики фиксированным порядком
  * сведения (§770-дисциплина): связи, поток весь/заслонённый, шаги марша. */
 static void efc_run(const etree *T, const tr3_cut *cu, const tr3_mesh *ms, const frame *fr,
-                    const opyr *P, double *efc, int64_t *nlink, double *sall, double *sthru,
-                    int64_t *nmarch) {
+                    const opyr *P, double hcontrib, double *efc, int64_t *nlink, double *sall,
+                    double *sthru, int64_t *nmarch) {
   /* порог вклада §621: доля средневзвешенной радиосити ЛАМП с корня */
   double bsum = 0.0, asum = 0.0;
   for (int k = 0; k < T->e[0].nb; k++) {
@@ -3126,7 +3132,7 @@ static void efc_run(const etree *T, const tr3_cut *cu, const tr3_mesh *ms, const
     for (int c = 0; c < 3; c++)
       bsum += (double)rb->flux[c] / 3.0;
   }
-  double tau = g_hcontrib * (asum > 0.0 ? bsum / asum : 0.0);
+  double tau = hcontrib * (asum > 0.0 ? bsum / asum : 0.0);
   int nth = g_omp1 ? 1 : omp_get_max_threads();
   int64_t *plink = calloc((size_t)nth, sizeof *plink);
   double *pthru = calloc((size_t)nth, sizeof *pthru);
@@ -6192,6 +6198,7 @@ int main(int argc, char **argv) {
   double xcoarse = 0.0;   /* §772: метров дальности на лист размера; 0 — выключено */
   int xbounce = 0;        /* §774: лестница N прокидок-отскоков; 0 — выключено */
   int xnofc = 0;          /* §796 НК: инъекция эмиссией, как до first-collision */
+  int hcontrib_set = 0;   /* §796: задан ли hcontrib= явно (для fc-умолчания) */
   double xtailq = -1.0;   /* §774: q хвоста: <0 — измерить, 0 — усечение, >0 — НК */
   int xbcmp774 = 0;       /* §774: базовый прогон и сравнение в одном процессе */
   int xleak = 0;          /* §778: диагностический клип покрытия — адреса дыр */
@@ -6443,7 +6450,10 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[i], "nokemit") == 0) g_nokemit = 1;
     if (strcmp(argv[i], "hangle") == 0) g_hangle = 1;
-    if (strncmp(argv[i], "hcontrib=", 9) == 0) g_hcontrib = strtod(argv[i] + 9, NULL);
+    if (strncmp(argv[i], "hcontrib=", 9) == 0) {
+      g_hcontrib = strtod(argv[i] + 9, NULL);
+      hcontrib_set = 1; /* §796: явный порог перебивает fc-умолчание */
+    }
     if (strcmp(argv[i], "gflatvis") == 0) g_gflatvis = 1;
     if (strcmp(argv[i], "nolinkcache") == 0) g_nolinkcache = 1;
     if (strcmp(argv[i], "gnonorm") == 0) g_gnonorm = 1;
@@ -8209,7 +8219,8 @@ int main(int argc, char **argv) {
           efc_build(&ET6, sr6, 0, nsrc, 0, lev);
           int64_t nl6 = 0, nm6 = 0;
           double all6 = 0.0, thr6 = 0.0;
-          efc_run(&ET6, &cut, &mesh, &fr, &P, efc796, &nl6, &all6, &thr6, &nm6);
+          efc_run(&ET6, &cut, &mesh, &fr, &P, hcontrib_set ? g_hcontrib : HZ_FC_CONTRIB, efc796,
+                  &nl6, &all6, &thr6, &nm6);
           etree_free(&ET6);
           free(sr6);
           /* перехват и инъекция; сторож самозаслона А1292 — доля E_fc = 0 */

@@ -2470,7 +2470,9 @@ static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], c
       break;
     }
   if (bb == NULL) return;
-  double w[3], r2 = 0.0;
+  /* нулевая инициализация — гейт (§794-класс): gcc-analyzer на пути из
+   * efc_run теряет запись w[k] в цикле ниже; путь ложный, семантика та же */
+  double w[3] = {0, 0, 0}, r2 = 0.0;
   for (int k = 0; k < 3; k++) {
     w[k] = (double)bb->c[k] - pi[k];
     r2 += w[k] * w[k];
@@ -2966,6 +2968,223 @@ static void gather_apply(const linkcache *lc, const etree *T, const hz_dcslice *
       ind[3 * (size_t)i + (size_t)k] = (float)(acc[k] * fnorm * alb(m, S->c[i].mat, k));
   }
 }
+/* ---- §796: FIRST-COLLISION SOURCE ----------------------------------------
+ *
+ * Прямой свет Ke-ламп до ЭЛЕМЕНТОВ РАЗВЁРТКИ считается НЕПРЕРЫВНЫМ по
+ * направлениям сбором — той же машинерией, что ядро §597 (etree + hgather_rec
+ * + заслон shadowed_h), а в развёртку инъецируется ПЕРВОЕ ОТРАЖЕНИЕ
+ * ρ·E_fc/hsum; свип разносит только рассеянный хвост. Лечение А1286: «чешуя»
+ * кадра L9 — ray effect дискретных ординат (компактная лампа рисует звёзды по
+ * ND направлениям); у сбора направления непрерывны, и класс уходит на ЛЮБЫХ
+ * кусках, включая дешёвые DC. Ключ `xnofc` возвращает прежнюю инъекцию
+ * эмиссией ПОСИМВОЛЬНО (негативный контроль §796).
+ *
+ * Марши заслона fc-сбора НЕ попадают в `g_march_steps` (А1290): та строка
+ * §620 принадлежит ядру §597, и смешение изменило бы её в комбинированных
+ * прогонах. Счётчик у fc свой и печатается своей строкой. */
+
+/* Излучатель fc-дерева: светящийся элемент свипа. `flux` = π·L·area — ровно
+ * слагаемое `emitpow2`, поэтому Σ flux по корню обязана сойтись с печатью
+ * «Σ π·L·площадь»入 развёртки. `key` — мортон-код клетки (те же биты и тот же
+ * порядок осей, что у детей etree_build), `idx` — разрыв ничьих: сортировка
+ * становится тотальной, и порядок сложения в корзинах детерминирован. */
+typedef struct {
+  double c[3], n[3], flux, area;
+  uint64_t key;
+  int32_t idx;
+} efcsrc;
+
+static int efc_cmp(const void *a, const void *b) {
+  const efcsrc *x = a, *y = b;
+  if (x->key != y->key) return x->key < y->key ? -1 : 1;
+  return (x->idx > y->idx) - (x->idx < y->idx);
+}
+
+/* Клон etree_build над массивом излучателей-элементов: те же корзины по
+ * квадранту нормали, тот же спуск по битам мортон-кода. Копия сознательная:
+ * etree_build читает hz_dcslice (ячейки среза), а здесь элементы разреза —
+ * общей структуры входа у них нет, а менять §597-путь ради §796 значило бы
+ * трогать эталон гладкости, которым §796 принимается. */
+static int32_t efc_build(etree *T, const efcsrc *s, int32_t a, int32_t b, int lvl, int lev) {
+  int32_t me = etree_alloc(T, 1);
+  {
+    double c[6][3] = {{0}}, n[6][3] = {{0}}, fl[6] = {0}, ar[6] = {0};
+    double lo[6][3], hi[6][3];
+    for (int q = 0; q < 6; q++)
+      for (int k = 0; k < 3; k++) {
+        lo[q][k] = 1e300;
+        hi[q][k] = -1e300;
+      }
+    for (int32_t i = a; i < b; i++) {
+      int ax = 0;
+      for (int k = 1; k < 3; k++)
+        if (fabs(s[i].n[k]) > fabs(s[i].n[ax])) ax = k;
+      int q = 2 * ax + (s[i].n[ax] > 0.0 ? 1 : 0);
+      double aa = s[i].area;
+      ar[q] += aa;
+      fl[q] += s[i].flux;
+      for (int k = 0; k < 3; k++) {
+        c[q][k] += s[i].c[k] * aa;
+        n[q][k] += s[i].n[k] * aa;
+        if (s[i].c[k] < lo[q][k]) lo[q][k] = s[i].c[k];
+        if (s[i].c[k] > hi[q][k]) hi[q][k] = s[i].c[k];
+      }
+    }
+    int nbq = 0;
+    for (int q = 0; q < 6; q++)
+      if (ar[q] > 0.0) nbq++;
+    int32_t b0 = ebin_alloc(T, nbq);
+    T->e[me].b0 = b0;
+    T->e[me].nb = (signed char)nbq;
+    T->e[me].nch = 0;
+    for (int k = 0; k < 8; k++)
+      T->e[me].ch[k] = -1;
+    int j = 0;
+    for (int q = 0; q < 6; q++) {
+      if (!(ar[q] > 0.0)) continue;
+      ebin *bb = &T->b[b0 + j++];
+      memset(bb, 0, sizeof *bb);
+      bb->q = (signed char)q;
+      bb->area = (float)ar[q];
+      double nl = 0.0;
+      for (int k = 0; k < 3; k++) {
+        bb->c[k] = (float)(c[q][k] / ar[q]);
+        /* свип монохромный: три канала корзины несут одно и то же число */
+        bb->flux[k] = (float)fl[q];
+        double nk = n[q][k] / ar[q];
+        nl += nk * nk;
+      }
+      nl = sqrt(nl);
+      bb->nsum = (float)(nl * ar[q]);
+      for (int k = 0; k < 3; k++)
+        bb->n[k] = (float)(nl > 0.0 ? (n[q][k] / ar[q]) / nl : 0.0);
+      double r2 = 0.0;
+      for (int k = 0; k < 3; k++) {
+        double d = 0.5 * (hi[q][k] - lo[q][k]);
+        r2 += d * d;
+      }
+      bb->rad = (float)sqrt(r2);
+    }
+  }
+  if (b - a <= 1 || lvl >= lev) return me;
+  int sh = 3 * (lev - lvl - 1);
+  int32_t bnd[9];
+  bnd[0] = a;
+  int32_t cur = a;
+  for (int k = 1; k <= 8; k++) {
+    while (cur < b && (int)((s[cur].key >> sh) & 7u) < k)
+      cur++;
+    bnd[k] = cur;
+  }
+  int nc2 = 0;
+  int32_t ch2[8];
+  for (int k = 0; k < 8; k++) {
+    if (bnd[k + 1] <= bnd[k]) continue;
+    ch2[nc2++] = efc_build(T, s, bnd[k], bnd[k + 1], lvl + 1, lev);
+  }
+  for (int k = 0; k < nc2; k++)
+    T->e[me].ch[k] = ch2[k];
+  T->e[me].nch = (signed char)nc2;
+  return me;
+}
+
+/* Центроид элемента разреза В МИРЕ: среднее вершин многоугольника; при
+ * nv = 0 (не поместился, считан в nsebig) — центр клетки. Возврат 0 — откат
+ * к центру клетки, вызывающий его считает. */
+static int efc_center(const tr3_cut *cu, const tr3_mesh *ms, const frame *fr, int32_t e,
+                      double pi[3]) {
+  const tr3_selem *se = &cu->se[e];
+  if (se->nv > 0) {
+    for (int a = 0; a < 3; a++) {
+      pi[a] = 0.0;
+      for (int q = 0; q < se->nv; q++)
+        pi[a] += se->v[q][a];
+      pi[a] /= (double)se->nv;
+    }
+    return 1;
+  }
+  for (int a = 0; a < 3; a++)
+    pi[a] = fr->org[a] + ((double)ms->clo[se->cell][a] + 0.5 * (double)ms->csize[se->cell]) * fr->h;
+  return 0;
+}
+
+/* Угловой допуск спуска fc-сбора. Читается только под `hangle` (НК-режим
+ * прежнего углового критерия); рабочий спуск идёт по вкладу §621. Значение —
+ * рабочее у ядра §597 (`hgather=0.5`, канон §793). */
+#define HZ_FC_EPS 0.5
+
+/* Сбор E_fc по всем элементам. Возвращает счётчики фиксированным порядком
+ * сведения (§770-дисциплина): связи, поток весь/заслонённый, шаги марша. */
+static void efc_run(const etree *T, const tr3_cut *cu, const tr3_mesh *ms, const frame *fr,
+                    const opyr *P, double *efc, int64_t *nlink, double *sall, double *sthru,
+                    int64_t *nmarch) {
+  /* порог вклада §621: доля средневзвешенной радиосити ЛАМП с корня */
+  double bsum = 0.0, asum = 0.0;
+  for (int k = 0; k < T->e[0].nb; k++) {
+    const ebin *rb = &T->b[T->e[0].b0 + k];
+    asum += (double)rb->area;
+    for (int c = 0; c < 3; c++)
+      bsum += (double)rb->flux[c] / 3.0;
+  }
+  double tau = g_hcontrib * (asum > 0.0 ? bsum / asum : 0.0);
+  int nth = g_omp1 ? 1 : omp_get_max_threads();
+  int64_t *plink = calloc((size_t)nth, sizeof *plink);
+  double *pthru = calloc((size_t)nth, sizeof *pthru);
+  double *pall = calloc((size_t)nth, sizeof *pall);
+  int64_t *pmar = calloc((size_t)nth, sizeof *pmar);
+  if (plink == NULL || pthru == NULL || pall == NULL || pmar == NULL) exit(1);
+#pragma omp parallel for schedule(dynamic, 64) if (!g_omp1)
+  for (int32_t e = 0; e < cu->nse; e++) {
+    int th = g_omp1 ? 0 : omp_get_thread_num();
+    const tr3_selem *se = &cu->se[e];
+    efc[e] = 0.0;
+    if (!(se->area > 0.0)) continue;
+    /* нулевая инициализация — гейт: gcc-analyzer теряет запись pi[a] в цикле
+     * efc_center через границу OMP-замыкания (класс §794-FP), путь ложный */
+    double pi[3] = {0, 0, 0};
+    efc_center(cu, ms, fr, e, pi);
+    /* А1289: протяжённость ПРИЁМНИКА — сам элемент (√area), не клетка:
+     * на грубой сетке §782 клетка в метры заморозила бы дробление ламп. */
+    double rrecv = sqrt(se->area);
+    double acc[3] = {0, 0, 0}, ffacc = 0.0;
+    for (int q = 0; q < 6; q++)
+      hgather_rec(T, 0, q, pi, se->n, HZ_FC_EPS, tau, rrecv, P, fr, 1, acc, &plink[th], &pthru[th],
+                  &pall[th], NULL, &ffacc, NULL, 0, &pmar[th]);
+    /* нормировка §611 — как у сбора: оператор сжатие по построению */
+    double fnorm = (!g_gnonorm && ffacc > 1.0) ? 1.0 / ffacc : 1.0;
+    efc[e] = acc[0] * fnorm;
+  }
+  for (int t = 0; t < nth; t++) {
+    *nlink += plink[t];
+    *sall += pall[t];
+    *sthru += pthru[t];
+    *nmarch += pmar[t];
+  }
+  free(plink);
+  free(pthru);
+  free(pall);
+  free(pmar);
+}
+
+/* §796: пары «ключ квантованной плоскости — элемент» прибора чешуи и их
+ * порядок (по ключу, ничьи по элементу — сортировка тотальна, группы
+ * детерминированы). */
+typedef struct {
+  uint64_t key;
+  int32_t e;
+} cvpair796;
+
+static int cmp_cvpair796(const void *a, const void *b) {
+  const cvpair796 *x = a, *y = b;
+  if (x->key != y->key) return x->key < y->key ? -1 : 1;
+  return (x->e > y->e) - (x->e < y->e);
+}
+
+static int cmp_i32_796(const void *a, const void *b) {
+  int32_t x = *(const int32_t *)a, y = *(const int32_t *)b;
+  return (x > y) - (x < y);
+}
+
 /* УЗЕЛ ПО ЯЧЕЙКЕ СРЕЗА (§597, Р3). Ячейка несёт `lo` в сетке САМОГО МЕЛКОГО
  * уровня и свой уровень `lvl`; номера узла у неё нет. Спуск целочисленный: на
  * шаге `d` бит ребёнка берётся из разряда `lev−1−d` координаты — та же нумерация
@@ -5972,6 +6191,7 @@ int main(int argc, char **argv) {
   int xcontrib = 0;       /* §768: прибор вклада — перевозмущения ρ→0 по классам */
   double xcoarse = 0.0;   /* §772: метров дальности на лист размера; 0 — выключено */
   int xbounce = 0;        /* §774: лестница N прокидок-отскоков; 0 — выключено */
+  int xnofc = 0;          /* §796 НК: инъекция эмиссией, как до first-collision */
   double xtailq = -1.0;   /* §774: q хвоста: <0 — измерить, 0 — усечение, >0 — НК */
   int xbcmp774 = 0;       /* §774: базовый прогон и сравнение в одном процессе */
   int xleak = 0;          /* §778: диагностический клип покрытия — адреса дыр */
@@ -6085,6 +6305,7 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "xdsaeps=", 8) == 0) xdsaeps = strtod(argv[i] + 8, NULL);
     if (strncmp(argv[i], "xcoarse=", 8) == 0) xcoarse = strtod(argv[i] + 8, NULL);
     if (strncmp(argv[i], "xbounce=", 8) == 0) xbounce = (int)strtol(argv[i] + 8, NULL, 10);
+    if (strcmp(argv[i], "xnofc") == 0) xnofc = 1;
     if (strncmp(argv[i], "xtailq=", 7) == 0) xtailq = strtod(argv[i] + 7, NULL);
     if (strcmp(argv[i], "xbcmp") == 0) xbcmp774 = 1;
     if (strcmp(argv[i], "xleak") == 0) xleak = 1;
@@ -7937,6 +8158,80 @@ int main(int argc, char **argv) {
                "точное решение φ = 4π·влёт = %.6f\n",
                bconst, 4.0 * 3.14159265358979323846 * bconst);
       }
+      /* ---- §796: FIRST-COLLISION SOURCE — инъекция первым отражением ----
+       * Прямой свет от eemit-ламп собирается непрерывным механизмом (efc_*),
+       * elem_emit подменяется на ρ·E_fc/hsum; Ke в свип не инъецируется.
+       * Пути со СТАРОЙ семантикой инъекции сохраняют её сами: xnofc (НК),
+       * xhall/xemitfacet (elem_emit там NULL), xconst (печь, eemit = 0),
+       * xunit (источники в ноль), xcmp (мост к ядру считает прямой свипом),
+       * xcontrib (перевозмущение ρ→0 обязано гасить и первый отскок),
+       * xdsa (закрытая линия §757 со старыми единицами моста). */
+      double *efc796 = NULL, *einj796 = NULL;
+      double injpow796 = 0.0;
+      int fcold = xnofc || xhall || xemitfacet || xconst || xunit || xcmp || xcontrib || xdsa;
+      if (!fcold) {
+        double tfc0 = now_s();
+        int32_t nsrc = 0;
+        for (int32_t k = 0; k < cut.nse; k++)
+          if (eemit[k] > 0.0 && cut.se[k].area > 0.0) nsrc++;
+        if (nsrc == 0) {
+          printf("   §796 FIRST-COLLISION: светящихся элементов нет — инъекция прежняя\n");
+          fcold = 1;
+        } else {
+          efcsrc *sr6 = malloc((size_t)nsrc * sizeof *sr6);
+          efc796 = calloc((size_t)(cut.nse > 0 ? cut.nse : 1), sizeof *efc796);
+          einj796 = calloc((size_t)(cut.nse > 0 ? cut.nse : 1), sizeof *einj796);
+          if (sr6 == NULL || efc796 == NULL || einj796 == NULL) exit(1);
+          int32_t js = 0;
+          for (int32_t k = 0; k < cut.nse; k++) {
+            if (!(eemit[k] > 0.0 && cut.se[k].area > 0.0)) continue;
+            efcsrc *s = &sr6[js];
+            efc_center(&cut, &mesh, &fr, k, s->c);
+            for (int a = 0; a < 3; a++)
+              s->n[a] = cut.se[k].n[a];
+            s->area = cut.se[k].area;
+            s->flux = 3.14159265358979323846 * eemit[k] * cut.se[k].area;
+            s->idx = js;
+            s->key = 0;
+            for (int sh = lev - 1; sh >= 0; sh--) {
+              uint64_t bit = (uint64_t)(((mesh.clo[cut.se[k].cell][0] >> sh) & 1) |
+                                        (((mesh.clo[cut.se[k].cell][1] >> sh) & 1) << 1) |
+                                        (((mesh.clo[cut.se[k].cell][2] >> sh) & 1) << 2));
+              s->key = (s->key << 3) | bit;
+            }
+            js++;
+          }
+          qsort(sr6, (size_t)nsrc, sizeof *sr6, efc_cmp);
+          etree ET6;
+          memset(&ET6, 0, sizeof ET6);
+          efc_build(&ET6, sr6, 0, nsrc, 0, lev);
+          int64_t nl6 = 0, nm6 = 0;
+          double all6 = 0.0, thr6 = 0.0;
+          efc_run(&ET6, &cut, &mesh, &fr, &P, efc796, &nl6, &all6, &thr6, &nm6);
+          etree_free(&ET6);
+          free(sr6);
+          /* перехват и инъекция; сторож самозаслона А1292 — доля E_fc = 0 */
+          double icept6 = 0.0;
+          int64_t nz6 = 0, nrc6 = 0;
+          for (int32_t k = 0; k < cut.nse; k++) {
+            if (!(cut.se[k].area > 0.0)) continue;
+            nrc6++;
+            icept6 += efc796[k] * cut.se[k].area;
+            if (!(efc796[k] > 0.0)) nz6++;
+            double rho6 =
+                (cut.se[k].facet >= 0 && cut.se[k].facet < ftab.n) ? frho[cut.se[k].facet] : 0.0;
+            if (cut.se[k].hsum > 0.0) einj796[k] = rho6 * efc796[k] / cut.se[k].hsum;
+            injpow796 += rho6 * efc796[k] * cut.se[k].area;
+          }
+          printf("   §796 FIRST-COLLISION: излучателей %d, излучено %.6e, ПЕРЕХВАЧЕНО %.6e "
+                 "(%.1f %%), инъекция Σρ·E·area %.6e; связей %lld (заслонённого потока %.1f %%), "
+                 "маршей %lld; E_fc = 0 у %lld из %lld элементов (%.1f %%); %.2f с\n",
+                 nsrc, emitpow2, icept6, 100.0 * icept6 / (emitpow2 > 0.0 ? emitpow2 : 1.0),
+                 injpow796, (long long)nl6, 100.0 * thr6 / (all6 > 0.0 ? all6 : 1.0),
+                 (long long)nm6, (long long)nz6, (long long)nrc6,
+                 100.0 * (double)nz6 / (double)(nrc6 > 0 ? nrc6 : 1), now_s() - tfc0);
+        }
+      }
       tr3_dirs dirs;
       if (tr3_dirs_product(&dirs, nmu, nmu) != 0) exit(1);
       tr3_problem prob = {.m = &mesh,
@@ -7944,7 +8239,7 @@ int main(int argc, char **argv) {
                           .cut = &cut,
                           .facet_rho = frho,
                           .facet_emit = femit,
-                          .elem_emit = (xhall || xemitfacet) ? NULL : eemit,
+                          .elem_emit = (xhall || xemitfacet) ? NULL : (fcold ? eemit : einj796),
                           .nfacet = ftab.n,
                           .solid_rho = xsolidrho,
                           .binc0 = bconst,
@@ -8986,9 +9281,12 @@ int main(int argc, char **argv) {
        * Прибор проверен на двух известных точках: 0.6969 при xrho=0.7 и
        * 0.9973 при xrho=1 (ручной счёт по логам §737). При xhall излучение
        * задано иначе, и формула не действует. */
+      /* §796: под first-collision «эмиссия» формулы — ИНЪЕЦИРОВАННАЯ мощность
+       * Σρ·E_fc·area, а не π·L·area ламп: инъецируется первое отражение. */
+      double emitref796 = fcold ? emitpow2 : injpow796;
       if (st.psin > 0.0 && !xhall)
         printf("      §739 ρ_eff = (psout − эмиссия)/psin = (%.4e − %.4e)/%.4e = %.4f\n", st.psout,
-               emitpow2, st.psin, (st.psout - emitpow2) / st.psin);
+               emitref796, st.psin, (st.psout - emitref796) / st.psin);
       /* §782: Σ|E·area| БЛИЖНЕЙ ЛИЦЕВОЙ ЗОНЫ — приёмочная величина политики
        * огрубления (тот же предикат, что §768/§774): дальняя зона грубится,
        * и её ошибка не должна доносить сюда (А1212). Печатается всегда. */
@@ -9006,7 +9304,11 @@ int main(int argc, char **argv) {
             d2 += dd * dd;
             dot += cut.se[e].n[a] * dd;
           }
-          double w = st.eirr[e] * cut.se[e].area;
+          /* §796: зона меряет ПОЛНУЮ облучённость E_fc + рассеянное; при
+           * старой инъекции — прежнее eirr (ветвь, не «+0», ради посимвольной
+           * воспроизводимости xnofc-мира). */
+          double e796 = efc796 != NULL ? st.eirr[e] + efc796[e] : st.eirr[e];
+          double w = e796 * cut.se[e].area;
           ts2 += fabs(w);
           if (cut.se[e].nv > 0 && sqrt(d2) < 15.0 && !(dot > 0.0)) {
             zs2 += fabs(w);
@@ -9016,6 +9318,91 @@ int main(int argc, char **argv) {
         printf("      §782 ЗОНА (<15 м, лицевые): элементов %lld, Σ|E·area| %.6g; всей сцены "
                "%.6g\n",
                (long long)nz2, zs2, ts2);
+      }
+      /* ---- §796: ПРИБОР ЧЕШУИ ЧИСЛОМ (только в кадровых прогонах) --------
+       * Чешуя = вариация полной облучённости между элементами ОДНОЙ плоской
+       * поверхности. Группировка по КВАНТОВАННОЙ ПЛОСКОСТИ, а не по фасету:
+       * DC-фасеты одноклеточные, и фасетные группы мелки (А1288 — населённость
+       * фасетов печатается рядом как замер этого). Ключ группы: нормаль,
+       * округлённая к решётке 1/HZ_CV_NQ (4 — разделяет оси и диагонали, но
+       * терпит QEF-рябь), плюс корзина офсета шагом HZ_CV_OFFH·h (4h — толще
+       * кванта DC-вершины, тоньше межэтажного шага). CV = std/mean по группе
+       * из ≥ HZ_CV_MIN элементов (8 — минимум, при котором std читаем). */
+      if (xframe && st.eirr != NULL && cut.nse > 0) {
+        enum { HZ_CV_NQ = 4, HZ_CV_OFFH = 4, HZ_CV_MIN = 8 };
+        cvpair796 *cp = malloc((size_t)cut.nse * sizeof *cp);
+        int32_t *fpop = calloc((size_t)(ftab.n > 0 ? ftab.n : 1), sizeof *fpop);
+        if (cp == NULL || fpop == NULL) exit(1);
+        int32_t ncp = 0;
+        for (int32_t e = 0; e < cut.nse; e++) {
+          if (!(cut.se[e].area > 0.0)) continue;
+          if (cut.se[e].facet >= 0 && cut.se[e].facet < ftab.n) fpop[cut.se[e].facet]++;
+          double pc[3];
+          efc_center(&cut, &mesh, &fr, e, pc);
+          double off = 0.0;
+          uint64_t kq = 0;
+          for (int a = 0; a < 3; a++) {
+            long qn = lround(cut.se[e].n[a] * (double)HZ_CV_NQ);
+            kq = (kq << 8) | (uint64_t)(uint8_t)(qn + 16);
+            off += cut.se[e].n[a] * pc[a];
+          }
+          long ob = (long)floor(off / ((double)HZ_CV_OFFH * fr.h));
+          cp[ncp].key = (kq << 32) | (uint64_t)(uint32_t)(int32_t)ob;
+          cp[ncp].e = e;
+          ncp++;
+        }
+        qsort(cp, (size_t)ncp, sizeof *cp, cmp_cvpair796);
+        double *cvv = malloc((size_t)(ncp > 0 ? ncp : 1) * sizeof *cvv);
+        if (cvv == NULL) exit(1);
+        int32_t ng = 0, ngbig = 0;
+        int32_t i0 = 0;
+        while (i0 < ncp) {
+          int32_t i1 = i0;
+          while (i1 < ncp && cp[i1].key == cp[i0].key)
+            i1++;
+          ng++;
+          if (i1 - i0 >= HZ_CV_MIN) {
+            double s1 = 0.0, s2 = 0.0;
+            for (int32_t j = i0; j < i1; j++) {
+              int32_t e = cp[j].e;
+              double v = efc796 != NULL ? st.eirr[e] + efc796[e] : st.eirr[e];
+              s1 += v;
+              s2 += v * v;
+            }
+            double nn6 = (double)(i1 - i0);
+            double mean = s1 / nn6;
+            double var = s2 / nn6 - mean * mean;
+            if (mean > 0.0 && var > 0.0) cvv[ngbig++] = sqrt(var) / mean;
+          }
+          i0 = i1;
+        }
+        /* населённость фасетов — замер А1288 (сила фасетной группировки) */
+        int32_t nfnz = 0;
+        for (int32_t i = 0; i < ftab.n; i++)
+          if (fpop[i] > 0) {
+            fpop[nfnz++] = fpop[i]; /* уплотнение на месте: fpop дальше не ключ */
+          }
+        double fp50 = 0.0, fp90 = 0.0;
+        int32_t fpmax = 0;
+        if (nfnz > 0) {
+          qsort(fpop, (size_t)nfnz, sizeof *fpop, cmp_i32_796);
+          fp50 = fpop[nfnz / 2];
+          fp90 = fpop[(int32_t)((int64_t)nfnz * 9 / 10)];
+          fpmax = fpop[nfnz - 1];
+        }
+        if (ngbig > 0) {
+          qsort(cvv, (size_t)ngbig, sizeof *cvv, cmp_dev699);
+          printf("   §796 ЧЕШУЯ (%s): групп плоскостей %d (с ≥%d элементами %d); CV p50 %.4f, "
+                 "p90 %.4f, макс %.4f; населённость фасетов: p50 %.0f, p90 %.0f, макс %d\n",
+                 efc796 != NULL ? "fc" : "xnofc", ng, (int)HZ_CV_MIN, ngbig, cvv[ngbig / 2],
+                 cvv[(int32_t)((int64_t)ngbig * 9 / 10)], cvv[ngbig - 1], fp50, fp90, fpmax);
+        } else
+          printf("   §796 ЧЕШУЯ: групп с ≥%d элементами НЕТ (плоскостных групп %d) — прибор "
+                 "пуст, приёмка только глазами\n",
+                 (int)HZ_CV_MIN, ng);
+        free(cvv);
+        free(cp);
+        free(fpop);
       }
       /* §768: ПРИБОР ВКЛАДА — перевозмущение. Выключаем отражение класса
        * поверхностей (ρ→0 поэлементно; заслон сохраняется — А1210) и меряем
@@ -9138,7 +9525,9 @@ int main(int argc, char **argv) {
             nmiss758++;
             continue;
           }
-          g_swEn[ni] += st.eirr[e] * a;
+          /* §796: кадр читает ПОЛНУЮ облучённость — прямая E_fc плюс
+           * рассеянный хвост свипа; при старой инъекции — прежнее eirr */
+          g_swEn[ni] += (efc796 != NULL ? st.eirr[e] + efc796[e] : st.eirr[e]) * a;
           g_swEd[ni] += a;
         }
         swE_lift(&T, 0);
@@ -9271,6 +9660,8 @@ int main(int argc, char **argv) {
       free(st.sout);
       tr3_dirs_free(&dirs);
       free(frho);
+      free(efc796);
+      free(einj796);
       free(eemit);
       free(femit);
       free(sig_t);

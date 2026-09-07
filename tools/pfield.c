@@ -3163,6 +3163,11 @@ typedef struct {
   double *sout1; /* НЕ const: НК-скрэмбл портит хранилище (А1349) */
   double qhat1;  /* q̂ лестницы кадра 1; ≤0 — замыкания не было */
   double emitpow1;
+  /* Р3 §810/А1357: альбедо фасетов кадра 1 для ПЕРЕИСПОЛЬЗОВАНИЯ (свойство
+   * фасета, не сетки; уже умножено на xrhoscale в кадре 1 — повторное
+   * умножение запрещено). NULL — прежний скоринг по элементам сетки 2. */
+  const double *frho1;
+  int xrhocal; /* калибровка: построить ОБЕ версии, сверить, напечатать */
   /* задача-шаблон: ординаты, лимитер, reltol — всё камера-независимое */
   const tr3_problem *prob;
   double eye1[3], shift[3];
@@ -3380,16 +3385,27 @@ static void warm808_run(const warm808 *cx) {
             cut2.mvol[ci][i][j] = 0.0;
       }
     }
-  /* АЛЬБЕДО ФАСЕТОВ сетки 2 — тот же §739-скоринг по элементам сетки 2 (без
-   * xmatrho — константа xrho, как прежде). Материал живёт у элемента (§667). */
+  /* АЛЬБЕДО ФАСЕТОВ сетки 2. Р3 §810/А1357: по умолчанию ПЕРЕИСПОЛЬЗУЕТСЯ
+   * frho кадра 1 — альбедо есть свойство ФАСЕТА (общая таблица ft), а
+   * скоринг — лишь атрибуция по данной сетке (разброс А1135); frho1 уже несёт
+   * множитель xrhoscale, повторное умножение запрещено. Калибровка xrhocal
+   * строит скоринг-версию и печатает расхождение (порог 5 % — информация,
+   * не переключатель: переключать поведение в прогоне значило бы мерить
+   * другую физику, чем напечатана). */
   const int32_t nse2 = cut2.nse;
   double *frho2 = calloc((size_t)(cx->ft->n > 0 ? cx->ft->n : 1), sizeof *frho2);
   double *eemit2 = calloc((size_t)(nse2 > 0 ? nse2 : 1), sizeof *eemit2);
   double *sigt2 = calloc((size_t)mesh2.ncell, sizeof *sigt2);
   double *sigs2 = calloc((size_t)mesh2.ncell, sizeof *sigs2);
   if (frho2 == NULL || eemit2 == NULL || sigt2 == NULL || sigs2 == NULL) exit(1);
-  for (int32_t i = 0; i < cx->ft->n; i++)
-    frho2[i] = cx->xrho;
+  int frho_reused = 0;
+  if (cx->frho1 != NULL) {
+    memcpy(frho2, cx->frho1, (size_t)cx->ft->n * sizeof *frho2);
+    frho_reused = 1;
+  } else {
+    for (int32_t i = 0; i < cx->ft->n; i++)
+      frho2[i] = cx->xrho;
+  }
   if (cx->xmatrho) {
     double *frnum = calloc((size_t)cx->ft->n, sizeof *frnum);
     double *frden = calloc((size_t)cx->ft->n, sizeof *frden);
@@ -3497,8 +3513,136 @@ static void warm808_run(const warm808 *cx) {
              "класс А1217)\n",
              (long long)nlsclip808, (int)LS808);
   }
-  for (int32_t i = 0; i < cx->ft->n; i++)
-    frho2[i] *= cx->xrhoscale;
+  if (!frho_reused)
+    for (int32_t i = 0; i < cx->ft->n; i++)
+      frho2[i] *= cx->xrhoscale;
+  /* Калибровка Р3 (xrhocal): построить скоринг-версию тем же кодом и сверить
+   * с переиспользованной — расхождение печатается ДОРОГОЙ ОДНОКРАТНОЙ
+   * проверкой, в рабочий путь не входит. */
+  if (cx->xrhocal && frho_reused) {
+    double *frs = calloc((size_t)(cx->ft->n > 0 ? cx->ft->n : 1), sizeof *frs);
+    double *frnum = calloc((size_t)cx->ft->n, sizeof *frnum);
+    double *frden = calloc((size_t)cx->ft->n, sizeof *frden);
+    if (frs == NULL || frnum == NULL || frden == NULL) exit(1);
+    for (int32_t i = 0; i < cx->ft->n; i++)
+      frs[i] = cx->xrho;
+    if (cx->xmatrho) {
+      enum { LSC8 = 4096 };
+      int32_t lsc8[LSC8];
+      int64_t nclipc8 = 0;
+      for (int32_t k = 0; k < nse2; k++) {
+        if (cut2.se[k].nv <= 0) continue;
+        int32_t ci = cut2.se[k].cell;
+        if (ci < 0 || ci >= mesh2.ncell) continue;
+        const int32_t *ls = NULL;
+        int32_t nls = 0;
+        if (mesh2.csize[ci] > 1 && cut2.se[k].facet >= 0 && cut2.se[k].facet < cx->ft->n &&
+            cx->ft->f[cut2.se[k].facet].bounded) {
+          const hz_facet *fp8 = &cx->ft->f[cut2.se[k].facet];
+          int32_t blo8[3], bhi8[3];
+          int ntv8 = fp8->tnv >= 3 && fp8->tnv <= HZ_FACET_TVMAX ? fp8->tnv : 3;
+          for (int a = 0; a < 3; a++) {
+            double mn = fp8->tv[0][a], mx = fp8->tv[0][a];
+            for (int q2 = 1; q2 < ntv8; q2++) {
+              if (fp8->tv[q2][a] < mn) mn = fp8->tv[q2][a];
+              if (fp8->tv[q2][a] > mx) mx = fp8->tv[q2][a];
+            }
+            blo8[a] = (int32_t)floor(mn);
+            bhi8[a] = (int32_t)floor(mx);
+            if (blo8[a] < 0) blo8[a] = 0;
+            if (bhi8[a] > cx->occn - 1) bhi8[a] = cx->occn - 1;
+          }
+          int32_t nu = 0;
+          for (int32_t iz = blo8[2]; iz <= bhi8[2]; iz++)
+            for (int32_t iy = blo8[1]; iy <= bhi8[1]; iy++)
+              for (int32_t ix = blo8[0]; ix <= bhi8[0]; ix++) {
+                int32_t cl8[3] = {ix, iy, iz};
+                const int32_t *l2 = NULL;
+                int32_t n2 = ct_list(cx->ctctx, cl8, &l2);
+                for (int32_t q2 = 0; q2 < n2; q2++) {
+                  if (nu >= LSC8) {
+                    nclipc8++;
+                    break;
+                  }
+                  lsc8[nu++] = l2[q2];
+                }
+              }
+          ls = lsc8;
+          nls = nu;
+        } else {
+          int32_t cellc[3] = {mesh2.clo[ci][0], mesh2.clo[ci][1], mesh2.clo[ci][2]};
+          nls = ct_list(cx->ctctx, cellc, &ls);
+        }
+        if (nls == 0) continue;
+        double ec[3] = {0, 0, 0};
+        for (int q2 = 0; q2 < cut2.se[k].nv; q2++)
+          for (int a = 0; a < 3; a++)
+            ec[a] += cut2.se[k].v[q2][a] / (double)cut2.se[k].nv;
+        const double *en = cut2.se[k].n;
+        int32_t tbest = ls[0];
+        double sbest = cx->xmatfar ? -1.0 : 1e300, cbest = 1e300;
+        for (int32_t q2 = 0; q2 < nls; q2++) {
+          const double *A3, *B3, *C3;
+          tri_verts(cx->om, ls[q2], &A3, &B3, &C3);
+          double e1[3] = {B3[0] - A3[0], B3[1] - A3[1], B3[2] - A3[2]};
+          double e2[3] = {C3[0] - A3[0], C3[1] - A3[1], C3[2] - A3[2]};
+          double nt[3];
+          nt[0] = e1[1] * e2[2] - e1[2] * e2[1];
+          nt[1] = e1[2] * e2[0] - e1[0] * e2[2];
+          nt[2] = e1[0] * e2[1] - e1[1] * e2[0];
+          double nl = sqrt(nt[0] * nt[0] + nt[1] * nt[1] + nt[2] * nt[2]);
+          if (!(nl > 0.0)) continue;
+          double dist = 0.0, dot = 0.0, cd = 0.0;
+          for (int a = 0; a < 3; a++) {
+            dist += nt[a] / nl * (ec[a] - A3[a]);
+            dot += nt[a] / nl * en[a];
+            double tc = (A3[a] + B3[a] + C3[a]) / 3.0 - ec[a];
+            cd += tc * tc;
+          }
+          double sc = fabs(dist) + cx->ofr->u[0] * (1.0 - fabs(dot));
+          if (cx->xmatfar) {
+            if (sc > sbest) {
+              sbest = sc;
+              tbest = ls[q2];
+            }
+          } else if (sc < sbest - 1e-6 * cx->ofr->u[0] ||
+                     (sc < sbest + 1e-6 * cx->ofr->u[0] && cd < cbest)) {
+            sbest = sc;
+            cbest = cd;
+            tbest = ls[q2];
+          }
+        }
+        int32_t mi2 = cx->om->fm != NULL ? cx->om->fm[tbest] : 0;
+        if (mi2 < 0 || mi2 >= cx->om->nmtl) mi2 = 0;
+        double kd = cx->om->mtl[mi2].kd;
+        if (!(kd >= 0.0 && kd <= 1.0)) kd = 0.5;
+        frnum[cut2.se[k].facet] += kd * cut2.se[k].area;
+        frden[cut2.se[k].facet] += cut2.se[k].area;
+      }
+      for (int32_t i = 0; i < cx->ft->n; i++)
+        frs[i] = frden[i] > 0.0 ? cx->xrhoscale * frnum[i] / frden[i] : cx->xrhoscale * 0.5;
+      (void)nclipc8;
+    } else
+      for (int32_t i = 0; i < cx->ft->n; i++)
+        frs[i] = cx->xrho * cx->xrhoscale;
+    int64_t ndiff8 = 0;
+    double dmax8 = 0.0;
+    for (int32_t i = 0; i < cx->ft->n; i++) {
+      double d8 = fabs(frs[i] - frho2[i]);
+      if (d8 > 0.01) ndiff8++;
+      if (d8 > dmax8) dmax8 = d8;
+    }
+    printf("   §808/Р3 КАЛИБРОВКА АЛЬБЕДО: фасетов с |frho1−frho2| > 0.01 — %lld из %d "
+           "(%.2f %%), макс |Δ| %.4f%s\n",
+           (long long)ndiff8, cx->ft->n,
+           100.0 * (double)ndiff8 / (double)(cx->ft->n > 0 ? cx->ft->n : 1), dmax8,
+           100.0 * (double)ndiff8 / (double)(cx->ft->n > 0 ? cx->ft->n : 1) > 5.0
+               ? " — ПРЕВЫШЕН ПОРОГ 5 %%, НАХОДКА"
+               : "");
+    free(frs);
+    free(frnum);
+    free(frden);
+  }
   /* §786-раздача Ke на сетке 2 — та же машина: энергия ячейки точным клипом
    * треугольников к листовым клеткам, раздача элементам по площадям. */
   double emitpow2b = 0.0;
@@ -4078,6 +4222,136 @@ static void warm808_run(const warm808 *cx) {
   free(solid2);
   tr3_cut_free(&cut2);
   tr3_mesh_free(&mesh2);
+}
+
+/* ---- §810: РАСПИСАНИЕ ОТСКОКОВ — лестница на СМЕШАННЫХ ординатах -----------
+ *
+ * Директива §768-приписки: «отскок n глаже отскока n−1 ⇒ грубить с номером;
+ * агрессивность от ШИРИНЫ ЛЕПЕСТКА; первый отскок не грубить (тени)». Ось
+ * этого шага — УГЛОВАЯ: такт 1 идёт набором d1 (рабочие ординаты), такты ≥2 —
+ * набором d2 (реже: после одного диффузного отскока угловой спектр — свёртка
+ * с ламбертовым лепестком). Состояние (φ/bout/sout) угловой оси НЕ ИМЕЕТ
+ * (φ — скалярный поток), наборы меняются между тактами без преобразований.
+ * q̂ по двум последним приращениям: при N ≥ 3 оба — из ОДНОГО оператора S_{d2}
+ * (А1356); переходная Δ_1 в оценку не входит. Замыкание — то же, что §774.
+ * ПРОСТРАНСТВЕННАЯ ось (грейд на отскок) закрыта экономикой плана §810:
+ * пересборка грейда [1.0, 1.3] с против экономии такта ≤ 0.5 с. */
+static void sched810_ladder(const tr3_problem *pb, const tr3_dirs *d1, const tr3_dirs *d2, int nmu1,
+                            int nmu2, int nb, double xtailq, double *phi, tr3_stats *stout,
+                            double *qout, double *tout) {
+  const int32_t nse4 = pb->cut != NULL ? pb->cut->nse : 0;
+  const size_t nph = (size_t)pb->m->ncell * 4, nbo = (size_t)pb->m->nf * 4,
+               nso = (size_t)(nse4 > 0 ? nse4 : 1) * 4;
+  double *pphi = calloc(nph, sizeof *pphi);
+  double *pbo = calloc(nbo, sizeof *pbo);
+  double *pso = calloc(nso, sizeof *pso);
+  double *dpphi = calloc(nph, sizeof *dpphi);
+  double *dpbo = calloc(nbo, sizeof *dpbo);
+  double *dpso = calloc(nso, sizeof *dpso);
+  double *peirr = calloc((size_t)(nse4 > 0 ? nse4 : 1), sizeof *peirr);
+  if (pphi == NULL || pbo == NULL || pso == NULL || dpphi == NULL || dpbo == NULL || dpso == NULL ||
+      peirr == NULL)
+    exit(1);
+  double *ub = NULL, *us = NULL;
+  double qnum = 0.0, qden = 0.0, denprev = 0.0;
+  double scprev[6] = {0, 0, 0, 0, 0, 0};
+  memset(stout, 0, sizeof *stout);
+  double t0 = now_s();
+  for (int t = 1; t <= nb; t++) {
+    tr3_problem pl = *pb;
+    pl.d = t == 1 ? d1 : d2; /* §810: первый отскок не грубится */
+    if (t > 1) {
+      pl.warm_start = 1;
+      pl.bout_in = ub;
+      pl.sout_in = us;
+    }
+    tr3_stats stt;
+    memset(&stt, 0, sizeof stt);
+    double tt = now_s();
+    if (tr3_sweep_solve(&pl, 1, 0.0, phi, &stt) != 0) exit(1);
+    double num_t = 0.0, dencur = 0.0, dmx = 0.0;
+    for (size_t i = 0; i < nph; i++) {
+      double dc = phi[i] - pphi[i];
+      num_t += dc * dpphi[i];
+      if (fabs(dc) > dmx) dmx = fabs(dc);
+      dencur += dc * dc;
+      dpphi[i] = dc;
+      pphi[i] = phi[i];
+    }
+    for (size_t i = 0; i < nbo; i++) {
+      double dc = stt.bout[i] - pbo[i];
+      num_t += dc * dpbo[i];
+      dencur += dc * dc;
+      dpbo[i] = dc;
+      pbo[i] = stt.bout[i];
+    }
+    for (size_t i = 0; i < nso; i++) {
+      double dc = stt.sout[i] - pso[i];
+      num_t += dc * dpso[i];
+      dencur += dc * dc;
+      dpso[i] = dc;
+      pso[i] = stt.sout[i];
+    }
+    if (t > 1) {
+      qnum = num_t;
+      qden = denprev;
+    }
+    denprev = dencur;
+    printf("   §810 такт %2d (nmu %d, ND %d): |Δφ|∞ %.3e, psin %.6g, %.2f с\n", t,
+           t == 1 ? nmu1 : nmu2, t == 1 ? d1->n : d2->n, dmx, stt.psin, now_s() - tt);
+    free(ub);
+    free(us);
+    ub = stt.bout;
+    us = stt.sout;
+    if (t < nb) {
+      if (stt.eirr != NULL)
+        for (int32_t e = 0; e < nse4; e++)
+          peirr[e] = stt.eirr[e];
+      scprev[0] = stt.pin;
+      scprev[1] = stt.pout;
+      scprev[2] = stt.pabs;
+      scprev[3] = stt.psin;
+      scprev[4] = stt.psout;
+      scprev[5] = stt.psolid;
+      free(stt.eirr);
+    } else
+      *stout = stt;
+  }
+  *tout = now_s() - t0;
+  if (ub == NULL || us == NULL) exit(1); /* nb ≥ 1: решатель обязан оставить состояние */
+  double q = -1.0;
+  if (xtailq > 0.0)
+    q = xtailq;
+  else if (xtailq < 0.0 && nb >= HZ_TAILN_MIN && qden > 0.0)
+    q = qnum / qden;
+  if (q > 0.0 && q <= HZ_TAILQ_MAX) {
+    double mult = q / (1.0 - q);
+    for (size_t i = 0; i < nph; i++)
+      phi[i] += mult * dpphi[i];
+    for (size_t i = 0; i < nbo; i++)
+      ub[i] += mult * dpbo[i];
+    for (size_t i = 0; i < nso; i++)
+      us[i] += mult * dpso[i];
+    if (stout->eirr != NULL)
+      for (int32_t e = 0; e < nse4; e++)
+        stout->eirr[e] += mult * (stout->eirr[e] - peirr[e]);
+    stout->pin += mult * (stout->pin - scprev[0]);
+    stout->pout += mult * (stout->pout - scprev[1]);
+    stout->pabs += mult * (stout->pabs - scprev[2]);
+    stout->psin += mult * (stout->psin - scprev[3]);
+    stout->psout += mult * (stout->psout - scprev[4]);
+    stout->psolid += mult * (stout->psolid - scprev[5]);
+  }
+  *qout = q;
+  printf("   §810 ЛЕСТНИЦА: %d тактов за %.2f с, q̂ %.4f (%s)\n", nb, *tout, q > 0.0 ? q : 0.0,
+         xtailq > 0.0 ? "ФОРСИРОВАН — НК" : (q > 0.0 ? "измерен" : "нет — усечение"));
+  free(pphi);
+  free(pbo);
+  free(pso);
+  free(dpphi);
+  free(dpbo);
+  free(dpso);
+  free(peirr);
 }
 
 static int32_t g_xcmp_n = 0, g_xcmp_nemit = 0;
@@ -7452,6 +7726,9 @@ int main(int argc, char **argv) {
   double xwarm3[3] = {0, 0, 0}; /* сдвиг глаза кадра 2, МЕТРЫ (А1347) */
   int xwarm_n = 1;              /* корректирующих прокидок: 1 умолчание, 2 — ветка А1348 */
   int xscramble808 = 0;         /* §808 НК-1: знак у top-1 % |sout| хранения кадра 1 */
+  int xs810_set = 0;            /* §810: расписание отскоков — ключ задан */
+  int xs810_1 = 0, xs810_2 = 0; /* nmu такта 1 и тактов ≥2; 0,0 = ординаты канона */
+  int xrhocal810 = 0;           /* §810 Р3: калибровка переиспользования альбедо */
   int xleak = 0;                /* §778: диагностический клип покрытия — адреса дыр */
   int xnopiece = 0;             /* §780 НК: раздача и рез бесконечными плоскостями, как до Р-8 */
   int xobjpiece = 0;            /* §794: куски из ТРЕУГОЛЬНИКОВ СЦЕНЫ (авторские нормали) */
@@ -7594,6 +7871,17 @@ int main(int argc, char **argv) {
       xwarm_set = 1;
     }
     if (strcmp(argv[i], "xscramble") == 0) xscramble808 = 1;
+    /* §810: xsched=N1,N2 — ординаты (nmu) такта 1 и тактов ≥2 лестницы
+     * xbounce; 0 в поле = ордината канона (nmu). Умолчание «канон,канон» —
+     * прежний мир; рабочая точка «2,1»; НК — «1,1» (тени грубятся) и «2,3»
+     * (хвост дороже — двусторонняя вилка). */
+    if (strncmp(argv[i], "xsched=", 7) == 0) {
+      xs810_1 = (int)strtol(argv[i] + 7, NULL, 10);
+      const char *cp810 = strchr(argv[i] + 7, ',');
+      xs810_2 = cp810 != NULL ? (int)strtol(cp810 + 1, NULL, 10) : xs810_1;
+      xs810_set = 1;
+    }
+    if (strcmp(argv[i], "xrhocal") == 0) xrhocal810 = 1;
     if (strcmp(argv[i], "xleak") == 0) xleak = 1;
     if (strcmp(argv[i], "xnopiece") == 0) xnopiece = 1;
     if (strcmp(argv[i], "xobjpiece") == 0) xobjpiece = 1;
@@ -10234,6 +10522,8 @@ int main(int argc, char **argv) {
         }
         st = stfin;
         printf("   §774 ЛЕСТНИЦА: %d тактов за %.2f с\n", xbounce, now_s() - tlad);
+        const double t774lad = now_s() - tlad; /* §810: база сравнения — та же
+                                                * величина, что напечатана выше */
         /* замыкание хвоста */
         double qhat = -1.0;
         if (xtailq > 0.0)
@@ -10333,6 +10623,84 @@ int main(int argc, char **argv) {
           free(phiB4);
           free(eirrB);
         }
+        /* §810: РАСПИСАНИЕ ОТСКОКОВ. База сравнения — УЖЕ посчитанная лестница
+         * кадра («2,2»: ординаты канона); расписание — диагностический прогон
+         * на своих наборах по sched810_ladder. Кадр остаётся при ординатах
+         * канона до приёмки П1/П2 — переворот умолчания отдельным решением. */
+        if (xs810_set) {
+          if (xs810_1 < 0 || xs810_1 > 4 || xs810_2 < 0 || xs810_2 > 4) {
+            fprintf(stderr, "xsched=: поля %d,%d — вне [0, 4] (0 = ордината канона)\n", xs810_1,
+                    xs810_2);
+            exit(1);
+          }
+          int n1_810 = xs810_1 > 0 ? xs810_1 : nmu;
+          int n2_810 = xs810_2 > 0 ? xs810_2 : nmu;
+          tr3_dirs d1_810, d2_810;
+          const tr3_dirs *pd1 = &dirs, *pd2 = &dirs;
+          if (n1_810 != nmu) {
+            if (tr3_dirs_product(&d1_810, n1_810, n1_810) != 0) exit(1);
+            pd1 = &d1_810;
+          }
+          if (n2_810 != nmu) {
+            if (tr3_dirs_product(&d2_810, n2_810, n2_810) != 0) exit(1);
+            pd2 = &d2_810;
+          }
+          const size_t nph810 = (size_t)mesh.ncell * 4;
+          double *phiS = calloc(nph810, sizeof *phiS);
+          double *rel810 = malloc((size_t)(cut.nse > 0 ? cut.nse : 1) * sizeof *rel810);
+          if (phiS == NULL || rel810 == NULL) exit(1);
+          tr3_stats stS;
+          memset(&stS, 0, sizeof stS);
+          double qS = -1.0, tS = 0.0;
+          sched810_ladder(&prob, pd1, pd2, n1_810, n2_810, xbounce, xtailq, phiS, &stS, &qS, &tS);
+          /* сравнение с лестницей кадра (st — закрытое состояние той же сетки) */
+          double dps810 = st.psin > 0.0 ? 100.0 * (stS.psin - st.psin) / st.psin : 0.0;
+          double zw810 = 0.0, zb810 = 0.0;
+          int64_t nzone810 = 0, nuse810 = 0;
+          for (int32_t e = 0; e < cut.nse; e++) {
+            double a9 = cut.se[e].area;
+            if (!(a9 > 0.0) || stS.eirr == NULL || st.eirr == NULL) continue;
+            double c9[3] = {0, 0, 0};
+            for (int q = 0; q < cut.se[e].nv; q++)
+              for (int a = 0; a < 3; a++)
+                c9[a] += cut.se[e].v[q][a] / (double)(cut.se[e].nv > 0 ? cut.se[e].nv : 1);
+            double d2 = 0.0, dot = 0.0;
+            for (int a = 0; a < 3; a++) {
+              double dd = c9[a] - g_eye[a];
+              d2 += dd * dd;
+              dot += cut.se[e].n[a] * dd;
+            }
+            int inzone = sqrt(d2) < 15.0 && !(dot > 0.0);
+            double wS = fabs(stS.eirr[e]) * a9, wB = fabs(st.eirr[e]) * a9;
+            if (inzone) {
+              zw810 += wS;
+              zb810 += wB;
+              nzone810++;
+            }
+            if (fabs(st.eirr[e]) > 0.0)
+              rel810[nuse810++] = fabs(stS.eirr[e] - st.eirr[e]) / fabs(st.eirr[e]);
+          }
+          double dz810 = 100.0 * (zw810 - zb810) / (zb810 > 0.0 ? zb810 : 1.0);
+          double p99810 = 0.0;
+          if (nuse810 > 0) {
+            qsort(rel810, (size_t)nuse810, sizeof *rel810, cmp_dev699);
+            p99810 = rel810[(nuse810 * 99) / 100];
+          }
+          int bit810 =
+              n1_810 == nmu && n2_810 == nmu && memcmp(phiS, phi, nph810 * sizeof(double)) == 0;
+          printf("   §810 РАСПИСАНИЕ: такт1 nmu %d (ND %d), хвост nmu %d (ND %d); лестница "
+                 "%.2f с против %.2f с (выигрыш ×%.2f); Δpsin %+.3f %%, Δ зоны %+.3f %%; "
+                 "q̂ %.4f; eirr p99 %.4g (покрытие %lld); тождество «канон,канон»: %s\n",
+                 n1_810, pd1->n, n2_810, pd2->n, tS, t774lad, tS > 0.0 ? t774lad / tS : 0.0, dps810,
+                 dz810, qS > 0.0 ? qS : 0.0, p99810, (long long)nuse810, bit810 ? "ДА" : "нет");
+          free(stS.bout);
+          free(stS.sout);
+          free(stS.eirr);
+          free(phiS);
+          free(rel810);
+          if (pd1 == &d1_810) tr3_dirs_free(&d1_810);
+          if (pd2 == &d2_810) tr3_dirs_free(&d2_810);
+        }
         /* §808: СТЕНД ИНКРЕМЕНТНОСТИ СВЕТА. Стоит ПОСЛЕ лестницы и замыкания
          * кадра 1: его вход — закрытое состояние (phi, st.bout, st.sout) и
          * измеренный q̂. Гварды здесь, а не в разборе ключей: условие — не
@@ -10385,6 +10753,8 @@ int main(int argc, char **argv) {
           cx8.sout1 = st.sout;
           cx8.qhat1 = qhat;
           cx8.emitpow1 = emitpow2;
+          cx8.frho1 = frho; /* Р3 §810: переиспользование альбедо фасетов */
+          cx8.xrhocal = xrhocal810;
           cx8.prob = &prob;
           for (int a = 0; a < 3; a++)
             cx8.eye1[a] = g_eye[a];

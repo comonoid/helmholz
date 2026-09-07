@@ -88,7 +88,10 @@ static float *pfm_read(const char *path, int *w, int *h, int *nch) {
   return d;
 }
 
-/* локальный размах в окне 3×3 */
+/* локальный размах в окне 3×3. Берётся по КАНАЛУ R (индекс 0): кромка — свойство
+ * геометрии эталона, одного канала достаточно; кромка, живущая только в G/B,
+ * этим детектором не выделяется — названо, приёмка стоит на |Δ| и его адресе,
+ * а не на ведре (§806, А1331). */
 static double span3(const float *a, int w, int h, int nch, int x, int y) {
   double lo = 1e300, hi = -1e300;
   for (int dy = -1; dy <= 1; dy++)
@@ -100,6 +103,17 @@ static double span3(const float *a, int w, int h, int nch, int x, int y) {
       if (v > hi) hi = v;
     }
   return hi - lo;
+}
+
+/* адрес максимума (§806/А1341): канал именем RGB по индексу, координаты в
+ * порядке строк ФАЙЛА (y растёт снизу вверх — как лежит PFM). Нулевой
+ * максимум печатается прочерком, а не (R, (0, 0)) — иначе прочерк
+ * неотличим от адреса. */
+static void addr_of(char *buf, size_t cap, int ch, long x, long y) {
+  if (ch < 0 || x < 0)
+    snprintf(buf, cap, "[—]");
+  else
+    snprintf(buf, cap, "[канал %c, пиксель (%ld, %ld)]", "RGB"[ch], x, y);
 }
 
 int main(int argc, char **argv) {
@@ -122,6 +136,12 @@ int main(int argc, char **argv) {
     free(b);
     return 2;
   }
+  if (c0 != c1) {
+    fprintf(stderr, "число каналов не совпало: %d против %d\n", c0, c1);
+    free(a);
+    free(b);
+    return 2;
+  }
 
   /* СРЕДНИЙ РАЗМАХ ЭТАЛОНА — масштаб, относительно которого решается, кромка
    * это или гладкое место. Берётся из эталона и от сравнения не зависит. */
@@ -132,37 +152,76 @@ int main(int argc, char **argv) {
       sp_sum += span3(a, w0, h0, c0, x, y);
   double sp_mean = sp_sum / (double)np;
 
+  /* А1331/§806: сравнение ПО ВСЕМ КАНАЛАМ, а не только каналу 0 — порча в G
+   * (НК-2 §804, nk2_corrupt.pfm) этим прибором не замечалась. |Δ| пикселя =
+   * максимум по его каналам, у максимума печатается адрес. Отн-метрика —
+   * по тому же правилу на канал: нулевой эталонный канал в ней не участвует
+   * (А1342: тёмные G/B не рождают inf). Диапазон эталона — тоже по всем
+   * каналам. */
   double emax_in = 0.0, esum_in = 0.0, emax_ed = 0.0;
   double rmax_in = 0.0, rsum_in = 0.0;
   size_t nin = 0, ned = 0;
   double amin = 1e300, amax = -1e300;
+  int ech_in = -1, ech_ed = -1, rch_in = -1;
+  long ein_x = -1, ein_y = -1, eed_x = -1, eed_y = -1, rin_x = -1, rin_y = -1;
   for (int y = 0; y < h0; y++)
     for (int x = 0; x < w0; x++) {
       size_t i = ((size_t)y * (size_t)w0 + (size_t)x);
-      double va = a[i * (size_t)c0], vb = b[i * (size_t)c1];
-      if (va < amin) amin = va;
-      if (va > amax) amax = va;
-      double e = fabs(va - vb);
+      double ebest = 0.0, rbest = 0.0;
+      int ec = 0, rc = 0;
+      for (int c = 0; c < c0; c++) {
+        double va = a[i * (size_t)c0 + (size_t)c], vb = b[i * (size_t)c1 + (size_t)c];
+        if (va < amin) amin = va;
+        if (va > amax) amax = va;
+        double e = fabs(va - vb);
+        if (e > ebest) {
+          ebest = e;
+          ec = c;
+        }
+        if (fabs(va) > 0.0 && e / fabs(va) > rbest) {
+          rbest = e / fabs(va);
+          rc = c;
+        }
+      }
       int edge = span3(a, w0, h0, c0, x, y) > 2.0 * sp_mean;
       if (edge) {
         ned++;
-        if (e > emax_ed) emax_ed = e;
+        if (ebest > emax_ed) {
+          emax_ed = ebest;
+          ech_ed = ec;
+          eed_x = x;
+          eed_y = y;
+        }
       } else {
         nin++;
-        esum_in += e;
-        if (e > emax_in) emax_in = e;
-        double r = fabs(va) > 0.0 ? e / fabs(va) : 0.0;
-        rsum_in += r;
-        if (r > rmax_in) rmax_in = r;
+        esum_in += ebest;
+        if (ebest > emax_in) {
+          emax_in = ebest;
+          ech_in = ec;
+          ein_x = x;
+          ein_y = y;
+        }
+        rsum_in += rbest;
+        if (rbest > rmax_in) {
+          rmax_in = rbest;
+          rch_in = rc;
+          rin_x = x;
+          rin_y = y;
+        }
       }
     }
 
+  char ea_in[64], ea_ed[64], ra_in[64];
+  addr_of(ea_in, sizeof ea_in, ech_in, ein_x, ein_y);
+  addr_of(ea_ed, sizeof ea_ed, ech_ed, eed_x, eed_y);
+  addr_of(ra_in, sizeof ra_in, rch_in, rin_x, rin_y);
   printf("%dx%d, эталон %.6f…%.6f, средний размах 3x3 %.4e\n", w0, h0, amin, amax, sp_mean);
-  printf("ВНЕ КРОМОК (%zu пикселей, %.1f%%): |Δ| сред %.6e, макс %.6e; отн сред %.6e, макс %.6e\n",
-         nin, 100.0 * (double)nin / (double)np, esum_in / (double)nin, emax_in,
-         rsum_in / (double)nin, rmax_in);
-  printf("НА КРОМКАХ (%zu пикселей, %.1f%%): |Δ| макс %.6e\n", ned,
-         100.0 * (double)ned / (double)np, emax_ed);
+  printf("ВНЕ КРОМОК (%zu пикселей, %.1f%%): |Δ| сред %.6e, макс %.6e %s; отн сред %.6e, макс "
+         "%.6e %s\n",
+         nin, 100.0 * (double)nin / (double)np, esum_in / (double)nin, emax_in, ea_in,
+         rsum_in / (double)nin, rmax_in, ra_in);
+  printf("НА КРОМКАХ (%zu пикселей, %.1f%%): |Δ| макс %.6e %s\n", ned,
+         100.0 * (double)ned / (double)np, emax_ed, ea_ed);
   free(a);
   free(b);
   return 0;

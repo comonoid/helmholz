@@ -4023,6 +4023,11 @@ static int g_nofrustum = 0;
  * чинить один и тот же промах. */
 static int g_walk = 0;
 
+/* §804: PFM-ВЫХОД КАДРА — умолчание ВКЛ (image.h: PFM — канонический выход,
+ * радианс как есть до тон-маппа), НК-ключ xnopfm возвращает мир без PFM.
+ * Пишется тем же ветвлением, что и PPM (в ходьбе не пишется вовсе). */
+static int g_nopfm = 0;
+
 /* ТЕКСТУРЫ ЖИВУТ МЕЖДУ КАДРАМИ. Их загрузка — работа РАЗОВАЯ (`105` файлов,
  * `24.5` МБ), и в цикле ходьбы она платилась бы каждый кадр. Поэтому массивы
  * вынесены из кадрового контекста в файловые: `litctx` получает УКАЗАТЕЛИ на
@@ -6496,6 +6501,12 @@ int main(int argc, char **argv) {
    * нужны, чтобы отличить «не сошлось» от «не дали сойтись». */
   int xit = 30;
   double xtol = 1e-4;
+  /* §804/А1270: относительный критерий останова; 0 (умолчание) — абсолютный,
+   * мир без ключей посимвольно прежний. Канон-команда ставит 1e-5: при
+   * выросшем ×10 масштабе состояния абсолютный 1e-5 упирается в пол невязки
+   * (база §804: 40 тактов при невязке 6.67e-04 и max|состояние| 161.23,
+   * rel 4.1e-6 — уже сошлось). */
+  double xreltol = 0.0;
   double xrho = 0.7;
   int ss2 = 0, xtrace = 0, qplane = 0;
   int sweepfrac = 1, sweepr01 = 0, nocull = 0, alb0 = 0, area = 0;
@@ -6557,6 +6568,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xmatrho") == 0) xmatrho = 1;
     if (strncmp(argv[i], "xrhoscale=", 10) == 0) xrhoscale = strtod(argv[i] + 10, NULL);
     if (strncmp(argv[i], "xrelax=", 7) == 0) xrelax = strtod(argv[i] + 7, NULL);
+    if (strncmp(argv[i], "xreltol=", 8) == 0) xreltol = strtod(argv[i] + 8, NULL);
+    if (strcmp(argv[i], "xnopfm") == 0) g_nopfm = 1;
     if (strcmp(argv[i], "xdsa") == 0) {
       xdsa = 1;
       xmatrho = 1;
@@ -8525,8 +8538,9 @@ int main(int argc, char **argv) {
             double rho6 =
                 (cut.se[k].facet >= 0 && cut.se[k].facet < ftab.n) ? frho[cut.se[k].facet] : 0.0;
             /* К29-нормировка Σ_{ω·n>0} w(ω·n) считается ЗДЕСЬ по набору
-             * ординат (поле se.hsum в cut3 не заполняется — мёртвое, А1294;
-             * поймано первым же прогоном: инъекция выходила нулевой). Деление
+             * ординат (поля se.hsum в cut3 НЕТ С §804 — оно не заполнялось
+             * нигде, А1294; поймано первым же прогоном: инъекция через него
+             * выходила нулевой). Деление
              * на неё, а не на π, делает инъецированную мощность В ЕДИНИЦАХ
              * СХЕМЫ равной ρ·E_fc·area точно. */
             double hs6 = 0.0;
@@ -8562,7 +8576,8 @@ int main(int argc, char **argv) {
                           .maxp_off = xnomaxp,
                           .relax = xrelax,
                           .chain_cell1 = xchain >= 0 ? xchain + 1 : 0,
-                          .trace = xtrace};
+                          .trace = xtrace,
+                          .reltol = xreltol};
       if (xchain >= 0 && !xunit) {
         fprintf(stderr, "xchain= требует xunit: пол обрыва трассы — уровень единичного входа\n");
         exit(1);
@@ -9004,8 +9019,9 @@ int main(int argc, char **argv) {
               usprev[e] = st.sout[4 * (size_t)e];
             for (int32_t f = 0; f < mesh.nf; f++)
               ubprev[f] = st.bout[4 * (size_t)f];
-            printf("   §752 такт %2d: resid %.3e; max|поправка| %.3e; %.1f с\n", it9, st.resid,
-                   cmx9, now_s() - t9);
+            printf("   §752 такт %2d: resid %.3e (rel %.1e, max|состояние| %.3e); max|поправка| "
+                   "%.3e; %.1f с\n",
+                   it9, st.resid, st.resid_rel, st.statemax, cmx9, now_s() - t9);
             free(ub9);
             free(us9);
             free(st.eirr);
@@ -9070,9 +9086,9 @@ int main(int argc, char **argv) {
           }
           for (int32_t e = 0; e < cut.nse; e++)
             usprev[e] = st.sout[4 * (size_t)e];
-          printf("   §750 такт %2d: resid %.3e; грубое звено %d итер (%.2e -> %.2e); "
-                 "max|поправка| %.3e; %.1f с\n",
-                 it9, st.resid, mco, cr0, crn, cmx9, now_s() - t9);
+          printf("   §750 такт %2d: resid %.3e (rel %.1e, max|состояние| %.3e); грубое звено %d "
+                 "итер (%.2e -> %.2e); max|поправка| %.3e; %.1f с\n",
+                 it9, st.resid, st.resid_rel, st.statemax, mco, cr0, crn, cmx9, now_s() - t9);
           free(ub9);
           free(us9);
           free(st.eirr);
@@ -9144,10 +9160,11 @@ int main(int argc, char **argv) {
           if (stB4.eirr != NULL)
             for (int32_t e = 0; e < cut.nse; e++)
               if (stB4.eirr[e] < 0.0) nnegB++;
-          printf("   §774 БАЗА (xit=%d, xtol=%.1e): итераций %d, невязка %.3e, psin %.6g, "
-                 "%.2f с; слепок Σ|φ| %.17g, max|φ| %.17g; eirr < 0 у %lld из %d\n",
-                 xit, xtol, stB4.iters, stB4.resid, stB4.psin, now_s() - tb0, sphiB, mphiB,
-                 (long long)nnegB, cut.nse);
+          printf("   §774 БАЗА (xit=%d, xtol=%.1e): итераций %d, невязка %.3e (rel %.1e, "
+                 "max|состояние| %.3e), psin %.6g, %.2f с; слепок Σ|φ| %.17g, max|φ| %.17g; "
+                 "eirr < 0 у %lld из %d\n",
+                 xit, xtol, stB4.iters, stB4.resid, stB4.resid_rel, stB4.statemax, stB4.psin,
+                 now_s() - tb0, sphiB, mphiB, (long long)nnegB, cut.nse);
           eirrB = stB4.eirr;
           psinB = stB4.psin;
           free(stB4.bout);
@@ -9570,8 +9587,8 @@ int main(int argc, char **argv) {
         hz_slice_free(&SF);
       }
       printf("   РАЗВЁРТКА: направлений %d, светящихся элементов %lld; код %d, итераций %d, "
-             "невязка %.2e, за %.2f с\n",
-             dirs.n, (long long)nlit, src, st.iters, st.resid, tsw);
+             "невязка %.2e (rel %.1e, max|состояние| %.3e), за %.2f с\n",
+             dirs.n, (long long)nlit, src, st.iters, st.resid, st.resid_rel, st.statemax, tsw);
       printf("      ЭНЕРГИЯ: втекло %.4e, вытекло %.4e, поглощено %.4e, баланс %.2e; в "
              "поверхности %.4e, из них %.4e; max φ %.4e, max исходящий радианс %.4e\n",
              st.pin, st.pout, st.pabs, st.balance, st.psin, st.psout, phimax, soutmax);
@@ -13254,6 +13271,46 @@ int main(int argc, char **argv) {
         /* В ХОДЬБЕ КАДР НЕ ПИШЕТСЯ НА ДИСК: `786` КБ на кадр — это и лишняя
          * работа, и мусор в `img/`. Снимок делает отдельный запуск без `walk`. */
         int prc = g_walk ? 0 : hz_ppm_write_rgb(path, outrgb, outw, outh);
+        /* §804/А1327: PFM — ТОТ ЖЕ КАДР ДО ТОН-МАППА. Источник — defcol
+         * растеризатора (радианса как есть); тон-мапп (белая точка + гамма)
+         * необратим, а PFM существует затем, чтобы диффузный инструмент читал
+         * ЛИНЕЙНЫЕ данные (формат — канонический выход по image.h). При ss2 —
+         * то же коробочное 2×2 среднее, что у PPM, но во FLOAT и без
+         * округления до байта: квантование до усреднения теряло бы ровно тот
+         * диапазон, ради которого PFM заводился. Незакрытые пиксели — нули из
+         * calloc. Умолчание ВКЛ, НК-ключ xnopfm; в ходьбе не пишется, как и
+         * PPM. */
+        if (!g_walk && !g_nopfm) {
+          double *pchan[3];
+          for (int c = 0; c < 3; c++) {
+            pchan[c] = malloc((size_t)outw * (size_t)outh * sizeof *pchan[c]);
+            if (pchan[c] == NULL) exit(1);
+          }
+          for (int y = 0; y < outh; y++)
+            for (int x = 0; x < outw; x++)
+              for (int c = 0; c < 3; c++) {
+                double s5 = 0.0;
+                int ns5 = 0;
+                for (int dy = 0; dy < 2; dy++)
+                  for (int dx = 0; dx < 2; dx++) {
+                    /* без ss2 четыре пробы читают ОДИН пиксель — среднее
+                     * равно ему самому, отдельная ветка не нужна */
+                    int rx = ss2 ? 2 * x + dx : x, ry = ss2 ? 2 * y + dy : y;
+                    s5 +=
+                        (double)LC.defcol[3 * ((size_t)ry * (size_t)resw + (size_t)rx) + (size_t)c];
+                    ns5++;
+                  }
+                pchan[c][(size_t)y * (size_t)outw + (size_t)x] = s5 / (double)ns5;
+              }
+          char pathp[256];
+          snprintf(pathp, sizeof pathp, "img/pfield_lit_L%d_%dx%d%s.pfm", lev, outw, outh,
+                   xframe ? "_sweep" : "");
+          int pfrc = hz_pfm_write(pathp, pchan[0], pchan[1], pchan[2], outw, outh);
+          printf("      PFM: радианса ДО тон-маппа, %dx%d -> %s (код %d)\n", outw, outh, pathp,
+                 pfrc);
+          for (int c = 0; c < 3; c++)
+            free(pchan[c]);
+        }
         if (g_walk) {
           double tf = t_slice + t_dir + t_rast;
           /* ПОЛОЖЕНИЕ ПЕЧАТАЕТСЯ, А НЕ ПОДРАЗУМЕВАЕТСЯ: без него «управление не

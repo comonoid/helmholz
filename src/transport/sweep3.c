@@ -309,6 +309,10 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   st->bout = NULL;
   st->eirr = NULL;
   st->sout = NULL;
+  /* §804: нормировочные поля — тем же правилом (ранний возврат не оставляет
+   * мусора в чтении вызывающего). */
+  st->statemax = 0.0;
+  st->resid_rel = 0.0;
 
   /* ПАРАЛЛЕЛЬНО ПО ОРДИНАТАМ. Внутри одной итерации направления НЕЗАВИСИМЫ:
    * каждое строит свой порядок обхода и своё угловое поле, а связывает их только
@@ -627,6 +631,10 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   int chn_n = 0, chn_mm = -1;
   double chn_bestlt = -1.0;
   double resid = 0.0;
+  /* §804: L∞ ОБНОВЛЁННОГО состояния по тем же массивам, из которых берётся
+   * резид. Нормировка для rel-критерия и печати; сбрасывается вместе с
+   * резидом на каждом такте. */
+  double stmax = 0.0;
   /* К81: пол невязки ловится ЗАСТОЕМ, а не порогом на её величину */
   double best = 1e300;
   int nstall = 0;
@@ -1544,16 +1552,19 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
      * старое состояние в момент замера ещё лежит в phi/bprev/sprev/mprev. */
     const double w748 = p->relax > 0.0 ? p->relax : 1.0;
     resid = 0.0;
+    stmax = 0.0;
     for (int32_t i = 0; i < nc * 4; i++) {
       double dd = fabs(phin[i] - phi[i]);
       if (dd > resid) resid = dd;
       phi[i] = (1.0 - w748) * phi[i] + w748 * phin[i];
+      if (fabs(phi[i]) > stmax) stmax = fabs(phi[i]);
     }
     for (int32_t i = 0; i < m->nf * 4; i++) {
       double dd = fabs(bout[i] - bprev[i]);
       if (dd > resid) resid = dd;
       bout[i] = (1.0 - w748) * bprev[i] + w748 * bout[i];
       bprev[i] = bout[i];
+      if (fabs(bout[i]) > stmax) stmax = fabs(bout[i]);
     }
     /* §731: ПЕЧАТЬ ТРАССЫ — цепочка направления с максимальным `|L|` в цели.
      * «Разрезанность» — отношение флюидного объёма к коробке меньше единицы;
@@ -1730,6 +1741,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       if (dd > resid) resid = dd;
       sout[i] = (1.0 - w748) * sprev[i] + w748 * sout[i]; /* §748 */
       sprev[i] = sout[i];
+      if (fabs(sout[i]) > stmax) stmax = fabs(sout[i]);
     }
     /* ЗЕРКАЛЬНОЕ хранимое — тоже часть состояния (К84), и без него критерий
      * объявил бы сходимость, пока зеркала ещё не установились. */
@@ -1738,6 +1750,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       if (dd > resid) resid = dd;
       mspec[i] = (1.0 - w748) * mprev[i] + w748 * mspec[i]; /* §748 */
       mprev[i] = mspec[i];
+      if (fabs(mspec[i]) > stmax) stmax = fabs(mspec[i]);
     }
     /* ИСТОРИЯ НЕВЯЗКИ ПЕЧАТАЕТСЯ ПО ТРЕБОВАНИЮ, И ЭТО НЕ ОТЛАДКА (К38).
      *
@@ -1752,10 +1765,11 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
      * если невязка стоит, а эти два числа МЕНЯЮТСЯ — это переключатель, а не
      * скорость, и лечится оно не разгоном. */
     if (p->trace > 0 && (it % p->trace == 0 || resid < tol))
-      printf("    it %5d  resid %.3e  nclip %d  maxp %d+%d+%d  nfb %d = грани(геом %d, поле %d) + "
-             "элементы(геом %d, поле %d); из полевых на ЩЕПКАХ %d\n",
-             it, resid, nclip_last, nmaxp_last, nmaxpe_last, nmaxpf_last, nfb, nfb_fg, nfb_fp,
-             nfb_eg, nfb_ep, nfb_thin);
+      printf("    it %5d  resid %.3e (rel %.1e, max|состояние| %.3e)  nclip %d  maxp %d+%d+%d  "
+             "nfb %d = грани(геом %d, поле %d) + элементы(геом %d, поле %d); из полевых на ЩЕПКАХ "
+             "%d\n",
+             it, resid, stmax > 0.0 ? resid / stmax : 0.0, stmax, nclip_last, nmaxp_last,
+             nmaxpe_last, nmaxpf_last, nfb, nfb_fg, nfb_fp, nfb_eg, nfb_ep, nfb_thin);
     /* §693: РОСТ КАК ФУНКЦИЯ ДОЛИ ФЛЮИДА, БЕЗ ПОРОГОВ. Декада — способ показать
      * кривую: каждая ячейка попадает ровно в одну, ни одна не отбрасывается.
      * Печатается медиана (а не среднее — А1090), p99 и максимум. */
@@ -2084,7 +2098,12 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
              "наклону — ячейка %d, доля флюида %.4g\n",
              it, m0, m1, m0 > 0.0 ? m1 / m0 : -1.0, wc2, wf);
     }
-    if (resid < tol) break;
+    /* §804/А1270: при reltol > 0 критерий ОТНОСИТЕЛЬНЫЙ — порог пропорционален
+     * масштабу состояния (нормировка тем же массивом, из которого взят резид).
+     * Умолчание reltol = 0 оставляет абсолютный критерий БЕЗ ИЗМЕНЕНИЯ — мир
+     * без ключей посимвольно прежний. Вырожденный stmax = 0 (нет источников)
+     * сводится к абсолюту: резид тогда тоже нулевой. */
+    if (p->reltol > 0.0 ? resid < p->reltol * (stmax > 0.0 ? stmax : 1.0) : resid < tol) break;
 
     /* ОСТАНОВКА ПО ЗАСТОЮ, А НЕ ТОЛЬКО ПО ДОПУСКУ — К81.
      *
@@ -2207,6 +2226,10 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   st->balance = st->pin + st->psout + st->pemit - st->pout - st->pabs - st->psin - st->psolid;
   st->iters = it;
   st->resid = resid;
+  /* §804: нормировка финального такта (А1270). Абсолютный резид — прежнее
+   * поле, семантика не меняется; рядом — знаменатель и частное. */
+  st->statemax = stmax;
+  st->resid_rel = stmax > 0.0 ? resid / stmax : 0.0;
   st->nclip = nclip_last;
   st->nfallback = nfb;
   st->bout = bout;

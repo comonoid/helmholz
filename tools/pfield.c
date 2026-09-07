@@ -3110,6 +3110,976 @@ static int32_t node_fill_best(const hz_dctree *t, int lev, const hz_dccell *c, i
   return best;
 }
 
+/* §774: потолок q̂ и минимум тактов для его оценки. Значения выведены в §774:
+ * выше замеренного диапазона сжатия 0.61…0.89 замыкание умножает шум последнего
+ * приращения как 1/(1−q); для оценки нужны ДВА приращения, и такт 1 — весь
+ * прямой свет от нуля, вне геометрического режима. Файловая область видимости:
+ * лестницей пользуется и стенд §808 (база кадра 2 — та же лестница). */
+static const double HZ_TAILQ_MAX = 0.95;
+static const int HZ_TAILN_MIN = 3;
+
+/* ---- §808: СТЕНД ИНКРЕМЕНТНОСТИ СВЕТА (xwarm=, xscramble) ------------------
+ *
+ * Двухкадровый стенд (план §808, аудит А1346…А1349). Кадр 1 — холодная лестница
+ * xbounce при камере cam; стенд сдвигает глаз на (DX,DY,DZ) и строит кадр 2
+ * тёплым путём: пересборка грейда+реза+Ke (ОБЩАЯ часть кадра 2 — А1346: она
+ * нужна и тёплому пути, и холодной базе, и в выигрыш инкрементности не
+ * входит), ремап состояния, ОДНА-ДВЕ корректирующие прокидки К76 + замыкание
+ * хвоста; рядом — же-процессная холодная база: та же лестница на сетке кадра
+ * 2. Метрики времени печатаются раздельно.
+ *
+ * РЕМАП ТРЁХ НОСИТЕЛЕЙ РАЗДЕЛЁН (А1348): φ — вложенно через ОБЩЕЕ октодерево
+ * (обе сетки суть наборы узлов одного ot, а два узла октодерева либо вложены,
+ * либо disjoint — соответствие есть лес по построению); sout — рестрикцией по
+ * ПЛОЩАДИ с контролем Σ sout·area (носитель — радианс, сохранять надо
+ * энергию, не значение); bout НЕ ремапится — грань новой сетки не имеет
+ * вложенного прообраза, он восстанавливается первой прокидкой из φ (в каноне
+ * bout и вовсе не читается: wall_rho NULL, solid_rho 0). Поэтому варианта
+ * «прокидок ноль» не существует — минимум одна, что план и предписывал.
+ *
+ * ДЕТЕКТОР СМЕНЫ ПОЛОСТИ (А1326): заливка идёт волной от ячейки КАМЕРЫ (Ш12),
+ * и телепорт в другую полость меняет её целиком. Проверка дёшевa и точна:
+ * класс ячейки НОВОГО глаза в маске кадра 1. «Полость» — та же компонента
+ * связности (заливка отмечает ровно одну); «тело»/«наружное» — полость иная
+ * или камера в материале: тёплый путь запрещён, кадр 2 считается холодным. */
+typedef struct {
+  /* сцена и дерево — камера-НЕзависимые, общие для обоих кадров */
+  const hz_octree *ot;
+  const hz_frame *ofr;
+  const hz_cutmap *cm;
+  const hz_facettab *ft;
+  const hz_objmesh *om;
+  void *ctctx; /* celltris* — ct_list принимает void* */
+  const opyr *occ;
+  const unsigned char *smask; /* заливка кадра 1 (Ш13) */
+  int occn, innerfluid, lev;
+  double xcoarse;
+  int xfernosolid, xmatrho, xmatfar;
+  double xrho, xrhoscale, xthin, xsemin, xtailq;
+  /* кадр 1: сетка, рез, закрытое состояние */
+  const tr3_mesh *m1;
+  const tr3_cut *c1;
+  const double *phi1;
+  double *sout1; /* НЕ const: НК-скрэмбл портит хранилище (А1349) */
+  double qhat1;  /* q̂ лестницы кадра 1; ≤0 — замыкания не было */
+  double emitpow1;
+  /* задача-шаблон: ординаты, лимитер, reltol — всё камера-независимое */
+  const tr3_problem *prob;
+  double eye1[3], shift[3];
+  int nwarm, xbounce, scramble;
+} warm808;
+
+/* Узел ot на глубине depth, содержащий коробку с углом clo (листовая решётка
+ * 2^log2size). −1 — дерево на этом пути мельче. Та же нумерация детей, что в
+ * node_of_cell: бит оси a — разряд log2(size) координаты a. */
+static int32_t warm808_node_at(const hz_octree *t, int depth, const int32_t clo[3]) {
+  int32_t ni = 0, size = (int32_t)1 << t->log2size;
+  for (int d = 0; d < depth; d++) {
+    if (t->nodes[ni].child0 < 0) return -1;
+    size >>= 1;
+    int bit = 0;
+    for (int a = 0; a < 3; a++)
+      if (clo[a] & size) bit |= 1 << a;
+    ni = t->nodes[ni].child0 + bit;
+  }
+  return ni;
+}
+
+/* ЯЧЕЙКИ СЕТКИ 1 под узлом ni: спуск останавливается на них — глубже сетки 1
+ * нет. Переполнение считается (fail closed: усредняется собранное, печатается). */
+static void warm808_collect(const hz_octree *t, const tr3_mesh *m1, int32_t ni, const int32_t lo[3],
+                            int32_t size, int32_t *out, int32_t *n, int32_t cap, int32_t *nover) {
+  if (m1->cellof[ni] >= 0) {
+    if (*n < cap)
+      out[(*n)++] = m1->cellof[ni];
+    else
+      (*nover)++;
+    return;
+  }
+  if (t->nodes[ni].child0 < 0) return;
+  int32_t half = size / 2;
+  for (int k = 0; k < 8; k++) {
+    int32_t clo[3] = {lo[0] + ((k & 1) ? half : 0), lo[1] + ((k & 2) ? half : 0),
+                      lo[2] + ((k & 4) ? half : 0)};
+    warm808_collect(t, m1, t->nodes[ni].child0 + k, clo, half, out, n, cap, nover);
+  }
+}
+
+/* Ячейка СЕТКИ 1, содержащая мировую точку p: спуск от корня, останов на
+ * первой ячейке сетки 1. −1 — вне куба либо спуск ушёл в лист, не встретив
+ * ячейки сетки 1 (у ремапа sout это «источника нет», а не ошибка). */
+static int32_t warm808_cell_at(const hz_octree *t, const tr3_mesh *m1, const hz_frame *ofr,
+                               const double p[3]) {
+  int32_t pi[3];
+  for (int a = 0; a < 3; a++) {
+    double f = floor((p[a] - ofr->o[a]) / ofr->u[a]);
+    if (!(f >= 0.0) || f > (double)((int32_t)1 << t->log2size) - 1.0) return -1;
+    pi[a] = (int32_t)f;
+  }
+  int32_t ni = 0, size = (int32_t)1 << t->log2size;
+  while (m1->cellof[ni] < 0 && t->nodes[ni].child0 >= 0) {
+    size >>= 1;
+    int bit = 0;
+    for (int a = 0; a < 3; a++)
+      if (pi[a] & size) bit |= 1 << a;
+    ni = t->nodes[ni].child0 + bit;
+  }
+  return m1->cellof[ni] >= 0 ? m1->cellof[ni] : -1;
+}
+
+/* Русская множественная для строк прибора («1 прокидка», «2 прокидки»). */
+static const char *warm808_plu(int n, const char *one, const char *few, const char *many) {
+  int n10 = n % 10, n100 = n % 100;
+  if (n10 == 1 && n100 != 11) return one;
+  if (n10 >= 2 && n10 <= 4 && (n100 < 12 || n100 > 14)) return few;
+  return many;
+}
+
+/* Пара (значение, элемент) для отбора top-1 % по |sout| (А1349) — детерминизм
+ * без ГСЧ: сортировка по значению, при равных по индексу. */
+typedef struct {
+  double v;
+  int32_t e;
+} warm808_pv;
+
+static int warm808_pv_cmp(const void *a, const void *b) {
+  const warm808_pv *x = a, *y = b;
+  if (x->v > y->v) return -1; /* по убыванию яркости; равные значения — по индексу */
+  if (x->v < y->v) return 1;
+  return (x->e > y->e) - (x->e < y->e);
+}
+
+static void warm808_run(const warm808 *cx) {
+  const double t808 = now_s();
+  double eye2[3];
+  int zero808 = 1;
+  for (int a = 0; a < 3; a++) {
+    eye2[a] = cx->eye1[a] + cx->shift[a];
+    if (fabs(cx->shift[a]) > 0.0) zero808 = 0; /* xwarm=0,0,0 даёт ровно нули */
+  }
+  printf(
+      "   §808 СДВИГ КАМЕРЫ: (%+.2f, %+.2f, %+.2f) м — глаз (%.2f %.2f %.2f) -> (%.2f %.2f %.2f); "
+      "%s\n",
+      cx->shift[0], cx->shift[1], cx->shift[2], cx->eye1[0], cx->eye1[1], cx->eye1[2], eye2[0],
+      eye2[1], eye2[2],
+      cx->nwarm == 1 ? "одна корректирующая прокидка"
+                     : "предсказанная ветка: две прокидки (А1348)");
+  /* НК-1 (А1349): порча ЗНАКА хранения кадра 1 — до ремапа, чтобы тёплый путь
+   * унаследовал её, а холодная база (с нуля) — нет. Переворачиваются ВСЕ
+   * ЧЕТЫРЕ коэффициента выбранных элементов: портится элемент, не число. */
+  if (cx->scramble && cx->c1->nse > 0) {
+    warm808_pv *pv = malloc((size_t)cx->c1->nse * sizeof *pv);
+    if (pv == NULL) exit(1);
+    int32_t npos = 0;
+    double pabs = 0.0, paff = 0.0;
+    for (int32_t e = 0; e < cx->c1->nse; e++) {
+      if (!(cx->c1->se[e].area > 0.0)) continue;
+      double v = fabs(cx->sout1[4 * (size_t)e]);
+      pv[npos].v = v;
+      pv[npos].e = e;
+      npos++;
+      pabs += v * cx->c1->se[e].area;
+    }
+    qsort(pv, (size_t)npos, sizeof *pv, warm808_pv_cmp);
+    int32_t ktop = npos / 100;
+    if (ktop < 1) ktop = 1;
+    if (ktop > npos) ktop = npos;
+    for (int32_t j = 0; j < ktop; j++) {
+      int32_t e = pv[j].e;
+      paff += pv[j].v * cx->c1->se[e].area;
+      for (int q = 0; q < 4; q++)
+        cx->sout1[4 * (size_t)e + (size_t)q] *= -1.0;
+    }
+    printf("   §808 НК-СКРЭМБЛ: перевернут знак у %d из %d элементов хранения (top-1 %% по "
+           "|sout|), доля |мощности| %.2f %%\n",
+           (int)ktop, (int)npos, 100.0 * paff / (pabs > 0.0 ? pabs : 1.0));
+    free(pv);
+  }
+  /* ДЕТЕКТОР ПОЛОСТИ (А1326). Класс ячейки нового глаза в маске кадра 1. */
+  {
+    int32_t e0[3];
+    for (int a = 0; a < 3; a++) {
+      double f = floor((eye2[a] - cx->ofr->o[a]) / cx->ofr->u[a]);
+      if (f < 0.0) f = 0.0;
+      if (f > (double)(cx->occn - 1)) f = (double)(cx->occn - 1);
+      e0[a] = (int32_t)f;
+    }
+    unsigned cls = cx->smask[hz_occ_index(cx->occn, e0[0], e0[1], e0[2])];
+    if (cls != 1u) {
+      printf("   §808 ЗАЛИВКА СМЕНИЛАСЬ: класс ячейки нового глаза в маске кадра 1 — %s; "
+             "тёплый путь ЗАПРЕЩЁН, кадр 2 — холодный пересчёт (стендом не повторяется: "
+             "холодная лестница уже измерена как база)\n",
+             cls == 0u ? "ТЕЛО" : "НАРУЖНОЕ");
+      printf("   §808 ИНКРЕМЕНТНОСТЬ: холод —, тёплый —; заливка СМЕНИЛАСЬ — тёплый путь "
+             "запрещён\n");
+      return;
+    }
+    printf("   §808 ЗАЛИВКА: ячейка нового глаза — ПОЛОСТЬ в маске кадра 1 (та же компонента "
+           "связности)\n");
+  }
+  /* ---- ОБЩАЯ ЧАСТЬ КАДРА 2: грейд + рез + раздача Ke (А1346) ---- */
+  double tgc = now_s();
+  c772 cb2;
+  memset(&cb2, 0, sizeof cb2);
+  cb2.t = cx->ot;
+  cb2.cm = cx->cm;
+  cb2.ft = cx->ft;
+  cb2.fr = cx->ofr;
+  cb2.occ = cx->occ->b[cx->lev];
+  cb2.smask = cx->smask;
+  cb2.occn = cx->occn;
+  cb2.innerfluid = cx->innerfluid;
+  for (int a = 0; a < 3; a++)
+    cb2.eye[a] = eye2[a];
+  cb2.d0 = cx->xcoarse;
+  tr3_mesh mesh2;
+  if (tr3_mesh_build_lod(&mesh2, cx->ot, cx->ofr, c772_stop, &cb2) != 0) exit(1);
+  uint8_t *solid2 = calloc((size_t)mesh2.ncell, 1);
+  if (solid2 == NULL) exit(1);
+  for (int32_t ci = 0; ci < mesh2.ncell; ci++) {
+    /* та же проба листьев, что у кадра 1 (Ш16/§782): сплошная = все листы сплошные */
+    int32_t s9 = mesh2.csize[ci];
+    int allsolid = 1;
+    for (int32_t iz = 0; iz < s9 && allsolid; iz++)
+      for (int32_t iy = 0; iy < s9 && allsolid; iy++)
+        for (int32_t ix = 0; ix < s9 && allsolid; ix++) {
+          size_t k = hz_occ_index(cx->occn, mesh2.clo[ci][0] + ix, mesh2.clo[ci][1] + iy,
+                                  mesh2.clo[ci][2] + iz);
+          if (!((cx->smask[k] == 0u || (cx->smask[k] == 2u && !cx->innerfluid)) &&
+                !hz_occ_get(cx->occ->b[cx->lev], k)))
+            allsolid = 0;
+        }
+    if (allsolid) solid2[ci] = 1u;
+  }
+  tr3_cut cut2;
+  int crc2 = tr3_cut_build2(&cut2, &mesh2, cx->ft, cx->cm, cx->xfernosolid ? NULL : solid2,
+                            cx->xcoarse > 0.0 ? c772_leaf_solid : NULL, &cb2);
+  if (crc2 != 0) {
+    fprintf(stderr, "§808: рез сетки кадра 2 не собрался (код %d)\n", crc2);
+    exit(1);
+  }
+  /* §717/§711 — те же постфильтры, что у кадра 1, в том же порядке */
+  if (cx->xsemin > 0.0)
+    for (int32_t k = 0; k < cut2.nse; k++) {
+      double h2 = cx->ofr->u[0] * cx->ofr->u[1];
+      if (cut2.se[k].area > 0.0 && cut2.se[k].area < cx->xsemin * h2) {
+        cut2.se[k].area = 0.0;
+        memset(cut2.se[k].m, 0, sizeof cut2.se[k].m);
+      }
+    }
+  if (cx->xthin > 0.0)
+    for (int32_t ci = 0; ci < mesh2.ncell; ci++) {
+      double vfl = cut2.mvol[ci][0][0];
+      if (!(vfl > 0.0) || cut2.solid[ci]) continue;
+      double s3 = (double)mesh2.csize[ci];
+      double V = s3 * s3 * s3 * cx->ofr->u[0] * cx->ofr->u[1] * cx->ofr->u[2];
+      if (V > 0.0 && vfl < cx->xthin * V) {
+        cut2.solid[ci] = 1;
+        for (int i = 0; i < 4; i++)
+          for (int j = 0; j < 4; j++)
+            cut2.mvol[ci][i][j] = 0.0;
+      }
+    }
+  /* АЛЬБЕДО ФАСЕТОВ сетки 2 — тот же §739-скоринг по элементам сетки 2 (без
+   * xmatrho — константа xrho, как прежде). Материал живёт у элемента (§667). */
+  const int32_t nse2 = cut2.nse;
+  double *frho2 = calloc((size_t)(cx->ft->n > 0 ? cx->ft->n : 1), sizeof *frho2);
+  double *eemit2 = calloc((size_t)(nse2 > 0 ? nse2 : 1), sizeof *eemit2);
+  double *sigt2 = calloc((size_t)mesh2.ncell, sizeof *sigt2);
+  double *sigs2 = calloc((size_t)mesh2.ncell, sizeof *sigs2);
+  if (frho2 == NULL || eemit2 == NULL || sigt2 == NULL || sigs2 == NULL) exit(1);
+  for (int32_t i = 0; i < cx->ft->n; i++)
+    frho2[i] = cx->xrho;
+  if (cx->xmatrho) {
+    double *frnum = calloc((size_t)cx->ft->n, sizeof *frnum);
+    double *frden = calloc((size_t)cx->ft->n, sizeof *frden);
+    if (frnum == NULL || frden == NULL) exit(1);
+    enum { LS808 = 4096 };
+    int32_t ls808[LS808];
+    int64_t nlsclip808 = 0;
+    for (int32_t k = 0; k < nse2; k++) {
+      if (cut2.se[k].nv <= 0) continue;
+      int32_t ci = cut2.se[k].cell;
+      if (ci < 0 || ci >= mesh2.ncell) continue;
+      const int32_t *ls = NULL;
+      int32_t nls = 0;
+      if (mesh2.csize[ci] > 1 && cut2.se[k].facet >= 0 && cut2.se[k].facet < cx->ft->n &&
+          cx->ft->f[cut2.se[k].facet].bounded) {
+        const hz_facet *fp8 = &cx->ft->f[cut2.se[k].facet];
+        int32_t blo8[3], bhi8[3];
+        int ntv8 = fp8->tnv >= 3 && fp8->tnv <= HZ_FACET_TVMAX ? fp8->tnv : 3;
+        for (int a = 0; a < 3; a++) {
+          double mn = fp8->tv[0][a], mx = fp8->tv[0][a];
+          for (int q2 = 1; q2 < ntv8; q2++) {
+            if (fp8->tv[q2][a] < mn) mn = fp8->tv[q2][a];
+            if (fp8->tv[q2][a] > mx) mx = fp8->tv[q2][a];
+          }
+          blo8[a] = (int32_t)floor(mn);
+          bhi8[a] = (int32_t)floor(mx);
+          if (blo8[a] < 0) blo8[a] = 0;
+          if (bhi8[a] > cx->occn - 1) bhi8[a] = cx->occn - 1;
+        }
+        int32_t nu = 0;
+        for (int32_t iz = blo8[2]; iz <= bhi8[2]; iz++)
+          for (int32_t iy = blo8[1]; iy <= bhi8[1]; iy++)
+            for (int32_t ix = blo8[0]; ix <= bhi8[0]; ix++) {
+              int32_t cl8[3] = {ix, iy, iz};
+              const int32_t *l2 = NULL;
+              int32_t n2 = ct_list(cx->ctctx, cl8, &l2);
+              for (int32_t q2 = 0; q2 < n2; q2++) {
+                if (nu >= LS808) {
+                  nlsclip808++;
+                  break;
+                }
+                ls808[nu++] = l2[q2];
+              }
+            }
+        ls = ls808;
+        nls = nu;
+      } else {
+        int32_t cellc[3] = {mesh2.clo[ci][0], mesh2.clo[ci][1], mesh2.clo[ci][2]};
+        nls = ct_list(cx->ctctx, cellc, &ls);
+      }
+      if (nls == 0) continue;
+      double ec[3] = {0, 0, 0};
+      for (int q2 = 0; q2 < cut2.se[k].nv; q2++)
+        for (int a = 0; a < 3; a++)
+          ec[a] += cut2.se[k].v[q2][a] / (double)cut2.se[k].nv;
+      const double *en = cut2.se[k].n;
+      int32_t tbest = ls[0];
+      double sbest = cx->xmatfar ? -1.0 : 1e300, cbest = 1e300;
+      for (int32_t q2 = 0; q2 < nls; q2++) {
+        const double *A3, *B3, *C3;
+        tri_verts(cx->om, ls[q2], &A3, &B3, &C3);
+        double e1[3] = {B3[0] - A3[0], B3[1] - A3[1], B3[2] - A3[2]};
+        double e2[3] = {C3[0] - A3[0], C3[1] - A3[1], C3[2] - A3[2]};
+        double nt[3];
+        nt[0] = e1[1] * e2[2] - e1[2] * e2[1];
+        nt[1] = e1[2] * e2[0] - e1[0] * e2[2];
+        nt[2] = e1[0] * e2[1] - e1[1] * e2[0];
+        double nl = sqrt(nt[0] * nt[0] + nt[1] * nt[1] + nt[2] * nt[2]);
+        if (!(nl > 0.0)) continue;
+        double dist = 0.0, dot = 0.0, cd = 0.0;
+        for (int a = 0; a < 3; a++) {
+          dist += nt[a] / nl * (ec[a] - A3[a]);
+          dot += nt[a] / nl * en[a];
+          double tc = (A3[a] + B3[a] + C3[a]) / 3.0 - ec[a];
+          cd += tc * tc;
+        }
+        double sc = fabs(dist) + cx->ofr->u[0] * (1.0 - fabs(dot));
+        if (cx->xmatfar) {
+          if (sc > sbest) {
+            sbest = sc;
+            tbest = ls[q2];
+          }
+        } else if (sc < sbest - 1e-6 * cx->ofr->u[0] ||
+                   (sc < sbest + 1e-6 * cx->ofr->u[0] && cd < cbest)) {
+          sbest = sc;
+          cbest = cd;
+          tbest = ls[q2];
+        }
+      }
+      int32_t mi2 = cx->om->fm != NULL ? cx->om->fm[tbest] : 0;
+      if (mi2 < 0 || mi2 >= cx->om->nmtl) mi2 = 0;
+      double kd = cx->om->mtl[mi2].kd;
+      if (!(kd >= 0.0 && kd <= 1.0)) kd = 0.5;
+      int32_t fi2 = cut2.se[k].facet;
+      double ar = cut2.se[k].area;
+      frnum[fi2] += kd * ar;
+      frden[fi2] += ar;
+    }
+    for (int32_t i = 0; i < cx->ft->n; i++)
+      frho2[i] = frden[i] > 0.0 ? frnum[i] / frden[i] : 0.5;
+    free(frnum);
+    free(frden);
+    if (nlsclip808 > 0)
+      printf("   §808 СКОРИНГ АЛЬБЕДО: усечено списков клеток %lld (бюджет %d треугольников, "
+             "класс А1217)\n",
+             (long long)nlsclip808, (int)LS808);
+  }
+  for (int32_t i = 0; i < cx->ft->n; i++)
+    frho2[i] *= cx->xrhoscale;
+  /* §786-раздача Ke на сетке 2 — та же машина: энергия ячейки точным клипом
+   * треугольников к листовым клеткам, раздача элементам по площадям. */
+  double emitpow2b = 0.0;
+  {
+    int32_t *cellat6 =
+        malloc((size_t)cx->occn * (size_t)cx->occn * (size_t)cx->occn * sizeof *cellat6);
+    double *Ecell6 = calloc((size_t)mesh2.ncell, sizeof *Ecell6);
+    double *Sarea6 = calloc((size_t)mesh2.ncell, sizeof *Sarea6);
+    if (cellat6 == NULL || Ecell6 == NULL || Sarea6 == NULL) exit(1);
+    for (size_t g = 0; g < (size_t)cx->occn * (size_t)cx->occn * (size_t)cx->occn; g++)
+      cellat6[g] = -1;
+    for (int32_t ci = 0; ci < mesh2.ncell; ci++)
+      for (int32_t iz = 0; iz < mesh2.csize[ci]; iz++)
+        for (int32_t iy = 0; iy < mesh2.csize[ci]; iy++)
+          for (int32_t ix = 0; ix < mesh2.csize[ci]; ix++)
+            cellat6[hz_occ_index(cx->occn, mesh2.clo[ci][0] + ix, mesh2.clo[ci][1] + iy,
+                                 mesh2.clo[ci][2] + iz)] = ci;
+    for (int32_t k = 0; k < nse2; k++)
+      if (cut2.se[k].area > 0.0) Sarea6[cut2.se[k].cell] += cut2.se[k].area;
+    for (int32_t t9 = 0; t9 < cx->om->nt; t9++) {
+      int32_t mt = cx->om->fm != NULL ? cx->om->fm[t9] : 0;
+      if (mt < 0 || mt >= cx->om->nmtl) mt = 0;
+      const double *ke3 = cx->om->mtl[mt].ke3;
+      double ke = (ke3[0] + ke3[1] + ke3[2]) / 3.0;
+      if (!(ke > 0.0)) continue;
+      double tri[3][3];
+      for (int q2 = 0; q2 < 3; q2++)
+        for (int a = 0; a < 3; a++)
+          tri[q2][a] = cx->om->v[3 * (size_t)cx->om->f[3 * (size_t)t9 + (size_t)q2] + (size_t)a];
+      int32_t blo9[3], bhi9[3];
+      for (int a = 0; a < 3; a++) {
+        double mn = tri[0][a], mx = tri[0][a];
+        for (int q2 = 1; q2 < 3; q2++) {
+          if (tri[q2][a] < mn) mn = tri[q2][a];
+          if (tri[q2][a] > mx) mx = tri[q2][a];
+        }
+        blo9[a] = (int32_t)floor((mn - cx->ofr->o[a]) / cx->ofr->u[a]);
+        bhi9[a] = (int32_t)floor((mx - cx->ofr->o[a]) / cx->ofr->u[a]);
+        if (blo9[a] < 0) blo9[a] = 0;
+        if (bhi9[a] > cx->occn - 1) bhi9[a] = cx->occn - 1;
+      }
+      for (int32_t iz = blo9[2]; iz <= bhi9[2]; iz++)
+        for (int32_t iy = blo9[1]; iy <= bhi9[1]; iy++)
+          for (int32_t ix = blo9[0]; ix <= bhi9[0]; ix++) {
+            double blo[3] = {cx->ofr->o[0] + cx->ofr->u[0] * (double)ix,
+                             cx->ofr->o[1] + cx->ofr->u[1] * (double)iy,
+                             cx->ofr->o[2] + cx->ofr->u[2] * (double)iz};
+            double bhi[3] = {blo[0] + cx->ofr->u[0], blo[1] + cx->ofr->u[1],
+                             blo[2] + cx->ofr->u[2]};
+            double A = leak_tri_box_area((const double (*)[3])tri, blo, bhi);
+            if (!(A > 0.0)) continue;
+            int32_t ci = cellat6[hz_occ_index(cx->occn, ix, iy, iz)];
+            if (ci >= 0 && Sarea6[ci] > 0.0) Ecell6[ci] += ke * A;
+          }
+    }
+    for (int32_t k = 0; k < nse2; k++) {
+      int32_t ci = cut2.se[k].cell;
+      if (!(cut2.se[k].area > 0.0) || !(Ecell6[ci] > 0.0)) continue;
+      eemit2[k] = Ecell6[ci] / (3.14159265358979323846 * Sarea6[ci]);
+      emitpow2b += Ecell6[ci] * cut2.se[k].area / Sarea6[ci];
+    }
+    free(cellat6);
+    free(Ecell6);
+    free(Sarea6);
+  }
+  double t_gc = now_s() - tgc;
+  printf("   §808 ГРЕЙД2+РЕЗ2 (общая часть кадра 2, обеим веткам): ячеек %d (кадр 1: %d), "
+         "элементов %d (было %d), роздано Ke %.4f (кадр 1: %.4f, Δ %+.2f %%); %.2f с\n",
+         mesh2.ncell, cx->m1->ncell, nse2, cx->c1->nse, emitpow2b, cx->emitpow1,
+         100.0 * (emitpow2b - cx->emitpow1) / (cx->emitpow1 > 0.0 ? cx->emitpow1 : 1.0), t_gc);
+  /* ---- РЕМАП (А1348) ---- */
+  const double trm0 = now_s();
+  const size_t nph2 = (size_t)mesh2.ncell * 4, nso2 = (size_t)(nse2 > 0 ? nse2 : 1) * 4,
+               nbo2 = (size_t)mesh2.nf * 4;
+  double *phi2 = calloc(nph2, sizeof *phi2);
+  double *sout2 = calloc(nso2, sizeof *sout2);
+  int32_t *buf8 = malloc((size_t)4096 * sizeof *buf8);
+  if (phi2 == NULL || sout2 == NULL || buf8 == NULL) exit(1);
+  /* масса φ кадра 1 — до ремапа (контроль УБИВАЕТ-в) */
+  double mass1 = 0.0, massabs1 = 0.0;
+  for (int32_t c = 0; c < cx->m1->ncell; c++) {
+    double w = cx->c1->mvol[c][0][0];
+    mass1 += cx->phi1[4 * (size_t)c] * w;
+    massabs1 += fabs(cx->phi1[4 * (size_t)c]) * w;
+  }
+  int64_t nid8 = 0, npr8 = 0, nre8 = 0, nov8 = 0;
+  /* гистограмма глубины: d = уровень_новой − уровень_источника (0 — тождество,
+   * + — продление вниз, − — рестрикция вверх); ±6 и дальше — крайние корзины.
+   * ГЛУБИНА УЗЛА = lev − log2(csize): считаем через log2, а не спуском —
+   * иначе перепутываются размер и глубина (поймано прогоном §808: «подъём»
+   * проверял один корень). */
+  int64_t dhist[13] = {0};
+  for (int32_t ci = 0; ci < mesh2.ncell; ci++) {
+    int32_t csize2 = mesh2.csize[ci];
+    int k2 = 0;
+    for (int32_t s = csize2; s > 1; s >>= 1)
+      k2++;
+    int depth2 = cx->lev - k2; /* глубина узла ni2 от корня */
+    int32_t ni2 = mesh2.node[ci];
+    int32_t found = -1, fdepth = -1;
+    for (int d = depth2; d >= 0; d--) {
+      int32_t ni = (d == depth2) ? ni2 : warm808_node_at(cx->ot, d, mesh2.clo[ci]);
+      if (ni >= 0 && cx->m1->cellof[ni] >= 0) {
+        found = cx->m1->cellof[ni];
+        fdepth = d;
+        break;
+      }
+    }
+    int drec = 0;
+    if (found >= 0 && fdepth == depth2) {
+      /* тождество: тот же узел ot — ячейка есть у обеих сеток */
+      memcpy(&phi2[4 * (size_t)ci], &cx->phi1[4 * (size_t)found], 4 * sizeof(double));
+      nid8++;
+    } else if (found >= 0) {
+      /* ПРОДЛЕНИЕ: старая ячейка крупнее; поле линейно в её базисе
+       * φ = m + Σ s_k·(x_k−c_k)/h_k, среднее в центре новой, наклоны ×h2/h1 */
+      int32_t cj = found;
+      const double *s1 = &cx->phi1[4 * (size_t)cj];
+      double h1 = (double)cx->m1->csize[cj], h2d = (double)csize2;
+      double m = s1[0];
+      for (int k = 1; k < 4; k++) {
+        double dc = ((double)mesh2.clo[ci][k - 1] + 0.5 * h2d) -
+                    ((double)cx->m1->clo[cj][k - 1] + 0.5 * h1);
+        m += s1[k] * dc / h1;
+      }
+      phi2[4 * (size_t)ci] = m;
+      for (int k = 1; k < 4; k++)
+        phi2[4 * (size_t)ci + (size_t)k] = s1[k] * (h2d / h1);
+      npr8++;
+      drec = depth2 - fdepth;
+    } else {
+      /* РЕСТРИКЦИЯ: сетка 1 мельче внутри; флюидо-взвешенное среднее её ячеек,
+       * наклоны пересчитываются в базис крупной (×h_старой/h_новой) */
+      int32_t ncol = 0, novc = 0;
+      warm808_collect(cx->ot, cx->m1, ni2, mesh2.clo[ci], csize2, buf8, &ncol, 4096, &novc);
+      nov8 += novc;
+      double wsum = 0.0, msum = 0.0, ssum[3] = {0, 0, 0};
+      double wdom = -1.0;
+      int ddom = 0;
+      for (int32_t j = 0; j < ncol; j++) {
+        int32_t cj = buf8[j];
+        double w = cx->c1->mvol[cj][0][0];
+        if (!(w > 0.0)) continue;
+        double ratio = (double)cx->m1->csize[cj] / (double)csize2;
+        wsum += w;
+        msum += w * cx->phi1[4 * (size_t)cj];
+        for (int k = 1; k < 4; k++)
+          ssum[k - 1] += w * cx->phi1[4 * (size_t)cj + (size_t)k] * ratio;
+        int dj = 0;
+        for (int32_t s = cx->m1->csize[cj]; s > 1; s >>= 1)
+          dj++;
+        if (w > wdom) {
+          wdom = w;
+          ddom = cx->lev - dj; /* глубина источника-доминанты */
+        }
+      }
+      if (wsum > 0.0) {
+        phi2[4 * (size_t)ci] = msum / wsum;
+        for (int k = 1; k < 4; k++)
+          phi2[4 * (size_t)ci + (size_t)k] = ssum[k - 1] / wsum;
+      }
+      nre8++;
+      drec = depth2 - ddom;
+    }
+    if (drec < -6) drec = -6;
+    if (drec > 6) drec = 6;
+    dhist[drec + 6]++;
+  }
+  double mass2 = 0.0, massabs2 = 0.0;
+  for (int32_t ci = 0; ci < mesh2.ncell; ci++) {
+    double w = cut2.mvol[ci][0][0];
+    mass2 += phi2[4 * (size_t)ci] * w;
+    massabs2 += fabs(phi2[4 * (size_t)ci]) * w;
+  }
+  /* sout — рестрикция по площади: веерная триангуляция многоугольника,
+   * центроиды треугольников с весами площадей ищут старый элемент ТОГО ЖЕ
+   * фасета (номер фасета — индекс в общей таблице ft, сетки его не меняют).
+   * Контроль — Σ sout·area до/после (энергия, УБИКАЕТ-в). */
+  double spow1 = 0.0, spowabs1 = 0.0;
+  for (int32_t e = 0; e < cx->c1->nse; e++) {
+    if (!(cx->c1->se[e].area > 0.0)) continue;
+    spow1 += cx->sout1[4 * (size_t)e] * cx->c1->se[e].area;
+    spowabs1 += fabs(cx->sout1[4 * (size_t)e]) * cx->c1->se[e].area;
+  }
+  int64_t ndark8 = 0;
+  double adark8 = 0.0, atot2 = 0.0;
+  for (int32_t e2 = 0; e2 < nse2; e2++) {
+    double a2 = cut2.se[e2].area;
+    if (!(a2 > 0.0)) continue;
+    atot2 += a2;
+    int32_t nv = cut2.se[e2].nv;
+    if (nv < 3) {
+      ndark8++;
+      adark8 += a2;
+      continue;
+    }
+    double acc0 = 0.0, accs[3] = {0, 0, 0}, wsum = 0.0;
+    for (int q = 1; q + 1 < nv; q++) {
+      const double *A = cut2.se[e2].v[0], *B = cut2.se[e2].v[q], *C = cut2.se[e2].v[q + 1];
+      double u[3], w[3], nx[3];
+      for (int k = 0; k < 3; k++) {
+        u[k] = B[k] - A[k];
+        w[k] = C[k] - A[k];
+      }
+      nx[0] = u[1] * w[2] - u[2] * w[1];
+      nx[1] = u[2] * w[0] - u[0] * w[2];
+      nx[2] = u[0] * w[1] - u[1] * w[0];
+      double ar = 0.5 * sqrt(nx[0] * nx[0] + nx[1] * nx[1] + nx[2] * nx[2]);
+      if (!(ar > 0.0)) continue;
+      double p[3];
+      for (int k = 0; k < 3; k++)
+        p[k] = (A[k] + B[k] + C[k]) / 3.0;
+      int32_t c1i = warm808_cell_at(cx->ot, cx->m1, cx->ofr, p);
+      if (c1i < 0) continue;
+      int32_t e1 = -1;
+      for (int32_t kk = cx->c1->sestart[c1i]; kk < cx->c1->sestart[c1i + 1]; kk++) {
+        int32_t ej = cx->c1->selist[kk];
+        if (cx->c1->se[ej].facet == cut2.se[e2].facet) {
+          e1 = ej;
+          break;
+        }
+      }
+      if (e1 < 0) continue;
+      double ratio =
+          (double)cx->m1->csize[cx->c1->se[e1].cell] / (double)mesh2.csize[cut2.se[e2].cell];
+      acc0 += ar * cx->sout1[4 * (size_t)e1];
+      for (int k = 1; k < 4; k++)
+        accs[k - 1] += ar * cx->sout1[4 * (size_t)e1 + (size_t)k] * ratio;
+      wsum += ar;
+    }
+    if (wsum > 0.0) {
+      sout2[4 * (size_t)e2] = acc0 / wsum;
+      for (int k = 1; k < 4; k++)
+        sout2[4 * (size_t)e2 + (size_t)k] = accs[k - 1] / wsum;
+    } else {
+      ndark8++;
+      adark8 += a2;
+    }
+  }
+  double spow2 = 0.0, spowabs2 = 0.0;
+  for (int32_t e2 = 0; e2 < nse2; e2++) {
+    if (!(cut2.se[e2].area > 0.0)) continue;
+    spow2 += sout2[4 * (size_t)e2] * cut2.se[e2].area;
+    spowabs2 += fabs(sout2[4 * (size_t)e2]) * cut2.se[e2].area;
+  }
+  double t_rm = now_s() - trm0;
+  double poured = 100.0 * (double)(npr8 + nre8) / (double)(mesh2.ncell > 0 ? mesh2.ncell : 1);
+  {
+    int64_t tot8 = nid8 + npr8 + nre8, acc8 = 0;
+    int p998 = 0, pset8 = 0;
+    for (int d = 0; d <= 6; d++) {
+      int64_t c8 = d == 0 ? dhist[6] : dhist[6 - d] + dhist[6 + d];
+      acc8 += c8;
+      if (!pset8 && acc8 >= (tot8 * 99) / 100) {
+        p998 = d;
+        pset8 = 1;
+      }
+    }
+    if (!pset8) p998 = 6;
+    printf(
+        "   §808 РЕМАП: φ — тождество %lld, продление %lld, рестрикция %lld (перелито %.1f %%, "
+        "глубина p99 %d ур., гистограмма d [−6..+6]: %lld %lld %lld %lld %lld %lld | %lld | "
+        "%lld %lld %lld %lld %lld %lld, переполнений сбора %lld); Σ|φ|·V %.6g -> %.6g (Δ %+.3f %%; "
+        "знаковая %.6g -> %.6g); sout — без источника %lld элементов (%.2f %% площади), "
+        "Σ sout·area %.6g -> %.6g (Δ %+.3f %%), Σ|sout|·area %.6g -> %.6g (Δ %+.3f %%); %.2f с\n",
+        (long long)nid8, (long long)npr8, (long long)nre8, poured, p998, (long long)dhist[0],
+        (long long)dhist[1], (long long)dhist[2], (long long)dhist[3], (long long)dhist[4],
+        (long long)dhist[5], (long long)dhist[6], (long long)dhist[7], (long long)dhist[8],
+        (long long)dhist[9], (long long)dhist[10], (long long)dhist[11], (long long)dhist[12],
+        (long long)nov8, massabs1, massabs2,
+        100.0 * (massabs2 - massabs1) / (massabs1 > 0.0 ? massabs1 : 1.0), mass1, mass2,
+        (long long)ndark8, 100.0 * adark8 / (atot2 > 0.0 ? atot2 : 1.0), spow1, spow2,
+        100.0 * (spow2 - spow1) / (fabs(spow1) > 0.0 ? fabs(spow1) : 1.0), spowabs1, spowabs2,
+        100.0 * (spowabs2 - spowabs1) / (spowabs1 > 0.0 ? spowabs1 : 1.0), t_rm);
+  }
+  /* ---- ТЁПЛЫЙ ПУТЬ: прокидки К76 поверх ремапа + замыкание ---- */
+  tr3_problem pw = *cx->prob;
+  pw.m = &mesh2;
+  pw.cut = &cut2;
+  pw.facet_rho = frho2;
+  pw.elem_emit = eemit2;
+  pw.sig_t = sigt2;
+  pw.sig_s = sigs2;
+  const int nw = cx->nwarm;
+  double *phip = malloc(nph2 * sizeof *phip);
+  double *sop = malloc(nso2 * sizeof *sop);
+  double *dphi = malloc(nph2 * sizeof *dphi);
+  double *dso = malloc(nso2 * sizeof *dso);
+  double *dbo = malloc(nbo2 * sizeof *dbo);
+  if (phip == NULL || sop == NULL || dphi == NULL || dso == NULL || dbo == NULL) exit(1);
+  memcpy(phip, phi2, nph2 * sizeof *phip);
+  memcpy(sop, sout2, nso2 * sizeof *sop);
+  for (size_t i = 0; i < nbo2; i++)
+    dbo[i] = 0.0; /* байт-нулевая база: bout первой прокидкой восстанавливается */
+  double *ubw = NULL, *usw = NULL, *eirr_w = NULL, *eirr_wp = NULL;
+  double *bop = NULL;
+  if (nw >= 2) {
+    bop = calloc(nbo2, sizeof *bop);
+    if (bop == NULL) exit(1);
+  }
+  double qnumw = 0.0, qdenw = 0.0, denprevw = 0.0;
+  double psinw = 0.0, psinwp = 0.0;
+  for (int t = 1; t <= nw; t++) {
+    tr3_problem pt = pw;
+    pt.warm_start = 1;
+    pt.bout_in = t > 1 ? ubw : NULL; /* bout НЕ ремапится (А1348) */
+    pt.sout_in = t > 1 ? usw : sout2;
+    tr3_stats stt;
+    memset(&stt, 0, sizeof stt);
+    double tt808 = now_s();
+    if (tr3_sweep_solve(&pt, 1, 0.0, phi2, &stt) != 0) exit(1);
+    double num_t = 0.0, dencur = 0.0, dmx8 = 0.0;
+    for (size_t i = 0; i < nph2; i++) {
+      double dc = phi2[i] - phip[i];
+      if (t > 1) num_t += dc * dphi[i];
+      if (fabs(dc) > dmx8) dmx8 = fabs(dc);
+      dencur += dc * dc;
+      dphi[i] = dc;
+      phip[i] = phi2[i];
+    }
+    for (size_t i = 0; i < nso2; i++) {
+      double dc = stt.sout[i] - sop[i];
+      if (t > 1) num_t += dc * dso[i];
+      dencur += dc * dc;
+      dso[i] = dc;
+      sop[i] = stt.sout[i];
+    }
+    if (nw >= 2 && t > 1)
+      for (size_t i = 0; i < nbo2; i++) {
+        double dc = stt.bout[i] - bop[i];
+        num_t += dc * dbo[i];
+        dencur += dc * dc;
+        dbo[i] = dc;
+        bop[i] = stt.bout[i];
+      }
+    else if (nw >= 2)
+      for (size_t i = 0; i < nbo2; i++) {
+        dbo[i] = stt.bout[i]; /* первая прокидка bout строит, не приращивает */
+        bop[i] = stt.bout[i];
+      }
+    if (t > 1) {
+      qnumw = num_t;
+      qdenw = denprevw;
+    }
+    denprevw = dencur;
+    free(ubw);
+    free(usw);
+    free(eirr_wp);
+    eirr_wp = eirr_w;
+    ubw = stt.bout;
+    usw = stt.sout;
+    eirr_w = stt.eirr;
+    psinwp = psinw;
+    psinw = stt.psin;
+    printf("   §808 тёплый такт %d: psin %.6g, |Δφ|∞ %.3e, %.2f с\n", t, stt.psin, dmx8,
+           now_s() - tt808);
+  }
+  (void)psinwp;
+  /* Замыкание: прирост последней прокидки × q̂/(1−q̂). q̂ при nw ≥ 2 измеряется
+   * по двум приростам; при nw = 1 наследуется у лестницы кадра 1 — оператор
+   * (сцена, альбедо) не менялся, скаляр сжатия глобальный. bout/eirr/psin при
+   * nw = 1 не замыкаются: их прирост НЕ в режиме сжатия (bout строится с нуля,
+   * у eirr нет базиса), замыкание завышало бы их в q̂/(1−q̂) раз. */
+  double qw = -1.0, multw = 0.0;
+  const char *qsrcw = "нет (чистое усечение)";
+  if (nw >= 2 && qdenw > 0.0) qw = qnumw / qdenw;
+  if (qw > 0.0 && qw <= HZ_TAILQ_MAX) {
+    multw = qw / (1.0 - qw);
+    qsrcw = "измерен (тёплый)";
+  } else if (cx->qhat1 > 0.0 && cx->qhat1 <= HZ_TAILQ_MAX) {
+    multw = cx->qhat1 / (1.0 - cx->qhat1);
+    qsrcw = "унаследован у кадра 1";
+  }
+  if (multw > 0.0) {
+    for (size_t i = 0; i < nph2; i++)
+      phi2[i] += multw * dphi[i];
+    for (size_t i = 0; i < nso2; i++)
+      usw[i] += multw * dso[i];
+    if (nw >= 2) {
+      for (size_t i = 0; i < nbo2; i++)
+        ubw[i] += multw * dbo[i];
+      if (eirr_w != NULL && eirr_wp != NULL)
+        for (int32_t e = 0; e < nse2; e++)
+          eirr_w[e] += multw * (eirr_w[e] - eirr_wp[e]);
+      psinw += multw * (psinw - psinwp);
+    }
+  }
+  double t_warm = now_s() - trm0; /* ремап + прокидки + замыкание (А1346-б) */
+  printf("   §808 ТЁПЛЫЙ: %d %s, замыкание q̂ %.4f (%s), psin %.6g, %.2f с (из них ремап %.2f с)\n",
+         nw, warm808_plu(nw, "прокидка", "прокидки", "прокидок"),
+         qw > 0.0 ? qw : (cx->qhat1 > 0.0 ? cx->qhat1 : 0.0), qsrcw, psinw, t_warm, t_rm);
+  /* ---- ХОЛОДНАЯ БАЗА: та же лестница на сетке кадра 2, с нуля ---- */
+  double tb0 = now_s();
+  double *phiB = calloc(nph2, sizeof *phiB);
+  double *pphiB = calloc(nph2, sizeof *pphiB);
+  double *pboB = calloc(nbo2, sizeof *pboB);
+  double *psoB = calloc(nso2, sizeof *psoB);
+  double *dpphiB = calloc(nph2, sizeof *dpphiB);
+  double *dpboB = calloc(nbo2, sizeof *dpboB);
+  double *dpsoB = calloc(nso2, sizeof *dpsoB);
+  double *peirrB = calloc((size_t)(nse2 > 0 ? nse2 : 1), sizeof *peirrB);
+  if (phiB == NULL || pphiB == NULL || pboB == NULL || psoB == NULL || dpphiB == NULL ||
+      dpboB == NULL || dpsoB == NULL || peirrB == NULL)
+    exit(1);
+  double *ubB = NULL, *usB = NULL;
+  double qnumB = 0.0, qdenB = 0.0, denprevB = 0.0;
+  double scprevB[6] = {0, 0, 0, 0, 0, 0};
+  tr3_stats stB;
+  memset(&stB, 0, sizeof stB);
+  for (int t = 1; t <= cx->xbounce; t++) {
+    tr3_problem pl = pw;
+    if (t > 1) {
+      pl.warm_start = 1;
+      pl.bout_in = ubB;
+      pl.sout_in = usB;
+    }
+    tr3_stats stt;
+    memset(&stt, 0, sizeof stt);
+    if (tr3_sweep_solve(&pl, 1, 0.0, phiB, &stt) != 0) exit(1);
+    double num_t = 0.0, dencur = 0.0;
+    for (size_t i = 0; i < nph2; i++) {
+      double dc = phiB[i] - pphiB[i];
+      num_t += dc * dpphiB[i];
+      dencur += dc * dc;
+      dpphiB[i] = dc;
+      pphiB[i] = phiB[i];
+    }
+    for (size_t i = 0; i < nbo2; i++) {
+      double dc = stt.bout[i] - pboB[i];
+      num_t += dc * dpboB[i];
+      dencur += dc * dc;
+      dpboB[i] = dc;
+      pboB[i] = stt.bout[i];
+    }
+    for (size_t i = 0; i < nso2; i++) {
+      double dc = stt.sout[i] - psoB[i];
+      num_t += dc * dpsoB[i];
+      dencur += dc * dc;
+      dpsoB[i] = dc;
+      psoB[i] = stt.sout[i];
+    }
+    if (t > 1) {
+      qnumB = num_t;
+      qdenB = denprevB;
+    }
+    denprevB = dencur;
+    free(ubB);
+    free(usB);
+    ubB = stt.bout;
+    usB = stt.sout;
+    if (t < cx->xbounce) {
+      if (stt.eirr != NULL)
+        for (int32_t e = 0; e < nse2; e++)
+          peirrB[e] = stt.eirr[e];
+      scprevB[0] = stt.pin;
+      scprevB[1] = stt.pout;
+      scprevB[2] = stt.pabs;
+      scprevB[3] = stt.psin;
+      scprevB[4] = stt.psout;
+      scprevB[5] = stt.psolid;
+      free(stt.eirr);
+    } else
+      stB = stt;
+  }
+  double qB = -1.0;
+  if (cx->xtailq > 0.0)
+    qB = cx->xtailq;
+  else if (cx->xtailq < 0.0 && cx->xbounce >= HZ_TAILN_MIN && qdenB > 0.0)
+    qB = qnumB / qdenB;
+  if (qB > 0.0 && qB <= HZ_TAILQ_MAX) {
+    double mult = qB / (1.0 - qB);
+    for (size_t i = 0; i < nph2; i++)
+      phiB[i] += mult * dpphiB[i];
+    for (size_t i = 0; i < nbo2; i++)
+      ubB[i] += mult * dpboB[i];
+    for (size_t i = 0; i < nso2; i++)
+      usB[i] += mult * dpsoB[i];
+    if (stB.eirr != NULL)
+      for (int32_t e = 0; e < nse2; e++)
+        stB.eirr[e] += mult * (stB.eirr[e] - peirrB[e]);
+    stB.pin += mult * (stB.pin - scprevB[0]);
+    stB.pout += mult * (stB.pout - scprevB[1]);
+    stB.pabs += mult * (stB.pabs - scprevB[2]);
+    stB.psin += mult * (stB.psin - scprevB[3]);
+    stB.psout += mult * (stB.psout - scprevB[4]);
+    stB.psolid += mult * (stB.psolid - scprevB[5]);
+  }
+  double t_base = now_s() - tb0; /* прокидки + замыкание (А1346-в) */
+  printf("   §808 БАЗА: %d %s с нуля, замыкание q̂ %.4f (%s), psin %.6g, %.2f с\n", cx->xbounce,
+         warm808_plu(cx->xbounce, "прокидка", "прокидки", "прокидок"), qB > 0.0 ? qB : 0.0,
+         cx->xtailq > 0.0 ? "ФОРСИРОВАН — НК" : (qB > 0.0 ? "измерен" : "нет — усечение"), stB.psin,
+         t_base);
+  /* ---- МЕТРИКИ: зона от НОВОГО глаза, поэлементный хвост ---- */
+  double dps = stB.psin > 0.0 ? 100.0 * (psinw - stB.psin) / stB.psin : 0.0;
+  double zw8 = 0.0, zb8 = 0.0;
+  int64_t nzone8 = 0, nuse8 = 0;
+  double *rel8 = malloc((size_t)(nse2 > 0 ? nse2 : 1) * sizeof *rel8);
+  if (rel8 == NULL) exit(1);
+  for (int32_t e = 0; e < nse2; e++) {
+    double a9 = cut2.se[e].area;
+    if (!(a9 > 0.0) || eirr_w == NULL || stB.eirr == NULL) continue;
+    double c9[3] = {0, 0, 0};
+    for (int q = 0; q < cut2.se[e].nv; q++)
+      for (int a = 0; a < 3; a++)
+        c9[a] += cut2.se[e].v[q][a] / (double)(cut2.se[e].nv > 0 ? cut2.se[e].nv : 1);
+    double d2 = 0.0, dot = 0.0;
+    for (int a = 0; a < 3; a++) {
+      double dd = c9[a] - eye2[a];
+      d2 += dd * dd;
+      dot += cut2.se[e].n[a] * dd;
+    }
+    int inzone = sqrt(d2) < 15.0 && !(dot > 0.0);
+    double ww8 = fabs(eirr_w[e]) * a9, wb8 = fabs(stB.eirr[e]) * a9;
+    if (inzone) {
+      zw8 += ww8;
+      zb8 += wb8;
+      nzone8++;
+    }
+    if (fabs(stB.eirr[e]) > 0.0) rel8[nuse8++] = fabs(eirr_w[e] - stB.eirr[e]) / fabs(stB.eirr[e]);
+  }
+  double dz = 100.0 * (zw8 - zb8) / (zb8 > 0.0 ? zb8 : 1.0);
+  printf("   §808 ИНКРЕМЕНТНОСТЬ: холод %.2f с (%d %s), тёплый %.2f с (%d %s + ремап %.2f с, "
+         "перелито %.1f %%), Δpsin %+.3f %%, Δ зоны %+.3f %%; заливка %s\n",
+         t_base, cx->xbounce, warm808_plu(cx->xbounce, "прокидка", "прокидки", "прокидок"), t_warm,
+         nw, warm808_plu(nw, "прокидка", "прокидки", "прокидок"), t_rm, poured, dps, dz,
+         "полость та же");
+  if (nuse8 > 0) {
+    qsort(rel8, (size_t)nuse8, sizeof *rel8, cmp_dev699);
+    printf("   §808 ПОЭЛЕМЕНТНО |Δeirr|/eirr (покрытие %lld из %d, база > 0): медиана %.4g, "
+           "p90 %.4g, p99 %.4g, макс %.4g\n",
+           (long long)nuse8, nse2, rel8[nuse8 / 2], rel8[(nuse8 * 9) / 10],
+           rel8[(nuse8 * 99) / 100], rel8[nuse8 - 1]);
+  }
+  printf("   §808 ЗОНА: Σ|E·area| (<15 м, лицевые, %lld элементов) %.6g против %.6g\n",
+         (long long)nzone8, zw8, zb8);
+  if (zero808) {
+    /* НК-3: сетки совпадают — база обязана быть ПОБИТОВО лестницей кадра 1
+     * (одно и то же вычисление), ремап — тождеством; тёплый путь отличается
+     * ровно на одну лишнюю эффективную итерацию (аудит исполнения скажет,
+     * посимвольно ли это равенство — план §808 НК-3 утверждал «да»). */
+    int bitsame = mesh2.ncell == cx->m1->ncell &&
+                  memcmp(phiB, cx->phi1, (size_t)cx->m1->ncell * 4 * sizeof(double)) == 0;
+    printf("   §808 НК-3 (сдвиг 0): ремап перелито %.1f %%, БАЗА == КАДР 1 побитово (φ): %s\n",
+           poured, bitsame ? "ДА" : "нет");
+  }
+  printf("   §808 СТЕНД всего: %.2f с (общая часть %.2f, тёплый %.2f, база %.2f)\n", now_s() - t808,
+         t_gc, t_warm, t_base);
+  free(rel8);
+  free(phi2);
+  free(sout2);
+  free(buf8);
+  free(phip);
+  free(sop);
+  free(dphi);
+  free(dso);
+  free(dbo);
+  free(bop);
+  free(ubw);
+  free(usw);
+  free(eirr_w);
+  free(eirr_wp);
+  free(phiB);
+  free(pphiB);
+  free(pboB);
+  free(psoB);
+  free(dpphiB);
+  free(dpboB);
+  free(dpsoB);
+  free(peirrB);
+  free(ubB);
+  free(usB);
+  free(stB.eirr);
+  free(eemit2);
+  free(frho2);
+  free(sigt2);
+  free(sigs2);
+  free(solid2);
+  tr3_cut_free(&cut2);
+  tr3_mesh_free(&mesh2);
+}
+
 static int32_t g_xcmp_n = 0, g_xcmp_nemit = 0;
 static double *g_xcmp_E = NULL, *g_xcmp_Edir = NULL, *g_xcmp_aw = NULL;
 static int32_t (*g_xcmp_lo)[3] = NULL;
@@ -6473,20 +7443,24 @@ int main(int argc, char **argv) {
    * fc осталась), и переворачивать канон под несработавшее лечение нельзя —
    * ключ остаётся исследовательским до вердикта (класс А1287/xobjpiece). */
   int xfc = 0;
-  int xfcelem = 0;        /* §798 НК: прямой канал кадра по-старому — агрегат E_fc+хвост
-                           * по ЭЛЕМЕНТАМ на узлах свипа (§796), ядровый канал не строится */
-  int hcontrib_set = 0;   /* §796: задан ли hcontrib= явно (для fc-умолчания) */
-  double xtailq = -1.0;   /* §774: q хвоста: <0 — измерить, 0 — усечение, >0 — НК */
-  int xbcmp774 = 0;       /* §774: базовый прогон и сравнение в одном процессе */
-  int xleak = 0;          /* §778: диагностический клип покрытия — адреса дыр */
-  int xnopiece = 0;       /* §780 НК: раздача и рез бесконечными плоскостями, как до Р-8 */
-  int xobjpiece = 0;      /* §794: куски из ТРЕУГОЛЬНИКОВ СЦЕНЫ (авторские нормали) */
-  int xclus = 0;          /* §800: кластеризованные OBJ-куски (полигоны, А1285) */
-  double xclustol = -1.0; /* §800: δ слияния, м; <0 — умолчание HZ_CLUS_TOL */
-  int xnomaxp = 0;        /* §735 НК: выключить принцип максимума — вернуть расходимость */
-  int xcmp = 0;           /* §744: поячеечное сличение свипа с ядром §597 */
-  int32_t xchain = -1;    /* §731: трасса цепочки к ячейке — только под xunit: пол
-                           * обрыва прогулки есть уровень единичного входа */
+  int xfcelem = 0;              /* §798 НК: прямой канал кадра по-старому — агрегат E_fc+хвост
+                                 * по ЭЛЕМЕНТАМ на узлах свипа (§796), ядровый канал не строится */
+  int hcontrib_set = 0;         /* §796: задан ли hcontrib= явно (для fc-умолчания) */
+  double xtailq = -1.0;         /* §774: q хвоста: <0 — измерить, 0 — усечение, >0 — НК */
+  int xbcmp774 = 0;             /* §774: базовый прогон и сравнение в одном процессе */
+  int xwarm_set = 0;            /* §808: стенд инкрементности — сдвиг камеры задан */
+  double xwarm3[3] = {0, 0, 0}; /* сдвиг глаза кадра 2, МЕТРЫ (А1347) */
+  int xwarm_n = 1;              /* корректирующих прокидок: 1 умолчание, 2 — ветка А1348 */
+  int xscramble808 = 0;         /* §808 НК-1: знак у top-1 % |sout| хранения кадра 1 */
+  int xleak = 0;                /* §778: диагностический клип покрытия — адреса дыр */
+  int xnopiece = 0;             /* §780 НК: раздача и рез бесконечными плоскостями, как до Р-8 */
+  int xobjpiece = 0;            /* §794: куски из ТРЕУГОЛЬНИКОВ СЦЕНЫ (авторские нормали) */
+  int xclus = 0;                /* §800: кластеризованные OBJ-куски (полигоны, А1285) */
+  double xclustol = -1.0;       /* §800: δ слияния, м; <0 — умолчание HZ_CLUS_TOL */
+  int xnomaxp = 0;              /* §735 НК: выключить принцип максимума — вернуть расходимость */
+  int xcmp = 0;                 /* §744: поячеечное сличение свипа с ядром §597 */
+  int32_t xchain = -1;          /* §731: трасса цепочки к ячейке — только под xunit: пол
+                                 * обрыва прогулки есть уровень единичного входа */
   int32_t xcelll[4] = {-1, -1, -1, -1}; /* §733: вскрытие обновления, до 4 ячеек */
   int xdir = -1;                        /* §733: направление вскрытия */
   /* §714: альбедо стыка вынесено в ОТДЕЛЬНЫЙ ключ и по умолчанию ВЫКЛЮЧЕНО:
@@ -6603,6 +7577,23 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xfcelem") == 0) xfcelem = 1;
     if (strncmp(argv[i], "xtailq=", 7) == 0) xtailq = strtod(argv[i] + 7, NULL);
     if (strcmp(argv[i], "xbcmp") == 0) xbcmp774 = 1;
+    /* §808: xwarm=DX,DY,DZ[,N] — двухкадровый стенд инкрементности света;
+     * необязательный N — число корректирующих прокидок (умолчание 1; 2 —
+     * предсказанная ветка А1348). Требует xcoarse>0 и xbounce>0. */
+    if (strncmp(argv[i], "xwarm=", 6) == 0) {
+      const char *cp = argv[i] + 6;
+      char *ep = NULL;
+      for (int k = 0; k < 3; k++) {
+        xwarm3[k] = strtod(cp, &ep);
+        if (ep == cp) break;
+        cp = ep;
+        if (*cp == ',') cp++;
+      }
+      if (*cp == ',') cp++;
+      if (*cp != '\0') xwarm_n = (int)strtol(cp, NULL, 10);
+      xwarm_set = 1;
+    }
+    if (strcmp(argv[i], "xscramble") == 0) xscramble808 = 1;
     if (strcmp(argv[i], "xleak") == 0) xleak = 1;
     if (strcmp(argv[i], "xnopiece") == 0) xnopiece = 1;
     if (strcmp(argv[i], "xobjpiece") == 0) xobjpiece = 1;
@@ -9128,14 +10119,8 @@ int main(int argc, char **argv) {
          * состояния (φ, bout, sout). Замыкаются состояние, eirr и скаляры К40
          * (все — линейные функционалы поля такта). Клип замыкания не ставится
          * (А1227): отрицательные eirr печатаются счётчиком, а не прячутся. */
-        /* Потолок q̂ — выше замеренного диапазона сжатия 0.61…0.89
-         * (§735/§741): при q → 1 замыкание умножает шум последнего
-         * приращения как 1/(1−q), и такой хвост доверия не заслуживает. */
-        static const double HZ_TAILQ_MAX = 0.95;
-        /* Минимум тактов для оценки q̂: нужны ДВА приращения, причём
-         * приращение такта 1 — весь прямой свет от нуля, вне геометрического
-         * режима ряда отражений. */
-        static const int HZ_TAILN_MIN = 3;
+        /* Потолок q̂ и минимум тактов — HZ_TAILQ_MAX/HZ_TAILN_MIN у §808-блока
+         * (файловая область видимости: та же лестница в стенде кадра 2). */
         const int32_t nse4 = cut.nse > 0 ? cut.nse : 1;
         const size_t nph = (size_t)mesh.ncell * 4, nbo = (size_t)mesh.nf * 4,
                      nso = (size_t)nse4 * 4;
@@ -9347,6 +10332,69 @@ int main(int argc, char **argv) {
           free(rel);
           free(phiB4);
           free(eirrB);
+        }
+        /* §808: СТЕНД ИНКРЕМЕНТНОСТИ СВЕТА. Стоит ПОСЛЕ лестницы и замыкания
+         * кадра 1: его вход — закрытое состояние (phi, st.bout, st.sout) и
+         * измеренный q̂. Гварды здесь, а не в разборе ключей: условие — не
+         * синтаксис, а семантика конфигурации (fcold считается позже). */
+        if (xwarm_set) {
+          if (!(xcoarse > 0.0)) {
+            fprintf(stderr, "xwarm= требует xcoarse>0: ремап грейда определён только "
+                            "при огрублении приёмников (план §808)\n");
+            exit(1);
+          }
+          if (!fcold || xhall || xemitfacet) {
+            fprintf(stderr, "xwarm= требует канонную инъекцию Ke по элементам (§786): "
+                            "несовместим с xfc/xhall/xemitfacet\n");
+            exit(1);
+          }
+          if (xrelax > 0.0) {
+            fprintf(stderr, "xwarm= при xrelax>0: демпфер гасил бы bout первой прокидки "
+                            "к нулю (§750)\n");
+            exit(1);
+          }
+          if (xwarm_n < 1 || xwarm_n > 2) {
+            fprintf(stderr, "xwarm=: прокидок %d — вне [1, 2] (А1348)\n", xwarm_n);
+            exit(1);
+          }
+          warm808 cx8;
+          memset(&cx8, 0, sizeof cx8);
+          cx8.ot = &ot;
+          cx8.ofr = &ofr;
+          cx8.cm = &cmap;
+          cx8.ft = &ftab;
+          cx8.om = &m;
+          cx8.ctctx = &CT;
+          cx8.occ = &P;
+          cx8.smask = solidmask;
+          cx8.occn = fr.n;
+          cx8.innerfluid = xinnerfluid;
+          cx8.lev = lev;
+          cx8.xcoarse = xcoarse;
+          cx8.xfernosolid = xfernosolid;
+          cx8.xmatrho = xmatrho;
+          cx8.xmatfar = xmatfar;
+          cx8.xrho = xrho;
+          cx8.xrhoscale = xrhoscale;
+          cx8.xthin = xthin;
+          cx8.xsemin = xsemin;
+          cx8.xtailq = xtailq;
+          cx8.m1 = &mesh;
+          cx8.c1 = &cut;
+          cx8.phi1 = phi;
+          cx8.sout1 = st.sout;
+          cx8.qhat1 = qhat;
+          cx8.emitpow1 = emitpow2;
+          cx8.prob = &prob;
+          for (int a = 0; a < 3; a++)
+            cx8.eye1[a] = g_eye[a];
+          cx8.shift[0] = xwarm3[0];
+          cx8.shift[1] = xwarm3[1];
+          cx8.shift[2] = xwarm3[2];
+          cx8.nwarm = xwarm_n;
+          cx8.xbounce = xbounce;
+          cx8.scramble = xscramble808;
+          warm808_run(&cx8);
         }
         free(pphi);
         free(pbo);

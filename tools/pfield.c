@@ -2574,6 +2574,179 @@ static void hgather_rec(const etree *T, int32_t ni, int q, const double pi[3], c
   }
 }
 
+/* --- 3ж. §812: БЛИКИ — АНАЛИТИЧЕСКИЙ ФОНГ-ЧЛЕН В РАСТРЕ ---------------------
+ *
+ * Раскол §625, измеренный планом §812: свип на канон-ординатах ND 32 несёт
+ * лепестки шире ~0.9 рад (§538), Bistro-глянец живёт в 0.1…1 рад — ОБРАЗ в
+ * свипе недостижим (ND 64…256 — такт ×2…×8, линейность А1358), аналитике
+ * число ординат не нужно. Альбедо свипа идёт ОТ kd (§739-скоринг), Ks-доля
+ * сегодня ПРОПАДАЕТ — член её добавляет, двойного счёта нет; глянцевое
+ * косвенное (Ks²) — названная потеря.
+ *
+ * Машина: etree излучателей §796 (efc_build, светящиеся элементы) + СВОЙ
+ * обход с ядром Фонга (А1367). Ядро (А1366): L_o = f_r·E_bin,
+ * f_r = ks·(ns+2)/(2π)·cosψ^ns, E_bin = Φ·cosθ_i·cosθ_lamp/(πr² + A) — та же
+ * форма, что у диффузного члена (при ns = 0, ks = ρ ядро ТОЧНО ламбертово,
+ * поэтому ns ≤ 0 пропускается — дубль диффуза, А1365). Лепесток режет обход:
+ * вне cosψ < cext вклад нуль, конус ~sqrt(ln(1/ε)/ns) узок. Белая точка —
+ * ДИФФУЗНАЯ (А1364): блик клипуется насыщением, а не тонет в перцентиле. */
+static int g_xgloss = 0;
+static etree *g_glet = NULL;
+static const opyr *g_glP = NULL;
+static const frame *g_glfr = NULL;
+static double g_gltau = 0.0, g_glcext = 0.0, g_glbeta = 0.0;
+static int g_glks0 = 0;     /* НК-а: ks := 0 — кадр обязан стать посимвольным */
+static int g_glnorm812 = 0; /* НК-б: нормаль перевёрнута у каждого 100-го треугольника */
+static float *g_glspec = NULL;
+static int64_t g_glnpx1 = 0, g_glnpx10 = 0, g_glclip = 0, g_glmarch = 0, g_glprune = 0,
+               g_glleaf = 0;
+static double g_glsum = 0.0, g_glt812 = 0.0;
+
+/* Потоковые счётчики обхода: в OMP-регионе у каждого потока свои, сведение —
+ * критической секцией после цикла (гонка в горячем цикле недопустима, А1036). */
+typedef struct {
+  int64_t prune, leaf, march;
+  double sum, t;
+} glstat812;
+
+static void gloss812_rec(const etree *T, int32_t ni, int q, const double pi[3],
+                         const double nsurf[3], const double wr[3], double ks, double nsp, int vis,
+                         double out[3], glstat812 *st) {
+  const enode *e = &T->e[ni];
+  const ebin *bb = NULL;
+  for (int k = 0; k < e->nb; k++)
+    if (T->b[e->b0 + k].q == q) {
+      bb = &T->b[e->b0 + k];
+      break;
+    }
+  if (bb == NULL) return;
+  double w[3] = {0, 0, 0}, r2 = 0.0;
+  for (int k = 0; k < 3; k++) {
+    w[k] = (double)bb->c[k] - pi[k];
+    r2 += w[k] * w[k];
+  }
+  if (!(r2 > 0.0)) return;
+  double r = sqrt(r2);
+  double ci8 = (w[0] * nsurf[0] + w[1] * nsurf[1] + w[2] * nsurf[2]) / r;
+  double cj8 = -(w[0] * (double)bb->n[0] + w[1] * (double)bb->n[1] + w[2] * (double)bb->n[2]) / r;
+  if (!(ci8 > 0.0) || !(cj8 > 0.0)) {
+    st->prune++;
+    return;
+  }
+  double cps = (w[0] * wr[0] + w[1] * wr[1] + w[2] * wr[2]) / r;
+  /* ЛЕПЕСТОК: (cosψ)^ns < 1e-3 вне конуса; радиус корзины — консервативно */
+  if (cps + (double)bb->rad / r < g_glcext) {
+    st->prune++;
+    return;
+  }
+  /* консервативная оценка вклада СВЕРХУ (урок §621: дробление по ВКЛАДУ, а не
+   * по угловому размеру: косинусы ≤ 1, значит вклад ≤ ядро_макс·Φ/(πr²)) */
+  double fmax = (double)bb->flux[0];
+  if ((double)bb->flux[1] > fmax) fmax = (double)bb->flux[1];
+  if ((double)bb->flux[2] > fmax) fmax = (double)bb->flux[2];
+  double cmax =
+      ks * (nsp + 2.0) / 6.28318530717958647692 * fmax * ci8 * cj8 / (3.14159265358979323846 * r2);
+  if (!(cmax > g_gltau)) {
+    st->prune++;
+    return;
+  }
+  /* дробление: ядро меняется внутри корзины — пока угловой радиус больше
+   * полуширины лепестка на полувысоте β = sqrt(2·ln2/ns)/2 */
+  if (e->nch > 0 && (double)bb->rad / r > 0.5 * g_glbeta) {
+    for (int k = 0; k < e->nch; k++)
+      gloss812_rec(T, e->ch[k], q, pi, nsurf, wr, ks, nsp, vis, out, st);
+    return;
+  }
+  st->leaf++;
+  int blocked = 0;
+  if (vis) {
+    double cw[3] = {(double)bb->c[0], (double)bb->c[1], (double)bb->c[2]};
+    blocked = shadowed_h(g_glP, g_glfr, pi, cw, &st->march);
+  }
+  if (blocked) return;
+  double g8 = ci8 * cj8 / (3.14159265358979323846 * r2 + (double)bb->area);
+  double fr8 = ks * (nsp + 2.0) / 6.28318530717958647692;
+  if (cps < 0.0) cps = 0.0;
+  double k8 = fr8 * pow(cps, nsp) * g8;
+  for (int c = 0; c < 3; c++)
+    out[c] += k8 * (double)bb->flux[c];
+}
+
+/* Спек-член одного пикселя: ks/ns — материала победившего треугольника
+ * (смотрит ВЫЗЫВАЮЩИЙ, §667: материал живёт у элемента); dr — направление
+ * ГЛАЗ→пиксель, исходящее к камере V = −dr; отражение R = 2(N·V)N − V. */
+static void gloss812_pixel(const etree *T, const double wp[3], const double nn[3],
+                           const double dr[3], double ks, double nsp, int vis, double out[3],
+                           glstat812 *st) {
+  out[0] = out[1] = out[2] = 0.0;
+  if (!(ks > 0.0) || !(nsp > 0.0)) return; /* А1365: ns ≤ 0 — дубль диффуза */
+  double vv[3];
+  for (int c = 0; c < 3; c++)
+    vv[c] = -dr[c];
+  double dn = vv[0] * nn[0] + vv[1] * nn[1] + vv[2] * nn[2];
+  if (!(dn > 0.0)) return; /* пиксель видит тыл — лоба нет */
+  double wr[3];
+  for (int c = 0; c < 3; c++)
+    wr[c] = 2.0 * dn * nn[c] - vv[c];
+  for (int q = 0; q < 6; q++)
+    gloss812_rec(T, 0, q, wp, nn, wr, ks, nsp, vis, out, st);
+}
+
+/* САМОТЕСТ А1366: одна корзина ровно над точкой, лампа перпендикулярно,
+ * отражение совпадает с направлением на лампу (cps = 1): полученное против
+ * аналитики f_r·Φ/(πr² + A). Возвращает 0 при совпадении до 1e-12. */
+static int gloss812_selftest(void) {
+  etree T;
+  memset(&T, 0, sizeof T);
+  if (etree_alloc(&T, 1) < 0) return 1;
+  if (ebin_alloc(&T, 1) < 0) {
+    etree_free(&T);
+    return 1;
+  }
+  T.e[0].b0 = 0;
+  T.e[0].nb = 1;
+  T.e[0].nch = 0;
+  for (int k = 0; k < 8; k++)
+    T.e[0].ch[k] = -1;
+  ebin *bb = &T.b[0];
+  memset(bb, 0, sizeof *bb);
+  bb->q = 5; /* нормаль (0,0,−1): ось 2, минус */
+  bb->c[0] = 0.0f;
+  bb->c[1] = 0.0f;
+  bb->c[2] = 1.0f;
+  bb->n[2] = -1.0f;
+  bb->area = 0.01f;
+  bb->flux[0] = bb->flux[1] = bb->flux[2] = 2.0f;
+  bb->rad = 0.05f;
+  /* камера НАД точкой смотрит вниз: dr = глаз→пиксель = (0,0,−1); исходящее к
+   * камере V = (0,0,1); отражение R = V — лампа прямо в лоб, cps = 1 */
+  double pi[3] = {0, 0, 0}, nn[3] = {0, 0, 1}, dr[3] = {0, 0, -1};
+  double out[3] = {0, 0, 0};
+  glstat812 st;
+  memset(&st, 0, sizeof st);
+  double tau_sv = g_gltau, beta_sv = g_glbeta, cext_sv = g_glcext;
+  g_gltau = 0.0;
+  g_glbeta = 1e9;  /* не дробить (детей и так нет) */
+  g_glcext = -1.0; /* лепесток не отсекает */
+  double ks = 0.3, nsp = 8.0;
+  gloss812_pixel(&T, pi, nn, dr, ks, nsp, 0, out, &st);
+  g_gltau = tau_sv;
+  g_glbeta = beta_sv;
+  g_glcext = cext_sv;
+  double r = 1.0;
+  /* ожидание — из ТЕХ ЖЕ float-констант корзины (урок А1344: предсказывать от
+   * носителя; расхождение 2e-10 было float-округлением 0.01f против 0.01) */
+  double A8 = (double)bb->area, F8 = (double)bb->flux[0];
+  double expect =
+      ks * (nsp + 2.0) / 6.28318530717958647692 * F8 / (3.14159265358979323846 * r * r + A8);
+  int bad = fabs(out[0] - expect) > 1e-12 * (fabs(expect) > 0.0 ? fabs(expect) : 1.0);
+  printf("   §812 САМОТЕСТ ЯДРА: одна лампа над точкой, cps = 1: получено %.12e против "
+         "аналитики %.12e — %s\n",
+         out[0], expect, bad ? "РАСХОЖДЕНИЕ" : "ТОЖДЕСТВО");
+  etree_free(&T);
+  return bad;
+}
+
 /* --- 3з. СВИП ПОТОКОМ (Ш5, §383) ------------------------------------------- */
 
 /* ЧТО ЗДЕСЬ ДЕЛАЕТСЯ И ЧЕМ ЭТО ОТЛИЧАЕТСЯ ОТ ЛУЧА. Луч платит `O(шаги)` за
@@ -3668,11 +3841,13 @@ static void warm808_run(const warm808 *cx) {
       const double *ke3 = cx->om->mtl[mt].ke3;
       double ke = (ke3[0] + ke3[1] + ke3[2]) / 3.0;
       if (!(ke > 0.0)) continue;
-      double tri[3][3];
+      /* нулевая инициализация — гейт: анализатор теряет заполнение через
+       * вложенный цикл по q2/a (ложный класс, что у cellc/e1 выше) */
+      double tri[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
       for (int q2 = 0; q2 < 3; q2++)
         for (int a = 0; a < 3; a++)
           tri[q2][a] = cx->om->v[3 * (size_t)cx->om->f[3 * (size_t)t9 + (size_t)q2] + (size_t)a];
-      int32_t blo9[3], bhi9[3];
+      int32_t blo9[3] = {0, 0, 0}, bhi9[3] = {0, 0, 0};
       for (int a = 0; a < 3; a++) {
         double mn = tri[0][a], mx = tri[0][a];
         for (int q2 = 1; q2 < 3; q2++) {
@@ -7007,6 +7182,10 @@ static void lit_resolve(litctx *L, int gamn) {
       int32_t ccl[3] = {0, 0, 0};
       int cvalid = 0, cnt791 = 0, ccap = 0;
       uvtri791 *ctri = NULL;
+      /* §812: потоковые счётчики блик-канала (сведение — критической секцией
+       * ниже; гонка в горячем цикле недопустима, А1036) */
+      glstat812 st812;
+      memset(&st812, 0, sizeof st812);
 #pragma omp for schedule(static)
       for (int py2 = 0; py2 < L->h; py2++) {
         for (int px2 = 0; px2 < L->w; px2++) {
@@ -7081,6 +7260,12 @@ static void lit_resolve(litctx *L, int gamn) {
                   u9->e1[c] = e1[c];
                   u9->e2[c] = e2[c];
                 }
+                /* §812 НК-б: перевёрнутая нормаль у каждого 100-го
+                 * треугольника. Расстояние argmin не меняется (|dot|), uv и
+                 * текстура не меняются — шевелится ТОЛЬКО блик-канал. */
+                if (g_glnorm812 && (ls3[t3] % 100) == 0)
+                  for (int c = 0; c < 3; c++)
+                    u9->n[c] = -u9->n[c];
                 u9->d11 = d11;
                 u9->d12 = d12;
                 u9->d22 = d22;
@@ -7137,6 +7322,27 @@ static void lit_resolve(litctx *L, int gamn) {
               if (mt < 0 || mt >= L->nmtl) mt = L->defmat[k];
               uvdens = u9->uvdens;
               nsurf791++;
+              /* §812: СПЕК-ЧЛЕН — по авторской нормали и материалу победившего
+               * треугольника, ДО текстурного continue (материал без текстуры
+               * бликует тоже). Буфер глобальный, индексация как defcol;
+               * сведение — в критической секции после цикла. */
+              if (g_glet != NULL && g_glspec != NULL) {
+                double ks812 = 0.0, ns812 = 0.0;
+                if (mt >= 0 && mt < L->nmtl) {
+                  const double *ks3 = L->mesh->mtl[mt].ks3;
+                  ks812 = (ks3[0] + ks3[1] + ks3[2]) / 3.0;
+                  ns812 = L->mesh->mtl[mt].ns;
+                }
+                if (g_glks0) ks812 = 0.0;
+                if (ks812 > 0.0 && ns812 > 0.0) {
+                  double t812a = now_s();
+                  double out812[3];
+                  gloss812_pixel(g_glet, wp, u9->n, dr, ks812, ns812, 1, out812, &st812);
+                  for (int c = 0; c < 3; c++)
+                    g_glspec[3 * k + (size_t)c] = (float)out812[c];
+                  st812.t += now_s() - t812a;
+                }
+              }
             }
           }
           if (L->texrgb[mt] == NULL) continue;
@@ -7183,6 +7389,17 @@ static void lit_resolve(litctx *L, int gamn) {
         }
       }
       free(ctri);
+      /* §812: сведение потоковых счётчиков блик-канала (по одному входу на
+       * поток — не в горячем цикле) */
+      if (g_glet != NULL) {
+#pragma omp critical
+        {
+          g_glprune += st812.prune;
+          g_glleaf += st812.leaf;
+          g_glmarch += st812.march;
+          g_glt812 += st812.t;
+        }
+      }
     }
     L->nsurfuv += nsurf791;
     L->ntexpx += ntex791;
@@ -7196,10 +7413,29 @@ static void lit_resolve(litctx *L, int gamn) {
   size_t np = (size_t)L->w * (size_t)L->h;
   for (size_t k = 0; k < np; k++) {
     if (L->z[k] >= 1e299) continue; /* пиксель не закрыт ничем */
+    /* §812: спек — ПОСЛЕ текстуры (блик не крашится ею), белая точка
+     * ДИФФУЗНАЯ (А1364): блик честно клипуется насыщением. Доли и клип —
+     * в прибор (сериальный цикл, глобальные счётчики без гонок). */
+    if (g_glspec != NULL) {
+      double sp8 =
+          (double)g_glspec[3 * k] + (double)g_glspec[3 * k + 1] + (double)g_glspec[3 * k + 2];
+      double dd8 =
+          (double)L->defcol[3 * k] + (double)L->defcol[3 * k + 1] + (double)L->defcol[3 * k + 2];
+      if (sp8 > 0.01 * (dd8 + sp8)) g_glnpx1++;
+      if (sp8 > 0.1 * (dd8 + sp8)) g_glnpx10++;
+      g_glsum += sp8;
+    }
     for (int c = 0; c < 3; c++) {
+      /* без ключа — ИСХОДНОЕ выражение без добавок: мир посимвольный */
       double t = (double)L->defcol[3 * k + (size_t)c] / L->white;
+      if (g_glspec != NULL) t += (double)g_glspec[3 * k + (size_t)c] / L->white;
       if (t < 0.0) t = 0.0;
-      if (t > 1.0) t = 1.0;
+      if (t > 1.0) {
+        t = 1.0;
+        /* клип считается только там, где спек ДОБАВИЛ (иначе это диффузный
+         * клип, не блик) */
+        if (g_glspec != NULL && g_glspec[3 * k + (size_t)c] > 0.0f) g_glclip++;
+      }
       int ix = (int)(t * (double)gamn);
       if (ix >= gamn) ix = gamn - 1;
       L->rgb[3 * k + (size_t)c] = lut[ix];
@@ -7882,6 +8118,19 @@ int main(int argc, char **argv) {
       xs810_set = 1;
     }
     if (strcmp(argv[i], "xrhocal") == 0) xrhocal810 = 1;
+    /* §812: блики — аналитический Фонг-член в растре (требует кадр со светом
+     * и развёртку: дерево ламп строится по eemit). НК-ключи: xgloss0 — ks := 0
+     * (кадр посимвольно прежний), xglnorm812 — нормаль перевёрнута у каждого
+     * 100-го треугольника (блик-канал обязан поехать). */
+    if (strcmp(argv[i], "xgloss") == 0) g_xgloss = 1;
+    if (strcmp(argv[i], "xgloss0") == 0) {
+      g_xgloss = 1;
+      g_glks0 = 1;
+    }
+    if (strcmp(argv[i], "xglnorm812") == 0) {
+      g_xgloss = 1;
+      g_glnorm812 = 1;
+    }
     if (strcmp(argv[i], "xleak") == 0) xleak = 1;
     if (strcmp(argv[i], "xnopiece") == 0) xnopiece = 1;
     if (strcmp(argv[i], "xobjpiece") == 0) xobjpiece = 1;
@@ -11543,6 +11792,85 @@ int main(int argc, char **argv) {
               }
         }
       }
+      /* §812: ДЕРЕВО ЛАМП ДЛЯ БЛИКОВ (машина §796: efcsrc/efc_build). Строится
+       * ПО развёртке по фактическим eemit и живёт ДО КОНЦА прогона — кадровый
+       * путь читает; сведение счётчиков — прибором после кадра. Порог вклада —
+       * как у fc-сбора (§621/§796): доля средней радиосити с корня. */
+      if (g_xgloss) {
+        if (crc != 0 || cut.nse <= 0) {
+          fprintf(stderr, "xgloss требует развёртку с элементами (xsweep)\n");
+          exit(1);
+        }
+        int32_t nsrc812 = 0;
+        for (int32_t k = 0; k < cut.nse; k++)
+          if (eemit[k] > 0.0 && cut.se[k].area > 0.0) nsrc812++;
+        if (nsrc812 > 0) {
+          efcsrc *sr812 = malloc((size_t)nsrc812 * sizeof *sr812);
+          if (sr812 == NULL) exit(1);
+          int32_t js812 = 0;
+          for (int32_t k = 0; k < cut.nse; k++) {
+            if (!(eemit[k] > 0.0 && cut.se[k].area > 0.0)) continue;
+            efcsrc *s8 = &sr812[js812];
+            efc_center(&cut, &mesh, &fr, k, s8->c);
+            for (int a = 0; a < 3; a++)
+              s8->n[a] = cut.se[k].n[a];
+            s8->area = cut.se[k].area;
+            s8->flux = 3.14159265358979323846 * eemit[k] * cut.se[k].area;
+            s8->idx = js812;
+            s8->key = 0;
+            for (int sh = lev - 1; sh >= 0; sh--) {
+              uint64_t bit = (uint64_t)(((mesh.clo[cut.se[k].cell][0] >> sh) & 1) |
+                                        (((mesh.clo[cut.se[k].cell][1] >> sh) & 1) << 1) |
+                                        (((mesh.clo[cut.se[k].cell][2] >> sh) & 1) << 2));
+              s8->key = (s8->key << 3) | bit;
+            }
+            js812++;
+          }
+          qsort(sr812, (size_t)nsrc812, sizeof *sr812, efc_cmp);
+          g_glet = malloc(sizeof *g_glet);
+          if (g_glet == NULL) exit(1);
+          memset(g_glet, 0, sizeof *g_glet);
+          if (efc_build(g_glet, sr812, 0, nsrc812, 0, lev) < 0) exit(1);
+          double bsum812 = 0.0, asum812 = 0.0;
+          for (int k = 0; k < g_glet->e[0].nb; k++) {
+            const ebin *rb = &g_glet->b[g_glet->e[0].b0 + k];
+            asum812 += (double)rb->area;
+            bsum812 += (double)rb->flux[0];
+          }
+          g_gltau = (hcontrib_set ? g_hcontrib : HZ_FC_CONTRIB) *
+                    (asum812 > 0.0 ? bsum812 / asum812 : 0.0);
+          /* полуширина лепестка на полувысоте β = sqrt(2·ln2/ns) и косинус
+           * отсечения (cps)^ns < 1e-3 — НОСИТЕЛИ узкие, берутся по медианному
+           * ns сцены (приближение счётчика, не порог: точная ширина у каждого
+           * материала своя, консервативность даёт оценка cmax) */
+          double nsmed812 = 0.0;
+          {
+            double *nsv = malloc((size_t)(m.nmtl > 0 ? m.nmtl : 1) * sizeof *nsv);
+            if (nsv == NULL) exit(1);
+            int32_t nnv = 0;
+            for (int32_t mi9 = 0; mi9 < m.nmtl; mi9++) {
+              const double *ks3 = m.mtl[mi9].ks3;
+              double ks9 = (ks3[0] + ks3[1] + ks3[2]) / 3.0;
+              if (ks9 > 0.0 && m.mtl[mi9].ns > 0.0) nsv[nnv++] = m.mtl[mi9].ns;
+            }
+            if (nnv > 0) {
+              qsort(nsv, (size_t)nnv, sizeof *nsv, cmp_dev699);
+              nsmed812 = nsv[nnv / 2];
+            }
+            free(nsv);
+          }
+          g_glbeta = nsmed812 > 0.0 ? sqrt(2.0 * 0.69314718055994530942 / nsmed812) : 1.0;
+          g_glcext = nsmed812 > 0.0 ? pow(1e-3, 1.0 / nsmed812) : -1.0;
+          g_glP = &P;
+          g_glfr = &fr;
+          printf("   §812 ДЕРЕВО ЛАМП: излучателей %d, корзин %d; порог вклада %.3e; "
+                 "медианный Ns сцены %.1f (β %.3f рад, cext %.3f)\n",
+                 (int)nsrc812, (int)g_glet->nb, g_gltau, nsmed812, g_glbeta, g_glcext);
+          free(sr812);
+        } else
+          printf("   §812 ДЕРЕВО ЛАМП: светящихся элементов нет — канал пуст\n");
+        if (gloss812_selftest() != 0) exit(1);
+      }
       free(st.bout);
       free(st.eirr);
       free(st.sout);
@@ -14450,6 +14778,18 @@ int main(int argc, char **argv) {
         LC.areapix = apix;
         LC.defcol = calloc(np * 3, sizeof *LC.defcol);
         if (LC.defcol == NULL) exit(1);
+        /* §812: буфер спек-члена той же кадровой размерности; в цикле ходьбы
+         * переиспользуется с обнулением (кадровое поле, не сцено-якорное) */
+        if (g_glet != NULL) {
+          if (g_glspec == NULL) {
+            g_glspec = calloc(np * 3, sizeof *g_glspec);
+            if (g_glspec == NULL) exit(1);
+          } else
+            memset(g_glspec, 0, np * 3 * sizeof *g_glspec);
+          g_glnpx1 = g_glnpx10 = g_glclip = g_glprune = g_glleaf = g_glmarch = 0;
+          g_glsum = 0.0;
+          g_glt812 = 0.0;
+        }
         /* Ш8 (§575): ЗАГРУЗКА ТЕКСТУР. Имя из `map_Kd`, каталог — `ppm256` рядом
          * с текстурами сцены (готовит `scripts/tex_prep.sh`). Отсутствующая
          * текстура НЕ ошибка: материал остаётся одноцветным, и число таких
@@ -14632,6 +14972,19 @@ int main(int argc, char **argv) {
           LC.tris = NULL;
         }
         lit_resolve(&LC, g_gamn);
+        if (g_glet != NULL) {
+          int64_t ncovg8 = 0;
+          size_t npg8 = (size_t)resw * (size_t)resh;
+          for (size_t i8 = 0; i8 < npg8; i8++)
+            if (zb[i8] < 1e299) ncovg8++;
+          printf("   §812 БЛИКИ: канал %.2f с; пикселей со спеком > 1 %% — %.2f %%, > 10 %% — "
+                 "%.2f %% (закрытых %lld); в клипе каналов %lld; корзин-листьев %lld, маршей "
+                 "%lld, отсечений %lld; Σ спек %.4e\n",
+                 g_glt812, 100.0 * (double)g_glnpx1 / (double)(ncovg8 > 0 ? ncovg8 : 1),
+                 100.0 * (double)g_glnpx10 / (double)(ncovg8 > 0 ? ncovg8 : 1), (long long)ncovg8,
+                 (long long)g_glclip, (long long)g_glleaf, (long long)g_glmarch,
+                 (long long)g_glprune, g_glsum);
+        }
         printf("      §573 ПРОФИЛЬ РАСТРА: обход дерева с ПУСТЫМ обработчиком %.1f мс (код %d), "
                "обход+растр %.1f мс — значит сама растеризация %.1f мс\n",
                t_walk * 1e3, wrc0, (now_s() - ta) * 1e3, (now_s() - ta - t_walk) * 1e3);

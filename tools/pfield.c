@@ -3512,7 +3512,10 @@ static void remap818_phi(const hz_octree *ot, int lev, const tr3_mesh *mfrom, co
         int32_t cj = buf8[j];
         double w = cfrom->mvol[cj][0][0];
         if (!(w > 0.0)) continue;
-        double ratio = (double)mfrom->csize[cj] / (double)csize2;
+        /* §821: s = g·h (базис имеет градиент 1/h), поэтому наклон грубой
+         * ячейки БОЛЬШЕ наклона мелкой в h_грубая/h_мелая раз; было
+         * h_откуда/h_куда — инверсия, невидимая при отношениях ≈ 1 (§808) */
+        double ratio = (double)csize2 / (double)mfrom->csize[cj];
         wsum += w;
         msum += w * phifrom[4 * (size_t)cj];
         for (int k = 1; k < 4; k++)
@@ -3595,8 +3598,11 @@ static void remap818_se(const hz_octree *ot, const hz_frame *ofr, const tr3_mesh
         }
       }
       if (e1 < 0) continue;
+      /* §821: та же конвенция s = g·h — наклон к базису ПРИЁМНИКА
+       * умножается на h_приём/h_источник (было наоборот — раздувало наклоны
+       * при переходе на мелкую сетку и взорвало такты k ≥ 2, А1396) */
       double ratio =
-          (double)mfrom->csize[cfrom->se[e1].cell] / (double)mto->csize[cto->se[e2].cell];
+          (double)mto->csize[cto->se[e2].cell] / (double)mfrom->csize[cfrom->se[e1].cell];
       acc0 += ar * xfrom[4 * (size_t)e1];
       for (int k = 1; k < 4; k++)
         accs[k - 1] += ar * xfrom[4 * (size_t)e1 + (size_t)k] * ratio;
@@ -11081,6 +11087,7 @@ int main(int argc, char **argv) {
           if (v8 != NULL && !(v8->d0 < xcoarse) && !(xcoarse < v8->d0)) v8 = NULL;
           double *phiv818 = NULL, *soutv818 = NULL;
           int32_t *buf818 = NULL;
+          double *phic818 = NULL; /* §821: копия φ для круговорота */
           if (v8 != NULL) {
             pl.ang814 = NULL; /* прибор анизотропии рассчитан на базу */
             pl.m = &v8->m;
@@ -11093,21 +11100,42 @@ int main(int argc, char **argv) {
             buf818 = malloc(4096 * sizeof *buf818);
             if (phiv818 == NULL || soutv818 == NULL || buf818 == NULL) exit(1);
             {
+              phic818 = malloc((size_t)mesh.ncell * 4 * sizeof *phic818);
+              if (phic818 == NULL) exit(1);
+              memcpy(phic818, phi, (size_t)mesh.ncell * 4 * sizeof *phic818);
               int64_t ni818 = 0, np818 = 0, nr818 = 0, no818 = 0, dh818[13] = {0};
               remap818_phi(&ot, lev, &mesh, &cut, phi, &v8->m, phiv818, buf818, &ni818, &np818,
                            &nr818, &no818, dh818);
             }
+            /* §821: ЧИСТЫЙ круговорот ремапа (без решения между плечами):
+             * R(P(φ)) обязан вернуть φ до различий резов */
+            if (v8 != NULL) {
+              double *prt818 = calloc((size_t)mesh.ncell * 4, sizeof *prt818);
+              int64_t nib818 = 0, npb818 = 0, nrb818 = 0, nob818 = 0, dhb818[13] = {0};
+              if (prt818 == NULL) exit(1);
+              remap818_phi(&ot, lev, &v8->m, &v8->c, phiv818, &mesh, prt818, buf818, &nib818,
+                           &npb818, &nrb818, &nob818, dhb818);
+              double rtb818 = 0.0;
+              for (size_t i = 0; i < (size_t)mesh.ncell * 4; i++) {
+                double d818 = fabs(prt818[i] - phi[i]);
+                if (d818 > rtb818) rtb818 = d818;
+              }
+              printf("   §818 КРУГОВОРОТ-ЧИСТЫЙ: max|Δφ| %.3e\n", rtb818);
+              free(prt818);
+            }
             if (t > 1) {
               /* bout не переносится (А1348): в каноне он и так мёртв
                * (wall_rho == NULL, состояние нулевое) */
-              pl.warm_start = 1;
-              pl.bout_in = NULL;
-              double pw18a, pw18b, pw18c, pw18d;
-              int64_t nd818;
-              double ad818, at818;
-              remap818_se(&ot, &ofr, &mesh, &cut, usL, &v8->m, &v8->c, soutv818, &pw18a, &pw18b,
-                          &pw18c, &pw18d, &nd818, &ad818, &at818);
-              pl.sout_in = soutv818;
+              if (v8 != NULL) {
+                pl.warm_start = 1;
+                pl.bout_in = NULL;
+                double pw18a, pw18b, pw18c, pw18d;
+                int64_t nd818;
+                double ad818, at818;
+                remap818_se(&ot, &ofr, &mesh, &cut, usL, &v8->m, &v8->c, soutv818, &pw18a, &pw18b,
+                            &pw18c, &pw18d, &nd818, &ad818, &at818);
+                pl.sout_in = soutv818;
+              }
             }
           }
           double tt0 = now_s();
@@ -11139,11 +11167,22 @@ int main(int argc, char **argv) {
               free(stt.eirr);
               stt.eirr = eirrb818;
             }
+            /* §821: КРУГОВОРОТ — грубо→мелко→грубо; DG1-поле, точно
+             * представимое в грубом пространстве, обязано вернуться точно
+             * (значения и наклоны линейного поля точны при любых весах).
+             * Не ноль — конвенция наклонов неверна (А1396). */
+            double rt818 = 0.0;
+            for (size_t i = 0; i < (size_t)mesh.ncell * 4; i++) {
+              double d818 = fabs(phi[i] - phic818[i]);
+              if (d818 > rt818) rt818 = d818;
+            }
+            printf("   §818 КРУГОВОРОТ: max|Δφ| %.3e (должен быть ~1e-13 от поля)\n", rt818);
             printf("   §818 ТАКТ: такт %d на D0 %.0f (ячеек %d, элементов %d): psin %.6g; "
                    "ремап φ продл+рестр %lld/%lld, ΔΣ sout·area (выход) %+.3f %%\n",
                    t, v8->d0, v8->m.ncell, v8->c.nse, stt.psin, (long long)np818, (long long)nr818,
                    100.0 * (pw18c - pw18a) / (fabs(pw18a) > 0.0 ? fabs(pw18a) : 1.0));
             free(phiv818);
+            free(phic818);
             free(soutv818);
             free(buf818);
           }

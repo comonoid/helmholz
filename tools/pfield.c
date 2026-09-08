@@ -11088,6 +11088,7 @@ int main(int argc, char **argv) {
           double *phiv818 = NULL, *soutv818 = NULL;
           int32_t *buf818 = NULL;
           double *phic818 = NULL; /* §821: копия φ для круговорота */
+          double *phie818 = NULL; /* §822: φ на входе такта (вариантная сетка) */
           if (v8 != NULL) {
             pl.ang814 = NULL; /* прибор анизотропии рассчитан на базу */
             pl.m = &v8->m;
@@ -11106,6 +11107,11 @@ int main(int argc, char **argv) {
               int64_t ni818 = 0, np818 = 0, nr818 = 0, no818 = 0, dh818[13] = {0};
               remap818_phi(&ot, lev, &mesh, &cut, phi, &v8->m, phiv818, buf818, &ni818, &np818,
                            &nr818, &no818, dh818);
+              /* §822: φ после входного ремапа — вход такта для вскрытия
+               * (копия ПОСЛЕ ремапа: до него буфер нулевой, А1399-класс) */
+              phie818 = malloc((size_t)v8->m.ncell * 4 * sizeof *phie818);
+              if (phie818 == NULL) exit(1);
+              memcpy(phie818, phiv818, (size_t)v8->m.ncell * 4 * sizeof *phie818);
             }
             /* §821: ЧИСТЫЙ круговорот ремапа (без решения между плечами):
              * R(P(φ)) обязан вернуть φ до различий резов */
@@ -11138,6 +11144,8 @@ int main(int argc, char **argv) {
               }
             }
           }
+          if (v8 != NULL)
+            pl.trace = 1; /* §822: счётчики ограничителя на вариантном такте (однопоточно) */
           double tt0 = now_s();
           if (tr3_sweep_solve(&pl, 1, 0.0, v8 != NULL ? phiv818 : phi, &stt) != 0) exit(1);
           if (v8 != NULL) {
@@ -11185,6 +11193,48 @@ int main(int argc, char **argv) {
             free(phic818);
             free(soutv818);
             free(buf818);
+            /* §822: ВСКРЫТИЕ взрыва — если поле на выходе такта на много
+             * порядков выше входа, печатаем анатомию ячейки-виновника:
+             * объём флюида против объёма ячейки, сплошность, элементы,
+             * φ на входе и выходе. */
+            {
+              double ein822 = 0.0, eout822 = 0.0;
+              int32_t cin822 = -1, cout822 = -1;
+              for (int32_t c = 0; c < v8->m.ncell; c++) {
+                double a822 = fabs(phie818[(size_t)c * 4]);
+                if (a822 > ein822) {
+                  ein822 = a822;
+                  cin822 = c;
+                }
+                double b822 = fabs(phiv818[(size_t)c * 4]);
+                if (b822 > eout822) {
+                  eout822 = b822;
+                  cout822 = c;
+                }
+              }
+              printf("   §822 ВХОД/ВЫХОД: max|φ| %.4e -> %.4e (рост %.2e)\n", ein822, eout822,
+                     eout822 / (ein822 > 0.0 ? ein822 : 1e-300));
+              if (eout822 > 100.0 * (ein822 > 0.0 ? ein822 : 1e-300)) {
+                int32_t c822 = cout822;
+                int32_t nse822 = v8->c.sestart[c822 + 1] - v8->c.sestart[c822];
+                double s3 = (double)v8->m.csize[c822];
+                double V822 = s3 * s3 * s3 * ofr.u[0] * ofr.u[1] * ofr.u[2];
+                printf("   §822 ВСКРЫТИЕ: ячейка %d (мир %.2f %.2f %.2f, размер %d): φ вход "
+                       "%.4e выход %.4e; vfl %.4e из V %.4e (доля %.2e); solid %d; элементов "
+                       "%d; МинЭлемент",
+                       c822, ofr.o[0] + ofr.u[0] * (double)v8->m.clo[c822][0],
+                       ofr.o[1] + ofr.u[1] * (double)v8->m.clo[c822][1],
+                       ofr.o[2] + ofr.u[2] * (double)v8->m.clo[c822][2], (int)v8->m.csize[c822],
+                       phie818[(size_t)c822 * 4], phiv818[(size_t)c822 * 4], v8->c.mvol[c822][0][0],
+                       V822, v8->c.mvol[c822][0][0] / (V822 > 0.0 ? V822 : 1.0),
+                       (int)v8->c.solid[c822], nse822);
+                if (nse822 > 0)
+                  for (int32_t k = v8->c.sestart[c822]; k < v8->c.sestart[c822 + 1]; k++)
+                    printf(" %.2e", v8->c.se[v8->c.selist[k]].area);
+                printf("\n");
+              }
+            }
+            free(phie818);
           }
           /* §814: анизотропия r = |Σ w·L0·ω| / Σ w·L0, ДВУХ объектов: ПОЛЯ такта
            * (сумма ряда) и ПРИРАЩЕНИЯ такта (свет, отразившийся t раз) —

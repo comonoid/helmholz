@@ -2602,6 +2602,34 @@ static int64_t g_glnpx1 = 0, g_glnpx10 = 0, g_glclip = 0, g_glmarch = 0, g_glpru
                g_glleaf = 0;
 static double g_glsum = 0.0, g_glt812 = 0.0;
 
+/* §814: ПРИБОР КЛАССИФИКАЦИИ ОТКЛИКА (xresp814). Класс на пиксель пишет
+ * разрешитель по материалу ПОБЕДИВШЕГО ТРЕУГОЛЬНИКА (А1373: площадь говорит
+ * треугольник, не материал сцены); сведение — сериально в тон-маппинге:
+ * ПЛОЩАДЬ (пиксели) и ВЕС (Σ defcol — вклад в освещённость кадра, А1361:
+ * вес до реза). Прибор ТОЛЬКО читает — кадр не трогает. Классы:
+ * 0 не разрешён; 1 kd-only (ks ≤ 0 или ns ≤ 0 — дубль диффуза, А1365);
+ * 2 узкая: β(ns) < Δω свипа — ядро обязательно; 3 широкая: β ≥ Δω — место
+ * члена в эффективном альбедо свипа; 4 околозеркальная: β < угловой размер
+ * пикселя — пер-пиксельное ядро алиасится, нужен след луча. */
+static int g_xresp814 = 0;
+static int g_rspks0 = 0; /* НК-а: классификатор видит ks := 0 */
+static unsigned char *g_rspcls = NULL;
+static long long g_rspn[5];
+static double g_rspw[5];
+/* §538: лепесток, разрешимый свипом, — полуширина 27° при ND 64; при ND 32
+ * вдвое шире, 2·27° = 0.9425 рад. Это Δω, против которого сравнивается β. */
+#define HZ_RESP_DW814 0.9424777960769379
+
+/* β(ns) — полуширина лепестка Фонга на полувысоте: cos^ns β = 1/2. */
+static double resp_beta814(double nsp) {
+  return acos(pow(0.5, 1.0 / nsp));
+}
+
+/* §814: порог «ячейка освещена» для анизотропии — доля от max Σ w·L0. Вывод:
+ * шум квадратуры ячейки без света ~1e-16 от пика поля, порог на четыре
+ * порядка выше шума и на двенадцать ниже пика — от мусора с обеих сторон. */
+#define HZ_DIFF_FLOOR814 1e-12
+
 /* Потоковые счётчики обхода: в OMP-регионе у каждого потока свои, сведение —
  * критической секцией после цикла (гонка в горячем цикле недопустима, А1036). */
 typedef struct {
@@ -7322,6 +7350,28 @@ static void lit_resolve(litctx *L, int gamn) {
               if (mt < 0 || mt >= L->nmtl) mt = L->defmat[k];
               uvdens = u9->uvdens;
               nsurf791++;
+              /* §814: класс отклика пикселя — материал победившего
+               * треугольника (А1373). Только читает: кадр не трогает. */
+              if (g_rspcls != NULL) {
+                double ksR = 0.0, nsR = 0.0;
+                if (mt >= 0 && mt < L->nmtl) {
+                  const double *ks3R = L->mesh->mtl[mt].ks3;
+                  ksR = (ks3R[0] + ks3R[1] + ks3R[2]) / 3.0;
+                  nsR = L->mesh->mtl[mt].ns;
+                }
+                if (g_rspks0) ksR = 0.0; /* НК-а: классификатор без Ks */
+                unsigned char clsR = 1;  /* kd-only */
+                if (ksR > 0.0 && nsR > 0.0) {
+                  double bR = resp_beta814(nsR);
+                  if (bR < L->pxrad)
+                    clsR = 4; /* лепесток уже пикселя — ядро алиасится */
+                  else if (bR < HZ_RESP_DW814)
+                    clsR = 2; /* узкая: свип не разрешает, ядро обязательно */
+                  else
+                    clsR = 3; /* широкая: место члена — в альбедо свипа */
+                }
+                g_rspcls[k] = clsR;
+              }
               /* §812: СПЕК-ЧЛЕН — по авторской нормали и материалу победившего
                * треугольника, ДО текстурного continue (материал без текстуры
                * бликует тоже). Буфер глобальный, индексация как defcol;
@@ -7413,6 +7463,13 @@ static void lit_resolve(litctx *L, int gamn) {
   size_t np = (size_t)L->w * (size_t)L->h;
   for (size_t k = 0; k < np; k++) {
     if (L->z[k] >= 1e299) continue; /* пиксель не закрыт ничем */
+    /* §814: сведение классов отклика — площадь и вес (Σ defcol). Сериально,
+     * глобальные счётчики без гонок; цена — три сложения на пиксель. */
+    if (g_rspcls != NULL) {
+      g_rspn[g_rspcls[k]]++;
+      g_rspw[g_rspcls[k]] +=
+          (double)L->defcol[3 * k] + (double)L->defcol[3 * k + 1] + (double)L->defcol[3 * k + 2];
+    }
     /* §812: спек — ПОСЛЕ текстуры (блик не крашится ею), белая точка
      * ДИФФУЗНАЯ (А1364): блик честно клипуется насыщением. Доли и клип —
      * в прибор (сериальный цикл, глобальные счётчики без гонок). */
@@ -7948,6 +8005,7 @@ int main(int argc, char **argv) {
   int xcontrib = 0;       /* §768: прибор вклада — перевозмущения ρ→0 по классам */
   double xcoarse = 0.0;   /* §772: метров дальности на лист размера; 0 — выключено */
   int xbounce = 0;        /* §774: лестница N прокидок-отскоков; 0 — выключено */
+  int xdiff814 = 0;       /* §814: прибор анизотропии переносимого поля по тактам */
   /* §796: first-collision source — ПО КЛЮЧУ, а не умолчанием. План §796 менял
    * умолчание (прецедент §780), но приёмка П3 провалена (УБИВАЕТ: чешуя при
    * fc осталась), и переворачивать канон под несработавшее лечение нельзя —
@@ -8131,6 +8189,17 @@ int main(int argc, char **argv) {
       g_xgloss = 1;
       g_glnorm812 = 1;
     }
+    /* §814: приборы единой модели. xresp814 — классификация отклика по
+     * resolved-треугольникам растра (площадь И вес; кадр не трогает, печатает
+     * только с кадром). xresp0814 — НК-а: классификатор видит ks := 0, все
+     * спек-классы обязаны лечь в нуль. xdiff814 — анизотропия переносимого
+     * поля по тактам лестницы (требует xbounce). */
+    if (strcmp(argv[i], "xresp814") == 0) g_xresp814 = 1;
+    if (strcmp(argv[i], "xresp0814") == 0) {
+      g_xresp814 = 1;
+      g_rspks0 = 1;
+    }
+    if (strcmp(argv[i], "xdiff814") == 0) xdiff814 = 1;
     if (strcmp(argv[i], "xleak") == 0) xleak = 1;
     if (strcmp(argv[i], "xnopiece") == 0) xnopiece = 1;
     if (strcmp(argv[i], "xobjpiece") == 0) xobjpiece = 1;
@@ -10125,6 +10194,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "xbounce= несовместим с xdsa/xunit/xconst/xcmp/xcontrib\n");
         exit(1);
       }
+      /* §814: прибор анизотропии везётся тактами лестницы */
+      if (xdiff814 && xbounce <= 0) {
+        fprintf(stderr, "xdiff814 требует xbounce=: тактов, по которым мерить, нет\n");
+        exit(1);
+      }
       /* §733: вскрытие обновления — предсказания калиброваны единичным входом */
       if ((xcelll[0] >= 0 || xdir >= 0) && (!xunit || xcelll[0] < 0 || xdir < 0)) {
         fprintf(stderr, "xcell=/xdir= требуют xunit и друг друга\n");
@@ -10705,6 +10779,25 @@ int main(int argc, char **argv) {
         double *ubL = NULL, *usL = NULL; /* прокидка К76 */
         double q_num = 0.0, q_den = 0.0, denprev = 0.0;
         double sc_prev[6] = {0, 0, 0, 0, 0, 0}; /* скаляры К40 такта N−1 */
+        /* §814: прибор анизотропии (xdiff814): моменты такта — решатель
+         * перезаписывает их каждой итерацией, здесь maxit = 1 — моменты
+         * такта; рядом моменты прошлого такта для ПРИРАЩЕНИЯ и r приращения
+         * такта и позапрошлого (r = −1 — тёмная ячейка). */
+        double *ang814b = NULL, *ang814p = NULL, *r814c = NULL, *r814p = NULL;
+        if (xdiff814) {
+          ang814b = calloc(nph, sizeof *ang814b);
+          ang814p = calloc(nph, sizeof *ang814p);
+          r814c = calloc((size_t)mesh.ncell, sizeof *r814c);
+          r814p = calloc((size_t)mesh.ncell, sizeof *r814p);
+          if (ang814b == NULL || ang814p == NULL || r814c == NULL || r814p == NULL) exit(1);
+          /* r = −1 — «не было приращения»: иначе такт 1 оставил бы нули
+           * calloc-а, и такт 2 сравнил бы приращение с мусорным 0.0
+           * (ловилось на cavity05: «трёхтактных 9423» при пустом такте 1) */
+          for (int32_t c = 0; c < mesh.ncell; c++) {
+            r814c[c] = -1.0;
+            r814p[c] = -1.0;
+          }
+        }
         tr3_stats stfin;
         memset(&stfin, 0, sizeof stfin);
         double tlad = now_s();
@@ -10712,6 +10805,7 @@ int main(int argc, char **argv) {
           tr3_problem pl = prob;
           tr3_stats stt;
           memset(&stt, 0, sizeof stt);
+          pl.ang814 = ang814b;
           if (t > 1) {
             pl.warm_start = 1;
             pl.bout_in = ubL;
@@ -10719,6 +10813,66 @@ int main(int argc, char **argv) {
           }
           double tt0 = now_s();
           if (tr3_sweep_solve(&pl, 1, 0.0, phi, &stt) != 0) exit(1);
+          /* §814: анизотропия r = |Σ w·L0·ω| / Σ w·L0, ДВУХ объектов: ПОЛЯ такта
+           * (сумма ряда) и ПРИРАЩЕНИЯ такта (свет, отразившийся t раз) —
+           * модельная величина именно приращение: сумма каждый такт получает
+           * свежее ОСТРОЕ излучение источника, и её анизотропия падать не
+           * обязана (замерено на cavity05 до правки). Монотонность — по
+           * приращению, у ячеек светлых в трёх тактах подряд. ND рядом
+           * (А1374): сравнение законно только одношкально. */
+          if (ang814b != NULL) {
+            double smax814 = 0.0;
+            for (int32_t c = 0; c < mesh.ncell; c++)
+              if (ang814b[(size_t)c * 4] > smax814) smax814 = ang814b[(size_t)c * 4];
+            long long nlit814 = 0, ninc814 = 0, nboth814 = 0, nmon814 = 0;
+            double *rv814 = malloc((size_t)mesh.ncell * sizeof *rv814);
+            double *dv814 = malloc((size_t)mesh.ncell * sizeof *dv814);
+            if (rv814 == NULL || dv814 == NULL) exit(1);
+            for (int32_t c = 0; c < mesh.ncell; c++) {
+              const double *m814 = ang814b + (size_t)c * 4;
+              const double s0814 = m814[0];
+              if (s0814 > HZ_DIFF_FLOOR814 * smax814) {
+                rv814[nlit814++] =
+                    sqrt(m814[1] * m814[1] + m814[2] * m814[2] + m814[3] * m814[3]) / s0814;
+              }
+              if (t > 1) {
+                const double *q814 = ang814p + (size_t)c * 4;
+                const double d0814 = m814[0] - q814[0];
+                if (d0814 > HZ_DIFF_FLOOR814 * smax814) {
+                  const double dx814 = m814[1] - q814[1], dy814 = m814[2] - q814[2],
+                               dz814 = m814[3] - q814[3];
+                  const double rinc814 =
+                      sqrt(dx814 * dx814 + dy814 * dy814 + dz814 * dz814) / d0814;
+                  dv814[ninc814++] = rinc814;
+                  if (r814p[c] >= 0.0) {
+                    nboth814++;
+                    if (rinc814 < r814p[c]) nmon814++;
+                  }
+                  r814c[c] = rinc814;
+                } else
+                  r814c[c] = -1.0;
+              }
+            }
+            qsort(rv814, (size_t)nlit814, sizeof *rv814, cmp_dev699);
+            qsort(dv814, (size_t)ninc814, sizeof *dv814, cmp_dev699);
+            printf("   §814 ДИФФ: такт %d (ND %d): поле p50 %.4f p99 %.4f; приращение p50 %.4f "
+                   "p99 %.4f; монотонных (приращение) %.1f %% (ячеек %lld, приращений %lld, "
+                   "трёхтактных %lld)\n",
+                   t, prob.d->n, nlit814 > 0 ? rv814[nlit814 / 2] : -1.0,
+                   nlit814 > 0 ? rv814[(nlit814 * 99) / 100] : -1.0,
+                   ninc814 > 0 ? dv814[ninc814 / 2] : -1.0,
+                   ninc814 > 0 ? dv814[(ninc814 * 99) / 100] : -1.0,
+                   nboth814 > 0 ? 100.0 * (double)nmon814 / (double)nboth814 : -1.0,
+                   (long long)nlit814, (long long)ninc814, (long long)nboth814);
+            free(rv814);
+            free(dv814);
+            memcpy(ang814p, ang814b, nph * sizeof *ang814p);
+            { /* такт становится прошлым */
+              double *tmp814 = r814p;
+              r814p = r814c;
+              r814c = tmp814;
+            }
+          }
           /* приращение такта, его норма и скалярные произведения с прошлым */
           double dmaxphi = 0.0, dmaxso = 0.0, num_t = 0.0, dencur = 0.0;
           for (size_t i = 0; i < nph; i++) {
@@ -10771,6 +10925,17 @@ int main(int argc, char **argv) {
         }
         st = stfin;
         printf("   §774 ЛЕСТНИЦА: %d тактов за %.2f с\n", xbounce, now_s() - tlad);
+        /* §814 НК-в (свидетель живости): нулевые моменты прибора обязаны
+         * совпасть с φ той же итерации — те же слагаемые в том же порядке.
+         * Не ноль — прибор читает не то поле. */
+        if (ang814b != NULL) {
+          double wmax814 = 0.0;
+          for (int32_t c = 0; c < mesh.ncell; c++) {
+            double d814 = fabs(ang814b[(size_t)c * 4] - phi[(size_t)c * 4]);
+            if (d814 > wmax814) wmax814 = d814;
+          }
+          printf("   §814 ДИФФ: свидетель Σ w·L0 == φ: max|Δ| %.3e (обязан быть 0)\n", wmax814);
+        }
         const double t774lad = now_s() - tlad; /* §810: база сравнения — та же
                                                 * величина, что напечатана выше */
         /* замыкание хвоста */
@@ -11022,6 +11187,10 @@ int main(int argc, char **argv) {
         free(dpbo);
         free(dpso);
         free(peirr);
+        free(ang814b);
+        free(ang814p);
+        free(r814c);
+        free(r814p);
       } else if (!xunit) {
         src = tr3_sweep_solve(&prob, xit, xtol, phi, &st);
       } else {
@@ -14790,6 +14959,18 @@ int main(int argc, char **argv) {
           g_glsum = 0.0;
           g_glt812 = 0.0;
         }
+        /* §814: буфер класса отклика — кадровой размерности, обнуляется КАЖДЫЙ
+         * кадр: неразрешённый пиксель обязан быть классом 0, а не наследником
+         * прошлого кадра. */
+        if (g_xresp814) {
+          if (g_rspcls == NULL) {
+            g_rspcls = calloc(np, sizeof *g_rspcls);
+            if (g_rspcls == NULL) exit(1);
+          } else
+            memset(g_rspcls, 0, np * sizeof *g_rspcls);
+          memset(g_rspn, 0, sizeof g_rspn);
+          memset(g_rspw, 0, sizeof g_rspw);
+        }
         /* Ш8 (§575): ЗАГРУЗКА ТЕКСТУР. Имя из `map_Kd`, каталог — `ppm256` рядом
          * с текстурами сцены (готовит `scripts/tex_prep.sh`). Отсутствующая
          * текстура НЕ ошибка: материал остаётся одноцветным, и число таких
@@ -14984,6 +15165,21 @@ int main(int argc, char **argv) {
                  100.0 * (double)g_glnpx10 / (double)(ncovg8 > 0 ? ncovg8 : 1), (long long)ncovg8,
                  (long long)g_glclip, (long long)g_glleaf, (long long)g_glmarch,
                  (long long)g_glprune, g_glsum);
+        }
+        /* §814: классификация отклика — площадь (пиксели) и ВЕС (Σ defcol,
+         * вклад в освещённость) по классам; знаменатель — РАЗРЕШЁННЫЕ пиксели
+         * (А1373). Вывод первым, чтобы вес читался до площади. */
+        if (g_rspcls != NULL) {
+          long long nrsp814 = g_rspn[1] + g_rspn[2] + g_rspn[3] + g_rspn[4];
+          double wtot814 = g_rspw[1] + g_rspw[2] + g_rspw[3] + g_rspw[4];
+          double da = nrsp814 > 0 ? 100.0 / (double)nrsp814 : 0.0;
+          double dw = wtot814 > 0.0 ? 100.0 / wtot814 : 0.0;
+          printf("   §814 ОТКЛИК: разрешено %lld px; площадь kd-only %.1f %% / узкая %.1f %% / "
+                 "широкая %.1f %% / зеркало %.2f %% / без треугольника %.2f %%; вес %.1f / %.1f / "
+                 "%.1f / %.2f / %.2f %%\n",
+                 (long long)nrsp814, da * (double)g_rspn[1], da * (double)g_rspn[2],
+                 da * (double)g_rspn[3], da * (double)g_rspn[4], da * (double)g_rspn[0],
+                 dw * g_rspw[1], dw * g_rspw[2], dw * g_rspw[3], dw * g_rspw[4], dw * g_rspw[0]);
         }
         printf("      §573 ПРОФИЛЬ РАСТРА: обход дерева с ПУСТЫМ обработчиком %.1f мс (код %d), "
                "обход+растр %.1f мс — значит сама растеризация %.1f мс\n",

@@ -337,6 +337,10 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   int32_t *indegall = calloc((size_t)nth * (size_t)nc, sizeof(int32_t));
   int32_t *orderall = calloc((size_t)nth * (size_t)nc, sizeof(int32_t));
   int32_t *queueall = calloc((size_t)nth * (size_t)nc, sizeof(int32_t));
+  /* §814: per-thread пластины угловых моментов — ТОЛЬКО под прибором
+   * (p->ang814 != NULL); без него памяти нет и цены нет. */
+  double *ang814all =
+      p->ang814 != NULL ? calloc((size_t)nth * (size_t)nc * 4, sizeof(double)) : NULL;
   double *phin = calloc((size_t)nc * 4, sizeof(double));
   double *bout = calloc((size_t)m->nf * 4, sizeof(double));
   double *binf = calloc((size_t)m->nf * 4, sizeof(double));
@@ -392,6 +396,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     free(indegall);
     free(orderall);
     free(queueall);
+    free(ang814all);
     free(phin);
     free(binfall);
     free(sinfall);
@@ -677,6 +682,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       int32_t *queue = queueall + (size_t)tid * (size_t)nc;
       double *binft = binfall + (size_t)tid * (size_t)m->nf * 4;
       double *sinft = sinfall + (size_t)tid * (size_t)(nse > 0 ? nse : 1) * 4;
+      double *angt = ang814all != NULL ? ang814all + (size_t)tid * (size_t)nc * 4 : NULL;
       double om[3] = {d->ox[mm], d->oy[mm], d->oz[mm]};
       /* --- топологический порядок для этого направления ---
        * ПЕРЕСТРАИВАЕТСЯ КАЖДУЮ ИТЕРАЦИЮ, И ЭТО СОЗНАТЕЛЬНО: кэш стоил бы
@@ -1141,6 +1147,20 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       for (int32_t c = 0; c < nc; c++)
         for (int j = 0; j < 4; j++)
           phit[c * 4 + j] += d->w[mm] * L[c * 4 + j];
+      /* §814: угловые моменты направления. Нулевой член DG1 — средняя ячейки,
+       * он у всех направлений интегрируется по одной и той же флюидной части,
+       * поэтому отношение |Σ w·L0·ω| / Σ w·L0 есть анизотропия углового
+       * распределения независимо от геометрии ячейки. */
+      if (angt != NULL) {
+        const double wm814 = d->w[mm];
+        for (int32_t c = 0; c < nc; c++) {
+          const double l0814 = L[(size_t)c * 4];
+          angt[(size_t)c * 4 + 0] += wm814 * l0814;
+          angt[(size_t)c * 4 + 1] += wm814 * l0814 * om[0];
+          angt[(size_t)c * 4 + 2] += wm814 * l0814 * om[1];
+          angt[(size_t)c * 4 + 3] += wm814 * l0814 * om[2];
+        }
+      }
       /* §731: ОБРАТНАЯ ПРОГУЛКА ОТ ЦЕЛИ. Угловое поле `L` направления в этой
        * точке полно; шаг — к наибольшему по `|L|` верховому соседу (прокси
        * вклада, А1113). Однопоточно, как и весь цикл (nth = 1). */
@@ -1251,6 +1271,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       free(indegall);
       free(orderall);
       free(queueall);
+      free(ang814all);
       free(phin);
       free(bout);
       free(binf);
@@ -1287,6 +1308,17 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
       const double *stt = sinfall + (size_t)th * (size_t)(nse > 0 ? nse : 1) * 4;
       for (int32_t i = 0; i < nse * 4; i++)
         sinf[i] += stt[i];
+    }
+    /* §814: сведение угловых моментов итерации — ПЕРЕЗАПИСЬ, так что после
+     * возврата лежит последняя полная итерация. */
+    if (ang814all != NULL) {
+      memset(p->ang814, 0, (size_t)nc * 4 * sizeof(double));
+      for (int th = 0; th < nth; th++) {
+        const double *at = ang814all + (size_t)th * (size_t)nc * 4;
+        for (size_t i = 0; i < (size_t)nc * 4; i++)
+          p->ang814[i] += at[i];
+      }
+      memset(ang814all, 0, (size_t)nth * (size_t)nc * 4 * sizeof(double));
     }
     st->pin = pin_acc;
     st->pout = pout_acc;
@@ -2248,6 +2280,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   free(indegall);
   free(orderall);
   free(queueall);
+  free(ang814all);
   free(phin);
   free(binf);
   free(sinf);

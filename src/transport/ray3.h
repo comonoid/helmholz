@@ -90,4 +90,9 @@ typedef struct {
 #define TR3_MARCH_ESIGMA 2
 int tr3_march(const tr3_scene *sc, const double o[3], const double d[3], double tmax, tr3_hit *h);
 
+/* §829: прибор доли марша — счётчик вызовов и Σ шагов по ячейкам. Пассивные
+ * атомики; долю ВРЕМЕНИ даёт perf по символу tr3_march (план §829). */
+void hz_ray3_stats_get(long long *calls, long long *steps);
+void hz_ray3_stats_print(const char *tag);
+
 #endif

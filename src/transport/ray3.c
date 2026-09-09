@@ -2,7 +2,29 @@
 
 #include "transport/ray3.h"
 #include <math.h>
+#include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
+
+/* §829: прибор ДОЛИ МАРША В КОНВЕЙЕРЕ — счётчик вызовов и Σ шагов по ячейкам.
+ * Пассивные атомики с relaxed (вызовы возможны из omp-регионов, А1036); физика
+ * их не читает. Долю ВРЕМЕНИ даёт perf по символу tr3_march (план §829). */
+static _Atomic long long g_stat_march = 0;
+static _Atomic long long g_stat_march_steps = 0;
+
+void hz_ray3_stats_get(long long *calls, long long *steps) {
+  *calls = atomic_load_explicit(&g_stat_march, memory_order_relaxed);
+  *steps = atomic_load_explicit(&g_stat_march_steps, memory_order_relaxed);
+}
+
+void hz_ray3_stats_print(const char *tag) {
+  printf("   §829 МАРШ (%s): вызовов %lld, шагов %lld\n", tag,
+         atomic_load_explicit(&g_stat_march, memory_order_relaxed),
+         atomic_load_explicit(&g_stat_march_steps, memory_order_relaxed));
+}
+
+static int tr3_march_body(const tr3_scene *sc, const double o[3], const double d[3], double tmax,
+                          tr3_hit *h);
 
 /* Пересечение луча со СЛОЕМ [lo, hi] по оси a. Возвращает 0, если пусто. */
 static int slab(double p0, double dd, double lo, double hi, double *t0, double *t1) {
@@ -61,6 +83,16 @@ static int sphere_hit(const hz_surf *s, const double o[3], const double d[3], do
 }
 
 int tr3_march(const tr3_scene *sc, const double o[3], const double d[3], double tmax, tr3_hit *h) {
+  /* §829: счёт — одной точкой, в обёртке; сумма шагов читается из готового hit,
+   * поэтому место возврата не важно. */
+  atomic_fetch_add_explicit(&g_stat_march, 1, memory_order_relaxed);
+  int rc = tr3_march_body(sc, o, d, tmax, h);
+  atomic_fetch_add_explicit(&g_stat_march_steps, h->nsteps, memory_order_relaxed);
+  return rc;
+}
+
+static int tr3_march_body(const tr3_scene *sc, const double o[3], const double d[3], double tmax,
+                          tr3_hit *h) {
   memset(h, 0, sizeof *h);
   h->facet = -1;
   h->surf = -1;

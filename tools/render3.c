@@ -930,5 +930,10 @@ int main(int argc, char **argv) {
   hz_facettab_free(&ftab);
   hz_surftab_free(&stab);
   hz_oct_free(&t);
+  /* §829: пассивная печать приборов карты/марша — НК-б плана §829 (зубы
+   * прибора: здесь марш по построению в каждом пикселе, счётчики обязаны быть
+   * ненулевыми). Физику не читает и не меняет. */
+  hz_cutmap_stats_print("render3");
+  hz_ray3_stats_print("render3");
   return 0;
 }

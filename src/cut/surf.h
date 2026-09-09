@@ -223,4 +223,10 @@ int hz_facets_for_box(const hz_facettab *ft, int32_t f0, int32_t nf, const int32
 int hz_cutmap_hspaces(const hz_facettab *ft, const hz_cutmap *m, const hz_cutrec *r, hz_hspace *h,
                       int32_t *hid, int32_t *hid_flipped, int max);
 
+/* §829: прибор доли карты разреза — счётчики вызовов find/hspaces (плюс Σ
+ * развёрнутых полуплоскостей). Пассивные атомики; долю ВРЕМЕНИ даёт perf по
+ * этим же символам (план §829). */
+void hz_cutmap_stats_get(long long *find, long long *hspaces, long long *nf);
+void hz_cutmap_stats_print(const char *tag);
+
 #endif

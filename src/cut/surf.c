@@ -2,8 +2,31 @@
 
 #include "cut/surf.h"
 #include <math.h>
+#include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* §829: ПРИБОР ДОЛИ КАРТЫ РАЗРЕЗА В КОНВЕЙЕРЕ — счётчики вызовов, без часов
+ * (часы легли бы на каждый вызов; долю времени даёт perf по этим же символам,
+ * план §829). Пассивны: физика их не читает, «мир посимвольно прежен».
+ * Атомики с relaxed — вызовы идут из omp-регионов, гонка недопустима (А1036). */
+static _Atomic long long g_stat_find = 0;
+static _Atomic long long g_stat_hspaces = 0;
+static _Atomic long long g_stat_hsp_nf = 0;
+
+void hz_cutmap_stats_get(long long *find, long long *hspaces, long long *nf) {
+  *find = atomic_load_explicit(&g_stat_find, memory_order_relaxed);
+  *hspaces = atomic_load_explicit(&g_stat_hspaces, memory_order_relaxed);
+  *nf = atomic_load_explicit(&g_stat_hsp_nf, memory_order_relaxed);
+}
+
+void hz_cutmap_stats_print(const char *tag) {
+  printf("   §829 КАРТА (%s): find %lld / hspaces %lld (Σ полуплоскостей %lld)\n", tag,
+         atomic_load_explicit(&g_stat_find, memory_order_relaxed),
+         atomic_load_explicit(&g_stat_hspaces, memory_order_relaxed),
+         atomic_load_explicit(&g_stat_hsp_nf, memory_order_relaxed));
+}
 
 /* --- 1. поверхности -------------------------------------------------------- */
 
@@ -329,6 +352,7 @@ int hz_cutmap_add(hz_cutmap *m, int32_t cell, const int32_t *fref, int32_t nf) {
 }
 
 const hz_cutrec *hz_cutmap_find(const hz_cutmap *m, int32_t cell) {
+  atomic_fetch_add_explicit(&g_stat_find, 1, memory_order_relaxed);
   int32_t lo = 0, hi = m->nr - 1;
   while (lo <= hi) {
     int32_t mid = lo + (hi - lo) / 2; /* не (lo+hi)/2: переполнение при 2e8 записях */
@@ -358,6 +382,8 @@ const hz_cutrec *hz_cutcur_next(hz_cutcur *c, int32_t cell) {
 
 int hz_cutmap_hspaces(const hz_facettab *ft, const hz_cutmap *m, const hz_cutrec *r, hz_hspace *h,
                       int32_t *hid, int32_t *hid_flipped, int max) {
+  atomic_fetch_add_explicit(&g_stat_hspaces, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_stat_hsp_nf, r->nf, memory_order_relaxed);
   if (r->nf > max) return -1;
   for (int32_t j = 0; j < r->nf; j++) {
     int32_t ref = m->fref[r->f0 + j];

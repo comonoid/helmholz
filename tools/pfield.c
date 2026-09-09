@@ -15772,6 +15772,11 @@ int main(int argc, char **argv) {
          * цену обхода от цены рисования. Замерено: `141` мс на кадр при `512²`,
          * то есть `13 %` кадра платились за прибор. В однокадровом прогоне он
          * остаётся: там он и осмыслен. */
+        /* §829: снапшот приборов ПЕРЕД растер-секцией — дельта после приборов
+         * §828 даёт точное число вызовов карты/марша В КАДРЕ, без часов. */
+        long long f829a, h829a, nf829a, mc829a, ms829a;
+        hz_cutmap_stats_get(&f829a, &h829a, &nf829a);
+        hz_ray3_stats_get(&mc829a, &ms829a);
         double ta_w = now_s();
         int wrc0 = 0;
         if (!g_walk) wrc0 = hz_dc_walk(&T, lod_stop, &LLc, lit_none, &LC);
@@ -15868,9 +15873,17 @@ int main(int argc, char **argv) {
                hz_dc_walk_memo_stops(), hz_dc_walk_memo_evals(), hz_dc_walk_memo_flips(),
                (unsigned long long)LC.polysum);
         double t4828 = now_s();
-        printf("   §828 РАСТР: сбор %.1f / полосы %.1f / resolve %.1f / приборы %.1f мс (нитей %d)\n",
-               (t0828 - ta) * 1e3, (t2828 - t0828) * 1e3, (t3828 - t2828) * 1e3, (t4828 - t3828) * 1e3,
-               omp_get_max_threads());
+        printf(
+            "   §828 РАСТР: сбор %.1f / полосы %.1f / resolve %.1f / приборы %.1f мс (нитей %d)\n",
+            (t0828 - ta) * 1e3, (t2828 - t0828) * 1e3, (t3828 - t2828) * 1e3, (t4828 - t3828) * 1e3,
+            omp_get_max_threads());
+        {
+          long long f829b, h829b, nf829b, mc829b, ms829b;
+          hz_cutmap_stats_get(&f829b, &h829b, &nf829b);
+          hz_ray3_stats_get(&mc829b, &ms829b);
+          printf("   §829 РАСТР-ДЕЛЬТА: find +%lld / hspaces +%lld / марш +%lld (шагов +%lld)\n",
+                 f829b - f829a, h829b - h829a, mc829b - mc829a, ms829b - ms829a);
+        }
         double t_rast = now_s() - ta;
         int64_t ncov = 0;
         for (size_t i2 = 0; i2 < np; i2++)
@@ -16061,6 +16074,11 @@ int main(int argc, char **argv) {
            t_occ, t_edges, t_tree, t_build_all, g_t_frame * 1e3, g_t_fslice * 1e3, g_t_fdir * 1e3,
            g_t_fras * 1e3, g_t_bounce * 1e3, now_s() - g_t0);
   }
+  /* §829: ИТОГОВЫЕ totals за весь прогон (состав оговаривает А1416: сюда
+   * попадают СТЫК, рез и диагностика, но НЕ растер-секция — та отдельной
+   * дельтой у §828). Долю времени даёт perf по тем же символам. */
+  hz_cutmap_stats_print("всего за прогон");
+  hz_ray3_stats_print("всего за прогон");
   ct_free(&CT);
   hz_dc_free(&T);
   hz_htab_free(&ht);

@@ -2623,7 +2623,13 @@ static int g_xclamp823 = 0;
  * ключ; канон без ключа посимвольно прежний. */
 static int g_xrgb = 0;
 static int g_nch826 = 1; /* §826: каналов свипового поля/лестницы (xrgb → 3) */
-static int g_rspks0 = 0; /* НК-а: классификатор видит ks := 0 */
+/* §830: микробенч resolve — ключи-УДАЛЕНИЯ (диагностика трафика; база без
+ * ключей посимвольно прежна, кадр с ключом меняется предсказанно). Цена блока
+ * = разница полных прогонов: внутри omp-цикла почасовикам не поддаётся без
+ * искажения (урок §812-таймера: два now_s на пиксель). */
+static int g_xno791_830 = 0; /* удалить блок §791: клетка-треугольники+argmin */
+static int g_xnotex830 = 0;  /* удалить трилинейную выборку текстуры */
+static int g_rspks0 = 0;     /* НК-а: классификатор видит ks := 0 */
 static unsigned char *g_rspcls = NULL;
 static long long g_rspn[5];
 static double g_rspw[5];
@@ -7323,6 +7329,8 @@ static void lit_resolve(litctx *L, int gamn) {
    * ЗАКРЫТЫМ пикселям. Перцентиль, а не максимум, — по той же причине, что и
    * раньше: одиночный блик не должен утопить кадр. */
   size_t npx = (size_t)L->w * (size_t)L->h;
+  size_t nv830 = 0;
+  double t830a = now_s();
   {
     float *v = malloc(npx * sizeof *v);
     if (v == NULL) exit(1);
@@ -7339,8 +7347,10 @@ static void lit_resolve(litctx *L, int gamn) {
       double w995 = (double)v[(size_t)((double)nv * 0.995)];
       if (w995 > 0.0) L->white = w995;
     }
+    nv830 = nv;
     free(v);
   }
+  double t830b = now_s();
   /* Ш8 (§575): ВЫБОРКА ТЕКСТУРЫ — ОДИН РАЗ НА ВИДИМЫЙ ПИКСЕЛЬ. Отложенный
    * буфер (Р3 §572), сделанный ради скорости, здесь окупается второй раз:
    * перекрытые фрагменты текстуру не читают вовсе.
@@ -7375,7 +7385,7 @@ static void lit_resolve(litctx *L, int gamn) {
            * к чьей плоскости точка ближе. §791: та же семантика argmin, но
            * пер-треугольная тригонометрия предвычислена на клетку, барицентрика
            * считается только победителю. */
-          if (L->mesh != NULL && L->ct != NULL) {
+          if (!g_xno791_830 && L->mesh != NULL && L->ct != NULL) { /* xno791_830: §830-удаление */
             const tr3_camera *cm2 = L->cam;
             double ax = ((double)px2 + 0.5) / (double)L->w * 2.0 - 1.0;
             double ay = 1.0 - ((double)py2 + 0.5) / (double)L->h * 2.0;
@@ -7542,6 +7552,7 @@ static void lit_resolve(litctx *L, int gamn) {
               }
             }
           }
+          if (g_xnotex830) continue; /* xnotex830: §830-удаление текстуры */
           if (L->texrgb[mt] == NULL) continue;
           double vv = 1.0 - vv0;
           /* УРОВЕНЬ ПИРАМИДЫ по следу пикселя в текселях. Ширина пикселя на
@@ -7601,6 +7612,7 @@ static void lit_resolve(litctx *L, int gamn) {
     L->nsurfuv += nsurf791;
     L->ntexpx += ntex791;
   }
+  double t830c = now_s();
   unsigned char *lut = malloc((size_t)gamn);
   if (lut == NULL) exit(1);
   for (int i = 0; i < gamn; i++) {
@@ -7646,6 +7658,13 @@ static void lit_resolve(litctx *L, int gamn) {
     }
   }
   free(lut);
+  double t830d = now_s();
+  /* §830: микробенч resolve — серийные скобки (искажение ~0); разбиение
+   * omp-блока дают ключи-удаления xno791_830 / xnotex830 разницей прогонов. */
+  printf("   §830 РЕЗОЛВ: белая %.0f / сэмплер %.0f / тонмап %.0f мс (пикселей %zu, закрыто %zu, "
+         "с координатой %lld)\n",
+         (t830b - t830a) * 1e3, (t830c - t830b) * 1e3, (t830d - t830c) * 1e3, npx, nv830,
+         (long long)L->nsurfuv);
 }
 
 /* ОТСЕЧЕНИЕ ДО ПРОЕКЦИИ (Ш5в). Срез строится на ПОЛНЫЙ ШАР — так и задумано
@@ -8357,6 +8376,8 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xdiff814") == 0) xdiff814 = 1;
     if (strcmp(argv[i], "xclamp823") == 0) g_xclamp823 = 1;
     if (strcmp(argv[i], "xrgb") == 0) g_xrgb = 1;
+    if (strcmp(argv[i], "xno791_830") == 0) g_xno791_830 = 1;
+    if (strcmp(argv[i], "xnotex830") == 0) g_xnotex830 = 1;
     if (strncmp(argv[i], "xtact818=", 9) == 0) {
       /* §818: список k:D0 через запятую; такт k бежит на сетке D0 */
       const char *s818 = argv[i] + 9;

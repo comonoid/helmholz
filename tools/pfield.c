@@ -2619,6 +2619,10 @@ static int32_t g_xbud818 = 0;
 /* §822: каскадо-устойчивый зажим по принципу максимума — диагностический
  * ключ; включение по умолчанию — отдельный шаг после свидетельств. */
 static int g_xclamp823 = 0;
+/* §826: цветной свет — лестница ×3 (ke3/kd3 по каналам); диагностический
+ * ключ; канон без ключа посимвольно прежний. */
+static int g_xrgb = 0;
+static int g_nch826 = 1; /* §826: каналов свипового поля/лестницы (xrgb → 3) */
 static int g_rspks0 = 0; /* НК-а: классификатор видит ks := 0 */
 static unsigned char *g_rspcls = NULL;
 static long long g_rspn[5];
@@ -2869,7 +2873,7 @@ static double *g_dsa_ffv = NULL;
 /* §758: свиповое поле на УЗЛАХ дерева для кадра — num/den (E·площадь и
  * площадь), подъём суммами поддеревьев: кадровый срез с LOD читает любой
  * уровень как площадно-взвешенное среднее поддерева. */
-static double *g_swEn = NULL, *g_swEd = NULL;
+static double *g_swEn[3] = {NULL, NULL, NULL}, *g_swEd[3] = {NULL, NULL, NULL}; /* §826: каналы */
 /* §798: второй узловой канал кадра — ПРЯМОЙ свет из ядрового сбора (гибрид
  * К-а §797); num/den той же механики, что g_swEn/g_swEd. */
 static double *g_fcdn = NULL, *g_fcdd = NULL;
@@ -8348,6 +8352,7 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[i], "xdiff814") == 0) xdiff814 = 1;
     if (strcmp(argv[i], "xclamp823") == 0) g_xclamp823 = 1;
+    if (strcmp(argv[i], "xrgb") == 0) g_xrgb = 1;
     if (strncmp(argv[i], "xtact818=", 9) == 0) {
       /* §818: список k:D0 через запятую; такт k бежит на сетке D0 */
       const char *s818 = argv[i] + 9;
@@ -9842,6 +9847,11 @@ int main(int argc, char **argv) {
           frmx[i] = -1.0;
         }
       }
+      /* §826: ПОБЕДЫВШИЙ треугольник каждого элемента — выбор канон-
+       * независим, поэтому frho_c для каналов c > 0 считается лёгким
+       * проходом по tbest_e без повторного скоринга (маршей). */
+      int32_t *tbest_e = g_xrgb ? calloc((size_t)cut.nse, sizeof *tbest_e) : NULL;
+      if (g_xrgb && tbest_e == NULL) exit(1);
       double lc[3], lu = 0.0, lv = 0.0;
       for (int k = 0; k < 3; k++)
         lc[k] = 0.5 * (lo[k] + hi[k]);
@@ -10019,7 +10029,8 @@ int main(int argc, char **argv) {
             int32_t mi2 = m.fm != NULL ? m.fm[tbest] : 0;
             if (mi2 < 0 || mi2 >= m.nmtl) mi2 = 0;
             double kd = m.mtl[mi2].kd;
-            if (!(kd >= 0.0 && kd <= 1.0)) kd = 0.5; /* как в alb() сбора */
+            if (!(kd >= 0.0 && kd <= 1.0)) kd = 0.5;     /* как в alb() сбора */
+            if (tbest_e != NULL) tbest_e[k] = tbest + 1; /* +1: 0 = «пропущен» */
             double kd0 = m.mtl[mi].kd;
             if (!(kd0 >= 0.0 && kd0 <= 1.0)) kd0 = 0.5;
             if (fabs(kd - kd0) > 0.0) {
@@ -10189,6 +10200,117 @@ int main(int argc, char **argv) {
        * плавучих на равенство запрещено гейтом. */
       for (int32_t i = 0; i < ftab.n; i++)
         frho[i] *= xrhoscale;
+      /* §826: КАНАЛЬНЫЕ frho/eemit/femit — kd3[c]/ke3[c] по ПОБЕЖДЁННЫМ
+       * треугольникам tbest_e. frho_c — без повторного скоринга (веса
+       * площадей канон-независимы); eemit_c — та же раздача §786 с
+       * ke_c = ke3[c] (клипы канон-независимы, проход дешёвый). */
+      double *frho826[3] = {NULL, NULL, NULL}, *eemit826[3] = {NULL, NULL, NULL},
+             *femit826[3] = {NULL, NULL, NULL};
+      if (g_xrgb) {
+        for (int c826 = 0; c826 < 3; c826++) {
+          frho826[c826] = malloc((size_t)ftab.n * sizeof *frho826[c826]);
+          eemit826[c826] = calloc((size_t)cut.nse, sizeof *eemit826[c826]);
+          femit826[c826] = calloc((size_t)ftab.n, sizeof *femit826[c826]);
+          if (frho826[c826] == NULL || eemit826[c826] == NULL || femit826[c826] == NULL) exit(1);
+        }
+        for (int c826 = 0; c826 < 3; c826++) {
+          double *num826 = calloc((size_t)ftab.n, sizeof *num826);
+          double *den826 = calloc((size_t)ftab.n, sizeof *den826);
+          if (num826 == NULL || den826 == NULL) exit(1);
+          for (int32_t k = 0; k < cut.nse; k++) {
+            if (tbest_e[k] == 0) continue;
+            int32_t mi826 = m.fm != NULL ? m.fm[tbest_e[k] - 1] : 0;
+            if (mi826 < 0 || mi826 >= m.nmtl) mi826 = 0;
+            double kd826 = m.mtl[mi826].kd3[c826];
+            if (!(kd826 >= 0.0 && kd826 <= 1.0)) kd826 = 0.5;
+            int32_t fi826 = cut.se[k].facet;
+            if (fi826 < 0 || fi826 >= ftab.n) continue;
+            num826[fi826] += kd826 * cut.se[k].area;
+            den826[fi826] += cut.se[k].area;
+          }
+          for (int32_t i = 0; i < ftab.n; i++)
+            frho826[c826][i] = (den826[i] > 0.0 ? num826[i] / den826[i] : 0.5) * xrhoscale;
+          free(num826);
+          free(den826);
+        }
+        for (int c826 = 0; c826 < 3; c826++) {
+          int32_t *cellat6 = malloc((size_t)fr.n * (size_t)fr.n * (size_t)fr.n * sizeof *cellat6);
+          double *Ecell6 = calloc((size_t)mesh.ncell, sizeof *Ecell6);
+          double *Sarea6 = calloc((size_t)mesh.ncell, sizeof *Sarea6);
+          if (cellat6 == NULL || Ecell6 == NULL || Sarea6 == NULL) exit(1);
+          for (size_t g = 0; g < (size_t)fr.n * (size_t)fr.n * (size_t)fr.n; g++)
+            cellat6[g] = -1;
+          for (int32_t ci = 0; ci < mesh.ncell; ci++)
+            for (int32_t iz = 0; iz < mesh.csize[ci]; iz++)
+              for (int32_t iy = 0; iy < mesh.csize[ci]; iy++)
+                for (int32_t ix = 0; ix < mesh.csize[ci]; ix++)
+                  cellat6[hz_occ_index(fr.n, mesh.clo[ci][0] + ix, mesh.clo[ci][1] + iy,
+                                       mesh.clo[ci][2] + iz)] = ci;
+          for (int32_t k = 0; k < cut.nse; k++)
+            if (cut.se[k].area > 0.0) Sarea6[cut.se[k].cell] += cut.se[k].area;
+          for (int32_t t9 = 0; t9 < m.nt; t9++) {
+            int32_t mt = m.fm != NULL ? m.fm[t9] : 0;
+            if (mt < 0 || mt >= m.nmtl) mt = 0;
+            double ke826 = m.mtl[mt].ke3[c826];
+            if (!(ke826 > 0.0)) continue;
+            double tri[3][3];
+            for (int q2 = 0; q2 < 3; q2++)
+              for (int a = 0; a < 3; a++)
+                tri[q2][a] = m.v[3 * (size_t)m.f[3 * (size_t)t9 + (size_t)q2] + (size_t)a];
+            int32_t blo9[3], bhi9[3];
+            for (int a = 0; a < 3; a++) {
+              double mn = tri[0][a], mx = tri[0][a];
+              for (int q2 = 1; q2 < 3; q2++) {
+                if (tri[q2][a] < mn) mn = tri[q2][a];
+                if (tri[q2][a] > mx) mx = tri[q2][a];
+              }
+              blo9[a] = (int32_t)floor((mn - ofr.o[a]) / ofr.u[a]);
+              bhi9[a] = (int32_t)floor((mx - ofr.o[a]) / ofr.u[a]);
+              if (blo9[a] < 0) blo9[a] = 0;
+              if (bhi9[a] > fr.n - 1) bhi9[a] = fr.n - 1;
+            }
+            for (int32_t iz = blo9[2]; iz <= bhi9[2]; iz++)
+              for (int32_t iy = blo9[1]; iy <= bhi9[1]; iy++)
+                for (int32_t ix = blo9[0]; ix <= bhi9[0]; ix++) {
+                  double blo[3] = {ofr.o[0] + ofr.u[0] * (double)ix,
+                                   ofr.o[1] + ofr.u[1] * (double)iy,
+                                   ofr.o[2] + ofr.u[2] * (double)iz};
+                  double bhi[3] = {blo[0] + ofr.u[0], blo[1] + ofr.u[1], blo[2] + ofr.u[2]};
+                  double A = leak_tri_box_area((const double (*)[3])tri, blo, bhi);
+                  if (!(A > 0.0)) continue;
+                  int32_t ci = cellat6[hz_occ_index(fr.n, ix, iy, iz)];
+                  if (ci < 0 || !(Sarea6[ci] > 0.0)) continue;
+                  Ecell6[ci] += ke826 * A;
+                }
+          }
+          double epow826 = 0.0;
+          for (int32_t k = 0; k < cut.nse; k++) {
+            int32_t ci = cut.se[k].cell;
+            if (!(cut.se[k].area > 0.0) || !(Ecell6[ci] > 0.0)) continue;
+            eemit826[c826][k] = Ecell6[ci] / (3.14159265358979323846 * Sarea6[ci]);
+            epow826 += Ecell6[ci] * cut.se[k].area / Sarea6[ci];
+            double b6 = 3.14159265358979323846 * eemit826[c826][k];
+            if (b6 > femit826[c826][cut.se[k].facet]) femit826[c826][cut.se[k].facet] = b6;
+          }
+          /* НК-3 §826: розданная мощность канала против Σ ke3[c]·площадь
+           * треугольников (аналитика тех же треугольников, без клипа) */
+          double ean826 = 0.0;
+          for (int32_t t9 = 0; t9 < m.nt; t9++) {
+            int32_t mt = m.fm != NULL ? m.fm[t9] : 0;
+            if (mt < 0 || mt >= m.nmtl) mt = 0;
+            const double *A9, *B9, *C9;
+            tri_verts(&m, t9, &A9, &B9, &C9);
+            double n9[3];
+            double a9 = tri_area2(A9, B9, C9, n9); /* уже половина */
+            ean826 += m.mtl[mt].ke3[c826] * a9;
+          }
+          printf("   §826 РАЗДАЧА кн.%d: роздано %.4f против Σ ke3·area %.4f (Δ %+.2f %%)\n", c826,
+                 epow826, ean826, 100.0 * (epow826 - ean826) / (ean826 > 0.0 ? ean826 : 1.0));
+          free(cellat6);
+          free(Ecell6);
+          free(Sarea6);
+        }
+      }
       /* ВХОД РАЗВЁРТКИ, А НЕ ТОЛЬКО ЕЁ ВЫХОД (А807). Ложный ноль на выходе
        * неотличим от «источник не задан», пока не напечатан сам источник. */
       /* ВТОРАЯ СУММА СЧИТАЕТСЯ ПО САМОМУ МАССИВУ (§670 Р4), а не повторным
@@ -10248,6 +10370,14 @@ int main(int argc, char **argv) {
       int fcold = !xfc || xhall || xemitfacet || xconst || xunit || xcmp || xcontrib || xdsa;
       /* §818: стенд ремапит eemit — инъекция первого столкновения на варианте
        * не перестраивается, режим несовместен честно */
+      if (g_xrgb && !xmatrho) {
+        fprintf(stderr, "xrgb требует xmatrho: канальные альбедо из kd3 скоринга\n");
+        exit(1);
+      }
+      if (g_xrgb && xtact_n818 > 0) {
+        fprintf(stderr, "xrgb несовместим с xtact818 в этом шаге\n");
+        exit(1);
+      }
       if (g_xclamp823 && (!fcold || xhall || xemitfacet)) {
         fprintf(stderr, "xclamp823 несовместим с xfc/xhall/xemitfacet: якорь зажима — max eemit "
                         "базовой раздачи\n");
@@ -10419,6 +10549,8 @@ int main(int argc, char **argv) {
       prob.dump_dir1 = xdir >= 0 ? xdir + 1 : 0;
       tr3_stats st;
       memset(&st, 0, sizeof st);
+      /* §826: канальные выходы лестницы для кадра (xrgb) */
+      double *eirr826[3] = {NULL, NULL, NULL};
       /* §744: ПРЯМОЙ прогон (альбедо 0) до полного — E_dir поэлементно для
        * сличения; полный прогон ниже перезапишет phi (warm_start = 0). */
       double *eind_dir = NULL;
@@ -10976,682 +11108,719 @@ int main(int argc, char **argv) {
           free(stB4.bout);
           free(stB4.sout);
         }
-        double *pphi = calloc(nph, sizeof *pphi); /* состояние такта t−1 */
-        double *pbo = calloc(nbo, sizeof *pbo);
-        double *pso = calloc(nso, sizeof *pso);
-        double *dpphi = calloc(nph, sizeof *dpphi); /* приращение такта t−1 */
-        double *dpbo = calloc(nbo, sizeof *dpbo);
-        double *dpso = calloc(nso, sizeof *dpso);
-        double *peirr = calloc((size_t)nse4, sizeof *peirr); /* eirr такта t−1 */
-        if (pphi == NULL || pbo == NULL || pso == NULL || dpphi == NULL || dpbo == NULL ||
-            dpso == NULL || peirr == NULL)
-          exit(1);
-        double *ubL = NULL, *usL = NULL; /* прокидка К76 */
-        double q_num = 0.0, q_den = 0.0, denprev = 0.0;
-        double sc_prev[6] = {0, 0, 0, 0, 0, 0}; /* скаляры К40 такта N−1 */
-        /* §814: прибор анизотропии (xdiff814): моменты такта — решатель
-         * перезаписывает их каждой итерацией, здесь maxit = 1 — моменты
-         * такта; рядом моменты прошлого такта для ПРИРАЩЕНИЯ и r приращения
-         * такта и позапрошлого (r = −1 — тёмная ячейка). */
-        int64_t nlpsum823 = 0; /* §822: зажимы за лестницу */
-        double *ang814b = NULL, *ang814p = NULL, *r814c = NULL, *r814p = NULL;
-        if (xdiff814) {
-          ang814b = calloc(nph, sizeof *ang814b);
-          ang814p = calloc(nph, sizeof *ang814p);
-          r814c = calloc((size_t)mesh.ncell, sizeof *r814c);
-          r814p = calloc((size_t)mesh.ncell, sizeof *r814p);
-          if (ang814b == NULL || ang814p == NULL || r814c == NULL || r814p == NULL) exit(1);
-          /* r = −1 — «не было приращения»: иначе такт 1 оставил бы нули
-           * calloc-а, и такт 2 сравнил бы приращение с мусорным 0.0
-           * (ловилось на cavity05: «трёхтактных 9423» при пустом такте 1) */
-          for (int32_t c = 0; c < mesh.ncell; c++) {
-            r814c[c] = -1.0;
-            r814p[c] = -1.0;
-          }
-        }
-        tr3_stats stfin;
-        memset(&stfin, 0, sizeof stfin);
-        /* §818: ВАРИАНТЫ СЕТОК пер-тактного стенда — та же сборка, что у кадра 1
-         * (c772 + сплошная маска + рез + постфильтры §717); альбедо — ОБЩИЙ
-         * фасетный frho (R3/А1357), eemit — скалярная рестрикция с базовой
-         * сетки, σ — вакуум канона (нулевые). */
-        vmesh818 v818_[8];
-        int nv818 = 0;
-        for (int q = 0; q < xtact_n818; q++) {
-          int seen818 = 0;
-          for (int r = 0; r < nv818; r++)
-            if (!(v818_[r].d0 < xt_d0818[q]) && !(xt_d0818[q] < v818_[r].d0)) seen818 = 1;
-          if (seen818) continue;
-          vmesh818 *v = &v818_[nv818++];
-          v->d0 = xt_d0818[q];
-          c772 cx818;
-          memset(&cx818, 0, sizeof cx818);
-          cx818.t = &ot;
-          cx818.cm = &cmap;
-          cx818.ft = &ftab;
-          cx818.fr = &ofr;
-          cx818.occ = P.b[lev];
-          cx818.smask = solidmask;
-          cx818.occn = fr.n;
-          cx818.innerfluid = xinnerfluid;
-          for (int a = 0; a < 3; a++)
-            cx818.eye[a] = g_eye[a];
-          cx818.d0 = v->d0;
-          if (c772_setbudget(&cx818, g_xbud818) != 0) exit(1);
-          if (tr3_mesh_build_lod(&v->m, &ot, &ofr, c772_stop, &cx818) != 0) exit(1);
-          uint8_t *solidv818 = calloc((size_t)v->m.ncell, 1);
-          if (solidv818 == NULL) exit(1);
-          for (int32_t ci = 0; ci < v->m.ncell; ci++) {
-            /* та же сплошная маска, что у кадра 1 (Ш16/§782) */
-            int32_t s9 = v->m.csize[ci];
-            int allsolid = solidmask != NULL;
-            for (int32_t iz = 0; iz < s9 && allsolid; iz++)
-              for (int32_t iy = 0; iy < s9 && allsolid; iy++)
-                for (int32_t ix = 0; ix < s9 && allsolid; ix++) {
-                  size_t k = hz_occ_index(fr.n, v->m.clo[ci][0] + ix, v->m.clo[ci][1] + iy,
-                                          v->m.clo[ci][2] + iz);
-                  int cls = solidmask[k];
-                  if (!((cls == 0u || (cls == 2u && !xinnerfluid)) && !hz_occ_get(P.b[lev], k)))
-                    allsolid = 0;
-                }
-            if (allsolid) solidv818[ci] = 1u;
-          }
-          if (tr3_cut_build2(&v->c, &v->m, &ftab, &cmap, xfernosolid ? NULL : solidv818,
-                             c772_leaf_solid, &cx818) != 0)
+        /* §826: КАНАЛЬНЫЙ цикл лестницы — транспорт безъупруг (σ = 0),
+         * каналы входят только через eemit_c/frho_c/femit_c; q̂ измеряется
+         * на канале 0 и ФОРСИРУЕТСЯ остальным (одношкально, А1393). */
+        int nch826 = g_xrgb ? 3 : 1;
+        g_nch826 = nch826;
+        int qhat0_set826 = 0;
+        double qhat0_826 = -1.0;
+        double qhat = -1.0; /* §826: поднят — используют §810/§818-блоки после лестницы */
+        double t774lad = 0.0;
+        for (int ch826 = 0; ch826 < nch826; ch826++) {
+          double xtailq_ch = (ch826 > 0 && qhat0_set826) ? qhat0_826 : xtailq;
+          double *pphi = calloc(nph, sizeof *pphi); /* состояние такта t−1 */
+          double *pbo = calloc(nbo, sizeof *pbo);
+          double *pso = calloc(nso, sizeof *pso);
+          double *dpphi = calloc(nph, sizeof *dpphi); /* приращение такта t−1 */
+          double *dpbo = calloc(nbo, sizeof *dpbo);
+          double *dpso = calloc(nso, sizeof *dpso);
+          double *peirr = calloc((size_t)nse4, sizeof *peirr); /* eirr такта t−1 */
+          if (pphi == NULL || pbo == NULL || pso == NULL || dpphi == NULL || dpbo == NULL ||
+              dpso == NULL || peirr == NULL)
             exit(1);
-          free(cx818.refs);
-          free(solidv818);
-          /* §717/§711 — те же постфильтры */
-          if (xsemin > 0.0)
-            for (int32_t k = 0; k < v->c.nse; k++) {
-              double h2 = ofr.u[0] * ofr.u[1];
-              if (v->c.se[k].area > 0.0 && v->c.se[k].area < xsemin * h2) {
-                v->c.se[k].area = 0.0;
-                memset(v->c.se[k].m, 0, sizeof v->c.se[k].m);
-              }
+          double *ubL = NULL, *usL = NULL; /* прокидка К76 */
+          double q_num = 0.0, q_den = 0.0, denprev = 0.0;
+          double sc_prev[6] = {0, 0, 0, 0, 0, 0}; /* скаляры К40 такта N−1 */
+          /* §814: прибор анизотропии (xdiff814): моменты такта — решатель
+           * перезаписывает их каждой итерацией, здесь maxit = 1 — моменты
+           * такта; рядом моменты прошлого такта для ПРИРАЩЕНИЯ и r приращения
+           * такта и позапрошлого (r = −1 — тёмная ячейка). */
+          int64_t nlpsum823 = 0; /* §822: зажимы за лестницу */
+          double *ang814b = NULL, *ang814p = NULL, *r814c = NULL, *r814p = NULL;
+          if (xdiff814) {
+            ang814b = calloc(nph, sizeof *ang814b);
+            ang814p = calloc(nph, sizeof *ang814p);
+            r814c = calloc((size_t)mesh.ncell, sizeof *r814c);
+            r814p = calloc((size_t)mesh.ncell, sizeof *r814p);
+            if (ang814b == NULL || ang814p == NULL || r814c == NULL || r814p == NULL) exit(1);
+            /* r = −1 — «не было приращения»: иначе такт 1 оставил бы нули
+             * calloc-а, и такт 2 сравнил бы приращение с мусорным 0.0
+             * (ловилось на cavity05: «трёхтактных 9423» при пустом такте 1) */
+            for (int32_t c = 0; c < mesh.ncell; c++) {
+              r814c[c] = -1.0;
+              r814p[c] = -1.0;
             }
-          if (xthin > 0.0)
-            for (int32_t ci = 0; ci < v->m.ncell; ci++) {
-              double vfl818 = v->c.mvol[ci][0][0];
-              if (!(vfl818 > 0.0) || v->c.solid[ci]) continue;
-              double s3 = (double)v->m.csize[ci];
-              double V = s3 * s3 * s3 * ofr.u[0] * ofr.u[1] * ofr.u[2];
-              if (V > 0.0 && vfl818 < xthin * V) {
-                v->c.solid[ci] = 1;
-                for (int i = 0; i < 4; i++)
-                  for (int j = 0; j < 4; j++)
-                    v->c.mvol[ci][i][j] = 0.0;
-              }
-            }
-          v->eemit = calloc((size_t)(v->c.nse > 0 ? v->c.nse : 1), sizeof *v->eemit);
-          v->sigt = calloc((size_t)v->m.ncell, sizeof *v->sigt);
-          v->sigs = calloc((size_t)v->m.ncell, sizeof *v->sigs);
-          if (v->eemit == NULL || v->sigt == NULL || v->sigs == NULL) exit(1);
-          double pwf818, pwt818;
-          remap818_se_sca(&ot, &ofr, &mesh, &cut, eemit, &v->m, &v->c, v->eemit, &pwf818, &pwt818);
-          printf("   §818 ВАРИАНТ: D0 %.0f: ячеек %d, элементов %d; Σ eemit·area %.4f -> %.4f "
-                 "(Δ %+.2f %%)\n",
-                 v->d0, v->m.ncell, v->c.nse, pwf818, pwt818,
-                 100.0 * (pwt818 - pwf818) / (fabs(pwf818) > 0.0 ? fabs(pwf818) : 1.0));
-        }
-        double tlad = now_s();
-        for (int t = 1; t <= xbounce; t++) {
-          tr3_problem pl = prob;
-          tr3_stats stt;
-          memset(&stt, 0, sizeof stt);
-          pl.ang814 = ang814b;
-          if (t > 1) {
-            pl.warm_start = 1;
-            pl.bout_in = ubL;
-            pl.sout_in = usL;
           }
-          /* §818: такт на вариантной сетке — вход ремапится база→вариант */
-          const vmesh818 *v8 = NULL;
-          for (int q = 0; q < xtact_n818; q++)
-            if (xt_k818[q] == t)
-              for (int r = 0; r < nv818; r++)
-                if (!(v818_[r].d0 < xt_d0818[q]) && !(xt_d0818[q] < v818_[r].d0)) v8 = &v818_[r];
-          /* тождественный быстрый путь: вариант = базе (D0 совпал) — машерии
-           * нет вовсе. Ремап на вырожденных элементах (nv < 3, центроиды мимо
-           * ячейки) теряет ~0.08 % эмиссии даже между ОДИНАКОВЫМИ сетками
-           * (НК-1, А1392) — на своей сетке он не нужен по определению. */
-          if (v8 != NULL && !(v8->d0 < xcoarse) && !(xcoarse < v8->d0)) v8 = NULL;
-          double *phiv818 = NULL, *soutv818 = NULL;
-          int32_t *buf818 = NULL;
-          double *phic818 = NULL; /* §821: копия φ для круговорота */
-          double *phie818 = NULL; /* §822: φ на входе такта (вариантная сетка) */
-          if (v8 != NULL) {
-            pl.ang814 = NULL; /* прибор анизотропии рассчитан на базу */
-            pl.m = &v8->m;
-            pl.cut = &v8->c;
-            pl.elem_emit = v8->eemit;
-            pl.sig_t = v8->sigt;
-            pl.sig_s = v8->sigs;
-            phiv818 = calloc((size_t)v8->m.ncell * 4, sizeof *phiv818);
-            soutv818 = calloc((size_t)(v8->c.nse > 0 ? v8->c.nse : 1) * 4, sizeof *soutv818);
-            buf818 = malloc(4096 * sizeof *buf818);
-            if (phiv818 == NULL || soutv818 == NULL || buf818 == NULL) exit(1);
-            {
-              phic818 = malloc((size_t)mesh.ncell * 4 * sizeof *phic818);
-              if (phic818 == NULL) exit(1);
-              memcpy(phic818, phi, (size_t)mesh.ncell * 4 * sizeof *phic818);
-              int64_t ni818 = 0, np818 = 0, nr818 = 0, no818 = 0, dh818[13] = {0};
-              remap818_phi(&ot, lev, &mesh, &cut, phi, &v8->m, phiv818, buf818, &ni818, &np818,
-                           &nr818, &no818, dh818);
-              /* §822: φ после входного ремапа — вход такта для вскрытия
-               * (копия ПОСЛЕ ремапа: до него буфер нулевой, А1399-класс) */
-              phie818 = malloc((size_t)v8->m.ncell * 4 * sizeof *phie818);
-              if (phie818 == NULL) exit(1);
-              memcpy(phie818, phiv818, (size_t)v8->m.ncell * 4 * sizeof *phie818);
+          tr3_stats stfin;
+          memset(&stfin, 0, sizeof stfin);
+          /* §818: ВАРИАНТЫ СЕТОК пер-тактного стенда — та же сборка, что у кадра 1
+           * (c772 + сплошная маска + рез + постфильтры §717); альбедо — ОБЩИЙ
+           * фасетный frho (R3/А1357), eemit — скалярная рестрикция с базовой
+           * сетки, σ — вакуум канона (нулевые). */
+          vmesh818 v818_[8];
+          int nv818 = 0;
+          for (int q = 0; q < xtact_n818; q++) {
+            int seen818 = 0;
+            for (int r = 0; r < nv818; r++)
+              if (!(v818_[r].d0 < xt_d0818[q]) && !(xt_d0818[q] < v818_[r].d0)) seen818 = 1;
+            if (seen818) continue;
+            vmesh818 *v = &v818_[nv818++];
+            v->d0 = xt_d0818[q];
+            c772 cx818;
+            memset(&cx818, 0, sizeof cx818);
+            cx818.t = &ot;
+            cx818.cm = &cmap;
+            cx818.ft = &ftab;
+            cx818.fr = &ofr;
+            cx818.occ = P.b[lev];
+            cx818.smask = solidmask;
+            cx818.occn = fr.n;
+            cx818.innerfluid = xinnerfluid;
+            for (int a = 0; a < 3; a++)
+              cx818.eye[a] = g_eye[a];
+            cx818.d0 = v->d0;
+            if (c772_setbudget(&cx818, g_xbud818) != 0) exit(1);
+            if (tr3_mesh_build_lod(&v->m, &ot, &ofr, c772_stop, &cx818) != 0) exit(1);
+            uint8_t *solidv818 = calloc((size_t)v->m.ncell, 1);
+            if (solidv818 == NULL) exit(1);
+            for (int32_t ci = 0; ci < v->m.ncell; ci++) {
+              /* та же сплошная маска, что у кадра 1 (Ш16/§782) */
+              int32_t s9 = v->m.csize[ci];
+              int allsolid = solidmask != NULL;
+              for (int32_t iz = 0; iz < s9 && allsolid; iz++)
+                for (int32_t iy = 0; iy < s9 && allsolid; iy++)
+                  for (int32_t ix = 0; ix < s9 && allsolid; ix++) {
+                    size_t k = hz_occ_index(fr.n, v->m.clo[ci][0] + ix, v->m.clo[ci][1] + iy,
+                                            v->m.clo[ci][2] + iz);
+                    int cls = solidmask[k];
+                    if (!((cls == 0u || (cls == 2u && !xinnerfluid)) && !hz_occ_get(P.b[lev], k)))
+                      allsolid = 0;
+                  }
+              if (allsolid) solidv818[ci] = 1u;
             }
-            /* §821: ЧИСТЫЙ круговорот ремапа (без решения между плечами):
-             * R(P(φ)) обязан вернуть φ до различий резов */
-            if (v8 != NULL) {
-              double *prt818 = calloc((size_t)mesh.ncell * 4, sizeof *prt818);
-              int64_t nib818 = 0, npb818 = 0, nrb818 = 0, nob818 = 0, dhb818[13] = {0};
-              if (prt818 == NULL) exit(1);
-              remap818_phi(&ot, lev, &v8->m, &v8->c, phiv818, &mesh, prt818, buf818, &nib818,
-                           &npb818, &nrb818, &nob818, dhb818);
-              double rtb818 = 0.0;
-              for (size_t i = 0; i < (size_t)mesh.ncell * 4; i++) {
-                double d818 = fabs(prt818[i] - phi[i]);
-                if (d818 > rtb818) rtb818 = d818;
+            if (tr3_cut_build2(&v->c, &v->m, &ftab, &cmap, xfernosolid ? NULL : solidv818,
+                               c772_leaf_solid, &cx818) != 0)
+              exit(1);
+            free(cx818.refs);
+            free(solidv818);
+            /* §717/§711 — те же постфильтры */
+            if (xsemin > 0.0)
+              for (int32_t k = 0; k < v->c.nse; k++) {
+                double h2 = ofr.u[0] * ofr.u[1];
+                if (v->c.se[k].area > 0.0 && v->c.se[k].area < xsemin * h2) {
+                  v->c.se[k].area = 0.0;
+                  memset(v->c.se[k].m, 0, sizeof v->c.se[k].m);
+                }
               }
-              printf("   §818 КРУГОВОРОТ-ЧИСТЫЙ: max|Δφ| %.3e\n", rtb818);
-              free(prt818);
+            if (xthin > 0.0)
+              for (int32_t ci = 0; ci < v->m.ncell; ci++) {
+                double vfl818 = v->c.mvol[ci][0][0];
+                if (!(vfl818 > 0.0) || v->c.solid[ci]) continue;
+                double s3 = (double)v->m.csize[ci];
+                double V = s3 * s3 * s3 * ofr.u[0] * ofr.u[1] * ofr.u[2];
+                if (V > 0.0 && vfl818 < xthin * V) {
+                  v->c.solid[ci] = 1;
+                  for (int i = 0; i < 4; i++)
+                    for (int j = 0; j < 4; j++)
+                      v->c.mvol[ci][i][j] = 0.0;
+                }
+              }
+            v->eemit = calloc((size_t)(v->c.nse > 0 ? v->c.nse : 1), sizeof *v->eemit);
+            v->sigt = calloc((size_t)v->m.ncell, sizeof *v->sigt);
+            v->sigs = calloc((size_t)v->m.ncell, sizeof *v->sigs);
+            if (v->eemit == NULL || v->sigt == NULL || v->sigs == NULL) exit(1);
+            double pwf818, pwt818;
+            remap818_se_sca(&ot, &ofr, &mesh, &cut, eemit, &v->m, &v->c, v->eemit, &pwf818,
+                            &pwt818);
+            printf("   §818 ВАРИАНТ: D0 %.0f: ячеек %d, элементов %d; Σ eemit·area %.4f -> %.4f "
+                   "(Δ %+.2f %%)\n",
+                   v->d0, v->m.ncell, v->c.nse, pwf818, pwt818,
+                   100.0 * (pwt818 - pwf818) / (fabs(pwf818) > 0.0 ? fabs(pwf818) : 1.0));
+          }
+          double tlad = now_s();
+          for (int t = 1; t <= xbounce; t++) {
+            tr3_problem pl = prob;
+            tr3_stats stt;
+            memset(&stt, 0, sizeof stt);
+            pl.ang814 = ang814b;
+            if (g_xrgb) { /* §826: канальные источники и альбедо */
+              pl.elem_emit = eemit826[ch826];
+              pl.facet_rho = frho826[ch826];
+              pl.facet_emit = femit826[ch826];
             }
             if (t > 1) {
-              /* bout не переносится (А1348): в каноне он и так мёртв
-               * (wall_rho == NULL, состояние нулевое) */
+              pl.warm_start = 1;
+              pl.bout_in = ubL;
+              pl.sout_in = usL;
+            }
+            /* §818: такт на вариантной сетке — вход ремапится база→вариант */
+            const vmesh818 *v8 = NULL;
+            for (int q = 0; q < xtact_n818; q++)
+              if (xt_k818[q] == t)
+                for (int r = 0; r < nv818; r++)
+                  if (!(v818_[r].d0 < xt_d0818[q]) && !(xt_d0818[q] < v818_[r].d0)) v8 = &v818_[r];
+            /* тождественный быстрый путь: вариант = базе (D0 совпал) — машерии
+             * нет вовсе. Ремап на вырожденных элементах (nv < 3, центроиды мимо
+             * ячейки) теряет ~0.08 % эмиссии даже между ОДИНАКОВЫМИ сетками
+             * (НК-1, А1392) — на своей сетке он не нужен по определению. */
+            if (v8 != NULL && !(v8->d0 < xcoarse) && !(xcoarse < v8->d0)) v8 = NULL;
+            double *phiv818 = NULL, *soutv818 = NULL;
+            int32_t *buf818 = NULL;
+            double *phic818 = NULL; /* §821: копия φ для круговорота */
+            double *phie818 = NULL; /* §822: φ на входе такта (вариантная сетка) */
+            if (v8 != NULL) {
+              pl.ang814 = NULL; /* прибор анизотропии рассчитан на базу */
+              pl.m = &v8->m;
+              pl.cut = &v8->c;
+              pl.elem_emit = v8->eemit;
+              pl.sig_t = v8->sigt;
+              pl.sig_s = v8->sigs;
+              phiv818 = calloc((size_t)v8->m.ncell * 4, sizeof *phiv818);
+              soutv818 = calloc((size_t)(v8->c.nse > 0 ? v8->c.nse : 1) * 4, sizeof *soutv818);
+              buf818 = malloc(4096 * sizeof *buf818);
+              if (phiv818 == NULL || soutv818 == NULL || buf818 == NULL) exit(1);
+              {
+                phic818 = malloc((size_t)mesh.ncell * 4 * sizeof *phic818);
+                if (phic818 == NULL) exit(1);
+                memcpy(phic818, phi, (size_t)mesh.ncell * 4 * sizeof *phic818);
+                int64_t ni818 = 0, np818 = 0, nr818 = 0, no818 = 0, dh818[13] = {0};
+                remap818_phi(&ot, lev, &mesh, &cut, phi, &v8->m, phiv818, buf818, &ni818, &np818,
+                             &nr818, &no818, dh818);
+                /* §822: φ после входного ремапа — вход такта для вскрытия
+                 * (копия ПОСЛЕ ремапа: до него буфер нулевой, А1399-класс) */
+                phie818 = malloc((size_t)v8->m.ncell * 4 * sizeof *phie818);
+                if (phie818 == NULL) exit(1);
+                memcpy(phie818, phiv818, (size_t)v8->m.ncell * 4 * sizeof *phie818);
+              }
+              /* §821: ЧИСТЫЙ круговорот ремапа (без решения между плечами):
+               * R(P(φ)) обязан вернуть φ до различий резов */
               if (v8 != NULL) {
-                pl.warm_start = 1;
-                pl.bout_in = NULL;
-                double pw18a, pw18b, pw18c, pw18d;
-                int64_t nd818;
-                double ad818, at818;
-                remap818_se(&ot, &ofr, &mesh, &cut, usL, &v8->m, &v8->c, soutv818, &pw18a, &pw18b,
-                            &pw18c, &pw18d, &nd818, &ad818, &at818);
-                pl.sout_in = soutv818;
-              }
-            }
-          }
-          if (v8 != NULL)
-            pl.trace = 1; /* §822: счётчики ограничителя на вариантном такте (однопоточно) */
-          double tt0 = now_s();
-          if (tr3_sweep_solve(&pl, 1, 0.0, v8 != NULL ? phiv818 : phi, &stt) != 0) exit(1);
-          nlpsum823 += stt.nlpmax;
-          if (v8 != NULL) {
-            /* выход такта: φ, sout, eirr ремапятся вариант→база, книга
-             * лестницы (приращения, q̂, замыкание) живёт на базе */
-            int64_t ni818 = 0, np818 = 0, nr818 = 0, no818 = 0, dh818[13] = {0};
-            remap818_phi(&ot, lev, &v8->m, &v8->c, phiv818, &mesh, phi, buf818, &ni818, &np818,
-                         &nr818, &no818, dh818);
-            double *soutb818 = calloc(nso, sizeof *soutb818);
-            double *boutb818 = calloc(nbo, sizeof *boutb818);
-            if (soutb818 == NULL || boutb818 == NULL) exit(1);
-            double pw18a, pw18b, pw18c, pw18d;
-            int64_t nd818;
-            double ad818, at818;
-            remap818_se(&ot, &ofr, &v8->m, &v8->c, stt.sout, &mesh, &cut, soutb818, &pw18a, &pw18b,
-                        &pw18c, &pw18d, &nd818, &ad818, &at818);
-            free(stt.sout);
-            stt.sout = soutb818;
-            free(stt.bout);
-            stt.bout = boutb818; /* мёртвое состояние канона: нули */
-            if (stt.eirr != NULL) {
-              double *eirrb818 = calloc((size_t)nse4, sizeof *eirrb818);
-              if (eirrb818 == NULL) exit(1);
-              double pw18e, pw18f;
-              remap818_se_sca(&ot, &ofr, &v8->m, &v8->c, stt.eirr, &mesh, &cut, eirrb818, &pw18e,
-                              &pw18f);
-              free(stt.eirr);
-              stt.eirr = eirrb818;
-            }
-            /* §821: КРУГОВОРОТ — грубо→мелко→грубо; DG1-поле, точно
-             * представимое в грубом пространстве, обязано вернуться точно
-             * (значения и наклоны линейного поля точны при любых весах).
-             * Не ноль — конвенция наклонов неверна (А1396). */
-            double rt818 = 0.0;
-            for (size_t i = 0; i < (size_t)mesh.ncell * 4; i++) {
-              double d818 = fabs(phi[i] - phic818[i]);
-              if (d818 > rt818) rt818 = d818;
-            }
-            printf("   §818 КРУГОВОРОТ: max|Δφ| %.3e (должен быть ~1e-13 от поля)\n", rt818);
-            printf("   §818 ТАКТ: такт %d на D0 %.0f (ячеек %d, элементов %d): psin %.6g; "
-                   "ремап φ продл+рестр %lld/%lld, ΔΣ sout·area (выход) %+.3f %%\n",
-                   t, v8->d0, v8->m.ncell, v8->c.nse, stt.psin, (long long)np818, (long long)nr818,
-                   100.0 * (pw18c - pw18a) / (fabs(pw18a) > 0.0 ? fabs(pw18a) : 1.0));
-            /* §822: ВСКРЫТИЕ взрыва — если поле на выходе такта на много
-             * порядков выше входа, печатаем анатомию ячейки-виновника:
-             * объём флюида против объёма ячейки, сплошность, элементы,
-             * φ на входе и выходе. */
-            {
-              double ein822 = 0.0, eout822 = 0.0;
-              int32_t cout822 = -1;
-              for (int32_t c = 0; c < v8->m.ncell; c++) {
-                double a822 = fabs(phie818[(size_t)c * 4]);
-                if (a822 > ein822) ein822 = a822;
-                double b822 = fabs(phiv818[(size_t)c * 4]);
-                if (b822 > eout822) {
-                  eout822 = b822;
-                  cout822 = c;
+                double *prt818 = calloc((size_t)mesh.ncell * 4, sizeof *prt818);
+                int64_t nib818 = 0, npb818 = 0, nrb818 = 0, nob818 = 0, dhb818[13] = {0};
+                if (prt818 == NULL) exit(1);
+                remap818_phi(&ot, lev, &v8->m, &v8->c, phiv818, &mesh, prt818, buf818, &nib818,
+                             &npb818, &nrb818, &nob818, dhb818);
+                double rtb818 = 0.0;
+                for (size_t i = 0; i < (size_t)mesh.ncell * 4; i++) {
+                  double d818 = fabs(prt818[i] - phi[i]);
+                  if (d818 > rtb818) rtb818 = d818;
                 }
-              }
-              printf("   §822 ВХОД/ВЫХОД: max|φ| %.4e -> %.4e (рост %.2e)\n", ein822, eout822,
-                     eout822 / (ein822 > 0.0 ? ein822 : 1e-300));
-              if (eout822 > 100.0 * (ein822 > 0.0 ? ein822 : 1e-300)) {
-                int32_t c822 = cout822;
-                int32_t nse822 = v8->c.sestart[c822 + 1] - v8->c.sestart[c822];
-                double s3 = (double)v8->m.csize[c822];
-                double V822 = s3 * s3 * s3 * ofr.u[0] * ofr.u[1] * ofr.u[2];
-                printf("   §822 ВСКРЫТИЕ: ячейка %d (мир %.2f %.2f %.2f, размер %d): φ вход "
-                       "%.4e выход %.4e; vfl %.4e из V %.4e (доля %.2e); solid %d; элементов "
-                       "%d; МинЭлемент",
-                       c822, ofr.o[0] + ofr.u[0] * (double)v8->m.clo[c822][0],
-                       ofr.o[1] + ofr.u[1] * (double)v8->m.clo[c822][1],
-                       ofr.o[2] + ofr.u[2] * (double)v8->m.clo[c822][2], (int)v8->m.csize[c822],
-                       phie818[(size_t)c822 * 4], phiv818[(size_t)c822 * 4], v8->c.mvol[c822][0][0],
-                       V822, v8->c.mvol[c822][0][0] / (V822 > 0.0 ? V822 : 1.0),
-                       (int)v8->c.solid[c822], nse822);
-                if (nse822 > 0)
-                  for (int32_t k = v8->c.sestart[c822]; k < v8->c.sestart[c822 + 1]; k++)
-                    printf(" %.2e", v8->c.se[v8->c.selist[k]].area);
-                printf("\n");
-              }
-            }
-            free(phie818);
-            free(phiv818);
-            free(phic818);
-            free(soutv818);
-            free(buf818);
-          }
-          /* §814: анизотропия r = |Σ w·L0·ω| / Σ w·L0, ДВУХ объектов: ПОЛЯ такта
-           * (сумма ряда) и ПРИРАЩЕНИЯ такта (свет, отразившийся t раз) —
-           * модельная величина именно приращение: сумма каждый такт получает
-           * свежее ОСТРОЕ излучение источника, и её анизотропия падать не
-           * обязана (замерено на cavity05 до правки). Монотонность — по
-           * приращению, у ячеек светлых в трёх тактах подряд. ND рядом
-           * (А1374): сравнение законно только одношкально. */
-          if (ang814b != NULL) {
-            double smax814 = 0.0;
-            for (int32_t c = 0; c < mesh.ncell; c++)
-              if (ang814b[(size_t)c * 4] > smax814) smax814 = ang814b[(size_t)c * 4];
-            long long nlit814 = 0, ninc814 = 0, nboth814 = 0, nmon814 = 0;
-            double *rv814 = malloc((size_t)mesh.ncell * sizeof *rv814);
-            double *dv814 = malloc((size_t)mesh.ncell * sizeof *dv814);
-            if (rv814 == NULL || dv814 == NULL) exit(1);
-            for (int32_t c = 0; c < mesh.ncell; c++) {
-              const double *m814 = ang814b + (size_t)c * 4;
-              const double s0814 = m814[0];
-              if (s0814 > HZ_DIFF_FLOOR814 * smax814) {
-                rv814[nlit814++] =
-                    sqrt(m814[1] * m814[1] + m814[2] * m814[2] + m814[3] * m814[3]) / s0814;
+                printf("   §818 КРУГОВОРОТ-ЧИСТЫЙ: max|Δφ| %.3e\n", rtb818);
+                free(prt818);
               }
               if (t > 1) {
-                const double *q814 = ang814p + (size_t)c * 4;
-                const double d0814 = m814[0] - q814[0];
-                if (d0814 > HZ_DIFF_FLOOR814 * smax814) {
-                  const double dx814 = m814[1] - q814[1], dy814 = m814[2] - q814[2],
-                               dz814 = m814[3] - q814[3];
-                  const double rinc814 =
-                      sqrt(dx814 * dx814 + dy814 * dy814 + dz814 * dz814) / d0814;
-                  dv814[ninc814++] = rinc814;
-                  if (r814p[c] >= 0.0) {
-                    nboth814++;
-                    if (rinc814 < r814p[c]) nmon814++;
-                  }
-                  r814c[c] = rinc814;
-                } else
-                  r814c[c] = -1.0;
+                /* bout не переносится (А1348): в каноне он и так мёртв
+                 * (wall_rho == NULL, состояние нулевое) */
+                if (v8 != NULL) {
+                  pl.warm_start = 1;
+                  pl.bout_in = NULL;
+                  double pw18a, pw18b, pw18c, pw18d;
+                  int64_t nd818;
+                  double ad818, at818;
+                  remap818_se(&ot, &ofr, &mesh, &cut, usL, &v8->m, &v8->c, soutv818, &pw18a, &pw18b,
+                              &pw18c, &pw18d, &nd818, &ad818, &at818);
+                  pl.sout_in = soutv818;
+                }
               }
             }
-            qsort(rv814, (size_t)nlit814, sizeof *rv814, cmp_dev699);
-            qsort(dv814, (size_t)ninc814, sizeof *dv814, cmp_dev699);
-            printf("   §814 ДИФФ: такт %d (ND %d): поле p50 %.4f p99 %.4f; приращение p50 %.4f "
-                   "p99 %.4f; монотонных (приращение) %.1f %% (ячеек %lld, приращений %lld, "
-                   "трёхтактных %lld)\n",
-                   t, prob.d->n, nlit814 > 0 ? rv814[nlit814 / 2] : -1.0,
-                   nlit814 > 0 ? rv814[(nlit814 * 99) / 100] : -1.0,
-                   ninc814 > 0 ? dv814[ninc814 / 2] : -1.0,
-                   ninc814 > 0 ? dv814[(ninc814 * 99) / 100] : -1.0,
-                   nboth814 > 0 ? 100.0 * (double)nmon814 / (double)nboth814 : -1.0,
-                   (long long)nlit814, (long long)ninc814, (long long)nboth814);
-            free(rv814);
-            free(dv814);
-            memcpy(ang814p, ang814b, nph * sizeof *ang814p);
-            { /* такт становится прошлым */
-              double *tmp814 = r814p;
-              r814p = r814c;
-              r814c = tmp814;
+            if (v8 != NULL)
+              pl.trace = 1; /* §822: счётчики ограничителя на вариантном такте (однопоточно) */
+            double tt0 = now_s();
+            if (tr3_sweep_solve(&pl, 1, 0.0, v8 != NULL ? phiv818 : phi, &stt) != 0) exit(1);
+            nlpsum823 += stt.nlpmax;
+            if (v8 != NULL) {
+              /* выход такта: φ, sout, eirr ремапятся вариант→база, книга
+               * лестницы (приращения, q̂, замыкание) живёт на базе */
+              int64_t ni818 = 0, np818 = 0, nr818 = 0, no818 = 0, dh818[13] = {0};
+              remap818_phi(&ot, lev, &v8->m, &v8->c, phiv818, &mesh, phi, buf818, &ni818, &np818,
+                           &nr818, &no818, dh818);
+              double *soutb818 = calloc(nso, sizeof *soutb818);
+              double *boutb818 = calloc(nbo, sizeof *boutb818);
+              if (soutb818 == NULL || boutb818 == NULL) exit(1);
+              double pw18a, pw18b, pw18c, pw18d;
+              int64_t nd818;
+              double ad818, at818;
+              remap818_se(&ot, &ofr, &v8->m, &v8->c, stt.sout, &mesh, &cut, soutb818, &pw18a,
+                          &pw18b, &pw18c, &pw18d, &nd818, &ad818, &at818);
+              free(stt.sout);
+              stt.sout = soutb818;
+              free(stt.bout);
+              stt.bout = boutb818; /* мёртвое состояние канона: нули */
+              if (stt.eirr != NULL) {
+                double *eirrb818 = calloc((size_t)nse4, sizeof *eirrb818);
+                if (eirrb818 == NULL) exit(1);
+                double pw18e, pw18f;
+                remap818_se_sca(&ot, &ofr, &v8->m, &v8->c, stt.eirr, &mesh, &cut, eirrb818, &pw18e,
+                                &pw18f);
+                free(stt.eirr);
+                stt.eirr = eirrb818;
+              }
+              /* §821: КРУГОВОРОТ — грубо→мелко→грубо; DG1-поле, точно
+               * представимое в грубом пространстве, обязано вернуться точно
+               * (значения и наклоны линейного поля точны при любых весах).
+               * Не ноль — конвенция наклонов неверна (А1396). */
+              double rt818 = 0.0;
+              for (size_t i = 0; i < (size_t)mesh.ncell * 4; i++) {
+                double d818 = fabs(phi[i] - phic818[i]);
+                if (d818 > rt818) rt818 = d818;
+              }
+              printf("   §818 КРУГОВОРОТ: max|Δφ| %.3e (должен быть ~1e-13 от поля)\n", rt818);
+              printf("   §818 ТАКТ: такт %d на D0 %.0f (ячеек %d, элементов %d): psin %.6g; "
+                     "ремап φ продл+рестр %lld/%lld, ΔΣ sout·area (выход) %+.3f %%\n",
+                     t, v8->d0, v8->m.ncell, v8->c.nse, stt.psin, (long long)np818,
+                     (long long)nr818,
+                     100.0 * (pw18c - pw18a) / (fabs(pw18a) > 0.0 ? fabs(pw18a) : 1.0));
+              /* §822: ВСКРЫТИЕ взрыва — если поле на выходе такта на много
+               * порядков выше входа, печатаем анатомию ячейки-виновника:
+               * объём флюида против объёма ячейки, сплошность, элементы,
+               * φ на входе и выходе. */
+              {
+                double ein822 = 0.0, eout822 = 0.0;
+                int32_t cout822 = -1;
+                for (int32_t c = 0; c < v8->m.ncell; c++) {
+                  double a822 = fabs(phie818[(size_t)c * 4]);
+                  if (a822 > ein822) ein822 = a822;
+                  double b822 = fabs(phiv818[(size_t)c * 4]);
+                  if (b822 > eout822) {
+                    eout822 = b822;
+                    cout822 = c;
+                  }
+                }
+                printf("   §822 ВХОД/ВЫХОД: max|φ| %.4e -> %.4e (рост %.2e)\n", ein822, eout822,
+                       eout822 / (ein822 > 0.0 ? ein822 : 1e-300));
+                if (eout822 > 100.0 * (ein822 > 0.0 ? ein822 : 1e-300)) {
+                  int32_t c822 = cout822;
+                  int32_t nse822 = v8->c.sestart[c822 + 1] - v8->c.sestart[c822];
+                  double s3 = (double)v8->m.csize[c822];
+                  double V822 = s3 * s3 * s3 * ofr.u[0] * ofr.u[1] * ofr.u[2];
+                  printf("   §822 ВСКРЫТИЕ: ячейка %d (мир %.2f %.2f %.2f, размер %d): φ вход "
+                         "%.4e выход %.4e; vfl %.4e из V %.4e (доля %.2e); solid %d; элементов "
+                         "%d; МинЭлемент",
+                         c822, ofr.o[0] + ofr.u[0] * (double)v8->m.clo[c822][0],
+                         ofr.o[1] + ofr.u[1] * (double)v8->m.clo[c822][1],
+                         ofr.o[2] + ofr.u[2] * (double)v8->m.clo[c822][2], (int)v8->m.csize[c822],
+                         phie818[(size_t)c822 * 4], phiv818[(size_t)c822 * 4],
+                         v8->c.mvol[c822][0][0], V822,
+                         v8->c.mvol[c822][0][0] / (V822 > 0.0 ? V822 : 1.0), (int)v8->c.solid[c822],
+                         nse822);
+                  if (nse822 > 0)
+                    for (int32_t k = v8->c.sestart[c822]; k < v8->c.sestart[c822 + 1]; k++)
+                      printf(" %.2e", v8->c.se[v8->c.selist[k]].area);
+                  printf("\n");
+                }
+              }
+              free(phie818);
+              free(phiv818);
+              free(phic818);
+              free(soutv818);
+              free(buf818);
             }
+            /* §814: анизотропия r = |Σ w·L0·ω| / Σ w·L0, ДВУХ объектов: ПОЛЯ такта
+             * (сумма ряда) и ПРИРАЩЕНИЯ такта (свет, отразившийся t раз) —
+             * модельная величина именно приращение: сумма каждый такт получает
+             * свежее ОСТРОЕ излучение источника, и её анизотропия падать не
+             * обязана (замерено на cavity05 до правки). Монотонность — по
+             * приращению, у ячеек светлых в трёх тактах подряд. ND рядом
+             * (А1374): сравнение законно только одношкально. */
+            if (ang814b != NULL) {
+              double smax814 = 0.0;
+              for (int32_t c = 0; c < mesh.ncell; c++)
+                if (ang814b[(size_t)c * 4] > smax814) smax814 = ang814b[(size_t)c * 4];
+              long long nlit814 = 0, ninc814 = 0, nboth814 = 0, nmon814 = 0;
+              double *rv814 = malloc((size_t)mesh.ncell * sizeof *rv814);
+              double *dv814 = malloc((size_t)mesh.ncell * sizeof *dv814);
+              if (rv814 == NULL || dv814 == NULL) exit(1);
+              for (int32_t c = 0; c < mesh.ncell; c++) {
+                const double *m814 = ang814b + (size_t)c * 4;
+                const double s0814 = m814[0];
+                if (s0814 > HZ_DIFF_FLOOR814 * smax814) {
+                  rv814[nlit814++] =
+                      sqrt(m814[1] * m814[1] + m814[2] * m814[2] + m814[3] * m814[3]) / s0814;
+                }
+                if (t > 1) {
+                  const double *q814 = ang814p + (size_t)c * 4;
+                  const double d0814 = m814[0] - q814[0];
+                  if (d0814 > HZ_DIFF_FLOOR814 * smax814) {
+                    const double dx814 = m814[1] - q814[1], dy814 = m814[2] - q814[2],
+                                 dz814 = m814[3] - q814[3];
+                    const double rinc814 =
+                        sqrt(dx814 * dx814 + dy814 * dy814 + dz814 * dz814) / d0814;
+                    dv814[ninc814++] = rinc814;
+                    if (r814p[c] >= 0.0) {
+                      nboth814++;
+                      if (rinc814 < r814p[c]) nmon814++;
+                    }
+                    r814c[c] = rinc814;
+                  } else
+                    r814c[c] = -1.0;
+                }
+              }
+              qsort(rv814, (size_t)nlit814, sizeof *rv814, cmp_dev699);
+              qsort(dv814, (size_t)ninc814, sizeof *dv814, cmp_dev699);
+              printf("   §814 ДИФФ: такт %d (ND %d): поле p50 %.4f p99 %.4f; приращение p50 %.4f "
+                     "p99 %.4f; монотонных (приращение) %.1f %% (ячеек %lld, приращений %lld, "
+                     "трёхтактных %lld)\n",
+                     t, prob.d->n, nlit814 > 0 ? rv814[nlit814 / 2] : -1.0,
+                     nlit814 > 0 ? rv814[(nlit814 * 99) / 100] : -1.0,
+                     ninc814 > 0 ? dv814[ninc814 / 2] : -1.0,
+                     ninc814 > 0 ? dv814[(ninc814 * 99) / 100] : -1.0,
+                     nboth814 > 0 ? 100.0 * (double)nmon814 / (double)nboth814 : -1.0,
+                     (long long)nlit814, (long long)ninc814, (long long)nboth814);
+              free(rv814);
+              free(dv814);
+              memcpy(ang814p, ang814b, nph * sizeof *ang814p);
+              { /* такт становится прошлым */
+                double *tmp814 = r814p;
+                r814p = r814c;
+                r814c = tmp814;
+              }
+            }
+            /* приращение такта, его норма и скалярные произведения с прошлым */
+            double dmaxphi = 0.0, dmaxso = 0.0, num_t = 0.0, dencur = 0.0;
+            for (size_t i = 0; i < nph; i++) {
+              double dc = phi[i] - pphi[i];
+              if (fabs(dc) > dmaxphi) dmaxphi = fabs(dc);
+              num_t += dc * dpphi[i];
+              dencur += dc * dc;
+              dpphi[i] = dc;
+              pphi[i] = phi[i];
+            }
+            for (size_t i = 0; i < nbo; i++) {
+              double dc = stt.bout[i] - pbo[i];
+              num_t += dc * dpbo[i];
+              dencur += dc * dc;
+              dpbo[i] = dc;
+              pbo[i] = stt.bout[i];
+            }
+            for (size_t i = 0; i < nso; i++) {
+              double dc = stt.sout[i] - pso[i];
+              if (fabs(dc) > dmaxso) dmaxso = fabs(dc);
+              num_t += dc * dpso[i];
+              dencur += dc * dc;
+              dpso[i] = dc;
+              pso[i] = stt.sout[i];
+            }
+            if (t > 1) {
+              q_num = num_t;
+              q_den = denprev;
+            }
+            denprev = dencur;
+            printf("   §774 такт %2d: |Δφ|∞ %.3e, |Δsout|∞ %.3e, psin %.6g, %.2f с\n", t, dmaxphi,
+                   dmaxso, stt.psin, now_s() - tt0);
+            free(ubL); /* состояние t−1 больше не нужно: копии лежат в pbo/pso */
+            free(usL);
+            ubL = stt.bout;
+            usL = stt.sout;
+            if (t < xbounce) {
+              if (stt.eirr != NULL)
+                for (int32_t e = 0; e < cut.nse; e++)
+                  peirr[e] = stt.eirr[e];
+              sc_prev[0] = stt.pin;
+              sc_prev[1] = stt.pout;
+              sc_prev[2] = stt.pabs;
+              sc_prev[3] = stt.psin;
+              sc_prev[4] = stt.psout;
+              sc_prev[5] = stt.psolid;
+              free(stt.eirr);
+            } else
+              stfin = stt; /* bout/sout = ubL/usL, освобождает общий путь */
           }
-          /* приращение такта, его норма и скалярные произведения с прошлым */
-          double dmaxphi = 0.0, dmaxso = 0.0, num_t = 0.0, dencur = 0.0;
-          for (size_t i = 0; i < nph; i++) {
-            double dc = phi[i] - pphi[i];
-            if (fabs(dc) > dmaxphi) dmaxphi = fabs(dc);
-            num_t += dc * dpphi[i];
-            dencur += dc * dc;
-            dpphi[i] = dc;
-            pphi[i] = phi[i];
+          st = stfin;
+          if (g_xclamp823)
+            printf("   §822 ЗАЖИМ: суммарно за лестницу %lld зажимов (lpmax %.4e)\n",
+                   (long long)nlpsum823, lpmax823);
+          printf("   §774 ЛЕСТНИЦА: %d тактов за %.2f с\n", xbounce, now_s() - tlad);
+          /* §814 НК-в (свидетель живости): нулевые моменты прибора обязаны
+           * совпасть с φ той же итерации — те же слагаемые в том же порядке.
+           * Не ноль — прибор читает не то поле. */
+          if (ang814b != NULL) {
+            double wmax814 = 0.0;
+            for (int32_t c = 0; c < mesh.ncell; c++) {
+              double d814 = fabs(ang814b[(size_t)c * 4] - phi[(size_t)c * 4]);
+              if (d814 > wmax814) wmax814 = d814;
+            }
+            printf("   §814 ДИФФ: свидетель Σ w·L0 == φ: max|Δ| %.3e (обязан быть 0)\n", wmax814);
           }
-          for (size_t i = 0; i < nbo; i++) {
-            double dc = stt.bout[i] - pbo[i];
-            num_t += dc * dpbo[i];
-            dencur += dc * dc;
-            dpbo[i] = dc;
-            pbo[i] = stt.bout[i];
+          t774lad = now_s() - tlad; /* §810: база сравнения — та же
+                                     * величина, что напечатана выше */
+          /* замыкание хвоста */
+          qhat = -1.0;
+          if (xtailq_ch > 0.0)
+            qhat = xtailq_ch; /* §826: форсированный q̂ канала 0 — всем каналам */
+          else if (xtailq_ch < 0.0 && xbounce >= HZ_TAILN_MIN && q_den > 0.0)
+            qhat = q_num / q_den;
+          if (qhat > 0.0 && qhat <= HZ_TAILQ_MAX) {
+            double mult = qhat / (1.0 - qhat);
+            double psin_raw = st.psin;
+            for (size_t i = 0; i < nph; i++)
+              phi[i] += mult * dpphi[i];
+            for (size_t i = 0; i < nbo; i++)
+              st.bout[i] += mult * dpbo[i];
+            for (size_t i = 0; i < nso; i++)
+              st.sout[i] += mult * dpso[i];
+            int64_t nneg = 0;
+            if (st.eirr != NULL)
+              for (int32_t e = 0; e < cut.nse; e++) {
+                st.eirr[e] += mult * (st.eirr[e] - peirr[e]);
+                if (st.eirr[e] < 0.0) nneg++;
+              }
+            st.pin += mult * (st.pin - sc_prev[0]);
+            st.pout += mult * (st.pout - sc_prev[1]);
+            st.pabs += mult * (st.pabs - sc_prev[2]);
+            st.psin += mult * (st.psin - sc_prev[3]);
+            st.psout += mult * (st.psout - sc_prev[4]);
+            st.psolid += mult * (st.psolid - sc_prev[5]);
+            printf("   §774 ЗАМЫКАНИЕ: q̂ %.4f (%s), множитель %.3f; psin %.6g -> %.6g; "
+                   "eirr < 0 у %lld элементов из %d\n",
+                   qhat, xtailq_ch > 0.0 ? "ФОРСИРОВАН — НК" : "измерен", mult, psin_raw, st.psin,
+                   (long long)nneg, cut.nse);
+          } else if (qhat > HZ_TAILQ_MAX)
+            printf("   §774 замыкание ПРОПУЩЕНО: q̂ %.4f вне (0, %.2f] — ЧИСТОЕ УСЕЧЕНИЕ "
+                   "(fail closed)\n",
+                   qhat, HZ_TAILQ_MAX);
+          else
+            printf("   §774 замыкание ВЫКЛЮЧЕНО (%s) — ЧИСТОЕ УСЕЧЕНИЕ\n",
+                   xtailq_ch < 0.0 ? "тактов меньше минимума либо нулевое приращение"
+                                   : "xtailq=0 по ключу");
+          {
+            double sphiL = 0.0, mphiL = 0.0;
+            for (size_t i = 0; i < nph; i += 4) {
+              sphiL += fabs(phi[i]);
+              if (fabs(phi[i]) > mphiL) mphiL = fabs(phi[i]);
+            }
+            printf("   §774 СЛЕПОК: Σ|φ| %.17g, max|φ| %.17g\n", sphiL, mphiL);
           }
-          for (size_t i = 0; i < nso; i++) {
-            double dc = stt.sout[i] - pso[i];
-            if (fabs(dc) > dmaxso) dmaxso = fabs(dc);
-            num_t += dc * dpso[i];
-            dencur += dc * dc;
-            dpso[i] = dc;
-            pso[i] = stt.sout[i];
+          /* §826: захват eirr канала для кадра + q̂ канала 0 — эталон для
+           * остальных (форсирование одношкально, А1393) */
+          if (g_xrgb) {
+            free(eirr826[ch826]);
+            eirr826[ch826] = malloc((size_t)nse4 * sizeof **eirr826);
+            if (eirr826[ch826] == NULL || st.eirr == NULL) exit(1);
+            memcpy(eirr826[ch826], st.eirr, (size_t)nse4 * sizeof **eirr826);
+            printf("   §826 КАНАЛ %d: psin %.6g, Σ|eirr|·A-площадей записан\n", ch826, st.psin);
           }
-          if (t > 1) {
-            q_num = num_t;
-            q_den = denprev;
+          if (ch826 == 0 && qhat > 0.0 && qhat <= HZ_TAILQ_MAX) {
+            qhat0_826 = qhat;
+            qhat0_set826 = 1;
           }
-          denprev = dencur;
-          printf("   §774 такт %2d: |Δφ|∞ %.3e, |Δsout|∞ %.3e, psin %.6g, %.2f с\n", t, dmaxphi,
-                 dmaxso, stt.psin, now_s() - tt0);
-          free(ubL); /* состояние t−1 больше не нужно: копии лежат в pbo/pso */
-          free(usL);
-          ubL = stt.bout;
-          usL = stt.sout;
-          if (t < xbounce) {
-            if (stt.eirr != NULL)
-              for (int32_t e = 0; e < cut.nse; e++)
-                peirr[e] = stt.eirr[e];
-            sc_prev[0] = stt.pin;
-            sc_prev[1] = stt.pout;
-            sc_prev[2] = stt.pabs;
-            sc_prev[3] = stt.psin;
-            sc_prev[4] = stt.psout;
-            sc_prev[5] = stt.psolid;
-            free(stt.eirr);
-          } else
-            stfin = stt; /* bout/sout = ubL/usL, освобождает общий путь */
-        }
-        st = stfin;
-        if (g_xclamp823)
-          printf("   §822 ЗАЖИМ: суммарно за лестницу %lld зажимов (lpmax %.4e)\n",
-                 (long long)nlpsum823, lpmax823);
-        printf("   §774 ЛЕСТНИЦА: %d тактов за %.2f с\n", xbounce, now_s() - tlad);
-        /* §814 НК-в (свидетель живости): нулевые моменты прибора обязаны
-         * совпасть с φ той же итерации — те же слагаемые в том же порядке.
-         * Не ноль — прибор читает не то поле. */
-        if (ang814b != NULL) {
-          double wmax814 = 0.0;
-          for (int32_t c = 0; c < mesh.ncell; c++) {
-            double d814 = fabs(ang814b[(size_t)c * 4] - phi[(size_t)c * 4]);
-            if (d814 > wmax814) wmax814 = d814;
+          /* сравнение с базой того же процесса */
+          if (xbcmp774) {
+            int bitphi = memcmp(phi, phiB4, nph * sizeof(double)) == 0;
+            int biteirr = eirrB != NULL && st.eirr != NULL &&
+                          memcmp(st.eirr, eirrB, (size_t)cut.nse * sizeof(double)) == 0;
+            double dps = psinB > 0.0 ? (st.psin - psinB) / psinB : 0.0;
+            /* зона §768: < 15 м от глаза, лицевые; предикат тот же, что у
+             * прибора вклада — сравнение читается против А1212 */
+            double zb = 0.0, zl = 0.0, tb = 0.0, tl = 0.0;
+            int64_t nzone = 0, nuse = 0, nneg2 = 0;
+            double *rel = malloc((size_t)nse4 * sizeof *rel);
+            if (rel == NULL) exit(1);
+            for (int32_t e = 0; e < cut.nse && eirrB != NULL && st.eirr != NULL; e++) {
+              double c9[3] = {0, 0, 0};
+              for (int q2 = 0; q2 < cut.se[e].nv; q2++)
+                for (int a = 0; a < 3; a++)
+                  c9[a] += cut.se[e].v[q2][a] / (double)(cut.se[e].nv > 0 ? cut.se[e].nv : 1);
+              double d2 = 0.0, dot = 0.0;
+              for (int a = 0; a < 3; a++) {
+                double dd = c9[a] - g_eye[a];
+                d2 += dd * dd;
+                dot += cut.se[e].n[a] * dd;
+              }
+              int inzone = sqrt(d2) < 15.0 && !(dot > 0.0);
+              double wb = eirrB[e] * cut.se[e].area, wl = st.eirr[e] * cut.se[e].area;
+              tb += fabs(wb);
+              tl += fabs(wl);
+              if (inzone) {
+                zb += fabs(wb);
+                zl += fabs(wl);
+                nzone++;
+              }
+              if (fabs(eirrB[e]) > 0.0) rel[nuse++] = fabs(st.eirr[e] - eirrB[e]) / fabs(eirrB[e]);
+              if (st.eirr[e] < 0.0) nneg2++;
+            }
+            printf("   §774 СРАВНЕНИЕ С БАЗОЙ: Δpsin %+.3f %%; Σ|E·area| зоны (<15 м, лицевые, "
+                   "%lld элементов) %.6g против %.6g (Δ %+.3f %%); всей сцены %.6g против %.6g "
+                   "(Δ %+.3f %%); ПОБИТОВО φ: %s, eirr: %s\n",
+                   100.0 * dps, (long long)nzone, zl, zb, 100.0 * (zl - zb) / (zb > 0.0 ? zb : 1.0),
+                   tl, tb, 100.0 * (tl - tb) / (tb > 0.0 ? tb : 1.0), bitphi ? "ДА" : "нет",
+                   biteirr ? "ДА" : "нет");
+            if (nuse > 0) {
+              qsort(rel, (size_t)nuse, sizeof *rel, cmp_dev699);
+              printf("   §774 ПОЭЛЕМЕНТНО |Δeirr|/eirr (покрытие %lld из %d, база > 0): медиана "
+                     "%.4g, p90 %.4g, p99 %.4g, макс %.4g; eirr < 0 после замыкания: %lld\n",
+                     (long long)nuse, cut.nse, rel[nuse / 2], rel[(nuse * 9) / 10],
+                     rel[(nuse * 99) / 100], rel[nuse - 1], (long long)nneg2);
+            }
+            free(rel);
+            free(phiB4);
+            free(eirrB);
           }
-          printf("   §814 ДИФФ: свидетель Σ w·L0 == φ: max|Δ| %.3e (обязан быть 0)\n", wmax814);
-        }
-        const double t774lad = now_s() - tlad; /* §810: база сравнения — та же
-                                                * величина, что напечатана выше */
-        /* замыкание хвоста */
-        double qhat = -1.0;
-        if (xtailq > 0.0)
-          qhat = xtailq; /* НК: форсированный множитель */
-        else if (xtailq < 0.0 && xbounce >= HZ_TAILN_MIN && q_den > 0.0)
-          qhat = q_num / q_den;
-        if (qhat > 0.0 && qhat <= HZ_TAILQ_MAX) {
-          double mult = qhat / (1.0 - qhat);
-          double psin_raw = st.psin;
-          for (size_t i = 0; i < nph; i++)
-            phi[i] += mult * dpphi[i];
-          for (size_t i = 0; i < nbo; i++)
-            st.bout[i] += mult * dpbo[i];
-          for (size_t i = 0; i < nso; i++)
-            st.sout[i] += mult * dpso[i];
-          int64_t nneg = 0;
-          if (st.eirr != NULL)
+          /* §810: РАСПИСАНИЕ ОТСКОКОВ. База сравнения — УЖЕ посчитанная лестница
+           * кадра («2,2»: ординаты канона); расписание — диагностический прогон
+           * на своих наборах по sched810_ladder. Кадр остаётся при ординатах
+           * канона до приёмки П1/П2 — переворот умолчания отдельным решением. */
+          if (xs810_set) {
+            if (xs810_1 < 0 || xs810_1 > 4 || xs810_2 < 0 || xs810_2 > 4) {
+              fprintf(stderr, "xsched=: поля %d,%d — вне [0, 4] (0 = ордината канона)\n", xs810_1,
+                      xs810_2);
+              exit(1);
+            }
+            int n1_810 = xs810_1 > 0 ? xs810_1 : nmu;
+            int n2_810 = xs810_2 > 0 ? xs810_2 : nmu;
+            tr3_dirs d1_810, d2_810;
+            const tr3_dirs *pd1 = &dirs, *pd2 = &dirs;
+            if (n1_810 != nmu) {
+              if (tr3_dirs_product(&d1_810, n1_810, n1_810) != 0) exit(1);
+              pd1 = &d1_810;
+            }
+            if (n2_810 != nmu) {
+              if (tr3_dirs_product(&d2_810, n2_810, n2_810) != 0) exit(1);
+              pd2 = &d2_810;
+            }
+            const size_t nph810 = (size_t)mesh.ncell * 4;
+            double *phiS = calloc(nph810, sizeof *phiS);
+            double *rel810 = malloc((size_t)(cut.nse > 0 ? cut.nse : 1) * sizeof *rel810);
+            if (phiS == NULL || rel810 == NULL) exit(1);
+            tr3_stats stS;
+            memset(&stS, 0, sizeof stS);
+            double qS = -1.0, tS = 0.0;
+            sched810_ladder(&prob, pd1, pd2, n1_810, n2_810, xbounce, xtailq, phiS, &stS, &qS, &tS);
+            /* сравнение с лестницей кадра (st — закрытое состояние той же сетки) */
+            double dps810 = st.psin > 0.0 ? 100.0 * (stS.psin - st.psin) / st.psin : 0.0;
+            double zw810 = 0.0, zb810 = 0.0;
+            int64_t nzone810 = 0, nuse810 = 0;
             for (int32_t e = 0; e < cut.nse; e++) {
-              st.eirr[e] += mult * (st.eirr[e] - peirr[e]);
-              if (st.eirr[e] < 0.0) nneg++;
+              double a9 = cut.se[e].area;
+              if (!(a9 > 0.0) || stS.eirr == NULL || st.eirr == NULL) continue;
+              double c9[3] = {0, 0, 0};
+              for (int q = 0; q < cut.se[e].nv; q++)
+                for (int a = 0; a < 3; a++)
+                  c9[a] += cut.se[e].v[q][a] / (double)(cut.se[e].nv > 0 ? cut.se[e].nv : 1);
+              double d2 = 0.0, dot = 0.0;
+              for (int a = 0; a < 3; a++) {
+                double dd = c9[a] - g_eye[a];
+                d2 += dd * dd;
+                dot += cut.se[e].n[a] * dd;
+              }
+              int inzone = sqrt(d2) < 15.0 && !(dot > 0.0);
+              double wS = fabs(stS.eirr[e]) * a9, wB = fabs(st.eirr[e]) * a9;
+              if (inzone) {
+                zw810 += wS;
+                zb810 += wB;
+                nzone810++;
+              }
+              if (fabs(st.eirr[e]) > 0.0)
+                rel810[nuse810++] = fabs(stS.eirr[e] - st.eirr[e]) / fabs(st.eirr[e]);
             }
-          st.pin += mult * (st.pin - sc_prev[0]);
-          st.pout += mult * (st.pout - sc_prev[1]);
-          st.pabs += mult * (st.pabs - sc_prev[2]);
-          st.psin += mult * (st.psin - sc_prev[3]);
-          st.psout += mult * (st.psout - sc_prev[4]);
-          st.psolid += mult * (st.psolid - sc_prev[5]);
-          printf("   §774 ЗАМЫКАНИЕ: q̂ %.4f (%s), множитель %.3f; psin %.6g -> %.6g; "
-                 "eirr < 0 у %lld элементов из %d\n",
-                 qhat, xtailq > 0.0 ? "ФОРСИРОВАН — НК" : "измерен", mult, psin_raw, st.psin,
-                 (long long)nneg, cut.nse);
-        } else if (qhat > HZ_TAILQ_MAX)
-          printf("   §774 замыкание ПРОПУЩЕНО: q̂ %.4f вне (0, %.2f] — ЧИСТОЕ УСЕЧЕНИЕ "
-                 "(fail closed)\n",
-                 qhat, HZ_TAILQ_MAX);
-        else
-          printf("   §774 замыкание ВЫКЛЮЧЕНО (%s) — ЧИСТОЕ УСЕЧЕНИЕ\n",
-                 xtailq < 0.0 ? "тактов меньше минимума либо нулевое приращение"
-                              : "xtailq=0 по ключу");
-        {
-          double sphiL = 0.0, mphiL = 0.0;
-          for (size_t i = 0; i < nph; i += 4) {
-            sphiL += fabs(phi[i]);
-            if (fabs(phi[i]) > mphiL) mphiL = fabs(phi[i]);
-          }
-          printf("   §774 СЛЕПОК: Σ|φ| %.17g, max|φ| %.17g\n", sphiL, mphiL);
-        }
-        /* сравнение с базой того же процесса */
-        if (xbcmp774) {
-          int bitphi = memcmp(phi, phiB4, nph * sizeof(double)) == 0;
-          int biteirr = eirrB != NULL && st.eirr != NULL &&
-                        memcmp(st.eirr, eirrB, (size_t)cut.nse * sizeof(double)) == 0;
-          double dps = psinB > 0.0 ? (st.psin - psinB) / psinB : 0.0;
-          /* зона §768: < 15 м от глаза, лицевые; предикат тот же, что у
-           * прибора вклада — сравнение читается против А1212 */
-          double zb = 0.0, zl = 0.0, tb = 0.0, tl = 0.0;
-          int64_t nzone = 0, nuse = 0, nneg2 = 0;
-          double *rel = malloc((size_t)nse4 * sizeof *rel);
-          if (rel == NULL) exit(1);
-          for (int32_t e = 0; e < cut.nse && eirrB != NULL && st.eirr != NULL; e++) {
-            double c9[3] = {0, 0, 0};
-            for (int q2 = 0; q2 < cut.se[e].nv; q2++)
-              for (int a = 0; a < 3; a++)
-                c9[a] += cut.se[e].v[q2][a] / (double)(cut.se[e].nv > 0 ? cut.se[e].nv : 1);
-            double d2 = 0.0, dot = 0.0;
-            for (int a = 0; a < 3; a++) {
-              double dd = c9[a] - g_eye[a];
-              d2 += dd * dd;
-              dot += cut.se[e].n[a] * dd;
+            double dz810 = 100.0 * (zw810 - zb810) / (zb810 > 0.0 ? zb810 : 1.0);
+            double p99810 = 0.0;
+            if (nuse810 > 0) {
+              qsort(rel810, (size_t)nuse810, sizeof *rel810, cmp_dev699);
+              p99810 = rel810[(nuse810 * 99) / 100];
             }
-            int inzone = sqrt(d2) < 15.0 && !(dot > 0.0);
-            double wb = eirrB[e] * cut.se[e].area, wl = st.eirr[e] * cut.se[e].area;
-            tb += fabs(wb);
-            tl += fabs(wl);
-            if (inzone) {
-              zb += fabs(wb);
-              zl += fabs(wl);
-              nzone++;
+            int bit810 =
+                n1_810 == nmu && n2_810 == nmu && memcmp(phiS, phi, nph810 * sizeof(double)) == 0;
+            printf("   §810 РАСПИСАНИЕ: такт1 nmu %d (ND %d), хвост nmu %d (ND %d); лестница "
+                   "%.2f с против %.2f с (выигрыш ×%.2f); Δpsin %+.3f %%, Δ зоны %+.3f %%; "
+                   "q̂ %.4f; eirr p99 %.4g (покрытие %lld); тождество «канон,канон»: %s\n",
+                   n1_810, pd1->n, n2_810, pd2->n, tS, t774lad, tS > 0.0 ? t774lad / tS : 0.0,
+                   dps810, dz810, qS > 0.0 ? qS : 0.0, p99810, (long long)nuse810,
+                   bit810 ? "ДА" : "нет");
+            free(stS.bout);
+            free(stS.sout);
+            free(stS.eirr);
+            free(phiS);
+            free(rel810);
+            if (pd1 == &d1_810) tr3_dirs_free(&d1_810);
+            if (pd2 == &d2_810) tr3_dirs_free(&d2_810);
+          }
+          /* §808: СТЕНД ИНКРЕМЕНТНОСТИ СВЕТА. Стоит ПОСЛЕ лестницы и замыкания
+           * кадра 1: его вход — закрытое состояние (phi, st.bout, st.sout) и
+           * измеренный q̂. Гварды здесь, а не в разборе ключей: условие — не
+           * синтаксис, а семантика конфигурации (fcold считается позже). */
+          if (xwarm_set) {
+            if (!(xcoarse > 0.0)) {
+              fprintf(stderr, "xwarm= требует xcoarse>0: ремап грейда определён только "
+                              "при огрублении приёмников (план §808)\n");
+              exit(1);
             }
-            if (fabs(eirrB[e]) > 0.0) rel[nuse++] = fabs(st.eirr[e] - eirrB[e]) / fabs(eirrB[e]);
-            if (st.eirr[e] < 0.0) nneg2++;
-          }
-          printf("   §774 СРАВНЕНИЕ С БАЗОЙ: Δpsin %+.3f %%; Σ|E·area| зоны (<15 м, лицевые, "
-                 "%lld элементов) %.6g против %.6g (Δ %+.3f %%); всей сцены %.6g против %.6g "
-                 "(Δ %+.3f %%); ПОБИТОВО φ: %s, eirr: %s\n",
-                 100.0 * dps, (long long)nzone, zl, zb, 100.0 * (zl - zb) / (zb > 0.0 ? zb : 1.0),
-                 tl, tb, 100.0 * (tl - tb) / (tb > 0.0 ? tb : 1.0), bitphi ? "ДА" : "нет",
-                 biteirr ? "ДА" : "нет");
-          if (nuse > 0) {
-            qsort(rel, (size_t)nuse, sizeof *rel, cmp_dev699);
-            printf("   §774 ПОЭЛЕМЕНТНО |Δeirr|/eirr (покрытие %lld из %d, база > 0): медиана "
-                   "%.4g, p90 %.4g, p99 %.4g, макс %.4g; eirr < 0 после замыкания: %lld\n",
-                   (long long)nuse, cut.nse, rel[nuse / 2], rel[(nuse * 9) / 10],
-                   rel[(nuse * 99) / 100], rel[nuse - 1], (long long)nneg2);
-          }
-          free(rel);
-          free(phiB4);
-          free(eirrB);
-        }
-        /* §810: РАСПИСАНИЕ ОТСКОКОВ. База сравнения — УЖЕ посчитанная лестница
-         * кадра («2,2»: ординаты канона); расписание — диагностический прогон
-         * на своих наборах по sched810_ladder. Кадр остаётся при ординатах
-         * канона до приёмки П1/П2 — переворот умолчания отдельным решением. */
-        if (xs810_set) {
-          if (xs810_1 < 0 || xs810_1 > 4 || xs810_2 < 0 || xs810_2 > 4) {
-            fprintf(stderr, "xsched=: поля %d,%d — вне [0, 4] (0 = ордината канона)\n", xs810_1,
-                    xs810_2);
-            exit(1);
-          }
-          int n1_810 = xs810_1 > 0 ? xs810_1 : nmu;
-          int n2_810 = xs810_2 > 0 ? xs810_2 : nmu;
-          tr3_dirs d1_810, d2_810;
-          const tr3_dirs *pd1 = &dirs, *pd2 = &dirs;
-          if (n1_810 != nmu) {
-            if (tr3_dirs_product(&d1_810, n1_810, n1_810) != 0) exit(1);
-            pd1 = &d1_810;
-          }
-          if (n2_810 != nmu) {
-            if (tr3_dirs_product(&d2_810, n2_810, n2_810) != 0) exit(1);
-            pd2 = &d2_810;
-          }
-          const size_t nph810 = (size_t)mesh.ncell * 4;
-          double *phiS = calloc(nph810, sizeof *phiS);
-          double *rel810 = malloc((size_t)(cut.nse > 0 ? cut.nse : 1) * sizeof *rel810);
-          if (phiS == NULL || rel810 == NULL) exit(1);
-          tr3_stats stS;
-          memset(&stS, 0, sizeof stS);
-          double qS = -1.0, tS = 0.0;
-          sched810_ladder(&prob, pd1, pd2, n1_810, n2_810, xbounce, xtailq, phiS, &stS, &qS, &tS);
-          /* сравнение с лестницей кадра (st — закрытое состояние той же сетки) */
-          double dps810 = st.psin > 0.0 ? 100.0 * (stS.psin - st.psin) / st.psin : 0.0;
-          double zw810 = 0.0, zb810 = 0.0;
-          int64_t nzone810 = 0, nuse810 = 0;
-          for (int32_t e = 0; e < cut.nse; e++) {
-            double a9 = cut.se[e].area;
-            if (!(a9 > 0.0) || stS.eirr == NULL || st.eirr == NULL) continue;
-            double c9[3] = {0, 0, 0};
-            for (int q = 0; q < cut.se[e].nv; q++)
-              for (int a = 0; a < 3; a++)
-                c9[a] += cut.se[e].v[q][a] / (double)(cut.se[e].nv > 0 ? cut.se[e].nv : 1);
-            double d2 = 0.0, dot = 0.0;
-            for (int a = 0; a < 3; a++) {
-              double dd = c9[a] - g_eye[a];
-              d2 += dd * dd;
-              dot += cut.se[e].n[a] * dd;
+            if (!fcold || xhall || xemitfacet) {
+              fprintf(stderr, "xwarm= требует канонную инъекцию Ke по элементам (§786): "
+                              "несовместим с xfc/xhall/xemitfacet\n");
+              exit(1);
             }
-            int inzone = sqrt(d2) < 15.0 && !(dot > 0.0);
-            double wS = fabs(stS.eirr[e]) * a9, wB = fabs(st.eirr[e]) * a9;
-            if (inzone) {
-              zw810 += wS;
-              zb810 += wB;
-              nzone810++;
+            if (xrelax > 0.0) {
+              fprintf(stderr, "xwarm= при xrelax>0: демпфер гасил бы bout первой прокидки "
+                              "к нулю (§750)\n");
+              exit(1);
             }
-            if (fabs(st.eirr[e]) > 0.0)
-              rel810[nuse810++] = fabs(stS.eirr[e] - st.eirr[e]) / fabs(st.eirr[e]);
+            if (xwarm_n < 1 || xwarm_n > 2) {
+              fprintf(stderr, "xwarm=: прокидок %d — вне [1, 2] (А1348)\n", xwarm_n);
+              exit(1);
+            }
+            warm808 cx8;
+            memset(&cx8, 0, sizeof cx8);
+            cx8.ot = &ot;
+            cx8.ofr = &ofr;
+            cx8.cm = &cmap;
+            cx8.ft = &ftab;
+            cx8.om = &m;
+            cx8.ctctx = &CT;
+            cx8.occ = &P;
+            cx8.smask = solidmask;
+            cx8.occn = fr.n;
+            cx8.innerfluid = xinnerfluid;
+            cx8.lev = lev;
+            cx8.xcoarse = xcoarse;
+            cx8.xfernosolid = xfernosolid;
+            cx8.xmatrho = xmatrho;
+            cx8.xmatfar = xmatfar;
+            cx8.xrho = xrho;
+            cx8.xrhoscale = xrhoscale;
+            cx8.xthin = xthin;
+            cx8.xsemin = xsemin;
+            cx8.xtailq = xtailq;
+            cx8.m1 = &mesh;
+            cx8.c1 = &cut;
+            cx8.phi1 = phi;
+            cx8.sout1 = st.sout;
+            cx8.qhat1 = qhat;
+            cx8.emitpow1 = emitpow2;
+            cx8.frho1 = frho; /* Р3 §810: переиспользование альбедо фасетов */
+            cx8.xrhocal = xrhocal810;
+            cx8.prob = &prob;
+            for (int a = 0; a < 3; a++)
+              cx8.eye1[a] = g_eye[a];
+            cx8.shift[0] = xwarm3[0];
+            cx8.shift[1] = xwarm3[1];
+            cx8.shift[2] = xwarm3[2];
+            cx8.nwarm = xwarm_n;
+            cx8.xbounce = xbounce;
+            cx8.scramble = xscramble808;
+            warm808_run(&cx8);
           }
-          double dz810 = 100.0 * (zw810 - zb810) / (zb810 > 0.0 ? zb810 : 1.0);
-          double p99810 = 0.0;
-          if (nuse810 > 0) {
-            qsort(rel810, (size_t)nuse810, sizeof *rel810, cmp_dev699);
-            p99810 = rel810[(nuse810 * 99) / 100];
-          }
-          int bit810 =
-              n1_810 == nmu && n2_810 == nmu && memcmp(phiS, phi, nph810 * sizeof(double)) == 0;
-          printf("   §810 РАСПИСАНИЕ: такт1 nmu %d (ND %d), хвост nmu %d (ND %d); лестница "
-                 "%.2f с против %.2f с (выигрыш ×%.2f); Δpsin %+.3f %%, Δ зоны %+.3f %%; "
-                 "q̂ %.4f; eirr p99 %.4g (покрытие %lld); тождество «канон,канон»: %s\n",
-                 n1_810, pd1->n, n2_810, pd2->n, tS, t774lad, tS > 0.0 ? t774lad / tS : 0.0, dps810,
-                 dz810, qS > 0.0 ? qS : 0.0, p99810, (long long)nuse810, bit810 ? "ДА" : "нет");
-          free(stS.bout);
-          free(stS.sout);
-          free(stS.eirr);
-          free(phiS);
-          free(rel810);
-          if (pd1 == &d1_810) tr3_dirs_free(&d1_810);
-          if (pd2 == &d2_810) tr3_dirs_free(&d2_810);
-        }
-        /* §808: СТЕНД ИНКРЕМЕНТНОСТИ СВЕТА. Стоит ПОСЛЕ лестницы и замыкания
-         * кадра 1: его вход — закрытое состояние (phi, st.bout, st.sout) и
-         * измеренный q̂. Гварды здесь, а не в разборе ключей: условие — не
-         * синтаксис, а семантика конфигурации (fcold считается позже). */
-        if (xwarm_set) {
-          if (!(xcoarse > 0.0)) {
-            fprintf(stderr, "xwarm= требует xcoarse>0: ремап грейда определён только "
-                            "при огрублении приёмников (план §808)\n");
-            exit(1);
-          }
-          if (!fcold || xhall || xemitfacet) {
-            fprintf(stderr, "xwarm= требует канонную инъекцию Ke по элементам (§786): "
-                            "несовместим с xfc/xhall/xemitfacet\n");
-            exit(1);
-          }
-          if (xrelax > 0.0) {
-            fprintf(stderr, "xwarm= при xrelax>0: демпфер гасил бы bout первой прокидки "
-                            "к нулю (§750)\n");
-            exit(1);
-          }
-          if (xwarm_n < 1 || xwarm_n > 2) {
-            fprintf(stderr, "xwarm=: прокидок %d — вне [1, 2] (А1348)\n", xwarm_n);
-            exit(1);
-          }
-          warm808 cx8;
-          memset(&cx8, 0, sizeof cx8);
-          cx8.ot = &ot;
-          cx8.ofr = &ofr;
-          cx8.cm = &cmap;
-          cx8.ft = &ftab;
-          cx8.om = &m;
-          cx8.ctctx = &CT;
-          cx8.occ = &P;
-          cx8.smask = solidmask;
-          cx8.occn = fr.n;
-          cx8.innerfluid = xinnerfluid;
-          cx8.lev = lev;
-          cx8.xcoarse = xcoarse;
-          cx8.xfernosolid = xfernosolid;
-          cx8.xmatrho = xmatrho;
-          cx8.xmatfar = xmatfar;
-          cx8.xrho = xrho;
-          cx8.xrhoscale = xrhoscale;
-          cx8.xthin = xthin;
-          cx8.xsemin = xsemin;
-          cx8.xtailq = xtailq;
-          cx8.m1 = &mesh;
-          cx8.c1 = &cut;
-          cx8.phi1 = phi;
-          cx8.sout1 = st.sout;
-          cx8.qhat1 = qhat;
-          cx8.emitpow1 = emitpow2;
-          cx8.frho1 = frho; /* Р3 §810: переиспользование альбедо фасетов */
-          cx8.xrhocal = xrhocal810;
-          cx8.prob = &prob;
-          for (int a = 0; a < 3; a++)
-            cx8.eye1[a] = g_eye[a];
-          cx8.shift[0] = xwarm3[0];
-          cx8.shift[1] = xwarm3[1];
-          cx8.shift[2] = xwarm3[2];
-          cx8.nwarm = xwarm_n;
-          cx8.xbounce = xbounce;
-          cx8.scramble = xscramble808;
-          warm808_run(&cx8);
-        }
-        free(pphi);
-        free(pbo);
-        free(pso);
-        free(dpphi);
-        free(dpbo);
-        free(dpso);
-        free(peirr);
-        free(ang814b);
-        free(ang814p);
-        free(r814c);
-        free(r814p);
-        for (int r = 0; r < nv818; r++) { /* §818: варианты стенда */
-          free(v818_[r].eemit);
-          free(v818_[r].sigt);
-          free(v818_[r].sigs);
-          tr3_cut_free(&v818_[r].c);
-          tr3_mesh_free(&v818_[r].m);
+          free(pphi);
+          free(pbo);
+          free(pso);
+          free(dpphi);
+          free(dpbo);
+          free(dpso);
+          free(peirr);
+          free(ang814b);
+          free(ang814p);
+          free(r814c);
+          free(r814p);
+          for (int r = 0; r < nv818; r++) { /* §818: варианты стенда */
+            free(v818_[r].eemit);
+            free(v818_[r].sigt);
+            free(v818_[r].sigs);
+            tr3_cut_free(&v818_[r].c);
+            tr3_mesh_free(&v818_[r].m);
+          } /* §826: конец канального цикла лестницы */
+          if (g_xrgb && eirr826[0] != NULL && st.eirr != NULL)
+            memcpy(st.eirr, eirr826[0],
+                   (size_t)nse4 * sizeof *st.eirr); /* общие печати — канал R */
         }
       } else if (!xunit) {
         src = tr3_sweep_solve(&prob, xit, xtol, phi, &st);
@@ -12153,11 +12322,14 @@ int main(int argc, char **argv) {
         free(eback);
       }
       /* §758: свиповое поле на узлы — для кадра развёрткой. E = eirr
-       * (входящая облучённость финального такта, А1187), вес — площадь. */
+       * (входящая облучённость финального такта, А1187), вес — площадь.
+       * §826: ПО КАНАЛАМ — eirr826[c] под xrgb, иначе один канал из st. */
       if (xframe && st.eirr != NULL) {
-        g_swEn = calloc((size_t)T.n, sizeof *g_swEn);
-        g_swEd = calloc((size_t)T.n, sizeof *g_swEd);
-        if (g_swEn == NULL || g_swEd == NULL) exit(1);
+        for (int c826 = 0; c826 < g_nch826; c826++) {
+          g_swEn[c826] = calloc((size_t)T.n, sizeof *g_swEn[c826]);
+          g_swEd[c826] = calloc((size_t)T.n, sizeof *g_swEd[c826]);
+          if (g_swEn[c826] == NULL || g_swEd[c826] == NULL) exit(1);
+        }
         int64_t nmiss758 = 0;
         for (int32_t e = 0; e < cut.nse; e++) {
           double a = cut.se[e].area;
@@ -12182,14 +12354,18 @@ int main(int argc, char **argv) {
           /* §796/§798: под гибридом узлы свипа несут ТОЛЬКО хвост (прямой
            * идёт вторым каналом из ядрового сбора); под xfcelem (НК §798) —
            * §796-агрегат E_fc + хвост; при старой инъекции — прежнее eirr */
-          double ev8 = st.eirr[e];
-          if (efc796 != NULL && xfcelem) ev8 += efc796[e];
-          g_swEn[ni] += ev8 * a;
-          g_swEd[ni] += a;
+          for (int c826 = 0; c826 < g_nch826; c826++) {
+            double ev8 = g_xrgb ? eirr826[c826][e] : st.eirr[e];
+            if (efc796 != NULL && xfcelem) ev8 += efc796[e];
+            g_swEn[c826][ni] += ev8 * a;
+            g_swEd[c826][ni] += a;
+          }
         }
         g_fcmode = efc796 == NULL ? 0 : (xfcelem ? 1 : 2);
-        swE_lift(&T, 0, g_swEn, g_swEd);
-        printf("   §758 СВИП->УЗЛЫ: элементов без узла %lld\n", (long long)nmiss758);
+        for (int c826 = 0; c826 < g_nch826; c826++)
+          swE_lift(&T, 0, g_swEn[c826], g_swEd[c826]);
+        printf("   §758 СВИП->УЗЛЫ: элементов без узла %lld (каналов %d)\n", (long long)nmiss758,
+               g_nch826);
       }
       /* ---- §798: ПРЯМОЙ КАНАЛ КАДРА ИЗ ЯДРОВОГО СБОРА (гибрид К-а §797) --
        * Приёмники — ячейки СРЕЗА ПОЛНОЙ ГЛУБИНЫ (одна DC-нормаль на ячейку,
@@ -13696,7 +13872,7 @@ int main(int argc, char **argv) {
       /* §758: КАДР РАЗВЁРТКОЙ. Сличение ДО растра в линейном пространстве
        * кадрового среза (мера кадровая — А1188), затем ПОДМЕНА irr на
        * свиповое E·alb + Ke. Покрытие и отказы — счётчиками (А891). */
-      if (xframe && g_swEn != NULL) {
+      if (xframe && g_swEn[0] != NULL) {
         int64_t ncov8 = 0, nmiss8 = 0, nz8 = 0, nuse8 = 0, nout8 = 0;
         double *rt8 = malloc((size_t)S.n * sizeof *rt8);
         double *tmp8 = malloc((size_t)S.n * sizeof *tmp8);
@@ -13712,10 +13888,10 @@ int main(int argc, char **argv) {
         if (eall8 == NULL) exit(1);
         for (int32_t i = 0; i < S.n; i++) {
           int uplev8 = 0;
-          int32_t ni = node_swE_best(&T, lev, &S.c[i], &uplev8, g_swEd);
-          double Ei = (ni >= 0) ? g_swEn[ni] / g_swEd[ni] : -1.0;
+          int32_t ni = node_swE_best(&T, lev, &S.c[i], &uplev8, g_swEd[0]);
+          double Ei = (ni >= 0) ? g_swEn[0][ni] / g_swEd[0][ni] : -1.0;
           /* §798: гибрид — прямой свет ВТОРЫМ каналом из ядрового сбора */
-          if (g_fcdn != NULL) {
+          if (!g_xrgb && g_fcdn != NULL) {
             int updir8 = 0;
             int32_t nd8 = node_swE_best(&T, lev, &S.c[i], &updir8, g_fcdd);
             if (nd8 >= 0) Ei = (Ei > 0.0 ? Ei : 0.0) + g_fcdn[nd8] / g_fcdd[nd8];
@@ -13741,7 +13917,18 @@ int main(int argc, char **argv) {
           const double *ke8 = m.mtl[S.c[i].mat < m.nmtl ? S.c[i].mat : 0].ke3;
           double bsum = 0.0;
           for (int k = 0; k < 3; k++) {
-            double v = Ei * alb(&m, S.c[i].mat, k) + (!g_nokemit ? ke8[k] : 0.0);
+            /* §826: по каналам — Ei_c из swEn[c]; без xrgb канал один,
+             * реплицируется на все три (моно-семантика прежняя) */
+            int cc = k < g_nch826 ? k : g_nch826 - 1;
+            int upc826 = 0;
+            int32_t nic826 = cc == 0 ? ni : node_swE_best(&T, lev, &S.c[i], &upc826, g_swEd[cc]);
+            double Eic = (nic826 >= 0) ? g_swEn[cc][nic826] / g_swEd[cc][nic826] : Ei;
+            if (!g_xrgb && g_fcdn != NULL && cc != 0) {
+              int updir826 = 0;
+              int32_t nd826 = node_swE_best(&T, lev, &S.c[i], &updir826, g_fcdd);
+              if (nd826 >= 0) Eic = (Eic > 0.0 ? Eic : 0.0) + g_fcdn[nd826] / g_fcdd[nd826];
+            }
+            double v = Eic * alb(&m, S.c[i].mat, k) + (!g_nokemit ? ke8[k] : 0.0);
             swv[3 * (size_t)i + (size_t)k] = (float)v;
             bsum += v;
           }
@@ -13932,7 +14119,7 @@ int main(int argc, char **argv) {
          * а канал E·alb + Ke до пикселей не доходил вовсе (вскрыто §798:
          * гибрид/НК дали ПОБИТОВО один кадр при разных Ei). xframe читает
          * узловые каналы; без xframe Ш15-картинка остаётся как была. */
-        if (xrad != NULL && !(xframe && g_swEn != NULL)) {
+        if (xrad != NULL && !(xframe && g_swEn[0] != NULL)) {
           int64_t nfound = 0;
           for (int32_t i = 0; i < S.n; i++) {
             /* Ячейка читает СВОЙ уровень пирамиды, а не угол на самом мелком. НК
@@ -15743,6 +15930,21 @@ int main(int argc, char **argv) {
               for (int k2 = 0; k2 < 3; k2++)
                 sirr824 += (double)LC.irr[3 * (size_t)i2 + (size_t)k2];
             printf("   §824 ПРОВОДКА: Σ defcol (до PFM) %.6e, Σ LC.irr %.6e\n", sdc824, sirr824);
+            /* §826: доля ЦВЕТНЫХ пикселей (порог 8/255 после белой точки) */
+            {
+              int64_t nrg826 = 0, nrb826 = 0, np826 = 0;
+              double thr826 = 8.0 / 255.0 * LC.white;
+              for (size_t k2 = 0; k2 < (size_t)resw * (size_t)resh; k2++) {
+                double r826 = (double)LC.defcol[3 * k2], g826 = (double)LC.defcol[3 * k2 + 1],
+                       b826 = (double)LC.defcol[3 * k2 + 2];
+                np826++;
+                if (fabs(r826 - g826) > thr826) nrg826++;
+                if (fabs(r826 - b826) > thr826) nrb826++;
+              }
+              printf("   §826 ЦВЕТ: |R−G|>8: %.1f %%, |R−B|>8: %.1f %% (из %lld px)\n",
+                     100.0 * (double)nrg826 / (double)(np826 > 0 ? np826 : 1),
+                     100.0 * (double)nrb826 / (double)(np826 > 0 ? np826 : 1), (long long)np826);
+            }
           }
           for (int y = 0; y < outh; y++)
             for (int x = 0; x < outw; x++)

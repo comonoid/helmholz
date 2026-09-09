@@ -7227,7 +7227,7 @@ static int lit_find(const litctx *L, const hz_dcref *r) {
  * z-буфер идёт без гонок и без атомарных операций, а порядок детерминирован —
  * это и даёт побитовость. */
 static void lit_tri(litctx *L, const double p[3][3], const double col[3][3], const double uv[3][2],
-                    int mat, int by0, int by1) {
+                    int mat, int by0, int by1, int64_t *nfrag_ctr) {
   const tr3_camera *cm = L->cam;
   double sx[3], sy[3], sz[3];
   for (int k = 0; k < 3; k++) {
@@ -7277,7 +7277,8 @@ static void lit_tri(litctx *L, const double p[3][3], const double col[3][3], con
       size_t k = (size_t)py * (size_t)L->w + (size_t)px;
       if (zz >= L->z[k]) continue;
       L->z[k] = zz;
-      L->nfrag++;
+      (*nfrag_ctr)++; /* §828: по-полосная пластина — общий счётчик давал
+                       * кэш-пинг-понг на каждый фрагмент (6.2 → 293 мс) */
       /* Р3 (§572): ОТЛОЖЕННОЕ ЗАТЕНЕНИЕ. Здесь только запоминается, ЧЕМ пиксель
        * закрыт; цвет и гамма считаются ОДИН раз на видимый пиксель после
        * обхода. Прежде гамма платилась за каждый прошедший z фрагмент, а
@@ -15794,6 +15795,10 @@ int main(int argc, char **argv) {
         if (LC.tris != NULL) {
           int nb2 = omp_get_max_threads();
           int bh = (resh + nb2 - 1) / nb2;
+          /* §828: по-полосные пластины nfrag — общий счётчик инкрементился на
+           * КАЖДЫЙ фрагмент из всех потоков (кэш-пинг-понг, 6.2 → 293 мс) */
+          int64_t *nfr828 = calloc((size_t)nb2, sizeof *nfr828);
+          if (nfr828 == NULL) exit(1);
 #pragma omp parallel for schedule(static)
           for (int b2 = 0; b2 < nb2; b2++) {
             int y0b = b2 * bh, y1b = y0b + bh - 1;
@@ -15806,9 +15811,12 @@ int main(int argc, char **argv) {
                * треугольники заново. */
               if (LC.tris[t5].iy1 < y0b || LC.tris[t5].iy0 > y1b) continue;
               lit_tri(&LC, LC.tris[t5].p, LC.tris[t5].col, LC.tris[t5].uv, LC.tris[t5].mat, y0b,
-                      y1b);
+                      y1b, &nfr828[b2]);
             }
           }
+          for (int b2 = 0; b2 < nb2; b2++)
+            LC.nfrag += nfr828[b2];
+          free(nfr828);
           free(LC.tris);
           LC.tris = NULL;
         }

@@ -13849,6 +13849,17 @@ int main(int argc, char **argv) {
           free(cp8);
         }
         free(eall8);
+        /* §824: контрольные суммы проводки — свиповое поле дошло ли до
+         * подмены и различается ли между прогонами (А1397) */
+        {
+          double ssw824 = 0.0, sir824 = 0.0;
+          for (int32_t i = 0; i < S.n; i++)
+            for (int k = 0; k < 3; k++) {
+              ssw824 += (double)swv[3 * (size_t)i + (size_t)k];
+              sir824 += (double)irr[3 * (size_t)i + (size_t)k];
+            }
+          printf("   §824 ПРОВОДКА: Σ swv %.6e, Σ irr (до подмены) %.6e\n", ssw824, sir824);
+        }
         memcpy(irr, swv, 3 * (size_t)S.n * sizeof *irr);
         free(rt8);
         free(tmp8);
@@ -15721,6 +15732,17 @@ int main(int argc, char **argv) {
           for (int c = 0; c < 3; c++) {
             pchan[c] = malloc((size_t)outw * (size_t)outh * sizeof *pchan[c]);
             if (pchan[c] == NULL) exit(1);
+          }
+          /* §824: Σ defcol перед PFM — вторая контрольная точка проводки
+           * (первая — Σ swv/irr перед подменой); А1397 */
+          {
+            double sdc824 = 0.0, sirr824 = 0.0;
+            for (size_t k2 = 0; k2 < (size_t)resw * (size_t)resh * 3; k2++)
+              sdc824 += (double)LC.defcol[k2];
+            for (int32_t i2 = 0; i2 < LC.S->n; i2++)
+              for (int k2 = 0; k2 < 3; k2++)
+                sirr824 += (double)LC.irr[3 * (size_t)i2 + (size_t)k2];
+            printf("   §824 ПРОВОДКА: Σ defcol (до PFM) %.6e, Σ LC.irr %.6e\n", sdc824, sirr824);
           }
           for (int y = 0; y < outh; y++)
             for (int x = 0; x < outw; x++)

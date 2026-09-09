@@ -15915,6 +15915,42 @@ int main(int argc, char **argv) {
                (long long)LC.nfrag, (long long)ncov, (double)LC.nfrag / (double)(ncov ? ncov : 1),
                g_gamn, (long long)LC.nsurfuv,
                100.0 * (double)LC.nsurfuv / (double)(ncov ? ncov : 1));
+        /* §831: СТРУКТУРНО-ТРАФИКНЫЙ АУДИТ (план §831). Байты стадий считаются
+         * из ТЕХ ЖЕ счётчиков, что печатают §572/§830 (один источник чисел):
+         * полосы пишут z+defcol на каждый фрагмент, прошедший z, и defuv+defmat
+         * там, где есть координата; resolve читает z/defuv/defmat, делает
+         * defcol read-modify-write и читает тексели; тонмап читает defcol и
+         * пишет rgb. Полоса ГБ/с = МБ / время §828/§830 — она отвечает на
+         * вопрос «полоса или латентность», а не предполагает ответ. */
+        {
+          size_t np831 = (size_t)resw * (size_t)resh;
+          double mb831 = 1.0 / (1024.0 * 1024.0);
+          /* записи полос: z 8 + defcol 12 всегда; defuv 8 + defmat 1 при uv */
+          double wr831 = (double)LC.nfrag * (8.0 + 12.0 + (LC.defuv != NULL ? 9.0 : 0.0));
+          /* resolve: z 8 + defuv 8 + defmat 1 чтений; defcol 12+12 RMW;
+           * тексели ~8 выборок × 3 Б на разрешённый пиксель */
+          double rd831 = (double)ncov * (8.0 + 1.0) + (double)LC.nsurfuv * (8.0 + 24.0 + 24.0);
+          double tm831 = (double)ncov * (12.0 + 3.0);
+          /* время растеризации ЭТОГО кадра — §828-скобка (ta выставлен перед
+           * обходом дерева); g_t_fras здесь ещё не накоплен (А1441) */
+          double t_r831 = now_s() - ta;
+          double buf831 = ((double)np831 * (8.0 /*z*/ + 12.0 /*defcol*/ + 3.0 /*rgb*/) +
+                           (double)np831 * (LC.defuv != NULL ? 8.0 + 1.0 : 0.0) +
+                           (g_glspec != NULL ? (double)np831 * 12.0 : 0.0)) *
+                          mb831;
+          /* свип-поля живут только в лестнице и к кадру уже освобождены
+           * (А1441): размер печатается по числу узлов, не по указателю */
+          double sw831 = (double)T.n * 8.0 * (double)g_nch826 * mb831;
+          printf("   §831 СТРУКТУРЫ: узел %zu Б (из них 16 Б k2 — парк), enode %zu, ebin %zu, "
+                 "фасет %zu, cutrec %zu, uvtri791 %zu, littri %zu; узлов дерева %d, буферов "
+                 "кадра %.1f МБ, свип-полей %.1f МБ (double, каналов %d)\n",
+                 sizeof(hz_onode), sizeof(enode), sizeof(ebin), sizeof(hz_facet), sizeof(hz_cutrec),
+                 sizeof(uvtri791), sizeof(struct littri), T.n, buf831, sw831, g_nch826);
+          printf("   §831 ТРАФИК: полосы %.0f МБ + resolve %.0f МБ + тонмап %.0f МБ = %.0f МБ за "
+                 "кадр; полоса %.2f ГБ/с при растеризации %.0f мс\n",
+                 wr831 * mb831, rd831 * mb831, tm831 * mb831, (wr831 + rd831 + tm831) * mb831,
+                 (wr831 + rd831 + tm831) * mb831 / 1024.0 / t_r831, t_r831 * 1e3);
+        }
         {
           double tot4 = 0.0;
           for (int b5 = 0; b5 < 10; b5++)

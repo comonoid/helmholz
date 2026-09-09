@@ -2629,7 +2629,10 @@ static int g_nch826 = 1; /* §826: каналов свипового поля/л
  * искажения (урок §812-таймера: два now_s на пиксель). */
 static int g_xno791_830 = 0; /* удалить блок §791: клетка-треугольники+argmin */
 static int g_xnotex830 = 0;  /* удалить трилинейную выборку текстуры */
-static int g_rspks0 = 0;     /* НК-а: классификатор видит ks := 0 */
+/* §832 НК-а: испортить вершину треугольника кадра на 1e-3 — допуск кадра
+ * обязан «поехать», иначе он слеп к тем сдвигам, ради которых заведён. */
+static int g_xuvulp832 = 0;
+static int g_rspks0 = 0; /* НК-а: классификатор видит ks := 0 */
 static unsigned char *g_rspcls = NULL;
 static long long g_rspn[5];
 static double g_rspw[5];
@@ -5460,6 +5463,12 @@ static void ind_core_build(const hz_dctree *T, const hz_htab *ht, const frame *f
     etree ETk;
     memset(&ETk, 0, sizeof ETk);
     etree_build(&ETk, &SF, fr, bcur, m, 0, SF.n, 0, lev);
+    /* §832: фактический размер дерева излучателей — прибор, а не догадка
+     * (план §832: enode/ebin не править без числа). */
+    printf("   §832 ДЕРЕВО ИЗЛУЧАТЕЛЕЙ (отскок %d): узлов %d × %zu Б + корзин %d × %zu Б = "
+           "%.1f МБ\n",
+           k + 1, ETk.n, sizeof(enode), ETk.nb, sizeof(ebin),
+           ((double)ETk.n * sizeof(enode) + (double)ETk.nb * sizeof(ebin)) / (1024.0 * 1024.0));
     t_tree += now_s() - ta1;
     double ta2 = now_s();
     int64_t nl = 0;
@@ -7142,11 +7151,18 @@ static void alight_selftest(void) {
  * Гамма `1/2.2`. Ложноцветной палитры здесь нет: она годится полю интенсивности,
  * а на геометрии делает картинку нечитаемой. */
 struct littri {
-  double p[3][3], col[3][3], uv[3][2];
+  /* §832: хранение во float, математика растеризации остаётся double
+   * («накапливать в double, хранить в float»). Ошибка вершины 50 м есть
+   * 50·2⁻²⁴ ≈ 3e-6 м ≈ 2.5e-4 пикселя 4K — сдвиг субпиксельный, кадр
+   * сравнивается с допуском, не побитово. */
+  float p[3][3], col[3][3], uv[3][2];
   int mat;
   /* Габарит по строкам, посчитанный ОДИН раз при сборе: без него каждая полоса
    * перепроецировала бы все треугольники заново, и деление на потоки не давало
-   * ничего (замерено: 218 -> 234 мс, то есть хуже). */
+   * ничего (замерено: 218 -> 234 мс, то есть хуже). Проекция считается ОТ
+   * УЖЕ СОХРАНЁННЫХ float-вершин (иначе габарит не совпал бы с растеризацией)
+   * и расширен на 1 строку вниз/вверх: floor/ceil на границе целого
+   * чувствителен к сдвигу порядка 1e-4 пикселя. */
   int iy0, iy1;
 };
 
@@ -7232,14 +7248,14 @@ static int lit_find(const litctx *L, const hz_dcref *r) {
  * значит без ограничения. Пиксель принадлежит РОВНО ОДНОЙ полосе, поэтому
  * z-буфер идёт без гонок и без атомарных операций, а порядок детерминирован —
  * это и даёт побитовость. */
-static void lit_tri(litctx *L, const double p[3][3], const double col[3][3], const double uv[3][2],
+static void lit_tri(litctx *L, const float p[3][3], const float col[3][3], const float uv[3][2],
                     int mat, int by0, int by1, int64_t *nfrag_ctr) {
   const tr3_camera *cm = L->cam;
   double sx[3], sy[3], sz[3];
   for (int k = 0; k < 3; k++) {
     double d[3];
     for (int q = 0; q < 3; q++)
-      d[q] = p[k][q] - cm->eye[q];
+      d[q] = (double)p[k][q] - cm->eye[q]; /* §832: подъём float->double */
     double zz = d[0] * cm->fwd[0] + d[1] * cm->fwd[1] + d[2] * cm->fwd[2];
     if (!(zz > 1e-6)) return;
     double rr = d[0] * cm->right[0] + d[1] * cm->right[1] + d[2] * cm->right[2];
@@ -7292,11 +7308,13 @@ static void lit_tri(litctx *L, const double p[3][3], const double col[3][3], con
        * делалась и выбрасывалась. */
       for (int c = 0; c < 3; c++)
         L->defcol[3 * k + (size_t)c] =
-            (float)(col[0][c] + u * (col[1][c] - col[0][c]) + v * (col[2][c] - col[0][c]));
+            (float)((double)col[0][c] + u * ((double)col[1][c] - (double)col[0][c]) +
+                    v * ((double)col[2][c] - (double)col[0][c]));
       if (L->defuv != NULL) {
         for (int c = 0; c < 2; c++)
           L->defuv[2 * k + (size_t)c] =
-              (float)(uv[0][c] + u * (uv[1][c] - uv[0][c]) + v * (uv[2][c] - uv[0][c]));
+              (float)((double)uv[0][c] + u * ((double)uv[1][c] - (double)uv[0][c]) +
+                      v * ((double)uv[2][c] - (double)uv[0][c]));
         L->defmat[k] = (unsigned char)mat;
       }
     }
@@ -7776,10 +7794,18 @@ static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv
         L->captris = nc2;
       }
       struct littri *dst = &L->tris[L->ntris++];
-      memcpy(dst->p, p3, sizeof p3);
-      memcpy(dst->col, c3, sizeof c3);
-      memcpy(dst->uv, u3, sizeof u3);
+      /* §832: конверсия в float ЗДЕСЬ — габарит строк ниже проецирует уже
+       * по сохранённым значениям, поэтому порядок «конверсия → проекция». */
+      for (int q3 = 0; q3 < 3; q3++) {
+        for (int c3i = 0; c3i < 3; c3i++) {
+          dst->p[q3][c3i] = (float)p3[q3][c3i];
+          dst->col[q3][c3i] = (float)c3[q3][c3i];
+        }
+        for (int c3i = 0; c3i < 2; c3i++)
+          dst->uv[q3][c3i] = (float)u3[q3][c3i];
+      }
       dst->mat = matp;
+      if (g_xuvulp832) dst->p[0][0] *= (1.0f + 1e-3f); /* §832 НК-а: предсказанная порча вершины */
       {
         const tr3_camera *cm3 = L->cam;
         double y0f = 1e300, y1f = -1e300;
@@ -7787,7 +7813,7 @@ static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv
         for (int q3 = 0; q3 < 3; q3++) {
           double d3[3];
           for (int c3i = 0; c3i < 3; c3i++)
-            d3[c3i] = p3[q3][c3i] - cm3->eye[c3i];
+            d3[c3i] = (double)dst->p[q3][c3i] - cm3->eye[c3i];
           double zz3 = d3[0] * cm3->fwd[0] + d3[1] * cm3->fwd[1] + d3[2] * cm3->fwd[2];
           if (!(zz3 > 1e-6)) {
             okp = 0;
@@ -7798,8 +7824,11 @@ static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv
           if (sy3 < y0f) y0f = sy3;
           if (sy3 > y1f) y1f = sy3;
         }
-        dst->iy0 = okp ? (int)floor(y0f) : 0;
-        dst->iy1 = okp ? (int)ceil(y1f) : L->h - 1;
+        /* §832: паддинг ±1 строка — конверсия вершин в float сдвигает
+         * проекцию на ~1e-4 пикселя, и floor/ceil ровно на целой границе
+         * мог бы отрезать крайнюю строку растеризации. */
+        dst->iy0 = okp ? (int)floor(y0f) - 1 : 0;
+        dst->iy1 = okp ? (int)ceil(y1f) + 1 : L->h - 1;
         /* РАЗМЕР ПОЛИГОНА НА ЭКРАНЕ — гистограмма по площади в пикселях.
          * Замечание пользователя 08-13: дефекты видны там, где полигон КРУПНЫЙ,
          * и вопрос «дробить или интерполировать тоньше» решается этим числом, а
@@ -7832,8 +7861,19 @@ static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv
         }
       }
     } else {
+      /* §832: одиночный путь рисует тем же float-представлением, что и
+       * полосный, — иначе omp1 и параллельный прогон считали бы разное. */
       int64_t nf7816 = 0;
-      lit_tri(L, p3, c3, u3, matp, 0, -1, &nf7816);
+      float p3f[3][3], c3f[3][3], u3f[3][2];
+      for (int q3 = 0; q3 < 3; q3++) {
+        for (int c3i = 0; c3i < 3; c3i++) {
+          p3f[q3][c3i] = (float)p3[q3][c3i];
+          c3f[q3][c3i] = (float)c3[q3][c3i];
+        }
+        for (int c3i = 0; c3i < 2; c3i++)
+          u3f[q3][c3i] = (float)u3[q3][c3i];
+      }
+      lit_tri(L, p3f, c3f, u3f, matp, 0, -1, &nf7816);
       L->nfrag += nf7816;
     }
   }
@@ -8378,6 +8418,7 @@ int main(int argc, char **argv) {
     if (strcmp(argv[i], "xrgb") == 0) g_xrgb = 1;
     if (strcmp(argv[i], "xno791_830") == 0) g_xno791_830 = 1;
     if (strcmp(argv[i], "xnotex830") == 0) g_xnotex830 = 1;
+    if (strcmp(argv[i], "xuvulp832") == 0) g_xuvulp832 = 1;
     if (strncmp(argv[i], "xtact818=", 9) == 0) {
       /* §818: список k:D0 через запятую; такт k бежит на сетке D0 */
       const char *s818 = argv[i] + 9;

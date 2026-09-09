@@ -627,6 +627,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   int nclip_last = 0, it = 0, nfb = 0;
   /* §735: счётчики клипа принципа максимума — ячейки и элементы */
   int nmaxp_last = 0, nmaxpe_last = 0, nmaxpf_last = 0;
+  int64_t nlpmax_last = 0; /* §822: каскадо-устойчивый зажим */
   /* §677: ОТКАТ РАСЩЕПЛЁН НА ЧЕТЫРЕ. К86 говорит, что условий два и природа у
    * них разная: вырождение элемента — свойство ГЕОМЕТРИИ (множество постоянно),
    * `corner_min < 0` — свойство ПОЛЯ, то есть ПЕРЕКЛЮЧАТЕЛЬ. Пока они считались
@@ -644,6 +645,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
   double best = 1e300;
   int nstall = 0;
   st->stalled = 0;
+  st->nlpmax = 0; /* §822: ранний возврат не оставляет мусора в чтении */
   for (it = 0; it < maxit; it++) {
     memset(phin, 0, (size_t)nc * 4 * sizeof(double));
     memset(binf, 0, (size_t)m->nf * 4 * sizeof(double));
@@ -658,6 +660,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     nmaxp_last = 0;
     nmaxpe_last = 0;
     nmaxpf_last = 0;
+    nlpmax_last = 0;
     nfb = 0;
     nfb_fg = nfb_fp = nfb_eg = nfb_ep = nfb_thin = 0;
     st->pin = st->pout = st->pabs = 0.0;
@@ -667,7 +670,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     int fail = 0;
 
 #pragma omp parallel for schedule(dynamic) if (nth > 1 && nmf == 0)                                \
-    reduction(+ : pin_acc, pout_acc, psolid_acc, nclip_last, nmaxp_last)
+    reduction(+ : pin_acc, pout_acc, psolid_acc, nclip_last, nmaxp_last, nlpmax_last)
     for (int mm = 0; mm < nd; mm++) {
       int tid = 0;
 #ifdef _OPENMP
@@ -1001,6 +1004,20 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
               cf[0] = cf[1] = cf[2] = cf[3] = 0.0;
             }
             nmaxp_last++;
+          }
+        }
+        /* §822: КАСКАДО-УСТОЙЧИВЫЙ ЗАЖИМ. Граница §735 выведена из втекущего
+         * и слепа к каскаду (А1401): заражённый сосед поднимает влёт, влёт —
+         * границу. Якорь от решения не зависит: при ρ ≤ 1 радианс нигде не
+         * выше максимальной радиансы источников. Допуск 1e-9 — named: на
+         * четыре порядка над шумом FP, на шесть ниже полезного сигнала. */
+        if (p->lpmax > 0.0) {
+          double cm823 = corner_amax(cf);
+          if (cm823 > p->lpmax * (1.0 + 1e-9)) {
+            double sc823 = p->lpmax / cm823;
+            for (int j = 0; j < 4; j++)
+              cf[j] *= sc823;
+            nlpmax_last++;
           }
         }
         for (int j = 0; j < 4; j++)
@@ -2257,6 +2274,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
     }
   st->balance = st->pin + st->psout + st->pemit - st->pout - st->pabs - st->psin - st->psolid;
   st->iters = it;
+  st->nlpmax = nlpmax_last; /* §822 */
   st->resid = resid;
   /* §804: нормировка финального такта (А1270). Абсолютный резид — прежнее
    * поле, семантика не меняется; рядом — знаменатель и частное. */

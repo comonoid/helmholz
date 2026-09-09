@@ -2616,6 +2616,9 @@ static int g_xresp814 = 0;
  * HZ_P3_MAXH. Только стендовый рычаг: расширенный бюджет поднимает память
  * грубых узлов, умолчание не трогается. */
 static int32_t g_xbud818 = 0;
+/* §822: каскадо-устойчивый зажим по принципу максимума — диагностический
+ * ключ; включение по умолчанию — отдельный шаг после свидетельств. */
+static int g_xclamp823 = 0;
 static int g_rspks0 = 0; /* НК-а: классификатор видит ks := 0 */
 static unsigned char *g_rspcls = NULL;
 static long long g_rspn[5];
@@ -8344,6 +8347,7 @@ int main(int argc, char **argv) {
       g_rspks0 = 1;
     }
     if (strcmp(argv[i], "xdiff814") == 0) xdiff814 = 1;
+    if (strcmp(argv[i], "xclamp823") == 0) g_xclamp823 = 1;
     if (strncmp(argv[i], "xtact818=", 9) == 0) {
       /* §818: список k:D0 через запятую; такт k бежит на сетке D0 */
       const char *s818 = argv[i] + 9;
@@ -10244,6 +10248,11 @@ int main(int argc, char **argv) {
       int fcold = !xfc || xhall || xemitfacet || xconst || xunit || xcmp || xcontrib || xdsa;
       /* §818: стенд ремапит eemit — инъекция первого столкновения на варианте
        * не перестраивается, режим несовместен честно */
+      if (g_xclamp823 && (!fcold || xhall || xemitfacet)) {
+        fprintf(stderr, "xclamp823 несовместим с xfc/xhall/xemitfacet: якорь зажима — max eemit "
+                        "базовой раздачи\n");
+        exit(1);
+      }
       if (xtact_n818 > 0 && (!fcold || xhall || xemitfacet)) {
         fprintf(stderr, "xtact818 несовместим с xfc/xhall/xemitfacet: источник варианта есть "
                         "рестрикция eemit базовой сетки\n");
@@ -10325,6 +10334,26 @@ int main(int argc, char **argv) {
                  100.0 * (double)nz6 / (double)(nrc6 > 0 ? nrc6 : 1), now_s() - tfc0);
         }
       }
+      /* §822: физический якорь зажима — верхняя граница ПОТОКА φ = ∫L dω,
+       * выведенная из РАСПИСАНИЯ применений оператора. Радианс за одно
+       * применение растёт не более чем на L_e_max (свежее излучение ≤ L_e,
+       * отражение ρ ≤ 1 не усиливает), значит после N применений
+       *     φ ≤ 4π·(N+1)·L_e_max.
+       * История якоря: (1) max eemit — ошибка категории (φ не радианс,
+       * П2-УБИВАЕТ); (2) 4π·L_e/(1−ρ_max) — на Bistro есть фасет с ρ ≈ 1,
+       * физической границы не существует, зажим честно отключался;
+       * (3) текущая — расписание-производная: конечно всегда, зависит от
+       * N, не подгоняется. N: такты лестницы + хвост замыкания (q̂ ≤
+       * HZ_TAILQ_MAX = 0.95 → множитель ≤ 19) с запасом. */
+      double lpmax823 = 0.0;
+      if (g_xclamp823) {
+        double emax823 = 0.0;
+        for (int32_t k = 0; k < cut.nse; k++)
+          if (eemit[k] > emax823) emax823 = eemit[k];
+        int napp823 = xbounce > 0 ? xbounce + 21 : xit + 2;
+        if (emax823 > 0.0)
+          lpmax823 = 4.0 * 3.14159265358979323846 * emax823 * (double)(napp823 > 0 ? napp823 : 1);
+      }
       tr3_problem prob = {.m = &mesh,
                           .d = &dirs,
                           .cut = &cut,
@@ -10339,6 +10368,7 @@ int main(int argc, char **argv) {
                           .limiter = xnolim ? 0 : 1,
                           .maxp_off = xnomaxp,
                           .relax = xrelax,
+                          .lpmax = g_xclamp823 ? lpmax823 : 0.0,
                           .chain_cell1 = xchain >= 0 ? xchain + 1 : 0,
                           .trace = xtrace,
                           .reltol = xreltol};
@@ -10963,6 +10993,7 @@ int main(int argc, char **argv) {
          * перезаписывает их каждой итерацией, здесь maxit = 1 — моменты
          * такта; рядом моменты прошлого такта для ПРИРАЩЕНИЯ и r приращения
          * такта и позапрошлого (r = −1 — тёмная ячейка). */
+        int64_t nlpsum823 = 0; /* §822: зажимы за лестницу */
         double *ang814b = NULL, *ang814p = NULL, *r814c = NULL, *r814p = NULL;
         if (xdiff814) {
           ang814b = calloc(nph, sizeof *ang814b);
@@ -11148,6 +11179,7 @@ int main(int argc, char **argv) {
             pl.trace = 1; /* §822: счётчики ограничителя на вариантном такте (однопоточно) */
           double tt0 = now_s();
           if (tr3_sweep_solve(&pl, 1, 0.0, v8 != NULL ? phiv818 : phi, &stt) != 0) exit(1);
+          nlpsum823 += stt.nlpmax;
           if (v8 != NULL) {
             /* выход такта: φ, sout, eirr ремапятся вариант→база, книга
              * лестницы (приращения, q̂, замыкание) живёт на базе */
@@ -11189,23 +11221,16 @@ int main(int argc, char **argv) {
                    "ремап φ продл+рестр %lld/%lld, ΔΣ sout·area (выход) %+.3f %%\n",
                    t, v8->d0, v8->m.ncell, v8->c.nse, stt.psin, (long long)np818, (long long)nr818,
                    100.0 * (pw18c - pw18a) / (fabs(pw18a) > 0.0 ? fabs(pw18a) : 1.0));
-            free(phiv818);
-            free(phic818);
-            free(soutv818);
-            free(buf818);
             /* §822: ВСКРЫТИЕ взрыва — если поле на выходе такта на много
              * порядков выше входа, печатаем анатомию ячейки-виновника:
              * объём флюида против объёма ячейки, сплошность, элементы,
              * φ на входе и выходе. */
             {
               double ein822 = 0.0, eout822 = 0.0;
-              int32_t cin822 = -1, cout822 = -1;
+              int32_t cout822 = -1;
               for (int32_t c = 0; c < v8->m.ncell; c++) {
                 double a822 = fabs(phie818[(size_t)c * 4]);
-                if (a822 > ein822) {
-                  ein822 = a822;
-                  cin822 = c;
-                }
+                if (a822 > ein822) ein822 = a822;
                 double b822 = fabs(phiv818[(size_t)c * 4]);
                 if (b822 > eout822) {
                   eout822 = b822;
@@ -11235,6 +11260,10 @@ int main(int argc, char **argv) {
               }
             }
             free(phie818);
+            free(phiv818);
+            free(phic818);
+            free(soutv818);
+            free(buf818);
           }
           /* §814: анизотропия r = |Σ w·L0·ω| / Σ w·L0, ДВУХ объектов: ПОЛЯ такта
            * (сумма ряда) и ПРИРАЩЕНИЯ такта (свет, отразившийся t раз) —
@@ -11347,6 +11376,9 @@ int main(int argc, char **argv) {
             stfin = stt; /* bout/sout = ubL/usL, освобождает общий путь */
         }
         st = stfin;
+        if (g_xclamp823)
+          printf("   §822 ЗАЖИМ: суммарно за лестницу %lld зажимов (lpmax %.4e)\n",
+                 (long long)nlpsum823, lpmax823);
         printf("   §774 ЛЕСТНИЦА: %d тактов за %.2f с\n", xbounce, now_s() - tlad);
         /* §814 НК-в (свидетель живости): нулевые моменты прибора обязаны
          * совпасть с φ той же итерации — те же слагаемые в том же порядке.

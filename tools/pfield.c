@@ -7812,8 +7812,11 @@ static int lit_poly(void *ctx, const hz_dcref *ref, const double (*v)[3], int nv
           }
         }
       }
-    } else
-      lit_tri(L, p3, c3, u3, matp, 0, -1);
+    } else {
+      int64_t nf7816 = 0;
+      lit_tri(L, p3, c3, u3, matp, 0, -1, &nf7816);
+      L->nfrag += nf7816;
+    }
   }
   return 0;
 }
@@ -15791,6 +15794,7 @@ int main(int argc, char **argv) {
           LC.tris = malloc((size_t)LC.captris * sizeof *LC.tris);
           if (LC.tris == NULL) exit(1);
         }
+        double t0828 = now_s();
         int wrc = hz_dc_walk(&T, lod_stop, &LLc, lit_poly, &LC);
         if (LC.tris != NULL) {
           int nb2 = omp_get_max_threads();
@@ -15820,7 +15824,9 @@ int main(int argc, char **argv) {
           free(LC.tris);
           LC.tris = NULL;
         }
+        double t2828 = now_s();
         lit_resolve(&LC, g_gamn);
+        double t3828 = now_s();
         if (g_glet != NULL) {
           int64_t ncovg8 = 0;
           size_t npg8 = (size_t)resw * (size_t)resh;
@@ -15861,6 +15867,10 @@ int main(int argc, char **argv) {
                "%016llx\n",
                hz_dc_walk_memo_stops(), hz_dc_walk_memo_evals(), hz_dc_walk_memo_flips(),
                (unsigned long long)LC.polysum);
+        double t4828 = now_s();
+        printf("   §828 РАСТР: сбор %.1f / полосы %.1f / resolve %.1f / приборы %.1f мс (нитей %d)\n",
+               (t0828 - ta) * 1e3, (t2828 - t0828) * 1e3, (t3828 - t2828) * 1e3, (t4828 - t3828) * 1e3,
+               omp_get_max_threads());
         double t_rast = now_s() - ta;
         int64_t ncov = 0;
         for (size_t i2 = 0; i2 < np; i2++)

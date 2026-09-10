@@ -441,9 +441,9 @@ static void pyr_visit(pyr_march_ctx *mc, int32_t l, int32_t pos) {
     mc->last_s = s;
     mc->have_last = 1;
     if (mc->bits) mc->bits[pos >> 6] |= (uint64_t)1 << (pos & 63);
-    if (mc->vindex) mc->vindex[pos] = (int32_t)mc->st->leaves;
     mc->st->leaves++;
     mc->st->nodes++;
+    if (mc->vindex) mc->vindex[pos] = (int32_t)mc->st->leaves; /* номер посещения, с 1 */
     return;
   }
   mc->st->nodes++;

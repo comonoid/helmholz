@@ -19,6 +19,8 @@
 #ifndef HZ_SWEEP_H
 #define HZ_SWEEP_H
 
+#include <stdint.h>
+
 #include "pyr.h"
 
 typedef struct {
@@ -26,6 +28,7 @@ typedef struct {
   double rho; /* albedo; < 0 — брать kd материалов (переданы в kd[]) */
   int iters;  /* итераций (тактов) */
   int tau0;   /* НК: слой не поглощает и не излучает (T ≡ 1) */
+  int mode;   /* 0 — скалярный луч §835, 1 — колонки §836 (граневой поток) */
   int noprop; /* НК: луч не переносится (L обнуляется на каждом листе) */
 } hz_sw_opts;
 

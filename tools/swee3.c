@@ -154,9 +154,32 @@ int main(int argc, char **argv) {
   so.iters = iters;
   so.tau0 = tau0;
   so.noprop = noprop;
-  if (hz_sw_run(&py, m.nt, area, nrm, kd, &so, &st, hist) != 0) {
-    fprintf(stderr, "swee3: свип не прошёл\n");
-    return 2;
+  for (int mode = 0; mode < 2; mode++) {
+    const char *mname = mode ? "col(§836)" : "scalar(§835)";
+    so.mode = mode;
+    for (i = 0; i < m.nt; i++)
+      py.pcs[i].e = 0.0f; /* режимы с чистого поля */
+    if (hz_sw_run(&py, m.nt, area, nrm, kd, &so, &st, hist) != 0) {
+      fprintf(stderr, "swee3: свип не прошёл\n");
+      return 2;
+    }
+    printf("[%s] итерации E_avg:", mname);
+    for (i = 0; i < iters; i++)
+      printf(" %.4f", hist[i]);
+    printf("\n");
+    if (iters >= 3) {
+      double f = hist[iters - 1] - hist[iters - 2];
+      double f0 = hist[iters - 2] - hist[iters - 3];
+      printf("[%s] фактор ряда: %.4f (ожидалось ~ρ)\n", mname, fabs(f0) > 1e-300 ? f / f0 : 0.0);
+    }
+    printf("[%s] баланс: излучено %.4f, поглощено %.4f, рециркуляция %.4f, потеряно %.4f\n", mname,
+           st.emitted, st.absorbed, st.recycled, st.lost);
+    if (fabs(rho - 1.0) > 1e-12 && !tau0 && !noprop) {
+      double rr = rho < 0 ? 0.5 : rho;
+      printf("[%s] аналитика: 1ст=%.4f 2ст=%.4f; E_avg=%.4f → %.2f×1ст, %.2f×2ст\n", mname,
+             le / (1.0 - rr), 2.0 * le / (1.0 - rr), st.e_avg, st.e_avg / (le / (1.0 - rr)),
+             st.e_avg / (2.0 * le / (1.0 - rr)));
+    }
   }
 
   printf("итерации E_avg:");

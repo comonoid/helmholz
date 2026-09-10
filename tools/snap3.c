@@ -38,7 +38,7 @@ int main(int argc, char **argv) {
   const char *path = NULL;
   double scale = 1.0, cell, t0, t1;
   int lev = 6; /* клеток по максимальной оси = 64: мелкая синтетика */
-  int screwb = 0, scrfew = 0;
+  int screwb = 0, scrfew = 0, march = 0, marchinv = 0, aggrat = 0;
   int i, ax;
   hz_objmesh m;
   hz_pyr py;
@@ -57,6 +57,13 @@ int main(int argc, char **argv) {
       screwb = 1;
     } else if (strcmp(argv[i], "scrfew") == 0) {
       scrfew = 1;
+    } else if (strcmp(argv[i], "march") == 0) {
+      march = 1;
+    } else if (strcmp(argv[i], "marchinv") == 0) {
+      march = 1;
+      marchinv = 1;
+    } else if (strncmp(argv[i], "aggrat=", 7) == 0) {
+      aggrat = atoi(argv[i] + 7);
     } else if (strncmp(argv[i], "scale=", 6) == 0) {
       scale = atof(argv[i] + 6);
     } else {
@@ -64,7 +71,9 @@ int main(int argc, char **argv) {
     }
   }
   if (!path) {
-    fprintf(stderr, "use: snap3 <scene.obj> [lev=N] [screwb|scrfew] [scale=F]\n");
+    fprintf(
+        stderr,
+        "use: snap3 <scene.obj> [lev=N] [screwb|scrfew] [march|marchinv] [aggrat=N] [scale=F]\n");
     return 2;
   }
   if (hz_obj_load(&m, path, scale) != 0) {
@@ -180,6 +189,90 @@ int main(int argc, char **argv) {
         (vd.d_cell == 0 && vd.d_csr == 0 && vd.d_bbox == 0 && vd.d_empty == 0))
       printf("НК НЕ СРАБОТАЛ — детекторы слепы, это провал контроля\n");
     free(dist);
+  }
+
+  /* ---- МАРШ (§834): 14 направлений = 6 осей + 8 диагоналей ---- */
+  if (march) {
+    static const double dirs[14][3] = {
+        {1, 0, 0},  {-1, 0, 0}, {0, 1, 0},  {0, -1, 0},  {0, 0, 1},   {0, 0, -1},  {1, 1, 1},
+        {1, 1, -1}, {1, -1, 1}, {-1, 1, 1}, {1, -1, -1}, {-1, 1, -1}, {-1, -1, 1}, {-1, -1, -1}};
+    const double sq3 = 0.57735026918962573; /* 1/√3, диагонали единичные */
+    static const char *names[14] = {"+x",  "-x",  "+y",  "-y",  "+z",  "-z",  "+++",
+                                    "++-", "+-+", "-++", "+--", "-+-", "--+", "---"};
+    uint64_t *bits = (uint64_t *)malloc((size_t)((py.nleaf + 63) >> 6) * sizeof *bits);
+    int32_t *vindex = (int32_t *)malloc((size_t)py.nleaf * sizeof *vindex);
+    int64_t tot_l = 0, tot_n = 0, tot_inv = 0, tot_a = 0, tot_dep = 0;
+    int d;
+    if (aggrat > 0) {
+      hz_pyr_mark_aggr(&py, (int32_t)aggrat);
+      printf("МАРШ: АГРЕГАТ помечен (aggrat=%d)\n", aggrat);
+    }
+    for (d = 0; d < 14; d++) {
+      double om[3] = {dirs[d][0], dirs[d][1], dirs[d][2]};
+      hz_pyr_march_stat st;
+      int miss;
+      int64_t dep = 0; /* нарушения порядка СОСЕДНИХ ПО ГРАНИ клеток вдоль ω (А1468) */
+      if (d >= 6) {
+        om[0] *= sq3;
+        om[1] *= sq3;
+        om[2] *= sq3;
+      }
+      hz_pyr_march(&py, om, marchinv, &st, bits, vindex);
+      miss = 0;
+      if (bits) {
+        int32_t li;
+        for (li = 0; li < py.nleaf; li++)
+          if (!((bits[li >> 6] >> (li & 63)) & 1)) miss++;
+      }
+      /* зависимые пары: ось a с ω_a ≠ 0; A=(i) → B=(i+e_a) низовой, обязана
+       * быть ПОЗЖЕ. Проверяем только осевые направления — там пары полные. */
+      if (d < 6) {
+        int axis = d / 2, sign = (d % 2 == 0) ? 1 : -1;
+        int64_t stride = axis == 0 ? 1 : (axis == 1 ? py.nx : (int64_t)py.nx * py.ny);
+        int32_t li;
+        for (li = 0; li < py.nleaf; li++) {
+          int64_t id = py.leaf_id[li], nb;
+          int64_t coord = (axis == 0)   ? id % py.nx
+                          : (axis == 1) ? (id / py.nx) % py.ny
+                                        : id / ((int64_t)py.nx * py.ny);
+          nb = id + (sign > 0 ? stride : -stride);
+          if (sign > 0 ? coord + 1 < (axis == 0   ? (int64_t)py.nx
+                                      : axis == 1 ? (int64_t)py.ny
+                                                  : (int64_t)py.nz)
+                       : coord > 0) {
+            int32_t nli = -1;
+            {
+              int32_t lo = 0, hi = py.nleaf;
+              while (lo < hi) {
+                int32_t mid = lo + (hi - lo) / 2;
+                if (py.leaf_id[mid] < nb)
+                  lo = mid + 1;
+                else
+                  hi = mid;
+              }
+              if (lo < py.nleaf && py.leaf_id[lo] == nb) nli = lo;
+            }
+            if (nli >= 0 && vindex[nli] < vindex[li]) dep++;
+          }
+        }
+      }
+      printf("  %s: листов %" PRId64 " (непосещённых %d) узлов %" PRId64 " инверсий %" PRId64
+             " событий %" PRId64 " зависимых-пар-нарушено %" PRId64 "\n",
+             names[d], st.leaves, miss, st.nodes, st.inversions, st.aggr, dep);
+      tot_l += st.leaves;
+      tot_n += st.nodes;
+      tot_inv += st.inversions;
+      tot_a += st.aggr;
+      tot_dep += dep;
+    }
+    printf("МАРШ суммарно: на направление листов %" PRId64 ", цепь %" PRId64
+           " (цепь/листья %.2f), инверсий %" PRId64 ", событий %" PRId64 ", зависимых-пар %" PRId64
+           "\n",
+           tot_l / 14, tot_n / 14, (double)(tot_n / 14) / (double)(tot_l / 14), tot_inv, tot_a,
+           tot_dep);
+    if (aggrat > 0) hz_pyr_unmark_aggr(&py);
+    free(vindex);
+    free(bits);
   }
 
   hz_pyr_free(&py);

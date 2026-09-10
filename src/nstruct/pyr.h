@@ -122,6 +122,26 @@ typedef struct {
 void hz_pyr_verify(const hz_pyr *py, int32_t nt, const double *tri_min, const double *tri_max,
                    const double *centroid, hz_pyr_verdict *vd);
 
+/* МАРШ (§834): обход направления omega по трём состояниям. Дети упорядо-
+ * чены проекцией центра на omega; АГРЕГАТ — стоп и одно событие; ПУСТ
+ * (отсутствует) — прыжок. invert_x — НК: ось x в порядке детей перевёр-
+ * нута. visit_bits — [nleaf+63]/64 бит посещений, может быть NULL. */
+typedef struct {
+  int64_t leaves;     /* посещено листьев */
+  int64_t nodes;      /* вся цепь: внутренние + листья */
+  int64_t aggr;       /* событий АГРЕГАТ */
+  int64_t inversions; /* нарушений неубывания проекции центра по ходу листьев */
+} hz_pyr_march_stat;
+
+void hz_pyr_march(const hz_pyr *py, const double omega[3], int invert_x, hz_pyr_march_stat *st,
+                  uint64_t *visit_bits, int32_t *visit_index /* [nleaf], NULL можно */);
+
+/* НК-инструмент §834: every == 1 — АГРЕГАТ только корень; otherwise каждый
+ * every-й внутренний узел (сквозная нумерация по уровням). hz_pyr_unmark
+ * возвращает все узлы в ДРОБЛЁН (§833 агрегатов сама не ставит). */
+void hz_pyr_mark_aggr(hz_pyr *py, int32_t every);
+void hz_pyr_unmark_aggr(hz_pyr *py);
+
 void hz_pyr_free(hz_pyr *py);
 
 #endif

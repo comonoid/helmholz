@@ -378,3 +378,171 @@ void hz_pyr_free(hz_pyr *py) {
   free(py->nlev_nodes);
   memset(py, 0, sizeof *py);
 }
+
+/* ---- МАРШ (§834) --------------------------------------------------------- */
+
+/* размеры сетки уровня ℓ (0 — родители листов); сторона клетки — cell·2^(ℓ+1) */
+static void pyr_level_dims(const hz_pyr *py, int32_t l, int64_t d[3]) {
+  int32_t sh = (int32_t)(l + 1);
+  d[0] = ((int64_t)py->nx + ((int64_t)1 << sh) - 1) >> sh;
+  d[1] = ((int64_t)py->ny + ((int64_t)1 << sh) - 1) >> sh;
+  d[2] = ((int64_t)py->nz + ((int64_t)1 << sh) - 1) >> sh;
+}
+
+/* проекция центра клетки на omega по СДВИГУ уровня: лист — sh=0 (базовая
+ * сетка), внутренний уровень ℓ — sh=ℓ+1 (А1466-ряд: сторона cell·2^sh) */
+static double pyr_slab(const hz_pyr *py, int32_t sh, int64_t id, const double omega[3],
+                       int invert_x) {
+  int64_t d[3];
+  double side, c[3];
+  int ax;
+  d[0] = ((int64_t)py->nx + ((int64_t)1 << sh) - 1) >> sh;
+  d[1] = ((int64_t)py->ny + ((int64_t)1 << sh) - 1) >> sh;
+  d[2] = ((int64_t)py->nz + ((int64_t)1 << sh) - 1) >> sh;
+  side = py->cell * (double)((int64_t)1 << sh);
+  c[0] = (double)(id % d[0]) + 0.5;
+  c[1] = (double)((id / d[0]) % d[1]) + 0.5;
+  c[2] = (double)(id / (d[0] * d[1])) + 0.5;
+  for (ax = 0; ax < 3; ax++)
+    c[ax] = py->lo[ax] + c[ax] * side;
+  return omega[0] * c[0] * (invert_x ? -1.0 : 1.0) + omega[1] * c[1] + omega[2] * c[2];
+}
+
+/* двоичный поиск id в отсортированном массиве узлов уровня; -1 если нет */
+static int32_t pyr_find_node(const hz_pyr_node *a, int32_t n, int64_t x) {
+  int32_t lo = 0, hi = n;
+  while (lo < hi) {
+    int32_t mid = lo + (hi - lo) / 2;
+    if (a[mid].id < x)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  if (lo < n && a[lo].id == x) return lo;
+  return -1;
+}
+
+typedef struct {
+  const hz_pyr *py;
+  const double *omega;
+  int invert_x;
+  hz_pyr_march_stat *st;
+  uint64_t *bits;
+  double last_s;
+  int have_last;
+  int32_t *vindex;
+} pyr_march_ctx;
+
+static void pyr_visit(pyr_march_ctx *mc, int32_t l, int32_t pos) {
+  const hz_pyr *py = mc->py;
+  if (l < 0) { /* лист (уровень −1): sh = 0, базовая сетка */
+    double s = pyr_slab(py, 0, py->leaf_id[pos], mc->omega, mc->invert_x);
+    if (mc->have_last && s < mc->last_s) mc->st->inversions++;
+    mc->last_s = s;
+    mc->have_last = 1;
+    if (mc->bits) mc->bits[pos >> 6] |= (uint64_t)1 << (pos & 63);
+    if (mc->vindex) mc->vindex[pos] = (int32_t)mc->st->leaves;
+    mc->st->leaves++;
+    mc->st->nodes++;
+    return;
+  }
+  mc->st->nodes++;
+  if (py->lev[l][pos].state == HZ_PYR_AGGR) { /* стоп: одно событие */
+    mc->st->aggr++;
+    return;
+  }
+  {
+    int64_t pd[3], cd[3], ci[3], kid;
+    int32_t cl = l - 1, cx, cy, cz; /* вниз к листьям: уровень 0 — предки листов */
+    double s[8];
+    int32_t pos_ch[8];
+    int32_t n = 0, u, v;
+    pyr_level_dims(py, l, pd);
+    if (cl < 0) { /* листья: базовая сетка */
+      cd[0] = py->nx;
+      cd[1] = py->ny;
+      cd[2] = py->nz;
+    } else
+      pyr_level_dims(py, cl, cd);
+    kid = py->lev[l][pos].id;
+    ci[0] = kid % pd[0];
+    ci[1] = (kid / pd[0]) % pd[1];
+    ci[2] = kid / (pd[0] * pd[1]);
+    for (cz = 0; cz < 2; cz++)
+      for (cy = 0; cy < 2; cy++)
+        for (cx = 0; cx < 2; cx++) {
+          int64_t qx = 2 * ci[0] + cx, qy = 2 * ci[1] + cy, qz = 2 * ci[2] + cz;
+          int32_t found;
+          if (qx >= cd[0] || qy >= cd[1] || qz >= cd[2]) continue;
+          kid = qx + cd[0] * (qy + cd[1] * qz);
+          if (cl < 0)
+            found = pyr_find(py->leaf_id, py->nleaf, kid);
+          else
+            found = pyr_find_node(py->lev[cl], py->nlev_nodes[cl], kid);
+          if (found < 0) continue; /* ПУСТ: прыжок, клетка не хранится */
+          s[n] = pyr_slab(py, cl < 0 ? 0 : cl + 1, kid, mc->omega, mc->invert_x);
+          pos_ch[n] = found; /* позиция в массиве своего уровня */
+          n++;
+        }
+    /* сортировка вставками по s (n ≤ 8) */
+    for (u = 1; u < n; u++) {
+      double su = s[u];
+      int32_t pu = pos_ch[u];
+      for (v = u; v > 0 && s[v - 1] > su; v--) {
+        s[v] = s[v - 1];
+        pos_ch[v] = pos_ch[v - 1];
+      }
+      s[v] = su;
+      pos_ch[v] = pu;
+    }
+    for (u = 0; u < n; u++)
+      pyr_visit(mc, cl, pos_ch[u]);
+  }
+}
+
+void hz_pyr_march(const hz_pyr *py, const double omega[3], int invert_x, hz_pyr_march_stat *st,
+                  uint64_t *bits, int32_t *vindex) {
+  pyr_march_ctx mc;
+  if (!py || !st) {
+    if (st) memset(st, 0, sizeof *st);
+    return;
+  }
+  memset(st, 0, sizeof *st);
+  if (bits) memset(bits, 0, (size_t)((py->nleaf + 63) >> 6) * sizeof *bits);
+  if (vindex) memset(vindex, -1, (size_t)py->nleaf * sizeof *vindex);
+  mc.py = py;
+  mc.omega = omega;
+  mc.invert_x = invert_x;
+  mc.st = st;
+  mc.vindex = vindex;
+  mc.bits = bits;
+  mc.last_s = 0.0;
+  mc.have_last = 0;
+  if (py->nleaf <= 0) return;
+  if (py->nlev == 0) { /* нет внутренних уровней: занятые листья — сами по себе */
+    pyr_visit(&mc, -1, 0);
+    return;
+  }
+  pyr_visit(&mc, py->nlev - 1, 0);
+}
+
+void hz_pyr_mark_aggr(hz_pyr *py, int32_t every) {
+  int32_t l, u;
+  int64_t g = 0;
+  if (!py || every <= 0) return;
+  if (every == 1) { /* только корень (А1467) */
+    py->lev[py->nlev - 1][0].state = HZ_PYR_AGGR;
+    return;
+  }
+  for (l = 0; l < py->nlev; l++)
+    for (u = 0; u < py->nlev_nodes[l]; u++)
+      if (g++ % every == 0) py->lev[l][u].state = HZ_PYR_AGGR;
+}
+
+void hz_pyr_unmark_aggr(hz_pyr *py) {
+  int32_t l, u;
+  if (!py) return;
+  for (l = 0; l < py->nlev; l++)
+    for (u = 0; u < py->nlev_nodes[l]; u++)
+      if (py->lev[l][u].state == HZ_PYR_AGGR) py->lev[l][u].state = HZ_PYR_FINE;
+}

@@ -197,6 +197,11 @@ build/pcoarse: tools/pcoarse.c $(PFULL) | build
 build/scenechk: tools/scenechk.c src/scene_obj.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/scenechk.c src/scene_obj.c -lm'
 
+# snap3 — §833, СНИМОК: пирамида шагов переноса на синтетике (STRUCTURE.md
+# §9.1). Топология и бюджет БЕЗ поля: биннинг, CSR, три состояния, детекторы.
+build/snap3: tools/snap3.c src/nstruct/pyr.c src/nstruct/pyr.h src/scene_obj.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/snap3.c src/nstruct/pyr.c src/scene_obj.c -lm'
+
 # psil — §149, шаг О50: сколько силуэтных рёбер переживает минимальный угловой
 # размер источника. Кроме сетки не нужно НИЧЕГО (ни сегментации, ни лестницы),
 # поэтому и собирается из одного `scene_obj.c`: замер про рёбра ВХОДА.

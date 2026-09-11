@@ -393,6 +393,7 @@ void hz_pyr_free(hz_pyr *py) {
   free(py->csr);
   free(py->leaf_id);
   free(py->leaf);
+  free(py->perm);
   for (l = 0; l < py->nlev; l++)
     free(py->lev[l]);
   free(py->lev);
@@ -618,6 +619,15 @@ int hz_pyr_morton(hz_pyr *py) {
   for (p = 0; p < py->nt; p++)
     tmp[p] = py->pcs[mp[p].p];
   memcpy(py->pcs, tmp, (size_t)py->nt * sizeof *tmp);
+  py->perm = (int32_t *)malloc((size_t)py->nt * sizeof *py->perm);
+  if (!py->perm) {
+    free(tmp);
+    free(mp);
+    hz_pyr_free(py);
+    return 2;
+  }
+  for (p = 0; p < py->nt; p++)
+    py->perm[p] = mp[p].p; /* слот → исходный кусок */
   free(tmp);
   tmp = NULL;
   free(mp);
@@ -651,5 +661,42 @@ int hz_pyr_morton(hz_pyr *py) {
     py->csr[fill[py->pcs[p].cell]++] = p;
   free(cnt);
   free(fill);
+  return 0;
+}
+
+/* §839: применить перестановку Morton к массиву потребителя — циклами на
+ * месте, без временного массива (gcc-analyzer теряет связь
+ * «проверка↔выделение» на временных массивах, diam 07-24). */
+int hz_pyr_permute(hz_pyr *py, void *base, size_t elem) {
+  uint8_t *seen = NULL;
+  int32_t i;
+  char *buf, *b = (char *)base;
+  if (!py || !py->perm || !base || elem == 0 || elem > 256) return 1;
+  seen = (uint8_t *)calloc((size_t)py->nt, 1);
+  buf = (char *)malloc(elem);
+  if (!seen || !buf) {
+    free(seen);
+    free(buf);
+    return 2;
+  }
+  for (i = 0; i < py->nt; i++) {
+    int32_t j, k;
+    if (seen[i]) continue;
+    memcpy(buf, b + (size_t)i * elem, elem); /* старое значение начала цикла */
+    j = i;
+    while (1) {
+      k = py->perm[j]; /* слот j получает старое значение из позиции perm[j] */
+      seen[j] = 1;     /* ПОСЛЕДНИЙ слот цикла тоже: иначе фантомный второй проход
+                        * применит перестановку дважды (ловлено §839 на полости) */
+      if (k == i) {
+        memcpy(b + (size_t)j * elem, buf, elem);
+        break;
+      }
+      memcpy(b + (size_t)j * elem, b + (size_t)k * elem, elem);
+      j = k;
+    }
+  }
+  free(seen);
+  free(buf);
   return 0;
 }

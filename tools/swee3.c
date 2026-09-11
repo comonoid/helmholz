@@ -132,36 +132,32 @@ int main(int argc, char **argv) {
       fprintf(stderr, "swee3: Morton не прошёл\n");
       return 2;
     }
-    /* параллельные массивы инструмента — в порядке кусков: новый p берёт
-     * старые значения по pcs[p].tri (А1491) */
+    /* параллельные массивы инструмента — той же перестановкой, циклами
+     * на месте (А1491: соответствие кусок↔треугольник — pcs[].tri) */
+    if (hz_pyr_permute(&py, area, sizeof *area) != 0 ||
+        hz_pyr_permute(&py, nrm, 3 * sizeof *nrm) != 0 ||
+        hz_pyr_permute(&py, kd, sizeof *kd) != 0) {
+      fprintf(stderr, "swee3: перестановка не прошла\n");
+      return 2;
+    }
     {
-      double *a2 = (double *)malloc((size_t)m.nt * sizeof *a2);
-      double *n2 = (double *)malloc((size_t)m.nt * 3 * sizeof *n2);
-      double *k2 = (double *)malloc((size_t)m.nt * sizeof *k2);
-      if (!a2 || !n2 || !k2) {
-        fprintf(stderr, "swee3: нет памяти\n");
-        return 2;
-      }
+      double dmax = 0;
+      int imax = -1;
       for (i = 0; i < m.nt; i++) {
-        int32_t t = py.pcs[i].tri;
-        a2[i] = area[t];
-        k2[i] = kd[t];
-        for (ax = 0; ax < 3; ax++)
-          n2[3 * (int64_t)i + ax] = nrm[3 * (int64_t)t + ax];
+        double dd = fabs(area[i] - hz_obj_tri_area(&m, py.pcs[i].tri));
+        if (dd > dmax) {
+          dmax = dd;
+          imax = i;
+        }
       }
-      memcpy(area, a2, (size_t)m.nt * sizeof *area);
-      memcpy(nrm, n2, (size_t)m.nt * 3 * sizeof *nrm);
-      memcpy(kd, k2, (size_t)m.nt * sizeof *kd);
-      free(a2);
-      free(n2);
-      free(k2);
+      printf("ИНВАРИАНТ: max|area[i]-tri_area(pcs[i].tri)| = %.3g на куске %d\n", dmax, imax);
     }
   }
 
   printf("== swee3 %s: nt=%d клетка %.4g м, it=%d le=%.3g rho=%s dirs=%d%s%s\n", path, m.nt, cell,
          iters, le, rho < 0 ? "kd" : "ovr", ndirs, tau0 ? " tau0" : "", noprop ? " noprop" : "");
-  printf("   листья: занятых %d, с кусками %d — пустых в обходе %d (по 24 Б на визит)\n",
-         py.nleaf, (int)py.ncentleaf, py.nleaf - (int)py.ncentleaf);
+  printf("   листья: занятых %d, с кусками %d — пустых в обходе %d (по 24 Б на визит)\n", py.nleaf,
+         (int)py.ncentleaf, py.nleaf - (int)py.ncentleaf);
 
   memset(&so, 0, sizeof so);
   so.le = le;

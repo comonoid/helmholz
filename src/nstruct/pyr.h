@@ -22,6 +22,7 @@
 #ifndef HZ_PYR_H
 #define HZ_PYR_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 /* Состояния узла (STRUCTURE.md §2.1). ПУСТ узлы не хранятся вовсе —
@@ -81,6 +82,8 @@ typedef struct {
   int32_t *nlev_nodes;
   int32_t nlev; /* уровней над листом; 0, если лист один на всю сцену */
 
+  int32_t *perm; /* §839: перестановка Morton (слот → исходный кусок); NULL до Morton */
+
   /* счётчики отчёта */
   int64_t nmarks;    /* bbox-пометок (сумма по треугольникам пересечённых клеток) */
   int64_t nmarkleaf; /* листьев с ≥1 bbox-пометкой (= nleaf) */
@@ -103,6 +106,11 @@ int64_t hz_pyr_wrap(int64_t c, int64_t n);
  * потребителя (area/nrm/kd). CSR пересобирается, leaf-структуры не
  * трогаются. Возврат 0/не-0. */
 int hz_pyr_morton(hz_pyr *py);
+
+/* §839: переставить массив потребителя (nt элементов по elem байт) той же
+ * перестановкой, что Morton применил к pcs — циклами на месте, без
+ * временных массивов. Требует вызова ПОСЛЕ hz_pyr_morton. */
+int hz_pyr_permute(hz_pyr *py, void *base, size_t elem);
 
 /* Построение. tri_min/tri_max/centroid — [3*nt], метры; mtl — [nt].
  * cell — размер клетки листа, м (> 0). Возврат 0/не-0 (память, аргументы). */

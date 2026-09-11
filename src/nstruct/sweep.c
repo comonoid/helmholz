@@ -104,27 +104,32 @@ typedef struct {
   hz_sw_wleaf *leaf;
   double *wcn; /* area·|ω·n| */
   double *wn;  /* |ω·n| */
+  double *kd;  /* альбедо куска — из походного слота: минус случайный поток */
   int32_t *wpid;
+  int32_t n; /* листьев в походе — только С КУСКАМИ (§838: пустой лист в
+              * модели слоя не делает ничего, его визит — чистые 24 Б) */
 } hz_sw_walk;
 
 static int sw_build_walk(const hz_pyr *py, int d, const int32_t *order, const double *area,
-                         const double *nrm, const double *om, hz_sw_walk *w) {
-  int32_t k;
+                         const double *nrm, const double *om, const double *kd, hz_sw_walk *w) {
+  int32_t k, wk = 0;
   int64_t pos = 0;
   w->leaf = (hz_sw_wleaf *)malloc((size_t)py->nleaf * sizeof *w->leaf);
   w->wcn = (double *)malloc((size_t)py->nt * sizeof *w->wcn);
   w->wn = (double *)malloc((size_t)py->nt * sizeof *w->wn);
+  w->kd = (double *)malloc((size_t)py->nt * sizeof *w->kd);
   w->wpid = (int32_t *)malloc((size_t)py->nt * sizeof *w->wpid);
-  if (!w->leaf || !w->wcn || !w->wn || !w->wpid) return 2;
+  if (!w->leaf || !w->wcn || !w->wn || !w->kd || !w->wpid) return 2;
   for (k = 0; k < py->nleaf; k++) {
     const hz_pyr_leaf *lf = &py->leaf[order[k]];
     int32_t u;
+    if (lf->npcs == 0) continue; /* пустой лист — не участник переноса */
     {
       int64_t slab_dummy;
-      sw_line_slab(py, d, py->leaf_id[order[k]], &w->leaf[k].line, &slab_dummy);
+      sw_line_slab(py, d, py->leaf_id[order[k]], &w->leaf[wk].line, &slab_dummy);
     }
-    w->leaf[k].npcs = lf->npcs;
-    w->leaf[k].first = pos;
+    w->leaf[wk].npcs = lf->npcs;
+    w->leaf[wk].first = pos;
     for (u = 0; u < lf->npcs; u++) {
       int32_t p = py->csr[lf->pcs_first + u];
       double d0 = om[0] * nrm[3 * (int64_t)p] + om[1] * nrm[3 * (int64_t)p + 1] +
@@ -132,10 +137,13 @@ static int sw_build_walk(const hz_pyr *py, int d, const int32_t *order, const do
       double an = fabs(d0);
       w->wcn[pos] = area[p] * an;
       w->wn[pos] = an;
+      w->kd[pos] = kd[p];
       w->wpid[pos] = p;
       pos++;
     }
+    wk++;
   }
+  w->n = wk;
   return 0;
 }
 
@@ -143,10 +151,12 @@ static void sw_free_walk(hz_sw_walk *w) {
   free(w->leaf);
   free(w->wcn);
   free(w->wn);
+  free(w->kd);
   free(w->wpid);
   w->leaf = NULL;
   w->wcn = NULL;
   w->wn = NULL;
+  w->kd = NULL;
   w->wpid = NULL;
 }
 
@@ -208,7 +218,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       for (li = 0; li < py->nleaf; li++)
         order[d][vindex[li] - 1] = li;
     }
-    counts[d] = py->nleaf;
+    counts[d] = (o->mode == 1) ? 0 : py->nleaf; /* col: заполнится после сборки похода */
   }
 
   /* §838: материализация походов (режим col) — cn/wn один раз на направление */
@@ -216,8 +226,9 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     for (d = 0; d < nd; d++) {
       double om[3] = {(double)sw_sv[d][0] / sw_norm[d], (double)sw_sv[d][1] / sw_norm[d],
                       (double)sw_sv[d][2] / sw_norm[d]};
-      rc = sw_build_walk(py, d, order[d], area, nrm, om, &walks[d]);
+      rc = sw_build_walk(py, d, order[d], area, nrm, om, kd, &walks[d]);
       if (rc != 0) goto done;
+      counts[d] = walks[d].n;
     }
   }
 
@@ -258,7 +269,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
             e = lf->first;
             for (u = 0; u < lf->npcs; u++, e++) {
               p = w->wpid[e];
-              double rho = o->rho < 0 ? kd[p] : o->rho;
+              double rho = o->rho < 0 ? w->kd[e] : o->rho;
               Lsurf += (o->le + rho * Eprev[p] / (2.0 * M_PI)) * w->wcn[e];
               Ed[p] += HZ_SW_W * L * (1.0 - T) * w->wn[e];
             }

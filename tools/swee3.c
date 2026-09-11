@@ -26,7 +26,7 @@ static double now_sec(void) {
 int main(int argc, char **argv) {
   const char *path = NULL, *cmpfile = NULL;
   double scale = 1.0, le = 1.0, rho = -1.0;
-  int iters = 20, lev = 6, tau0 = 0, noprop = 0, ndirs = 6, i, ax;
+  int iters = 20, lev = 6, tau0 = 0, noprop = 0, ndirs = 6, mort = 1, i, ax;
   double t0, t1;
   hz_objmesh m;
   hz_pyr py;
@@ -54,6 +54,8 @@ int main(int argc, char **argv) {
       ndirs = atoi(argv[i] + 5);
     else if (strncmp(argv[i], "cmp=", 4) == 0)
       cmpfile = argv[i] + 4;
+    else if (strncmp(argv[i], "mort=", 5) == 0)
+      mort = atoi(argv[i] + 5);
     else if (strncmp(argv[i], "scale=", 6) == 0)
       scale = atof(argv[i] + 6);
     else
@@ -125,9 +127,41 @@ int main(int argc, char **argv) {
     fprintf(stderr, "swee3: пирамида не построилась\n");
     return 2;
   }
+  if (mort) {
+    if (hz_pyr_morton(&py) != 0) {
+      fprintf(stderr, "swee3: Morton не прошёл\n");
+      return 2;
+    }
+    /* параллельные массивы инструмента — в порядке кусков: новый p берёт
+     * старые значения по pcs[p].tri (А1491) */
+    {
+      double *a2 = (double *)malloc((size_t)m.nt * sizeof *a2);
+      double *n2 = (double *)malloc((size_t)m.nt * 3 * sizeof *n2);
+      double *k2 = (double *)malloc((size_t)m.nt * sizeof *k2);
+      if (!a2 || !n2 || !k2) {
+        fprintf(stderr, "swee3: нет памяти\n");
+        return 2;
+      }
+      for (i = 0; i < m.nt; i++) {
+        int32_t t = py.pcs[i].tri;
+        a2[i] = area[t];
+        k2[i] = kd[t];
+        for (ax = 0; ax < 3; ax++)
+          n2[3 * (int64_t)i + ax] = nrm[3 * (int64_t)t + ax];
+      }
+      memcpy(area, a2, (size_t)m.nt * sizeof *area);
+      memcpy(nrm, n2, (size_t)m.nt * 3 * sizeof *nrm);
+      memcpy(kd, k2, (size_t)m.nt * sizeof *kd);
+      free(a2);
+      free(n2);
+      free(k2);
+    }
+  }
 
   printf("== swee3 %s: nt=%d клетка %.4g м, it=%d le=%.3g rho=%s dirs=%d%s%s\n", path, m.nt, cell,
          iters, le, rho < 0 ? "kd" : "ovr", ndirs, tau0 ? " tau0" : "", noprop ? " noprop" : "");
+  printf("   листья: занятых %d, с кусками %d — пустых в обходе %d (по 24 Б на визит)\n",
+         py.nleaf, (int)py.ncentleaf, py.nleaf - (int)py.ncentleaf);
 
   memset(&so, 0, sizeof so);
   so.le = le;
@@ -191,8 +225,9 @@ int main(int argc, char **argv) {
       fclose(f);
       rats = (double *)malloc((size_t)nold * sizeof *rats);
       for (q = 0; q < nold; q++) {
+        int32_t tri = py.pcs[q].tri; /* сличение по ИСХОДНОМУ треугольнику (А1491) */
         double en = py.pcs[q].e;
-        double r = (eold[q] > 1e-9) ? en / eold[q] : 1.0;
+        double r = (eold[tri] > 1e-9) ? en / eold[tri] : 1.0;
         rats[q] = r;
         rsum += r * area[q];
         asum += area[q];

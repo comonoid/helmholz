@@ -567,3 +567,88 @@ void hz_pyr_unmark_aggr(hz_pyr *py) {
     for (u = 0; u < py->nlev_nodes[l]; u++)
       if (py->lev[l][u].state == HZ_PYR_AGGR) py->lev[l][u].state = HZ_PYR_FINE;
 }
+
+/* ---- §839: MORTON-РАСКЛАДКА КУСКОВ --------------------------------------- */
+
+/* разнести 21 бит координаты через по 2 бита (63-битный код) */
+static uint64_t pyr_spread(uint64_t x) {
+  uint64_t r = x & 0x1FFFFF;
+  r = (r | (r << 32)) & 0x7F00000000FFFF;
+  r = (r | (r << 16)) & 0x7FFF0000FF0000FF;
+  r = (r | (r << 8)) & 0x7F00FF00FF00FF00;
+  r = (r | (r << 4)) & 0x70E38E38E38E38E3;
+  r = (r | (r << 2)) & 0x1249249249249249;
+  return r;
+}
+
+static uint64_t pyr_morton3(int64_t i, int64_t j, int64_t k) {
+  return pyr_spread((uint64_t)i) | (pyr_spread((uint64_t)j) << 1) | (pyr_spread((uint64_t)k) << 2);
+}
+
+typedef struct {
+  uint64_t key;
+  int32_t p;
+} pyr_mpair;
+
+static int pyr_cmp_mpair(const void *a, const void *b) {
+  uint64_t x = ((const pyr_mpair *)a)->key, y = ((const pyr_mpair *)b)->key;
+  return (x > y) - (x < y);
+}
+
+int hz_pyr_morton(hz_pyr *py) {
+  pyr_mpair *mp = NULL;
+  hz_piece *tmp = NULL;
+  int64_t *cnt = NULL;
+  int32_t *fill = NULL;
+  int32_t p, l;
+  if (!py || !py->pcs || !py->leaf_id || py->nt <= 0) return 1;
+  mp = (pyr_mpair *)malloc((size_t)py->nt * sizeof *mp);
+  tmp = (hz_piece *)malloc((size_t)py->nt * sizeof *tmp);
+  if (!mp || !tmp) {
+    free(mp);
+    free(tmp);
+    return 2;
+  }
+  for (p = 0; p < py->nt; p++) {
+    int64_t id = py->leaf_id[py->pcs[p].cell];
+    mp[p].key = pyr_morton3(id % py->nx, (id / py->nx) % py->ny, id / ((int64_t)py->nx * py->ny));
+    mp[p].p = p;
+  }
+  qsort(mp, (size_t)py->nt, sizeof *mp, pyr_cmp_mpair);
+  for (p = 0; p < py->nt; p++)
+    tmp[p] = py->pcs[mp[p].p];
+  memcpy(py->pcs, tmp, (size_t)py->nt * sizeof *tmp);
+  free(tmp);
+  tmp = NULL;
+  free(mp);
+  mp = NULL;
+
+  /* CSR заново: куски сгруппированы по клеткам в новом порядке Morton */
+  cnt = (int64_t *)calloc((size_t)py->nleaf + 1, sizeof *cnt);
+  if (!cnt) {
+    hz_pyr_free(py);
+    return 2;
+  }
+  for (p = 0; p < py->nt; p++)
+    cnt[py->pcs[p].cell + 1]++;
+  for (l = 0; l < py->nleaf; l++)
+    cnt[l + 1] += cnt[l];
+  for (l = 0; l < py->nleaf; l++) {
+    py->leaf[l].pcs_first = (int32_t)cnt[l];
+    py->leaf[l].npcs = (int32_t)(cnt[l + 1] - cnt[l]);
+  }
+  py->csr = (int32_t *)malloc((size_t)py->nt * sizeof *py->csr);
+  fill = (int32_t *)malloc((size_t)(py->nleaf + 1) * sizeof *fill);
+  if (!py->csr || !fill) {
+    free(cnt);
+    hz_pyr_free(py);
+    return 2;
+  }
+  for (l = 0; l < py->nleaf; l++)
+    fill[l] = py->leaf[l].pcs_first;
+  for (p = 0; p < py->nt; p++)
+    py->csr[fill[py->pcs[p].cell]++] = p;
+  free(cnt);
+  free(fill);
+  return 0;
+}

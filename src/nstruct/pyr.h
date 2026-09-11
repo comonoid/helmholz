@@ -96,6 +96,14 @@ int64_t hz_pyr_leaf_index(const double lo[3], double cell, int32_t nx, int32_t n
  * без заворота это выход за сетку). Отдельная чистая функция — под CBMC. */
 int64_t hz_pyr_wrap(int64_t c, int64_t n);
 
+/* §839: переукладка кусков по Morton-коду клетки владения. Куски вдоль
+ * любой линии луча становятся приближённо смежными в памяти. После вызова
+ * НЕДЕЙСТВИТЕЛЕН инвариант pcs[t].tri == t (А1490): исходный треугольник
+ * куска p есть pcs[p].tri — по нему переставляются параллельные массивы
+ * потребителя (area/nrm/kd). CSR пересобирается, leaf-структуры не
+ * трогаются. Возврат 0/не-0. */
+int hz_pyr_morton(hz_pyr *py);
+
 /* Построение. tri_min/tri_max/centroid — [3*nt], метры; mtl — [nt].
  * cell — размер клетки листа, м (> 0). Возврат 0/не-0 (память, аргументы). */
 int hz_pyr_build(hz_pyr *py, int32_t nt, const double *tri_min, const double *tri_max,

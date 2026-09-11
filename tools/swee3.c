@@ -192,10 +192,19 @@ int main(int argc, char **argv) {
     printf("[%s] баланс: излучено %.4f, поглощено %.4f, рециркуляция %.4f, потеряно %.4f\n", mname,
            st.emitted, st.absorbed, st.recycled, st.lost);
     if (fabs(rho - 1.0) > 1e-12 && !tau0 && !noprop) {
-      double rr = rho < 0 ? kd[0] * 0 + 0.5 : rho; /* kd сцены печатается выше */
-      printf("[%s] аналитика(ρ=%.2f): 1ст=%.4f 2ст=%.4f; E_avg=%.4f → %.2f×1ст, %.2f×2ст\n", mname,
-             rr, le / (1.0 - rr), 2.0 * le / (1.0 - rr), st.e_avg, st.e_avg / (le / (1.0 - rr)),
-             st.e_avg / (2.0 * le / (1.0 - rr)));
+      double rr = rho < 0 ? 0.5 : rho;
+      /* §842: точное решение МОДЕЛИ слоя: E = W·Le/(A − ρ·W/(2π)),
+       * W = Σ_p area_p·(выходная сумма весов) — квадратура учтена точно */
+      double W = 0, A = 0;
+      for (i = 0; i < m.nt; i++) {
+        W += hz_sw_exitwsum(nrm + 3 * (int64_t)i, ndirs) * area[i];
+        A += area[i];
+      }
+      double emodel = W * le / (A - rr * W / (2.0 * M_PI));
+      printf("[%s] модель слоя: E = %.4f (W=%.3f A=%.3f); свип: %.4f → %.3f×модели\n", mname,
+             emodel, W, A, st.e_avg, st.e_avg / emodel);
+      printf("[%s] справочно, непрерывная физика: 2πLe/(1−ρ) = %.3f\n", mname,
+             2.0 * M_PI * le / (1.0 - rr));
     }
   }
 

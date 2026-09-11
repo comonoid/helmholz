@@ -96,7 +96,6 @@ typedef struct {
   int64_t first; /* офсет в wcn/wn/kd/wpid */
   int64_t line;  /* линия; смена — тёмный вход луча */
   double cntot;  /* Σ area·|ω·n| по кускам листа */
-  double T;      /* exp(−τ) */
 } hz_sw_wleaf;
 
 typedef struct {
@@ -118,7 +117,7 @@ static void sw_free_walk(hz_sw_walk *w) {
 /* §841: поход строится ПРЯМО — фильтр кусковых листьев, сортировка ТОЛЬКО
  * их (полная сортировка 14.9M пустых не нужна вовсе), cntot/T сразу. */
 static int sw_build_walk(const hz_pyr *py, int d, const double *area, const double *nrm,
-                         const double *kd, const double *om, int tau0, hz_sw_walk *w) {
+                         const double *kd, const double *om, hz_sw_walk *w) {
   int32_t li, k;
   int64_t pos = 0;
   hz_sw_pair *pairs = (hz_sw_pair *)malloc((size_t)py->nleaf * sizeof *pairs);
@@ -166,7 +165,7 @@ static int sw_build_walk(const hz_pyr *py, int d, const double *area, const doub
       pos++;
     }
     w->leaf[k].cntot = cntot;
-    w->leaf[k].T = (tau0 || cntot <= 0.0) ? 1.0 : exp(-cntot / (py->cell * py->cell));
+    w->leaf[k].cntot = cntot;
   }
   free(pairs);
   return 0;
@@ -205,7 +204,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     for (d = 0; d < nd; d++) {
       double om[3] = {(double)sw_sv[d][0] / sw_norm[d], (double)sw_sv[d][1] / sw_norm[d],
                       (double)sw_sv[d][2] / sw_norm[d]};
-      rc = sw_build_walk(py, d, area, nrm, kd, om, o->tau0, &walks[d]);
+      rc = sw_build_walk(py, d, area, nrm, kd, om, &walks[d]);
       if (rc != 0) goto done;
     }
   } else {
@@ -239,7 +238,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         int32_t k;
         for (k = 0; k < w->n; k++) {
           const hz_sw_wleaf *lf = &w->leaf[k];
-          double Lsurf = 0.0, tau0T = lf->T;
+          double Lsurf = 0.0;
           int64_t e = lf->first, eend = lf->first + lf->npcs;
           int64_t pf = lf->first + 8 < nt ? lf->first + 8 : nt - 1;
           if (lf->line != prevline) { /* новая линия — тёмный вход */
@@ -254,13 +253,13 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
             p = w->wpid[e];
             double rho = o->rho < 0 ? w->kd[e] : o->rho;
             Lsurf += (o->le + rho * Eprev[p] / (2.0 * M_PI)) * w->wcn[e];
-            Ed[p] += HZ_SW_W * L * (1.0 - tau0T) * w->wn[e];
+            Ed[p] += HZ_SW_W * L * w->wn[e]; /* непрозрачный слой: инфлюкс целиком */
           }
           Lsurf /= lf->cntot;
-          absorbed += HZ_SW_W * L * (1.0 - tau0T) * csec;
-          emitted += HZ_SW_W * o->le * (1.0 - tau0T) * csec;
-          recycled += HZ_SW_W * (Lsurf - o->le) * (1.0 - tau0T) * csec;
-          L = L * tau0T + Lsurf * (1.0 - tau0T);
+          absorbed += HZ_SW_W * L * csec;
+          emitted += HZ_SW_W * o->le * csec;
+          recycled += HZ_SW_W * (Lsurf - o->le) * csec;
+          L = Lsurf; /* непрозрачный слой: луч гасится, остаётся переизлучение */
           if (o->noprop) L = 0.0;
         }
         lost += L * csec;
@@ -324,4 +323,29 @@ done:
     free(walks);
   }
   return rc;
+}
+
+double hz_sw_dirsum(const double n[3], int ndirs) {
+  int nd = (ndirs == 26) ? HZ_SW_ND : 6;
+  double s = 0.0;
+  for (int d = 0; d < nd; d++) {
+    double om[3] = {(double)sw_sv[d][0] / sw_norm[d], (double)sw_sv[d][1] / sw_norm[d],
+                    (double)sw_sv[d][2] / sw_norm[d]};
+    s += HZ_SW_W * fabs(om[0] * n[0] + om[1] * n[1] + om[2] * n[2]);
+  }
+  return s;
+}
+
+/* §842: Σ по ВЫХОДНЫМ направлениям (n·ω > 0) w·|ω·n| — облучённость куска
+ * в модели слоя при тёмном окружении. Для точного решения фикстуры. */
+double hz_sw_exitwsum(const double n[3], int ndirs) {
+  int nd = (ndirs == 26) ? HZ_SW_ND : 6;
+  double s = 0.0;
+  for (int d = 0; d < nd; d++) {
+    double om[3] = {(double)sw_sv[d][0] / sw_norm[d], (double)sw_sv[d][1] / sw_norm[d],
+                    (double)sw_sv[d][2] / sw_norm[d]};
+    double c = om[0] * n[0] + om[1] * n[1] + om[2] * n[2];
+    if (c > 0) s += HZ_SW_W * c;
+  }
+  return s;
 }

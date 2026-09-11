@@ -637,6 +637,7 @@ int hz_pyr_morton(hz_pyr *py) {
     py->leaf[l].pcs_first = (int32_t)cnt[l];
     py->leaf[l].npcs = (int32_t)(cnt[l + 1] - cnt[l]);
   }
+  free(py->csr); /* Morton перестраивает CSR: старый массив освобождается (LeakSanitizer §839) */
   py->csr = (int32_t *)malloc((size_t)py->nt * sizeof *py->csr);
   fill = (int32_t *)malloc((size_t)(py->nleaf + 1) * sizeof *fill);
   if (!py->csr || !fill) {

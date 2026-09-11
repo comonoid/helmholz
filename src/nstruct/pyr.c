@@ -92,10 +92,11 @@ int hz_pyr_build(hz_pyr *py, int32_t nt, const double *tri_min, const double *tr
                  double cell) {
   int32_t t, l;
   double size[3];
-  int64_t *marks = NULL; /* битовая карта bbox-занятости, ВРЕМЕННАЯ (в бюджет не входит) */
+  int64_t *marks = NULL; /* пометки bbox-занятости, ВРЕМЕННАЯ (в бюджет не входит) */
   int64_t *cnt = NULL;
   int32_t *fill = NULL;
   int64_t *cur = NULL, *par = NULL;
+  int64_t nm = 0;
   int32_t ncur;
   int64_t pnx, pny, pnz;
 
@@ -134,28 +135,48 @@ int hz_pyr_build(hz_pyr *py, int32_t nt, const double *tri_min, const double *tr
     py->pcs[t].cell = -1;
   }
 
-  /* 2. консервативная занятость по bbox — битовая карта */
-  marks = (int64_t *)calloc((size_t)((py->ncells + 63) >> 6), sizeof *marks);
-  if (!marks) {
-    hz_pyr_free(py);
-    return 2;
-  }
-  for (t = 0; t < nt; t++) {
-    int64_t x[2], y[2], z[2], ix, iy, iz;
-    pyr_bbox_span(py, t, tri_min, tri_max, x, y, z);
-    for (iz = z[0]; iz <= z[1]; iz++)
-      for (iy = y[0]; iy <= y[1]; iy++)
-        for (ix = x[0]; ix <= x[1]; ix++) {
-          int64_t id = ix + (int64_t)py->nx * (iy + (int64_t)py->ny * iz);
-          if ((marks[id >> 6] & ((int64_t)1 << (id & 63))) == 0) {
-            marks[id >> 6] |= (int64_t)1 << (id & 63);
-            py->nmarkleaf++;
+  /* 2. консервативная занятость по bbox — МАССИВ ПОМЕТОК + сортировка
+   * (§837): плотная битовая карта требует ncells/8 байт и не переживает
+   * grid-сцены (габарит сетки комнат при мелкой клетке ~1e17 клеток);
+   * сортировка пометок — секунды, память известна заранее. nm — число
+   * пометок, живёт до конца секции 3. */
+  {
+    int64_t cap = 1 << 20;
+    marks = (int64_t *)malloc((size_t)cap * sizeof *marks);
+    if (!marks) {
+      hz_pyr_free(py);
+      return 2;
+    }
+    for (t = 0; t < nt; t++) {
+      int64_t x[2], y[2], z[2], ix, iy, iz;
+      pyr_bbox_span(py, t, tri_min, tri_max, x, y, z);
+      for (iz = z[0]; iz <= z[1]; iz++)
+        for (iy = y[0]; iy <= y[1]; iy++)
+          for (ix = x[0]; ix <= x[1]; ix++) {
+            int64_t id = ix + (int64_t)py->nx * (iy + (int64_t)py->ny * iz);
+            if (nm == cap) {
+              int64_t *nm2 = (int64_t *)realloc(marks, (size_t)(cap *= 2) * sizeof *marks);
+              if (!nm2) {
+                free(marks);
+                hz_pyr_free(py);
+                return 2;
+              }
+              marks = nm2;
+            }
+            marks[nm++] = id;
+            py->nmarks++;
           }
-          py->nmarks++;
-        }
+    }
+    qsort(marks, (size_t)nm, sizeof *marks, pyr_cmp_i64);
+    py->nmarkleaf = 0;
+    {
+      int64_t u;
+      for (u = 0; u < nm; u++)
+        if (u == 0 || marks[u] != marks[u - 1]) py->nmarkleaf++;
+    }
   }
 
-  /* 3. занятые листья — из карты по возрастанию id */
+  /* 3. занятые листья — из отсортированных уникальных пометок */
   py->leaf_id = (int64_t *)malloc((size_t)py->nmarkleaf * sizeof *py->leaf_id);
   py->leaf = (hz_pyr_leaf *)malloc((size_t)py->nmarkleaf * sizeof *py->leaf);
   if (!py->leaf_id || !py->leaf) {
@@ -164,10 +185,10 @@ int hz_pyr_build(hz_pyr *py, int32_t nt, const double *tri_min, const double *tr
   }
   {
     int32_t n = 0;
-    int64_t id;
-    for (id = 0; id < py->ncells; id++)
-      if (marks[id >> 6] & ((int64_t)1 << (id & 63))) {
-        py->leaf_id[n] = id;
+    int64_t u;
+    for (u = 0; u < nm; u++)
+      if (u == 0 || marks[u] != marks[u - 1]) {
+        py->leaf_id[n] = marks[u];
         py->leaf[n].pcs_first = 0;
         py->leaf[n].npcs = 0;
         py->leaf[n].state = HZ_PYR_FINE;

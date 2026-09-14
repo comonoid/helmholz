@@ -28,7 +28,8 @@ int main(int argc, char **argv) {
   const char *path = NULL, *cmpfile = NULL;
   double scale = 1.0, le = 1.0, rho = -1.0;
   int iters = 20, lev = 6, tau0 = 0, noprop = 0, ndirs = 6, mort = 1, i, ax;
-  int mode = 1; /* §845: 2 — объёмный фронт (L на клетку, марш-порядок) */
+  int mode = 1;  /* §845: 2 — объёмный фронт (L на клетку, марш-порядок) */
+  int build = 0; /* §845-в: строитель похода (1 — прямой сортировочный) */
   int nphi = 0, nmu = 0;
   double t0, t1;
   hz_objmesh m;
@@ -60,6 +61,8 @@ int main(int argc, char **argv) {
         ndirs = nphi * 100 + nmu;
       else
         ndirs = atoi(argv[i] + 5);
+    } else if (strncmp(argv[i], "build=", 6) == 0) {
+      build = atoi(argv[i] + 6); /* §845-в: 1 — прямой сортировочный строитель */
     } else if (strncmp(argv[i], "mode=", 5) == 0) {
       mode = atoi(argv[i] + 5); /* §845: 2 — объёмный фронт */
     } else if (strncmp(argv[i], "cmp=", 4) == 0)
@@ -223,6 +226,7 @@ int main(int argc, char **argv) {
   }
 
   memset(&so, 0, sizeof so);
+  so.build = build;
   so.le = le;
   so.rho = rho;
   so.iters = iters;
@@ -241,7 +245,8 @@ int main(int argc, char **argv) {
     }
     t1 = now_sec();
     printf("[%s dirs=%d] трафик: %.2f МБ/итерацию, %.3f с → %.2f ГБ/с эффективной\n", mname,
-           md == 0 ? 6 : so.ndirs, (double)st.traffic / 1048576.0, t1 - t0,           (t1 - t0) > 1e-9 ? (double)st.traffic * (double)iters / (t1 - t0) / 1e9 : 0.0);
+           md == 0 ? 6 : so.ndirs, (double)st.traffic / 1048576.0, t1 - t0,
+           (t1 - t0) > 1e-9 ? (double)st.traffic * (double)iters / (t1 - t0) / 1e9 : 0.0);
     printf("[%s] итерации E_avg:", mname);
     for (i = 0; i < iters; i++)
       printf(" %.4f", hist[i]);

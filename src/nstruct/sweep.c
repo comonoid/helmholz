@@ -228,40 +228,25 @@ static int64_t sw_travel_rank(const hz_pyr *py, const int sg[3], int64_t id) {
  * — итерация mode 2 её не читает; сортировка по ОДНОМУ ключу (ранг марша). */
 static int64_t sw_inv_acc; /* §845-бис: сумма инверсий марша за построение походов */
 
-static int sw_build_walk_march(const hz_pyr *py, const double *om, const double *area,
-                               const double *nrm, const double *kd, int32_t *vindex, uint64_t *bits,
-                               hz_sw_walk *w) {
-  hz_pyr_march_stat ms;
-  hz_sw_pair *pairs;
-  int32_t li, k;
+/* §845-в: СБОРКА похода из УПОРЯДОЧЕННОГО списка кусковых листьев (lis[n])
+ * — общая для обоих строителей: предвычисление wcn/wn/kd/wpid и cntot. */
+static int sw_walk_assemble(const hz_pyr *py, const double *om, const double *area,
+                            const double *nrm, const double *kd, const int32_t *lis, int32_t n,
+                            hz_sw_walk *w) {
+  int32_t k;
   int64_t pos = 0;
-  hz_pyr_march(py, om, 0, &ms, bits, vindex);
-  sw_inv_acc += ms.inversions;
-  pairs = (hz_sw_pair *)malloc((size_t)py->nleaf * sizeof *pairs);
   w->leaf = (hz_sw_wleaf *)malloc((size_t)py->nleaf * sizeof *w->leaf);
   w->wcn = (double *)malloc((size_t)py->nt * sizeof *w->wcn);
   w->wn = (double *)malloc((size_t)py->nt * sizeof *w->wn);
   w->kd = (double *)malloc((size_t)py->nt * sizeof *w->kd);
   w->wpid = (int32_t *)malloc((size_t)py->nt * sizeof *w->wpid);
-  if (!pairs || !w->leaf || !w->wcn || !w->wn || !w->kd || !w->wpid) {
-    free(pairs);
+  if (!w->leaf || !w->wcn || !w->wn || !w->kd || !w->wpid) {
     sw_free_walk(w);
     return 2;
   }
-  {
-    int32_t np = 0;
-    for (li = 0; li < py->nleaf; li++) {
-      if (py->leaf[li].npcs == 0) continue; /* пустой лист — не участник переноса */
-      pairs[np].key = (int64_t)vindex[li];  /* ранг марша — ход луча */
-      pairs[np].key2 = 0;
-      pairs[np].li = li;
-      np++;
-    }
-    w->n = np;
-  }
-  qsort(pairs, (size_t)w->n, sizeof *pairs, sw_cmp_pair);
-  for (k = 0; k < w->n; k++) {
-    const hz_pyr_leaf *lf = &py->leaf[pairs[k].li];
+  w->n = n;
+  for (k = 0; k < n; k++) {
+    const hz_pyr_leaf *lf = &py->leaf[lis[k]];
     int32_t u;
     double cntot = 0.0;
     w->leaf[k].line = 0; /* линия в mode 2 не существует */
@@ -281,8 +266,93 @@ static int sw_build_walk_march(const hz_pyr *py, const double *om, const double 
     }
     w->leaf[k].cntot = cntot;
   }
-  free(pairs);
   return 0;
+}
+
+static int sw_build_walk_march(const hz_pyr *py, const double *om, const double *area,
+                               const double *nrm, const double *kd, int32_t *vindex, uint64_t *bits,
+                               hz_sw_walk *w) {
+  hz_pyr_march_stat ms;
+  hz_sw_pair *pairs;
+  int32_t li, k, rc;
+  hz_pyr_march(py, om, 0, &ms, bits, vindex);
+  sw_inv_acc += ms.inversions;
+  pairs = (hz_sw_pair *)malloc((size_t)py->nleaf * sizeof *pairs);
+  if (!pairs) return 2;
+  {
+    int32_t np = 0;
+    for (li = 0; li < py->nleaf; li++) {
+      if (py->leaf[li].npcs == 0) continue; /* пустой лист — не участник переноса */
+      pairs[np].key = (int64_t)vindex[li];  /* ранг марша — ход луча */
+      pairs[np].key2 = 0;
+      pairs[np].li = li;
+      np++;
+    }
+    w->n = np;
+  }
+  qsort(pairs, (size_t)w->n, sizeof *pairs, sw_cmp_pair);
+  {
+    int32_t *lis = (int32_t *)malloc((size_t)w->n * sizeof *lis);
+    if (!lis) {
+      free(pairs);
+      return 2;
+    }
+    for (k = 0; k < w->n; k++)
+      lis[k] = pairs[k].li;
+    free(pairs);
+    rc = sw_walk_assemble(py, om, area, nrm, kd, lis, w->n, w);
+    free(lis);
+  }
+  return rc;
+}
+
+/* §845-в: ПРЯМОЙ строитель — та же сортировка кусковых листьев по проекции
+ * центра на ω, что даёт марш (pyr_slab), но БЕЗ обхода пирамиды и двоичных
+ * поисков: O(nleaf) вычислений + одна сортировка. Инверсий нет по
+ * построению (сортируем по самой величине). */
+typedef struct {
+  double s;
+  int32_t li;
+} hz_sw_sitem;
+
+static int sw_cmp_sitem(const void *a, const void *b) {
+  const hz_sw_sitem *x = (const hz_sw_sitem *)a, *y = (const hz_sw_sitem *)b;
+  if (x->s > y->s) return 1;
+  if (x->s < y->s) return -1;
+  return (x->li > y->li) - (x->li < y->li); /* полный порядок: детерминизм */
+}
+
+static int sw_build_walk_sort(const hz_pyr *py, const double *om, const double *area,
+                              const double *nrm, const double *kd, hz_sw_walk *w) {
+  hz_sw_sitem *items = (hz_sw_sitem *)malloc((size_t)py->nleaf * sizeof *items);
+  int32_t li, k, np = 0, rc;
+  if (!items) return 2;
+  for (li = 0; li < py->nleaf; li++) {
+    int64_t id;
+    double c[3];
+    if (py->leaf[li].npcs == 0) continue;
+    id = py->leaf_id[li];
+    c[0] = py->lo[0] + ((double)(id % py->nx) + 0.5) * py->cell;
+    c[1] = py->lo[1] + ((double)((id / py->nx) % py->ny) + 0.5) * py->cell;
+    c[2] = py->lo[2] + ((double)(id / ((int64_t)py->nx * py->ny)) + 0.5) * py->cell;
+    items[np].s = om[0] * c[0] + om[1] * c[1] + om[2] * c[2];
+    items[np].li = li;
+    np++;
+  }
+  qsort(items, (size_t)np, sizeof *items, sw_cmp_sitem);
+  {
+    int32_t *lis = (int32_t *)malloc((size_t)np * sizeof *lis);
+    if (!lis) {
+      free(items);
+      return 2;
+    }
+    for (k = 0; k < np; k++)
+      lis[k] = items[k].li;
+    free(items);
+    rc = sw_walk_assemble(py, om, area, nrm, kd, lis, np, w);
+    free(lis);
+  }
+  return rc;
 }
 
 /* §841: поход строится ПРЯМО — фильтр кусковых листьев, сортировка ТОЛЬКО
@@ -384,9 +454,12 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       int sg[3];
       for (int ax = 0; ax < 3; ax++)
         sg[ax] = (tab[d].om[ax] > 0.0) - (tab[d].om[ax] < 0.0);
-      if (o->mode == 2)
-        rc = sw_build_walk_march(py, tab[d].om, area, nrm, kd, vindex, bits, &walks[d]);
-      else
+      if (o->mode == 2) {
+        if (o->build == 1)
+          rc = sw_build_walk_sort(py, tab[d].om, area, nrm, kd, &walks[d]);
+        else
+          rc = sw_build_walk_march(py, tab[d].om, area, nrm, kd, vindex, bits, &walks[d]);
+      } else
         rc = sw_build_walk(py, sg, tab[d].om, area, nrm, kd, &walks[d]);
       if (rc != 0) goto done;
       /* §845/А1525: хеш последовательности листьев — прибор против no-op:

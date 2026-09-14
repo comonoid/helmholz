@@ -353,23 +353,30 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       if (o->mode == 1) {
         const hz_sw_walk *w = &walks[d];
         int32_t k;
+        int64_t run = 0; /* §843: визитов в текущей линии */
         for (k = 0; k < w->n; k++) {
           const hz_sw_wleaf *lf = &w->leaf[k];
           double Lsurf = 0.0;
           int64_t e, eend = lf->first + lf->npcs;
           int64_t pf = lf->first + 8 < nt ? lf->first + 8 : nt - 1;
           if (lf->line != prevline) { /* новая линия — тёмный вход */
+            if (run == 1) st->nline1++;
+            else if (run == 2) st->nline2++;
+            if (run > 0) st->nline++;
+            run = 0;
             L = 0.0;
             prevline = lf->line;
           }
           if (o->noprop) L = 0.0;
           if (lf->cntot <= 0.0) continue; /* куски встык лучу — слоя нет */
+          st->nvisit++; /* §843: визит с слоем */
           __builtin_prefetch(&w->leaf[k + 8 < w->n ? k + 8 : w->n - 1]);
           __builtin_prefetch(&Eprev[w->wpid[pf]]);
           for (e = lf->first; e < eend; e++) {
             p = w->wpid[e];
             double rho = o->rho < 0 ? w->kd[e] : o->rho;
             Lsurf += (o->le + rho * Eprev[p] / (2.0 * M_PI)) * w->wcn[e];
+            if (L > 0.0) st->ndep++; /* §843: доставка света */
             Ed[p] += w_d * L * w->wn[e]; /* непрозрачный слой: инфлюкс целиком */
           }
           Lsurf /= lf->cntot;
@@ -378,7 +385,11 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
           recycled += w_d * (Lsurf - o->le) * csec;
           L = Lsurf; /* непрозрачный слой: луч гасится, остаётся переизлучение */
           if (o->noprop) L = 0.0;
+          run++;
         }
+        if (run == 1) st->nline1++;
+        else if (run == 2) st->nline2++;
+        if (run > 0) st->nline++;
         lost += L * csec;
       } else {
         int32_t k;

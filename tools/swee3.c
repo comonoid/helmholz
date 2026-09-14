@@ -194,6 +194,29 @@ int main(int argc, char **argv) {
          iters, le, rho < 0 ? "kd" : "ovr", ndirs, tau0 ? " tau0" : "", noprop ? " noprop" : "");
   printf("   листья: занятых %d, с кусками %d — пустых в обходе %d (по 24 Б на визит)\n", py.nleaf,
          (int)py.ncentleaf, py.nleaf - (int)py.ncentleaf);
+  { /* §843/А1513: кратность куска по листьям — свип посещает кусок в КАЖДОМ
+     * листе его bbox; если кратность > 1, площадь куска участвует в переносе
+     * многократно, и дискретизация может не сходиться с измельчением */
+    int *pcnt = (int *)calloc((size_t)m.nt, sizeof *pcnt);
+    int64_t slots = 0;
+    int32_t li2, u2, pmax = 0;
+    double pavg;
+    if (!pcnt) {
+      fprintf(stderr, "swee3: нет памяти\n");
+      return 2;
+    }
+    for (li2 = 0; li2 < py.nleaf; li2++)
+      for (u2 = 0; u2 < py.leaf[li2].npcs; u2++)
+        pcnt[py.csr[py.leaf[li2].pcs_first + u2]]++;
+    for (i = 0; i < m.nt; i++) {
+      slots += pcnt[i];
+      if (pcnt[i] > pmax) pmax = pcnt[i];
+    }
+    pavg = (double)slots / (double)m.nt;
+    printf("   КУСКИ×ЛИСТЬЯ: слотов %" PRId64 " на %d кусков — средняя кратность %.2f, максимум %d\n",
+           slots, m.nt, pavg, pmax);
+    free(pcnt);
+  }
 
   memset(&so, 0, sizeof so);
   so.le = le;
@@ -227,6 +250,11 @@ int main(int argc, char **argv) {
     }
     printf("[%s] баланс: излучено %.4f, поглощено %.4f, рециркуляция %.4f, потеряно %.4f\n", mname,
            st.emitted, st.absorbed, st.recycled, st.lost);
+    printf("[%s] доставки: визитов %" PRId64 ", с светом %" PRId64 " (%.1f %%)\n", mname, st.nvisit,
+           st.ndep, st.nvisit ? 100.0 * (double)st.ndep / (double)st.nvisit : 0.0);
+    printf("[%s] линии: %" PRId64 ", из 1 визита %.1f %%, из 2 — %.1f %%\n", mname, st.nline,
+           st.nline ? 100.0 * (double)st.nline1 / (double)st.nline : 0.0,
+           st.nline ? 100.0 * (double)st.nline2 / (double)st.nline : 0.0);
     if (fabs(rho - 1.0) > 1e-12 && !tau0 && !noprop) {
       double rr = rho < 0 ? 0.5 : rho;
       /* §842: точное решение МОДЕЛИ слоя: E = W·Le/(A − ρ·W/(2π)),

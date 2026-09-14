@@ -226,6 +226,8 @@ static int64_t sw_travel_rank(const hz_pyr *py, const int sg[3], int64_t id) {
  * границе домена. vindex — рабочий буфер [nleaf] (ранг марша, 1-based),
  * bits — буфер посещений [nleaf+63]/64. Линия в записях не заполняется (0)
  * — итерация mode 2 её не читает; сортировка по ОДНОМУ ключу (ранг марша). */
+static int64_t sw_inv_acc; /* §845-бис: сумма инверсий марша за построение походов */
+
 static int sw_build_walk_march(const hz_pyr *py, const double *om, const double *area,
                                const double *nrm, const double *kd, int32_t *vindex, uint64_t *bits,
                                hz_sw_walk *w) {
@@ -234,6 +236,7 @@ static int sw_build_walk_march(const hz_pyr *py, const double *om, const double 
   int32_t li, k;
   int64_t pos = 0;
   hz_pyr_march(py, om, 0, &ms, bits, vindex);
+  sw_inv_acc += ms.inversions;
   pairs = (hz_sw_pair *)malloc((size_t)py->nleaf * sizeof *pairs);
   w->leaf = (hz_sw_wleaf *)malloc((size_t)py->nleaf * sizeof *w->leaf);
   w->wcn = (double *)malloc((size_t)py->nt * sizeof *w->wcn);
@@ -376,6 +379,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   }
 
   if (o->mode == 1 || o->mode == 2) {
+    sw_inv_acc = 0;
     for (d = 0; d < nd; d++) {
       int sg[3];
       for (int ax = 0; ax < 3; ax++)
@@ -392,6 +396,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         st->order_hash = st->order_hash * 1099511628211ULL ^
                          (uint64_t)(uint32_t)walks[d].wpid[walks[d].leaf[k].first];
     }
+    st->ninv = sw_inv_acc;
   } else {
     /* scalar §835: марш по всем листьям, 6 осей */
     {

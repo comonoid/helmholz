@@ -240,9 +240,8 @@ int main(int argc, char **argv) {
       return 2;
     }
     t1 = now_sec();
-    printf("[%s nd=%d] трафик: %.2f МБ/итерацию, %.3f с → %.2f ГБ/с эффективной\n", mname,
-           md == 0 ? 6 : so.ndirs, (double)st.traffic / 1048576.0, t1 - t0,
-           (t1 - t0) > 1e-9 ? (double)st.traffic * (double)iters / (t1 - t0) / 1e9 : 0.0);
+    printf("[%s dirs=%d] трафик: %.2f МБ/итерацию, %.3f с → %.2f ГБ/с эффективной\n", mname,
+           md == 0 ? 6 : so.ndirs, (double)st.traffic / 1048576.0, t1 - t0,           (t1 - t0) > 1e-9 ? (double)st.traffic * (double)iters / (t1 - t0) / 1e9 : 0.0);
     printf("[%s] итерации E_avg:", mname);
     for (i = 0; i < iters; i++)
       printf(" %.4f", hist[i]);
@@ -261,6 +260,8 @@ int main(int argc, char **argv) {
            st.nline ? 100.0 * (double)st.nline2 / (double)st.nline : 0.0);
     printf("[%s] хеш порядка похода: %016" PRIx64 " (§845/А1525: режимы обязаны различаться)\n",
            mname, st.order_hash);
+    printf("[%s] инверсии марша: %" PRId64 " (§845-бис: 0 ожидается на целочисленных)\n", mname,
+           st.ninv);
     if (fabs(rho - 1.0) > 1e-12 && !tau0 && !noprop) {
       double rr = rho < 0 ? 0.5 : rho;
       /* §842: точное решение МОДЕЛИ слоя: E = W·Le/(A − ρ·W/(2π)),

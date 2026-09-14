@@ -221,6 +221,67 @@ static int64_t sw_travel_rank(const hz_pyr *py, const int sg[3], int64_t id) {
   return u;
 }
 
+/* §845: поход ОБЪЁМНОГО ФРОНТА — порядок листьев из МАРША §834 (ход луча),
+ * без линии и без тёмного входа на смене ключа: тёмный вход только на
+ * границе домена. vindex — рабочий буфер [nleaf] (ранг марша, 1-based),
+ * bits — буфер посещений [nleaf+63]/64. Линия в записях не заполняется (0)
+ * — итерация mode 2 её не читает; сортировка по ОДНОМУ ключу (ранг марша). */
+static int sw_build_walk_march(const hz_pyr *py, const double *om, const double *area,
+                               const double *nrm, const double *kd, int32_t *vindex, uint64_t *bits,
+                               hz_sw_walk *w) {
+  hz_pyr_march_stat ms;
+  hz_sw_pair *pairs;
+  int32_t li, k;
+  int64_t pos = 0;
+  hz_pyr_march(py, om, 0, &ms, bits, vindex);
+  pairs = (hz_sw_pair *)malloc((size_t)py->nleaf * sizeof *pairs);
+  w->leaf = (hz_sw_wleaf *)malloc((size_t)py->nleaf * sizeof *w->leaf);
+  w->wcn = (double *)malloc((size_t)py->nt * sizeof *w->wcn);
+  w->wn = (double *)malloc((size_t)py->nt * sizeof *w->wn);
+  w->kd = (double *)malloc((size_t)py->nt * sizeof *w->kd);
+  w->wpid = (int32_t *)malloc((size_t)py->nt * sizeof *w->wpid);
+  if (!pairs || !w->leaf || !w->wcn || !w->wn || !w->kd || !w->wpid) {
+    free(pairs);
+    sw_free_walk(w);
+    return 2;
+  }
+  {
+    int32_t np = 0;
+    for (li = 0; li < py->nleaf; li++) {
+      if (py->leaf[li].npcs == 0) continue; /* пустой лист — не участник переноса */
+      pairs[np].key = (int64_t)vindex[li];  /* ранг марша — ход луча */
+      pairs[np].key2 = 0;
+      pairs[np].li = li;
+      np++;
+    }
+    w->n = np;
+  }
+  qsort(pairs, (size_t)w->n, sizeof *pairs, sw_cmp_pair);
+  for (k = 0; k < w->n; k++) {
+    const hz_pyr_leaf *lf = &py->leaf[pairs[k].li];
+    int32_t u;
+    double cntot = 0.0;
+    w->leaf[k].line = 0; /* линия в mode 2 не существует */
+    w->leaf[k].npcs = lf->npcs;
+    w->leaf[k].first = pos;
+    for (u = 0; u < lf->npcs; u++) {
+      int32_t p = py->csr[lf->pcs_first + u];
+      double d0 = om[0] * nrm[3 * (int64_t)p] + om[1] * nrm[3 * (int64_t)p + 1] +
+                  om[2] * nrm[3 * (int64_t)p + 2];
+      double an = fabs(d0);
+      w->wcn[pos] = area[p] * an;
+      w->wn[pos] = an;
+      w->kd[pos] = kd[p];
+      w->wpid[pos] = p;
+      cntot += w->wcn[pos];
+      pos++;
+    }
+    w->leaf[k].cntot = cntot;
+  }
+  free(pairs);
+  return 0;
+}
+
 /* §841: поход строится ПРЯМО — фильтр кусковых листьев, сортировка ТОЛЬКО
  * их (полная сортировка 14.9M пустых не нужна вовсе), cntot/T сразу.
  * §843/А1508: сортировка по (линия, ход луча) — раньше порядок внутри
@@ -314,13 +375,22 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     goto done;
   }
 
-  if (o->mode == 1) {
+  if (o->mode == 1 || o->mode == 2) {
     for (d = 0; d < nd; d++) {
       int sg[3];
       for (int ax = 0; ax < 3; ax++)
         sg[ax] = (tab[d].om[ax] > 0.0) - (tab[d].om[ax] < 0.0);
-      rc = sw_build_walk(py, sg, tab[d].om, area, nrm, kd, &walks[d]);
+      if (o->mode == 2)
+        rc = sw_build_walk_march(py, tab[d].om, area, nrm, kd, vindex, bits, &walks[d]);
+      else
+        rc = sw_build_walk(py, sg, tab[d].om, area, nrm, kd, &walks[d]);
       if (rc != 0) goto done;
+      /* §845/А1525: хеш последовательности листьев — прибор против no-op:
+       * порядок mode 2 обязан отличаться от mode 1, иначе G1 ничего не меряет.
+       * Личность листа — его первый кусок (кусок сидит ровно в одном листе). */
+      for (int32_t k = 0; k < walks[d].n; k++)
+        st->order_hash = st->order_hash * 1099511628211ULL ^
+                         (uint64_t)(uint32_t)walks[d].wpid[walks[d].leaf[k].first];
     }
   } else {
     /* scalar §835: марш по всем листьям, 6 осей */
@@ -360,8 +430,10 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
           int64_t e, eend = lf->first + lf->npcs;
           int64_t pf = lf->first + 8 < nt ? lf->first + 8 : nt - 1;
           if (lf->line != prevline) { /* новая линия — тёмный вход */
-            if (run == 1) st->nline1++;
-            else if (run == 2) st->nline2++;
+            if (run == 1)
+              st->nline1++;
+            else if (run == 2)
+              st->nline2++;
             if (run > 0) st->nline++;
             run = 0;
             L = 0.0;
@@ -369,14 +441,14 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
           }
           if (o->noprop) L = 0.0;
           if (lf->cntot <= 0.0) continue; /* куски встык лучу — слоя нет */
-          st->nvisit++; /* §843: визит с слоем */
+          st->nvisit++;                   /* §843: визит с слоем */
           __builtin_prefetch(&w->leaf[k + 8 < w->n ? k + 8 : w->n - 1]);
           __builtin_prefetch(&Eprev[w->wpid[pf]]);
           for (e = lf->first; e < eend; e++) {
             p = w->wpid[e];
             double rho = o->rho < 0 ? w->kd[e] : o->rho;
             Lsurf += (o->le + rho * Eprev[p] / (2.0 * M_PI)) * w->wcn[e];
-            if (L > 0.0) st->ndep++; /* §843: доставка света */
+            if (L > 0.0) st->ndep++;     /* §843: доставка света */
             Ed[p] += w_d * L * w->wn[e]; /* непрозрачный слой: инфлюкс целиком */
           }
           Lsurf /= lf->cntot;
@@ -387,9 +459,49 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
           if (o->noprop) L = 0.0;
           run++;
         }
-        if (run == 1) st->nline1++;
-        else if (run == 2) st->nline2++;
+        if (run == 1)
+          st->nline1++;
+        else if (run == 2)
+          st->nline2++;
         if (run > 0) st->nline++;
+        lost += L * csec;
+      } else if (o->mode == 2) {
+        /* §845: ОБЪЁМНЫЙ ФРОНТ. L живёт на КЛЕТКЕ и идёт по ходу луча
+         * (марш); тёмный вход — только граница домена (L = 0 на старте
+         * направления). Куски клетки получают инфлюкс СВОЕЙ клетки:
+         * Ed_p += w·L_in·|ω·n_p|; клетка переизлучает проекционно-
+         * площадочным средним радианса своих кусков — та же формула, что
+         * в mode 1. Пустота (нет кусков в походе) L не меняет. Линии и
+         * счётчики nline* не существуют в этом режиме. */
+        const hz_sw_walk *w = &walks[d];
+        int32_t k;
+        L = 0.0;
+        for (k = 0; k < w->n; k++) {
+          const hz_sw_wleaf *lf = &w->leaf[k];
+          double Lsurf = 0.0, Lin;
+          int64_t e, eend = lf->first + lf->npcs;
+          int64_t pf = lf->first + 8 < nt ? lf->first + 8 : nt - 1;
+          if (o->noprop) L = 0.0;
+          Lin = L;
+          if (lf->cntot <= 0.0) continue; /* куски встык лучу — слоя нет */
+          st->nvisit++;
+          __builtin_prefetch(&w->leaf[k + 8 < w->n ? k + 8 : w->n - 1]);
+          __builtin_prefetch(&Eprev[w->wpid[pf]]);
+          for (e = lf->first; e < eend; e++) {
+            p = w->wpid[e];
+            double rho = o->rho < 0 ? w->kd[e] : o->rho;
+            Lsurf += (o->le + rho * Eprev[p] / (2.0 * M_PI)) * w->wcn[e];
+            if (Lin > 0.0) {
+              st->ndep++;
+              Ed[p] += w_d * Lin * w->wn[e]; /* инфлюкс клетки, доля по площади */
+            }
+          }
+          Lsurf /= lf->cntot;
+          absorbed += w_d * Lin * csec;
+          emitted += w_d * o->le * csec;
+          recycled += w_d * (Lsurf - o->le) * csec;
+          L = Lsurf;
+        }
         lost += L * csec;
       } else {
         int32_t k;

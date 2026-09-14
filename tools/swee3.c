@@ -28,6 +28,7 @@ int main(int argc, char **argv) {
   const char *path = NULL, *cmpfile = NULL;
   double scale = 1.0, le = 1.0, rho = -1.0;
   int iters = 20, lev = 6, tau0 = 0, noprop = 0, ndirs = 6, mort = 1, i, ax;
+  int mode = 1; /* §845: 2 — объёмный фронт (L на клетку, марш-порядок) */
   int nphi = 0, nmu = 0;
   double t0, t1;
   hz_objmesh m;
@@ -59,6 +60,8 @@ int main(int argc, char **argv) {
         ndirs = nphi * 100 + nmu;
       else
         ndirs = atoi(argv[i] + 5);
+    } else if (strncmp(argv[i], "mode=", 5) == 0) {
+      mode = atoi(argv[i] + 5); /* §845: 2 — объёмный фронт */
     } else if (strncmp(argv[i], "cmp=", 4) == 0)
       cmpfile = argv[i] + 4;
     else if (strncmp(argv[i], "mort=", 5) == 0)
@@ -213,7 +216,8 @@ int main(int argc, char **argv) {
       if (pcnt[i] > pmax) pmax = pcnt[i];
     }
     pavg = (double)slots / (double)m.nt;
-    printf("   КУСКИ×ЛИСТЬЯ: слотов %" PRId64 " на %d кусков — средняя кратность %.2f, максимум %d\n",
+    printf("   КУСКИ×ЛИСТЬЯ: слотов %" PRId64
+           " на %d кусков — средняя кратность %.2f, максимум %d\n",
            slots, m.nt, pavg, pmax);
     free(pcnt);
   }
@@ -225,9 +229,9 @@ int main(int argc, char **argv) {
   so.tau0 = tau0;
   so.noprop = noprop;
   so.ndirs = ndirs;
-  for (int mode = 1; mode < 2; mode++) { /* scalar §835 — только по требованию */
-    const char *mname = mode ? "col" : "scalar";
-    so.mode = mode;
+  for (int md = mode; md < mode + 1; md++) { /* один режим за прогон (§845: mode=2) */
+    const char *mname = (md == 2) ? "front" : (md ? "col" : "scalar");
+    so.mode = md;
     for (i = 0; i < m.nt; i++)
       py.pcs[i].e = 0.0f; /* режимы с чистого поля */
     t0 = now_sec();
@@ -237,7 +241,7 @@ int main(int argc, char **argv) {
     }
     t1 = now_sec();
     printf("[%s nd=%d] трафик: %.2f МБ/итерацию, %.3f с → %.2f ГБ/с эффективной\n", mname,
-           mode ? so.ndirs : 6, (double)st.traffic / 1048576.0, t1 - t0,
+           md == 0 ? 6 : so.ndirs, (double)st.traffic / 1048576.0, t1 - t0,
            (t1 - t0) > 1e-9 ? (double)st.traffic * (double)iters / (t1 - t0) / 1e9 : 0.0);
     printf("[%s] итерации E_avg:", mname);
     for (i = 0; i < iters; i++)
@@ -255,6 +259,8 @@ int main(int argc, char **argv) {
     printf("[%s] линии: %" PRId64 ", из 1 визита %.1f %%, из 2 — %.1f %%\n", mname, st.nline,
            st.nline ? 100.0 * (double)st.nline1 / (double)st.nline : 0.0,
            st.nline ? 100.0 * (double)st.nline2 / (double)st.nline : 0.0);
+    printf("[%s] хеш порядка похода: %016" PRIx64 " (§845/А1525: режимы обязаны различаться)\n",
+           mname, st.order_hash);
     if (fabs(rho - 1.0) > 1e-12 && !tau0 && !noprop) {
       double rr = rho < 0 ? 0.5 : rho;
       /* §842: точное решение МОДЕЛИ слоя: E = W·Le/(A − ρ·W/(2π)),

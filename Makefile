@@ -214,6 +214,10 @@ build/pgather: tools/pgather.c src/nstruct/pyr.c src/nstruct/pyr.h src/nstruct/s
 	src/nstruct/sweep.h src/scene_obj.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pgather.c src/nstruct/pyr.c src/nstruct/sweep.c src/scene_obj.c -lm'
 
+# ppmdiff — §848, разность двух кадров pgather (ND-лестница на кадре).
+build/ppmdiff: tools/ppmdiff.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/ppmdiff.c -lm'
+
 # psil — §149, шаг О50: сколько силуэтных рёбер переживает минимальный угловой
 # размер источника. Кроме сетки не нужно НИЧЕГО (ни сегментации, ни лестницы),
 # поэтому и собирается из одного `scene_obj.c`: замер про рёбра ВХОДА.

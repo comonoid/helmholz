@@ -3,7 +3,8 @@
  *
  * Ключи: it=N (умолчание 20), rho=F (<0 — kd материалов; 0 — НК),
  * le=F (умолчание 1), tau0 (НК: слой не взаимодействует),
- * noprop (НК: луч не переносится), dirs=6|26 (§837), lev=N,
+ * noprop (НК: луч не переносится), dirs=6|26 (§837) или dirs=NxM —
+ * продуктовая квадратура §843 (Чебышёв×Гаусс, nd = N·M), lev=N,
  * cmp=ФАЙЛ (сличение E с дампом старого пути по индексу куска).
  */
 #include <inttypes.h>
@@ -27,6 +28,7 @@ int main(int argc, char **argv) {
   const char *path = NULL, *cmpfile = NULL;
   double scale = 1.0, le = 1.0, rho = -1.0;
   int iters = 20, lev = 6, tau0 = 0, noprop = 0, ndirs = 6, mort = 1, i, ax;
+  int nphi = 0, nmu = 0;
   double t0, t1;
   hz_objmesh m;
   hz_pyr py;
@@ -50,9 +52,14 @@ int main(int argc, char **argv) {
       tau0 = 1;
     else if (strcmp(argv[i], "noprop") == 0)
       noprop = 1;
-    else if (strncmp(argv[i], "dirs=", 5) == 0)
-      ndirs = atoi(argv[i] + 5);
-    else if (strncmp(argv[i], "cmp=", 4) == 0)
+    else if (strncmp(argv[i], "dirs=", 5) == 0) {
+      /* §843: dirs=6|26 — легаси; dirs=NxM — продуктовая квадратура
+       * (Чебышёв по φ × Гаусс по μ, nd = N·M), кодируется N*100+M */
+      if (sscanf(argv[i] + 5, "%dx%d", &nphi, &nmu) == 2 && nphi > 0 && nmu > 0)
+        ndirs = nphi * 100 + nmu;
+      else
+        ndirs = atoi(argv[i] + 5);
+    } else if (strncmp(argv[i], "cmp=", 4) == 0)
       cmpfile = argv[i] + 4;
     else if (strncmp(argv[i], "mort=", 5) == 0)
       mort = atoi(argv[i] + 5);
@@ -62,13 +69,42 @@ int main(int argc, char **argv) {
       path = argv[i];
   }
   if (!path) {
-    fprintf(stderr, "use: swee3 <scene.obj> [it=N] [rho=F] [le=F] [tau0] [noprop] [dirs=6|26] "
-                    "[cmp=ФАЙЛ] [lev=N]\n");
+    fprintf(stderr, "use: swee3 <scene.obj> [it=N] [rho=F] [le=F] [tau0] [noprop] "
+                    "[dirs=6|26|NxM] [cmp=ФАЙЛ] [lev=N]\n");
     return 2;
   }
   if (hz_obj_load(&m, path, scale) != 0) {
     fprintf(stderr, "swee3: не читается %s\n", path);
     return 2;
+  }
+
+  { /* §843-G4: моменты квадратуры — Σw = 4π точно; Σw|n·ω̂| ≈ 2π (излом |μ|
+     * в нуле даёт ошибку порядка квадрата шага по μ, см. А1510) */
+    hz_sw_dir *tab = NULL;
+    int nd2 = 0;
+    static const double raw[3][3] = {{1, 2, 3}, {-5, 1, 2}, {3, 7, 11}};
+    if (hz_sw_dir_table(ndirs, &tab, &nd2) != 0) {
+      fprintf(stderr, "swee3: таблица направлений не строится (dirs=%d)\n", ndirs);
+      return 2;
+    }
+    double sw = 0.0;
+    for (i = 0; i < nd2; i++)
+      sw += tab[i].w;
+    printf("КВАДРАТУРА: dirs=%d nd=%d Σw=%.15g (4π=%.15g)", ndirs, nd2, sw,
+           4.0 * 3.14159265358979323846);
+    for (ax = 0; ax < 3; ax++) {
+      double nn = 0.0, sm = 0.0;
+      int q;
+      for (q = 0; q < 3; q++)
+        nn += raw[ax][q] * raw[ax][q];
+      nn = sqrt(nn);
+      for (i = 0; i < nd2; i++)
+        sm += tab[i].w * fabs(tab[i].om[0] * raw[ax][0] / nn + tab[i].om[1] * raw[ax][1] / nn +
+                              tab[i].om[2] * raw[ax][2] / nn);
+      printf("; Σw|cos|=%.12g", sm);
+    }
+    printf(" (2π=%.12g)\n", 2.0 * 3.14159265358979323846);
+    free(tab);
   }
 
   area = (double *)malloc((size_t)m.nt * sizeof *area);
@@ -229,6 +265,11 @@ int main(int argc, char **argv) {
       }
       fclose(f);
       rats = (double *)malloc((size_t)nold * sizeof *rats);
+      if (!rats) {
+        fprintf(stderr, "swee3: нет памяти\n");
+        free(eold);
+        return 2;
+      }
       for (q = 0; q < nold; q++) {
         int32_t tri = py.pcs[q].tri; /* сличение по ИСХОДНОМУ треугольнику (А1491) */
         double en = py.pcs[q].e;

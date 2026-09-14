@@ -81,6 +81,183 @@ static double pg_ray_tri(const double o[3], const double d[3], const double p[3]
   return t;
 }
 
+/* ---- §849: МАРШ ЛУЧА ПО ПИРАМИДЕ (bbox-CSR + 3D-DDA) --------------------- */
+
+/* bbox-CSR: для каждого листа — куски, чей bbox пересекает клетку.
+ * Владельческий CSR пирамиды для сбора ДЫРЯВ (А1543): треугольник краем
+ * в соседней клетке. Консервативен только bbox-признак. */
+typedef struct {
+  int64_t *start; /* [nleaf+1] */
+  int32_t *pids;  /* [ntotal] */
+  int64_t ntotal;
+} pg_bbox_csr;
+
+static void pg_bbox_span(const hz_pyr *py, const double cmin[3], const double cmax[3],
+                         int64_t i0[3], int64_t i1[3]) {
+  int32_t ax;
+  i0[0] = i0[1] = i0[2] = 0; /* анализатор теряет индукцию цикла по ax (FP-класс diam) */
+  i1[0] = i1[1] = i1[2] = 0;
+  for (ax = 0; ax < 3; ax++) {
+    int64_t n = ax == 0 ? py->nx : (ax == 1 ? py->ny : py->nz);
+    i0[ax] = (int64_t)((cmin[ax] - py->lo[ax]) / py->cell);
+    i1[ax] = (int64_t)((cmax[ax] - py->lo[ax]) / py->cell);
+    if (i0[ax] < 0) i0[ax] = 0;
+    if (i1[ax] >= n) i1[ax] = n - 1;
+  }
+}
+
+static int64_t pg_cell_id(const hz_pyr *py, int64_t i, int64_t j, int64_t k) {
+  return i + py->nx * (j + py->ny * k);
+}
+
+static void pg_bbox_csr_free(pg_bbox_csr *csr) {
+  free(csr->start);
+  free(csr->pids);
+  memset(csr, 0, sizeof *csr);
+}
+
+/* построение: два прохода counting-sort по всем клеткам bbox кусков */
+static int pg_bbox_csr_build(const hz_pyr *py, const double *cmin, const double *cmax,
+                             pg_bbox_csr *csr) {
+  int64_t *cnt;
+  int32_t p, li;
+  memset(csr, 0, sizeof *csr);
+  cnt = (int64_t *)calloc((size_t)py->nleaf, sizeof *cnt);
+  csr->start = (int64_t *)calloc((size_t)py->nleaf + 1, sizeof *csr->start);
+  if (!cnt || !csr->start) {
+    free(cnt);
+    pg_bbox_csr_free(csr);
+    return 2;
+  }
+  for (p = 0; p < py->nt; p++) {
+    int64_t i0[3], i1[3], i, j, k;
+    int32_t tri = py->pcs[p].tri; /* cmin/cmax не переставлялись — индекс по tri */
+    pg_bbox_span(py, cmin + 3 * (int64_t)tri, cmax + 3 * (int64_t)tri, i0, i1);
+    for (k = i0[2]; k <= i1[2]; k++)
+      for (j = i0[1]; j <= i1[1]; j++)
+        for (i = i0[0]; i <= i1[0]; i++) {
+          int32_t pos = hz_pyr_leaf_pos(py, pg_cell_id(py, i, j, k));
+          if (pos >= 0) cnt[pos]++;
+        }
+  }
+  for (li = 0; li < py->nleaf; li++)
+    csr->start[li + 1] = csr->start[li] + cnt[li];
+  csr->ntotal = csr->start[py->nleaf];
+  csr->pids = (int32_t *)malloc((size_t)(csr->ntotal > 0 ? csr->ntotal : 1) * sizeof *csr->pids);
+  if (!csr->pids) {
+    free(cnt);
+    pg_bbox_csr_free(csr);
+    return 2;
+  }
+  for (li = 0; li < py->nleaf; li++)
+    cnt[li] = csr->start[li]; /* переиспользован как курсор заполнения */
+  for (p = 0; p < py->nt; p++) {
+    int64_t i0[3], i1[3], i, j, k;
+    int32_t tri = py->pcs[p].tri;
+    pg_bbox_span(py, cmin + 3 * (int64_t)tri, cmax + 3 * (int64_t)tri, i0, i1);
+    for (k = i0[2]; k <= i1[2]; k++)
+      for (j = i0[1]; j <= i1[1]; j++)
+        for (i = i0[0]; i <= i1[0]; i++) {
+          int32_t pos = hz_pyr_leaf_pos(py, pg_cell_id(py, i, j, k));
+          if (pos >= 0) csr->pids[cnt[pos]++] = p;
+        }
+  }
+  free(cnt);
+  return 0;
+}
+
+/* DDA-сбор: ближайший кусок вдоль луча (Аманатидес—Ву; срезка А1544,
+ * многократная проверка куска безвредна — строгое «меньше», А1545,
+ * тай-брейк по порядку осей А1546). Приборы — steps/tested.
+ * Возврат куска или -1. */
+static int32_t pg_dda(const hz_pyr *py, const pg_bbox_csr *csr, const hz_objmesh *m,
+                      const double eye[3], const double rd[3], int64_t *steps, int64_t *tested) {
+  double tlo = 0.0, thi = 1e30, tcur, tbest = -1.0;
+  int64_t cell[3], stepv[3];
+  double tnext[3], tdelta[3];
+  int32_t ax, best = -1;
+  for (ax = 0; ax < 3; ax++) {
+    double n = ax == 0 ? (double)py->nx : (ax == 1 ? (double)py->ny : (double)py->nz);
+    if (fabs(rd[ax]) < 1e-30) {
+      if (eye[ax] < py->lo[ax] || eye[ax] > py->lo[ax] + n * py->cell) return -1;
+      continue;
+    }
+    {
+      double ta = (py->lo[ax] - eye[ax]) / rd[ax];
+      double tb = (py->lo[ax] + n * py->cell - eye[ax]) / rd[ax];
+      if (ta > tb) {
+        double tt = ta;
+        ta = tb;
+        tb = tt;
+      }
+      if (ta > tlo) tlo = ta;
+      if (tb < thi) thi = tb;
+    }
+  }
+  if (tlo > thi) return -1; /* мимо сцены (А1544) */
+  tcur = tlo;
+  for (ax = 0; ax < 3; ax++) {
+    int64_t nax = ax == 0 ? py->nx : (ax == 1 ? py->ny : py->nz);
+    double pos = eye[ax] + tcur * rd[ax];
+    int64_t idx = (int64_t)((pos - py->lo[ax]) / py->cell);
+    if (idx < 0) idx = 0;
+    if (idx >= nax) idx = nax - 1;
+    cell[ax] = idx;
+    if (fabs(rd[ax]) < 1e-30) {
+      tnext[ax] = 1e30;
+      tdelta[ax] = 0.0;
+      stepv[ax] = 0;
+    } else {
+      double boundary = rd[ax] > 0.0 ? py->lo[ax] + ((double)idx + 1.0) * py->cell
+                                     : py->lo[ax] + (double)idx * py->cell;
+      stepv[ax] = rd[ax] > 0.0 ? 1 : -1;
+      tdelta[ax] = py->cell / fabs(rd[ax]);
+      tnext[ax] = tcur + (boundary - pos) / rd[ax];
+    }
+  }
+  for (;;) {
+    int32_t pos = hz_pyr_leaf_pos(py, pg_cell_id(py, cell[0], cell[1], cell[2]));
+    double tn;
+    (*steps)++;
+    if (pos >= 0) {
+      int64_t s;
+      for (s = csr->start[pos]; s < csr->start[pos + 1]; s++) {
+        int32_t p = csr->pids[s];
+        double p3[3][3], tt;
+        (*tested)++;
+        hz_obj_tri(m, py->pcs[p].tri, p3);
+        tt = pg_ray_tri(eye, rd, p3);
+        if (tt >= 0.0 && (tbest < 0.0 || tt < tbest)) {
+          tbest = tt;
+          best = p;
+        }
+      }
+    }
+    /* ранний выход: вход в следующую клетку дальше ближайшего попадания */
+    tn = tnext[0];
+    if (tnext[1] < tn) tn = tnext[1];
+    if (tnext[2] < tn) tn = tnext[2];
+    if (tn > thi || (tbest >= 0.0 && tn > tbest)) break;
+    if (tnext[0] <= tnext[1] && tnext[0] <= tnext[2]) {
+      tcur = tnext[0];
+      tnext[0] += tdelta[0];
+      cell[0] += stepv[0];
+    } else if (tnext[1] <= tnext[2]) {
+      tcur = tnext[1];
+      tnext[1] += tdelta[1];
+      cell[1] += stepv[1];
+    } else {
+      tcur = tnext[2];
+      tnext[2] += tdelta[2];
+      cell[2] += stepv[2];
+    }
+    if (cell[0] < 0 || cell[1] < 0 || cell[2] < 0 || cell[0] >= py->nx || cell[1] >= py->ny ||
+        cell[2] >= py->nz)
+      break; /* страховка выхода из сетки */
+  }
+  return best;
+}
+
 int main(int argc, char **argv) {
   const char *path = NULL, *outfile = "img/pgather.ppm";
   double scale = 1.0, le = 1.0, rho = -1.0, fov = 60.0;
@@ -95,6 +272,9 @@ int main(int argc, char **argv) {
   int32_t *mtl = NULL;
   double cell, t0, t1, sw_time;
   double *lum = NULL;
+  int gather = 0; /* §849: 0 — DDA (умолчание), 1 — brute (путь верификации) */
+  pg_bbox_csr csr;
+  int64_t dda_steps = 0, dda_tested = 0;
 
   for (i = 1; i < argc; i++) {
     if (strncmp(argv[i], "lev=", 4) == 0)
@@ -121,6 +301,8 @@ int main(int argc, char **argv) {
       W = atoi(argv[i] + 2);
     else if (strncmp(argv[i], "H=", 2) == 0)
       H = atoi(argv[i] + 2);
+    else if (strncmp(argv[i], "gather=", 7) == 0)
+      gather = atoi(argv[i] + 7);
     else if (strncmp(argv[i], "k27=", 4) == 0)
       k27 = atoi(argv[i] + 4);
     else if (strncmp(argv[i], "out=", 4) == 0)
@@ -210,6 +392,10 @@ int main(int argc, char **argv) {
   }
 
   /* --- СВИП: поле E на кусках (только объёмный фронт §845/§846) --- */
+  if (gather == 0 && pg_bbox_csr_build(&py, cmin, cmax, &csr) != 0) {
+    fprintf(stderr, "pgather: bbox-CSR не построился\n");
+    return 2;
+  }
   memset(&so, 0, sizeof so);
   so.le = le;
   so.rho = rho;
@@ -399,13 +585,20 @@ int main(int argc, char **argv) {
           for (ax = 0; ax < 3; ax++)
             rd[ax] /= nn;
         }
-        for (i = 0; i < m.nt; i++) {
-          double p3[3][3], tt;
-          hz_obj_tri(&m, py.pcs[i].tri, p3);
-          tt = pg_ray_tri(eye, rd, p3);
-          if (tt >= 0.0 && (tbest < 0.0 || tt < tbest)) {
-            tbest = tt;
-            pbest = i;
+        if (gather == 0) { /* §849: марш по пирамиде */
+          int64_t st1 = 0, te1 = 0;
+          pbest = pg_dda(&py, &csr, &m, eye, rd, &st1, &te1);
+          dda_steps += st1;
+          dda_tested += te1;
+        } else {
+          for (i = 0; i < m.nt; i++) {
+            double p3[3][3], tt;
+            hz_obj_tri(&m, py.pcs[i].tri, p3);
+            tt = pg_ray_tri(eye, rd, p3);
+            if (tt >= 0.0 && (tbest < 0.0 || tt < tbest)) {
+              tbest = tt;
+              pbest = i;
+            }
           }
         }
         {
@@ -423,6 +616,11 @@ int main(int argc, char **argv) {
         }
       }
     t1 = now_sec();
+    if (gather == 0)
+      printf("DDA: клеток/луч %.1f, кусков/луч %.1f (%.2f %% от nt)\n",
+             (double)dda_steps / ((double)W * (double)H),
+             (double)dda_tested / ((double)W * (double)H),
+             100.0 * (double)dda_tested / ((double)W * (double)H) / (double)m.nt);
     printf("СБОР: лучей %d, попало %" PRId64 " (%.2f %%), средняя яркость %.4f, max %.4f, %.2f с\n",
            W * H, nhit, 100.0 * (double)nhit / ((double)W * (double)H),
            lsum / (nhit ? (double)nhit : 1.0), lmax, t1 - t0);
@@ -454,6 +652,7 @@ int main(int argc, char **argv) {
   }
 
   free(lum);
+  if (gather == 0) pg_bbox_csr_free(&csr);
   free(area);
   free(nrm);
   free(kd);

@@ -158,6 +158,9 @@ void hz_pyr_march(const hz_pyr *py, const double omega[3], int invert_x, hz_pyr_
 void hz_pyr_mark_aggr(hz_pyr *py, int32_t every);
 void hz_pyr_unmark_aggr(hz_pyr *py);
 
+/* §849: позиция листа по линейному id клетки (двоичный поиск); -1 — пусто. */
+int32_t hz_pyr_leaf_pos(const hz_pyr *py, int64_t id);
+
 void hz_pyr_free(hz_pyr *py);
 
 #endif

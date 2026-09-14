@@ -700,3 +700,11 @@ int hz_pyr_permute(hz_pyr *py, void *base, size_t elem) {
   free(buf);
   return 0;
 }
+
+/* §849: публичный поиск листа по линейному id клетки (для DDA-сбора
+ * камеры); -1 если клетка пуста. Собственно тот же двоичный поиск, что
+ * внутри марша. */
+int32_t hz_pyr_leaf_pos(const hz_pyr *py, int64_t id) {
+  if (!py || !py->leaf_id || py->nleaf <= 0) return -1;
+  return pyr_find(py->leaf_id, py->nleaf, id);
+}

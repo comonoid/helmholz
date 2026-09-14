@@ -575,10 +575,21 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
             }
           }
           Lsurf /= lf->cntot;
-          absorbed += w_d * Lin * csec;
-          emitted += w_d * o->le * csec;
-          recycled += w_d * (Lsurf - o->le) * csec;
-          L = Lsurf;
+          /* §846: ПЕРВЫЙ ПОРЯДОК — перехват трубки пластинами. Тень кусков
+           * T_tube = cntot/csec (для одной пластины точно; перекрытия не
+           * вычитаются — консервативно, А1530); прошедшая доля луча идёт
+           * сквозь клетку неперемешанной, переизлучённая — средним
+           * радиансом кусков. Стена (cntot ≥ csec): T=0 → L_out=Lsurf,
+           * как в §845; вакуум: T=1, луч не тронут. Депозиты выше уже
+           * согласованы: их сумма = (1−T)·входной поток трубки. */
+          {
+            double T_cell = 1.0 - lf->cntot / csec;
+            if (T_cell < 0.0) T_cell = 0.0;
+            absorbed += w_d * (1.0 - T_cell) * Lin * csec;
+            emitted += w_d * o->le * (1.0 - T_cell) * csec;
+            recycled += w_d * (Lsurf - o->le) * (1.0 - T_cell) * csec;
+            L = T_cell * Lin + (1.0 - T_cell) * Lsurf;
+          }
         }
         lost += L * csec;
       } else {

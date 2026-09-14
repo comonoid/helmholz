@@ -208,6 +208,12 @@ build/swee3: tools/swee3.c src/nstruct/pyr.c src/nstruct/pyr.h src/nstruct/sweep
 	src/nstruct/sweep.h src/scene_obj.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/swee3.c src/nstruct/pyr.c src/nstruct/sweep.c src/scene_obj.c -lm'
 
+# pgather — §847, СБОР ПО ПИКСЕЛЮ на новом носителе: свип mode=2 + камера;
+# картинка в img/ (правило проекта).
+build/pgather: tools/pgather.c src/nstruct/pyr.c src/nstruct/pyr.h src/nstruct/sweep.c \
+	src/nstruct/sweep.h src/scene_obj.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pgather.c src/nstruct/pyr.c src/nstruct/sweep.c src/scene_obj.c -lm'
+
 # psil — §149, шаг О50: сколько силуэтных рёбер переживает минимальный угловой
 # размер источника. Кроме сетки не нужно НИЧЕГО (ни сегментации, ни лестницы),
 # поэтому и собирается из одного `scene_obj.c`: замер про рёбра ВХОДА.

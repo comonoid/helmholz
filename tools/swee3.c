@@ -30,6 +30,7 @@ int main(int argc, char **argv) {
   int iters = 20, lev = 6, tau0 = 0, noprop = 0, ndirs = 6, mort = 1, i, ax;
   int mode = 1;  /* §845: 2 — объёмный фронт (L на клетку, марш-порядок) */
   int build = 0; /* §845-в: строитель похода (1 — прямой сортировочный) */
+  int vc = 1;    /* §851: компоненты пустоты по умолчанию включены */
   int nphi = 0, nmu = 0;
   double t0, t1;
   hz_objmesh m;
@@ -63,6 +64,8 @@ int main(int argc, char **argv) {
         ndirs = atoi(argv[i] + 5);
     } else if (strncmp(argv[i], "build=", 6) == 0) {
       build = atoi(argv[i] + 6); /* §845-в: 1 — прямой сортировочный строитель */
+    } else if (strncmp(argv[i], "vc=", 3) == 0) {
+      vc = atoi(argv[i] + 3); /* §851: 0 — старая однокомпонентная логика */
     } else if (strncmp(argv[i], "mode=", 5) == 0) {
       mode = atoi(argv[i] + 5); /* §845: 2 — объёмный фронт */
     } else if (strncmp(argv[i], "cmp=", 4) == 0)
@@ -227,6 +230,7 @@ int main(int argc, char **argv) {
 
   memset(&so, 0, sizeof so);
   so.build = build;
+  so.vc = vc;
   so.le = le;
   so.rho = rho;
   so.iters = iters;

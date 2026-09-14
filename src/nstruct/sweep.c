@@ -184,6 +184,7 @@ typedef struct {
   int32_t npcs;
   int64_t first; /* офсет в wcn/wn/kd/wpid */
   int64_t line;  /* линия; смена — тёмный вход луча */
+  int64_t cid;   /* §851: линейный id клетки листа (метки компонент) */
   double cntot;  /* Σ area·|ω·n| по кускам листа */
 } hz_sw_wleaf;
 
@@ -250,6 +251,7 @@ static int sw_walk_assemble(const hz_pyr *py, const double *om, const double *ar
     int32_t u;
     double cntot = 0.0;
     w->leaf[k].line = 0; /* линия в mode 2 не существует */
+    w->leaf[k].cid = py->leaf_id[lis[k]];
     w->leaf[k].npcs = lf->npcs;
     w->leaf[k].first = pos;
     for (u = 0; u < lf->npcs; u++) {
@@ -414,6 +416,132 @@ static int sw_build_walk(const hz_pyr *py, const int sg[3], const double *om, co
   free(pairs);
   return 0;
 }
+/* §851: ЛУЧЕВОЙ СВИП ОДНОГО НАПРАВЛЕНИЯ. Трубки = линии сетки вдоль om:
+ * стартуют тёмными (L=0) на входных гранях сетки, шаг DDA по клеткам;
+ * пустота транслирует L точно (свободный пробег — точное решение на
+ * вакууме); в клетке с кусками: депозит w·L·|cos| каждому куску,
+ * перехват T = max(0,1−cntot/csec), переизлучение Lsurf (А1530/А1531).
+ * Латеральная изоляция трубок возникает сама: линия стартует тёмной и
+ * умирает на выходе — «компоненты пустоты» не нужны как разметка
+ * (А1551). stamp исключает двойные визиты клетки линиями с общей
+ * входной гранью. */
+typedef struct {
+  double absorbed, emitted, recycled, lost;
+  int64_t nvisit, ndep, ncell;
+} sw_line_acc;
+
+static void sw_line_sweep_dir(const hz_pyr *py, const double om[3], double w_d, double le,
+                              const double *kd, const double *area, const double *nrm,
+                              const double *Eprev, double *Ed, double csec, double rho_ovr,
+                              int noprop, int32_t *stamp, int32_t mark, sw_line_acc *acc) {
+  int32_t ax;
+  int64_t f[3];
+  for (ax = 0; ax < 3; ax++) {
+    int64_t n = ax == 0 ? py->nx : (ax == 1 ? py->ny : py->nz);
+    if (fabs(om[ax]) < 1e-30) {
+      f[ax] = -1; /* ось не входная */
+      continue;
+    }
+    f[ax] = om[ax] > 0.0 ? 0 : n - 1;
+  }
+  for (ax = 0; ax < 3; ax++) {
+    int64_t b1, b2;
+    int32_t bxA, bxB;
+    int64_t nb1, nb2;
+    if (f[ax] < 0) continue;
+    bxA = (ax + 1) % 3;
+    bxB = (ax + 2) % 3;
+    nb1 = bxA == 0 ? py->nx : (bxA == 1 ? py->ny : py->nz);
+    nb2 = bxB == 0 ? py->nx : (bxB == 1 ? py->ny : py->nz);
+    for (b1 = 0; b1 < nb1; b1++)
+      for (b2 = 0; b2 < nb2; b2++) {
+        int64_t cc[3], cell[3], stepv[3];
+        double tmax[3], tdelta[3], L = 0.0;
+        int32_t a2;
+        cc[ax] = f[ax];
+        cc[bxA] = b1;
+        cc[bxB] = b2;
+        cell[0] = cc[0];
+        cell[1] = cc[1];
+        cell[2] = cc[2];
+        if (stamp[cell[0] + py->nx * (cell[1] + py->ny * cell[2])] == mark) continue;
+        for (a2 = 0; a2 < 3; a2++) {
+          if (fabs(om[a2]) < 1e-30) {
+            tmax[a2] = 1e30;
+            tdelta[a2] = 0.0;
+            stepv[a2] = 0;
+          } else {
+            double boundary = om[a2] > 0.0 ? py->lo[a2] + ((double)cell[a2] + 1.0) * py->cell
+                                           : py->lo[a2] + (double)cell[a2] * py->cell;
+            double pos = py->lo[a2] + ((double)cell[a2] + 0.5) * py->cell;
+            stepv[a2] = om[a2] > 0.0 ? 1 : -1;
+            tdelta[a2] = py->cell / fabs(om[a2]);
+            tmax[a2] = (boundary - pos) / om[a2];
+          }
+        }
+        for (;;) {
+          int64_t id = cell[0] + py->nx * (cell[1] + py->ny * cell[2]);
+          int32_t pos = hz_pyr_leaf_pos(py, id);
+          double tn;
+          acc->ncell++;
+          stamp[id] = mark;
+          if (pos >= 0) {
+            const hz_pyr_leaf *lf = &py->leaf[pos];
+            double Lsurf = 0.0, cntot = 0.0, T_cell;
+            int32_t u;
+            for (u = 0; u < lf->npcs; u++) {
+              int32_t p = py->csr[lf->pcs_first + u];
+              double d0 = om[0] * nrm[3 * (int64_t)p] + om[1] * nrm[3 * (int64_t)p + 1] +
+                          om[2] * nrm[3 * (int64_t)p + 2];
+              cntot += area[p] * fabs(d0);
+            }
+            if (cntot > 0.0) {
+              acc->nvisit++;
+              for (u = 0; u < lf->npcs; u++) {
+                int32_t p = py->csr[lf->pcs_first + u];
+                double d0 = om[0] * nrm[3 * (int64_t)p] + om[1] * nrm[3 * (int64_t)p + 1] +
+                            om[2] * nrm[3 * (int64_t)p + 2];
+                double an = fabs(d0);
+                double rho = rho_ovr < 0 ? kd[p] : rho_ovr;
+                Lsurf += (le + rho * Eprev[p] / (2.0 * M_PI)) * area[p] * an;
+                if (L > 0.0) {
+                  acc->ndep++;
+                  Ed[p] += w_d * L * an;
+                }
+              }
+              Lsurf /= cntot;
+              T_cell = 1.0 - cntot / csec;
+              if (T_cell < 0.0) T_cell = 0.0;
+              acc->absorbed += w_d * (1.0 - T_cell) * L * csec;
+              acc->emitted += w_d * le * (1.0 - T_cell) * csec;
+              acc->recycled += w_d * (Lsurf - le) * (1.0 - T_cell) * csec;
+              L = T_cell * L + (1.0 - T_cell) * Lsurf;
+              if (noprop) L = 0.0; /* НК: фронт не переносится */
+            }
+          }
+          tn = tmax[0];
+          if (tmax[1] < tn) tn = tmax[1];
+          if (tmax[2] < tn) tn = tmax[2];
+          if (tn > 1e29) break;
+          if (tmax[0] <= tmax[1] && tmax[0] <= tmax[2]) {
+            tmax[0] += tdelta[0];
+            cell[0] += stepv[0];
+          } else if (tmax[1] <= tmax[2]) {
+            tmax[1] += tdelta[1];
+            cell[1] += stepv[1];
+          } else {
+            tmax[2] += tdelta[2];
+            cell[2] += stepv[2];
+          }
+          if (cell[0] < 0 || cell[1] < 0 || cell[2] < 0 || cell[0] >= py->nx || cell[1] >= py->ny ||
+              cell[2] >= py->nz)
+            break;
+        }
+        if (noprop) L = 0.0;
+        acc->lost += L * csec;
+      }
+  }
+}
 
 int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, const double *kd,
               const hz_sw_opts *o, hz_sw_stat *st, double *e_hist) {
@@ -422,6 +550,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   uint64_t *bits = NULL;
   hz_sw_walk *walks = NULL;
   hz_sw_dir *tab = NULL;
+  int32_t *stampv = NULL; /* §851: штампы визитов линий [ncells] */
   int nd = 0, d, it, rc = 0;
   double csec;
 
@@ -448,7 +577,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     goto done;
   }
 
-  if (o->mode == 1 || o->mode == 2) {
+  if (o->mode == 1 || (o->mode == 2 && !o->vc)) {
     sw_inv_acc = 0;
     for (d = 0; d < nd; d++) {
       int sg[3];
@@ -485,6 +614,19 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       order[vindex[li] - 1] = li;
   }
 
+  /* §851: ЛУЧЕВОЙ СВИП (vc=1): трубки = линии сетки, см. sw_line_sweep_dir.
+   * Латеральная изоляция и «стороны» возникают сами — разметка компонент
+   * не нужна (упрощение против первой редакции плана). Штампы исключают
+   * двойные визиты клетки. */
+  if (o->mode == 2 && o->vc) {
+    int64_t ncells = (int64_t)py->nx * py->ny * py->nz;
+    stampv = (int32_t *)calloc((size_t)ncells, sizeof *stampv);
+    if (!stampv) {
+      rc = 2;
+      goto done;
+    }
+  }
+
   for (it = 0; it < o->iters; it++) {
     double emitted = 0, absorbed = 0, lost = 0, recycled = 0, e_sum = 0, area_sum = 0;
     int32_t p;
@@ -496,6 +638,22 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       double w_d = tab[d].w;
       if (o->mode == 0 && o->ndirs == 26)
         w_d = HZ_SW_W; /* §835-паритет: скалярный путь нёс вес 4π/26 на шести осях */
+      if (o->mode == 2 && o->vc) {
+        /* §851: ЛУЧЕВОЙ СВИП — трубки-линии сетки, старт тёмный на
+         * входных гранях; латеральная изоляция и стороны возникают сами */
+        sw_line_acc la = {0, 0, 0, 0, 0, 0, 0};
+        int32_t mark = (int32_t)(it * (nd + 1) + d + 1);
+        sw_line_sweep_dir(py, om, w_d, o->le, kd, area, nrm, Eprev, Ed, csec, o->rho, o->noprop,
+                          stampv, mark, &la);
+        absorbed += la.absorbed;
+        emitted += la.emitted;
+        recycled += la.recycled;
+        lost += la.lost;
+        st->nvisit += la.nvisit;
+        st->ndep += la.ndep;
+        st->traffic = la.ncell * 40; /* §851: грубая модель трафика лучевого свипа */
+        continue;
+      }
       double L = 0.0;
       int64_t prevline = -1;
       if (o->mode == 1) {
@@ -544,13 +702,9 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         if (run > 0) st->nline++;
         lost += L * csec;
       } else if (o->mode == 2) {
-        /* §845: ОБЪЁМНЫЙ ФРОНТ. L живёт на КЛЕТКЕ и идёт по ходу луча
-         * (марш); тёмный вход — только граница домена (L = 0 на старте
-         * направления). Куски клетки получают инфлюкс СВОЕЙ клетки:
-         * Ed_p += w·L_in·|ω·n_p|; клетка переизлучает проекционно-
-         * площадочным средним радианса своих кусков — та же формула, что
-         * в mode 1. Пустота (нет кусков в походе) L не меняет. Линии и
-         * счётчики nline* не существуют в этом режиме. */
+        /* §845/§846 (vc=0): объёмный фронт по кусковым листьям, L несётся
+         * скаляром (однокомпонентная логика — только для сличения; А1551:
+         * пересвечивает тонкие оболочки, латерально перемешивает). */
         const hz_sw_walk *w = &walks[d];
         int32_t k;
         L = 0.0;

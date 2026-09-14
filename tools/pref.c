@@ -440,6 +440,7 @@ int main(int argc, char **argv) {
   so.ndirs = 26;
   so.mode = 2;
   so.build = 1;
+  so.vc = 1;
   for (i = 0; i < m.nt; i++)
     py.pcs[i].e = 0.0f;
   if (hz_sw_run(&py, m.nt, area, nrm, kd, &so, &st, NULL) != 0) {

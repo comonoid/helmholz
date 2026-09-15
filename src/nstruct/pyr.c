@@ -59,6 +59,12 @@ static int pyr_cmp_i64(const void *a, const void *b) {
 }
 
 /* двоичный поиск id в отсортированном массиве; -1 если нет */
+static int32_t pyr_find(const int64_t *a, int32_t n, int64_t x);
+
+/* вперёд: размеры сетки уровня и поиск узла — нужны hz_pyr_set_lp (§852) */
+static void pyr_level_dims(const hz_pyr *py, int32_t l, int64_t d[3]);
+static int32_t pyr_find_node(const hz_pyr_node *a, int32_t n, int64_t x);
+
 static int32_t pyr_find(const int64_t *a, int32_t n, int64_t x) {
   int32_t lo = 0, hi = n;
   while (lo < hi) {
@@ -353,10 +359,12 @@ void hz_pyr_verify(const hz_pyr *py, int32_t nt, const double *tri_min, const do
   memset(vd, 0, sizeof *vd);
   if (!py || !py->pcs || !py->leaf || !py->leaf_id) return;
 
-  /* (а) владение: пересчёт по центроиду … */
+  /* (а) владение: пересчёт по центроиду ИСХОДНОГО треугольника куска
+   * (pcs[t].tri — после Morton слот ≠ треугольник, А1491) … */
   for (t = 0; t < nt && t < py->nt; t++) {
+    int32_t tri = py->pcs[t].tri;
     int64_t id =
-        hz_pyr_leaf_index(py->lo, py->cell, py->nx, py->ny, py->nz, centroid + 3 * (int64_t)t);
+        hz_pyr_leaf_index(py->lo, py->cell, py->nx, py->ny, py->nz, centroid + 3 * (int64_t)tri);
     int32_t want = pyr_find(py->leaf_id, py->nleaf, id);
     if (want != py->pcs[t].cell) vd->d_cell++;
   }
@@ -369,10 +377,11 @@ void hz_pyr_verify(const hz_pyr *py, int32_t nt, const double *tri_min, const do
     }
   }
 
-  /* (б) независимый второй проход bbox-ов */
+  /* (б) независимый второй проход bbox-ов (по исходному треугольнику) */
   for (t = 0; t < nt && t < py->nt; t++) {
     int64_t x[2], y[2], z[2], ix, iy, iz;
-    pyr_bbox_span(py, t, tri_min, tri_max, x, y, z);
+    int32_t tri = py->pcs[t].tri;
+    pyr_bbox_span(py, tri, tri_min, tri_max, x, y, z);
     for (iz = z[0]; iz <= z[1]; iz++)
       for (iy = y[0]; iy <= y[1]; iy++)
         for (ix = x[0]; ix <= x[1]; ix++) {
@@ -386,6 +395,81 @@ void hz_pyr_verify(const hz_pyr *py, int32_t nt, const double *tri_min, const do
     if (py->pcs[t].cell < 0 || py->pcs[t].cell >= py->nleaf) vd->d_empty++;
 }
 
+/* §852 (А1567): per-node max ℓ_p одним подъёмом. lp — [nt] в порядке
+ * ИСХОДНЫХ треугольников (кусок p смотрит треугольник py->pcs[p].tri).
+ * Куски с ℓ_p выше самого крупного уровня ОБРАБАТЫВАЮТСЯ НА ЛИСТЕ
+ * (ℓ_p := 0) — агрегатов нет (А1568), но счётчик обязателен: молчаливый
+ * клэмп вверх = скрытая агрегация. Вызывать ПОСЛЕ hz_pyr_morton. */
+int hz_pyr_set_lp(hz_pyr *py, const uint8_t *lp, int32_t *nup) {
+  int32_t l, li, u, up = 0;
+  if (!py || !lp || py->nt <= 0 || py->nleaf <= 0) return 1;
+  if (py->nlev > 254) return 1; /* ℓ_p живёт в байте; уровней столько не бывает */
+
+  /* лист: max ℓ_p кусков клетки; недостижимые уровни — на лист и в счётчик */
+  py->leaf_lp = (uint8_t *)malloc((size_t)py->nleaf);
+  if (!py->leaf_lp) return 2;
+  for (li = 0; li < py->nleaf; li++)
+    py->leaf_lp[li] = 255; /* нет кусков — не материален ни на каком уровне */
+  for (u = 0; u < py->nt; u++) {
+    uint8_t v = lp[py->pcs[u].tri]; /* ℓ_p исходного треугольника этого слота */
+    if (v > (uint8_t)py->nlev) {    /* клэмп ВВЕРХ только как явный отказ-на-лист (А1568) */
+      v = 0;
+      up++;
+    }
+    li = py->pcs[u].cell;
+    if (li < 0 || li >= py->nleaf) return 1;
+    if (py->leaf_lp[li] == 255 || v > py->leaf_lp[li]) py->leaf_lp[li] = v;
+  }
+  /* подъём: узел уровня ℓ = max по существующим детям; пропуски (ПУСТ)
+   * вклада не дают — состояние узла производное от поддерева */
+  py->lev_lp = (uint8_t **)calloc((size_t)py->nlev, sizeof *py->lev_lp);
+  if (!py->lev_lp) return 2;
+  for (l = 0; l < py->nlev; l++) {
+    int64_t pd[3], cd[3];
+    uint8_t *arr = (uint8_t *)malloc((size_t)py->nlev_nodes[l]);
+    if (!arr) return 2;
+    py->lev_lp[l] = arr;
+    if (l == 0) {
+      cd[0] = py->nx;
+      cd[1] = py->ny;
+      cd[2] = py->nz;
+    } else
+      pyr_level_dims(py, l - 1, cd);
+    pyr_level_dims(py, l, pd);
+    for (u = 0; u < py->nlev_nodes[l]; u++) {
+      int64_t kid = py->lev[l][u].id;
+      int64_t ci[3];
+      uint8_t m = 255;
+      int cx, cy, cz;
+      ci[0] = kid % pd[0];
+      ci[1] = (kid / pd[0]) % pd[1];
+      ci[2] = kid / (pd[0] * pd[1]);
+      for (cz = 0; cz < 2; cz++)
+        for (cy = 0; cy < 2; cy++)
+          for (cx = 0; cx < 2; cx++) {
+            int64_t id = 2 * ci[0] + cx + cd[0] * (2 * ci[1] + cy + cd[1] * (2 * ci[2] + cz));
+            int32_t found;
+            uint8_t v;
+            if (2 * ci[0] + cx >= cd[0] || 2 * ci[1] + cy >= cd[1] || 2 * ci[2] + cz >= cd[2])
+              continue; /* нечётная сетка: ребёнка за границей нет (А1567) */
+            if (l == 0) {
+              found = pyr_find(py->leaf_id, py->nleaf, id);
+              if (found < 0) continue; /* ПУСТ-ребёнок: вклада нет */
+              v = py->leaf_lp[found];
+            } else {
+              found = pyr_find_node(py->lev[l - 1], py->nlev_nodes[l - 1], id);
+              if (found < 0) continue;
+              v = py->lev_lp[l - 1][found];
+            }
+            if (v != 255 && (m == 255 || v > m)) m = v;
+          }
+      arr[u] = m;
+    }
+  }
+  if (nup) *nup = up;
+  return 0;
+}
+
 void hz_pyr_free(hz_pyr *py) {
   int32_t l;
   if (!py) return;
@@ -393,6 +477,12 @@ void hz_pyr_free(hz_pyr *py) {
   free(py->csr);
   free(py->leaf_id);
   free(py->leaf);
+  free(py->leaf_lp);
+  if (py->lev_lp) {
+    for (l = 0; l < py->nlev; l++)
+      free(py->lev_lp[l]);
+    free(py->lev_lp);
+  }
   free(py->perm);
   for (l = 0; l < py->nlev; l++)
     free(py->lev[l]);
@@ -652,6 +742,7 @@ int hz_pyr_morton(hz_pyr *py) {
   fill = (int32_t *)malloc((size_t)(py->nleaf + 1) * sizeof *fill);
   if (!py->csr || !fill) {
     free(cnt);
+    free(fill); /* fill мог выделиться при отказе соседнего malloc */
     hz_pyr_free(py);
     return 2;
   }
@@ -707,4 +798,13 @@ int hz_pyr_permute(hz_pyr *py, void *base, size_t elem) {
 int32_t hz_pyr_leaf_pos(const hz_pyr *py, int64_t id) {
   if (!py || !py->leaf_id || py->nleaf <= 0) return -1;
   return pyr_find(py->leaf_id, py->nleaf, id);
+}
+
+int32_t hz_pyr_node_pos(const hz_pyr *py, int32_t l, int64_t id) {
+  if (!py || l < 0 || l >= py->nlev) return -1;
+  return pyr_find_node(py->lev[l], py->nlev_nodes[l], id);
+}
+
+void hz_pyr_level_dims(const hz_pyr *py, int32_t l, int64_t d[3]) {
+  pyr_level_dims(py, l, d);
 }

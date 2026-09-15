@@ -380,6 +380,17 @@ int main(int argc, char **argv) {
     }
     cell = maxdim / (double)(1 << lev);
   }
+  { /* §852: вершины треугольников для точного пересечения лучевого свипа */
+    double *tv9 = (double *)malloc((size_t)m.nt * 9 * sizeof *tv9);
+    int32_t ti;
+    if (!tv9) { fprintf(stderr, "нет памяти на trivert\n"); return 2; }
+    for (ti = 0; ti < m.nt; ti++) {
+      double pp[3][3], aa;
+      hz_obj_tri(&m, ti, pp);
+      for (aa = 0; aa < 9; aa++) tv9[9 * (int64_t)ti + (int32_t)aa] = pp[0][aa];
+    }
+    so.trivert = tv9;
+  }
   if (hz_pyr_build(&py, m.nt, cmin, cmax, cent, mtl, m.lo, m.hi, cell) != 0) {
     fprintf(stderr, "pgather: пирамида не построилась\n");
     return 2;

@@ -31,6 +31,9 @@ int main(int argc, char **argv) {
   int mode = 1;  /* §845: 2 — объёмный фронт (L на клетку, марш-порядок) */
   int build = 0; /* §845-в: строитель похода (1 — прямой сортировочный) */
   int vc = 1;    /* §851: компоненты пустоты по умолчанию включены */
+  int lp = 0;    /* §852: LOD-уровень кусков ℓ_p (единый; лестница G1) */
+  int xint = 0;  /* §852/G1(a): 1 — всегда точное пересечение */
+  int screw = 0; /* НК А1572: скрестить куски с шагом screw (детекторы>0) */
   int nphi = 0, nmu = 0;
   double t0, t1;
   hz_objmesh m;
@@ -66,6 +69,12 @@ int main(int argc, char **argv) {
       build = atoi(argv[i] + 6); /* §845-в: 1 — прямой сортировочный строитель */
     } else if (strncmp(argv[i], "vc=", 3) == 0) {
       vc = atoi(argv[i] + 3); /* §851: 0 — старая однокомпонентная логика */
+    } else if (strncmp(argv[i], "lp=", 3) == 0) {
+      lp = atoi(argv[i] + 3); /* §852: ℓ_p кусков */
+    } else if (strncmp(argv[i], "xint=", 5) == 0) {
+      xint = atoi(argv[i] + 5); /* §852/G1(a): точное пересечение везде */
+    } else if (strncmp(argv[i], "screw=", 6) == 0) {
+      screw = atoi(argv[i] + 6); /* НК А1572 */
     } else if (strncmp(argv[i], "mode=", 5) == 0) {
       mode = atoi(argv[i] + 5); /* §845: 2 — объёмный фронт */
     } else if (strncmp(argv[i], "cmp=", 4) == 0)
@@ -168,6 +177,42 @@ int main(int argc, char **argv) {
     }
     cell = maxdim / (double)(1 << lev);
   }
+  memset(&so, 0, sizeof so); /* рано: дальше блоки §852 заполняют so сами */
+  {                          /* §852: вершины и bbox-ы треугольников (в порядке ИСХОДНЫХ) — точное
+                              * пересечение лучевого свипа и предикат А1566 */
+    double *tv9 = (double *)malloc((size_t)m.nt * 9 * sizeof *tv9);
+    double *tb6 = (double *)malloc((size_t)m.nt * 6 * sizeof *tb6);
+    uint8_t *lparr = (uint8_t *)malloc((size_t)m.nt);
+    int32_t ti;
+    if (!tv9 || !tb6 || !lparr) {
+      fprintf(stderr, "нет памяти на trivert/tribox/lp\n");
+      return 2;
+    }
+    for (ti = 0; ti < m.nt; ti++) {
+      double pp[3][3];
+      int aa;
+      hz_obj_tri(&m, ti, pp);
+      for (int v = 0; v < 3; v++)
+        for (aa = 0; aa < 3; aa++)
+          tv9[9 * (int64_t)ti + 3 * v + aa] = pp[v][aa];
+      for (ax = 0; ax < 3; ax++) {
+        double lo = pp[0][ax], hi = pp[0][ax];
+        for (int v = 1; v < 3; v++) {
+          if (pp[v][ax] < lo) lo = pp[v][ax];
+          if (pp[v][ax] > hi) hi = pp[v][ax];
+        }
+        tb6[6 * (int64_t)ti + ax] = lo;
+        tb6[6 * (int64_t)ti + 3 + ax] = hi;
+      }
+      lparr[ti] = (uint8_t)lp; /* §852: единый ℓ_p прогоном (лестница G1);
+                                * поэлементная политика §844 — отдельно */
+    }
+    so.trivert = tv9;
+    so.tribox = tb6;
+    so.domhi = m.hi;
+    so.lp = lparr;
+    so.xint = xint;
+  }
   if (hz_pyr_build(&py, m.nt, cmin, cmax, cent, mtl, m.lo, m.hi, cell) != 0) {
     fprintf(stderr, "swee3: пирамида не построилась\n");
     return 2;
@@ -197,6 +242,28 @@ int main(int argc, char **argv) {
       }
       printf("ИНВАРИАНТ: max|area[i]-tri_area(pcs[i].tri)| = %.3g на куске %d\n", dmax, imax);
     }
+  }
+  { /* §852/А1567: per-node max ℓ_p одним подъёмом (после Morton — CSR свежий) */
+    int32_t nup = 0;
+    if (hz_pyr_set_lp(&py, (const uint8_t *)so.lp, &nup) != 0) {
+      fprintf(stderr, "swee3: per-node max lp не построился\n");
+      return 2;
+    }
+    /* А1568: клэмп вверх — отказ с печатаемым счётчиком (обработка на листе) */
+    printf("LOD: lp=%d, кусков с ℓ_p выше доступного уровня (обработаны на листе): %d\n", lp,
+           (int)nup);
+  }
+  if (screw) { /* НК А1572: калибровка детекторов — при screw они ОБЯЗАНЫ
+                * сработать (d_cell/d_empty > 0) */
+    int32_t ns = hz_pyr_screw(&py, (int32_t)screw);
+    printf("НК: screw=%d — скрещено %d кусков\n", screw, (int)ns);
+  }
+  { /* НК А1572: детекторы пирамиды; на ЧИСТОМ прогоне — все нули */
+    hz_pyr_verdict vd;
+    hz_pyr_verify(&py, m.nt, cmin, cmax, cent, &vd);
+    printf("НК hz_pyr_verify: d_cell=%" PRId64 " d_csr=%" PRId64 " d_bbox=%" PRId64
+           " d_empty=%" PRId64 " (чистый прогон: все нули; при screw — ненули)\n",
+           vd.d_cell, vd.d_csr, vd.d_bbox, vd.d_empty);
   }
 
   printf("== swee3 %s: nt=%d клетка %.4g м, it=%d le=%.3g rho=%s dirs=%d%s%s\n", path, m.nt, cell,
@@ -228,8 +295,7 @@ int main(int argc, char **argv) {
     free(pcnt);
   }
 
-  memset(&so, 0, sizeof so);
-  so.build = build;
+  so.build = build; /* so уже обнулён и заполнен §852-блоками выше */
   so.vc = vc;
   so.le = le;
   so.rho = rho;
@@ -238,7 +304,7 @@ int main(int argc, char **argv) {
   so.noprop = noprop;
   so.ndirs = ndirs;
   for (int md = mode; md < mode + 1; md++) { /* один режим за прогон (§845: mode=2) */
-    const char *mname = (md == 2) ? "front" : (md ? "col" : "scalar");
+    const char *mname = (md == 3) ? "pyrfront" : ((md == 2) ? "front" : (md ? "col" : "scalar"));
     so.mode = md;
     for (i = 0; i < m.nt; i++)
       py.pcs[i].e = 0.0f; /* режимы с чистого поля */
@@ -271,6 +337,18 @@ int main(int argc, char **argv) {
            mname, st.order_hash);
     printf("[%s] инверсии марша: %" PRId64 " (§845-бис: 0 ожидается на целочисленных)\n", mname,
            st.ninv);
+    if (md == 3) { /* §852: приборы фронта */
+      double vfrac = st.ncellbase > 0 ? 1.0 - (double)st.ncellfront / (double)st.ncellbase : 0.0;
+      printf("[pyrfront] G6 нарушений: %" PRId64 " (чистый прогон: 0); спусков %" PRId64
+             ", материальных событий %" PRId64 ", ПУСТ-прыжков %" PRId64 "\n",
+             st.g6viol, st.ndesc, st.nmat, st.njump);
+      printf("[pyrfront] прибор пустоты (А1569): клеток полным DDA %" PRId64
+             ", посещено фронтом %" PRId64 " — пустых %.1f %% (предсказание > 90 %%)\n",
+             st.ncellbase, st.ncellfront, 100.0 * vfrac);
+      printf("[pyrfront] штамп А1564: пресечено повторных депозитов %" PRId64
+             "; сегментов за границей домена %" PRId64 "\n",
+             st.nstamp, st.nlostseg);
+    }
     if (fabs(rho - 1.0) > 1e-12 && !tau0 && !noprop) {
       double rr = rho < 0 ? 0.5 : rho;
       /* §842: точное решение МОДЕЛИ слоя: E = W·Le/(A − ρ·W/(2π)),
@@ -349,6 +427,9 @@ int main(int argc, char **argv) {
   free(cmax);
   free(mtl);
   free(hist);
+  free((void *)so.trivert);
+  free((void *)so.tribox);
+  free((void *)so.lp);
   hz_pyr_free(&py);
   hz_obj_free(&m);
   return 0;

@@ -5,6 +5,7 @@
 #include "sweep.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -416,24 +417,56 @@ static int sw_build_walk(const hz_pyr *py, const int sg[3], const double *om, co
   free(pairs);
   return 0;
 }
-/* §851: ЛУЧЕВОЙ СВИП ОДНОГО НАПРАВЛЕНИЯ. Трубки = линии сетки вдоль om:
- * стартуют тёмными (L=0) на входных гранях сетки, шаг DDA по клеткам;
- * пустота транслирует L точно (свободный пробег — точное решение на
- * вакууме); в клетке с кусками: депозит w·L·|cos| каждому куску,
- * перехват T = max(0,1−cntot/csec), переизлучение Lsurf (А1530/А1531).
- * Латеральная изоляция трубок возникает сама: линия стартует тёмной и
- * умирает на выходе — «компоненты пустоты» не нужны как разметка
- * (А1551). stamp исключает двойные визиты клетки линиями с общей
- * входной гранью. */
+/* §852: ЛУЧЕВОЙ СВИП ОДНОГО НАПРАВЛЕНИЯ С ТОЧНЫМ ПЕРЕСЕЧЕНИЕМ. Трубки =
+ * линии сетки вдоль om; стартуют тёмными на входных гранях; пустота
+ * транслирует L точно; в клетке с кусками — БЛИЖАЙШЕЕ пересечение линии
+ * с треугольником на отрезке [s_enter, s_exit]: депонирует свой инфлюкс
+ * и переизлучает СВОЙ радианс. Непрозрачность тоньше/толще клетки
+ * выражается геометрией — клеточных коэффициентов нет (А1557). */
 typedef struct {
   double absorbed, emitted, recycled, lost;
   int64_t nvisit, ndep, ncell;
 } sw_line_acc;
 
+/* Мёллер—Трумбор: t пересечения луча (o,d) с треугольником tv[9]; RAW —
+ * без отсечения позади луча (§852: стенка на границе домена даёт t<0 от
+ * центра входной клетки), фильтр — отрезком марша */
+static double sw_ray_tri_raw(const double o[3], const double d[3], const double tv[9]) {
+  double e1[3], e2[3], p[3], t[3], q[3], det, uu, vv, tt;
+  int ax;
+  for (ax = 0; ax < 3; ax++) {
+    e1[ax] = tv[3 + ax] - tv[ax];
+    e2[ax] = tv[6 + ax] - tv[ax];
+    t[ax] = o[ax] - tv[ax];
+  }
+  p[0] = d[1] * e2[2] - d[2] * e2[1];
+  p[1] = d[2] * e2[0] - d[0] * e2[2];
+  p[2] = d[0] * e2[1] - d[1] * e2[0];
+  det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+  if (fabs(det) < 1e-30) return -1.0;
+  uu = (t[0] * p[0] + t[1] * p[1] + t[2] * p[2]) / det;
+  if (uu < 0.0 || uu > 1.0) return -1.0;
+  q[0] = t[1] * e1[2] - t[2] * e1[1];
+  q[1] = t[2] * e1[0] - t[0] * e1[2];
+  q[2] = t[0] * e1[1] - t[1] * e1[0];
+  vv = (d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) / det;
+  if (vv < 0.0 || uu + vv > 1.0) return -1.0;
+  tt = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) / det;
+  return tt;
+}
+
+/* классический: только впереди луча (§851) */
+static double sw_ray_tri(const double o[3], const double d[3], const double tv[9]) {
+  double tt = sw_ray_tri_raw(o, d, tv);
+  return tt > 0.0 ? tt : -1.0;
+}
+
 static void sw_line_sweep_dir(const hz_pyr *py, const double om[3], double w_d, double le,
                               const double *kd, const double *area, const double *nrm,
-                              const double *Eprev, double *Ed, double csec, double rho_ovr,
-                              int noprop, int32_t *stamp, int32_t mark, sw_line_acc *acc) {
+                              const double *Eprev, double *Ed, double rho_ovr,
+                              const double *trivert, int noprop, int32_t *stamp, int32_t mark,
+                              sw_line_acc *acc) {
+  (void)area; /* площадь нужна была клеточной модели; точное пересечение её не читает */
   int32_t ax;
   int64_t f[3];
   for (ax = 0; ax < 3; ax++) {
@@ -456,7 +489,7 @@ static void sw_line_sweep_dir(const hz_pyr *py, const double om[3], double w_d, 
     for (b1 = 0; b1 < nb1; b1++)
       for (b2 = 0; b2 < nb2; b2++) {
         int64_t cc[3], cell[3], stepv[3];
-        double tmax[3], tdelta[3], L = 0.0;
+        double tmax[3], tdelta[3], L = 0.0, org[3], s_enter = 0.0;
         int32_t a2;
         cc[ax] = f[ax];
         cc[bxA] = b1;
@@ -464,6 +497,9 @@ static void sw_line_sweep_dir(const hz_pyr *py, const double om[3], double w_d, 
         cell[0] = cc[0];
         cell[1] = cc[1];
         cell[2] = cc[2];
+        org[0] = py->lo[0] + ((double)cc[0] + 0.5) * py->cell;
+        org[1] = py->lo[1] + ((double)cc[1] + 0.5) * py->cell;
+        org[2] = py->lo[2] + ((double)cc[2] + 0.5) * py->cell;
         if (stamp[cell[0] + py->nx * (cell[1] + py->ny * cell[2])] == mark) continue;
         for (a2 = 0; a2 < 3; a2++) {
           if (fabs(om[a2]) < 1e-30) {
@@ -482,47 +518,47 @@ static void sw_line_sweep_dir(const hz_pyr *py, const double om[3], double w_d, 
         for (;;) {
           int64_t id = cell[0] + py->nx * (cell[1] + py->ny * cell[2]);
           int32_t pos = hz_pyr_leaf_pos(py, id);
-          double tn;
+          double tn, s_exit;
           acc->ncell++;
           stamp[id] = mark;
-          if (pos >= 0) {
-            const hz_pyr_leaf *lf = &py->leaf[pos];
-            double Lsurf = 0.0, cntot = 0.0, T_cell;
-            int32_t u;
-            for (u = 0; u < lf->npcs; u++) {
-              int32_t p = py->csr[lf->pcs_first + u];
-              double d0 = om[0] * nrm[3 * (int64_t)p] + om[1] * nrm[3 * (int64_t)p + 1] +
-                          om[2] * nrm[3 * (int64_t)p + 2];
-              cntot += area[p] * fabs(d0);
-            }
-            if (cntot > 0.0) {
-              acc->nvisit++;
-              for (u = 0; u < lf->npcs; u++) {
-                int32_t p = py->csr[lf->pcs_first + u];
-                double d0 = om[0] * nrm[3 * (int64_t)p] + om[1] * nrm[3 * (int64_t)p + 1] +
-                            om[2] * nrm[3 * (int64_t)p + 2];
-                double an = fabs(d0);
-                double rho = rho_ovr < 0 ? kd[p] : rho_ovr;
-                Lsurf += (le + rho * Eprev[p] / (2.0 * M_PI)) * area[p] * an;
-                if (L > 0.0) {
-                  acc->ndep++;
-                  Ed[p] += w_d * L * an;
-                }
-              }
-              Lsurf /= cntot;
-              T_cell = 1.0 - cntot / csec;
-              if (T_cell < 0.0) T_cell = 0.0;
-              acc->absorbed += w_d * (1.0 - T_cell) * L * csec;
-              acc->emitted += w_d * le * (1.0 - T_cell) * csec;
-              acc->recycled += w_d * (Lsurf - le) * (1.0 - T_cell) * csec;
-              L = T_cell * L + (1.0 - T_cell) * Lsurf;
-              if (noprop) L = 0.0; /* НК: фронт не переносится */
-            }
-          }
           tn = tmax[0];
           if (tmax[1] < tn) tn = tmax[1];
           if (tmax[2] < tn) tn = tmax[2];
-          if (tn > 1e29) break;
+          s_exit = tn > 1e29 ? 1e30 : tn;
+          if (pos >= 0) {
+            /* §852: ТОЧНОЕ пересечение линии с треугольниками клетки на
+             * отрезке [s_enter, s_exit]: ближайший поглощает трубку,
+             * депонирует инфлюкс и переизлучает СВОЙ радианс (А1557). */
+            const hz_pyr_leaf *lf = &py->leaf[pos];
+            double tbest = -1.0;
+            int32_t pbest = -1, u;
+            double an_best = 0.0;
+            acc->nvisit++;
+            for (u = 0; u < lf->npcs; u++) {
+              int32_t p = py->csr[lf->pcs_first + u];
+              double tt = sw_ray_tri(org, om, trivert + 9 * (int64_t)py->pcs[p].tri);
+              if (tt > s_enter && tt <= s_exit && (tbest < 0.0 || tt < tbest)) {
+                tbest = tt;
+                pbest = p;
+                an_best = fabs(om[0] * nrm[3 * (int64_t)p] + om[1] * nrm[3 * (int64_t)p + 1] +
+                               om[2] * nrm[3 * (int64_t)p + 2]);
+              }
+            }
+            if (pbest >= 0) {
+              double rho = rho_ovr < 0 ? kd[pbest] : rho_ovr;
+              if (L > 0.0) {
+                acc->ndep++;
+                Ed[pbest] += w_d * L * an_best;
+                acc->absorbed += w_d * L * an_best;
+              }
+              acc->emitted += w_d * le * an_best;
+              acc->recycled += w_d * rho * Eprev[pbest] / (2.0 * M_PI) * an_best;
+              L = le + rho * Eprev[pbest] / (2.0 * M_PI); /* радианс СВОГО куска */
+            }
+            if (noprop) L = 0.0; /* НК: фронт не переносится */
+          }
+          if (s_exit > 1e29) break;
+          s_enter = s_exit;
           if (tmax[0] <= tmax[1] && tmax[0] <= tmax[2]) {
             tmax[0] += tdelta[0];
             cell[0] += stepv[0];
@@ -537,8 +573,658 @@ static void sw_line_sweep_dir(const hz_pyr *py, const double om[3], double w_d, 
               cell[2] >= py->nz)
             break;
         }
-        if (noprop) L = 0.0;
-        acc->lost += L * csec;
+      }
+  }
+}
+
+/* ---- §852: МАТЕРИАЛЬНЫЙ ФРОНТ НА ПИРАМИДЕ (mode 3) ------------------------ */
+
+/* Постановка (правлена по А1563…А1572): трубки = линии базовой сетки вдоль
+ * om (как §851); марш — по узлам пирамиды. Узел ПУСТ — прыжок одним шагом
+ * по tmax узла (А1569); МАТЕРИАЛЕН (max ℓ_p поддерева ≤ сторона узла) —
+ * локальное взаимодействие на СВОЁМ размере клетки; ПРОМЕЖУТОЧНЫЙ — спуск,
+ * продолжение DDA на детском уровне. L — РАДИАНС: сечение трубки при
+ * спуске НЕ ДЕЛИТСЯ, Φ = w·L·csec с сечением БАЗОВОЙ клетки постоянен,
+ * доля ребёнка 0/1 по геометрии входа, слияния нет (А1563). Клеточный
+ * перехват T = 1−cntot/csec — ТОЛЬКО под предикатом «bbox куска ⊆ клетка
+ * узла», вне предиката — точное пересечение, fail closed (А1566). Крат-
+ * ность 1 на (кусок, направление) — штампом (А1564; чинит и самозасветку
+ * тонкой оболочки vc=1: двусторонний ray-triangle больше не депонирует
+ * радианс оболочки на неё же при выходе трубки). G6: на каждом спуске
+ * parent_flux = Σchild_flux — по РОДИТЕЛЬСКОЙ ДОЛЕ a носителя (эмиссия —
+ * новая энергия, в тождество не входит); нарушение — счётчик, на чистом
+ * прогоне 0. Носитель — пара (a, b): a — родительская доля радианса,
+ * b — порождённая (эмиссия кусков); депозиты делятся в той же пропорции. */
+typedef struct {
+  const hz_pyr *py;
+  const hz_sw_opts *o;
+  const double *area, *nrm, *kd, *Eprev;
+  double *Ed;
+  const double *om;
+  double org[3]; /* центр входной клетки трубки */
+  double w_d, le, axcos;
+  int noprop, tau0, ax;
+  int64_t *pstamp; /* штамп (трубка × кусок × направление × итерация), А1564: гасит
+                    * повторный депозит ОДНОЙ трубки на ту же оболочку (вход и
+                    * выход тонкой оболочки); разные трубки направления
+                    * депонируют каждую по-своему — пространственный сбор */
+  int64_t pkey;    /* значение штампа текущей трубки: mark<<32 | номер трубки */
+  int64_t ntube;   /* счётчик трубок направления (в ключе штампа) */
+
+  int32_t mark;
+  /* bbox-индекс кусков по листьям (А1566: кусок владеет ОДНОЙ клеткой по
+   * центроиду, а пересекать трубку его треугольник может в СОСЕДНЕЙ —
+   * взаимодействие обязано идти по bbox-перекрытию, не по владению) */
+  const int32_t *bstart; /* [nleaf+1] */
+  const int32_t *bpids;  /* слоты кусков */
+  int32_t *pbuf;         /* куски материального узла (растёт по нужде) */
+  int64_t pbufcap;
+  double *abuf, *wbuf; /* скретч взаимодействия: без аллокаций на событие */
+  int64_t abufcap;
+  double hi[3];      /* верх сцены (клетки уровней шире домена на нечётных сетках) */
+  double lost;       /* поток за границей домена, w·csec-единицы */
+  int64_t ncellbase; /* базовых клеток полным DDA («до», прибор А1569) */
+  int cbase, cfront; /* прибор считается на первой итерации (геометрия статична) */
+  /* аккумуляторы */
+  double depA; /* Σ родительской доли, депонированной кускам (L-единицы) */
+  double absorbed, emitted, recycled;
+  int64_t g6viol, njump, nmat, ndesc, ncellfront, nstamp, nlostseg, ndep;
+} front_ctx;
+
+/* отрезок [h0,h1] луча (org, om) в коробке, пересечённый с [tin,tout];
+ * 0 — пусто */
+static int front_box_seg(const double blo[3], const double bhi[3], const double org[3],
+                         const double om[3], double tin, double tout, double *h0, double *h1) {
+  double t0 = tin, t1 = tout;
+  int ax;
+  for (ax = 0; ax < 3; ax++) {
+    if (fabs(om[ax]) < 1e-30) {
+      if (org[ax] < blo[ax] || org[ax] > bhi[ax]) return 0;
+      continue;
+    }
+    {
+      double ta = (blo[ax] - org[ax]) / om[ax];
+      double tb = (bhi[ax] - org[ax]) / om[ax];
+      if (ta > tb) {
+        double tt = ta;
+        ta = tb;
+        tb = tt;
+      }
+      if (ta > t0) t0 = ta;
+      if (tb < t1) t1 = tb;
+    }
+  }
+  /* t1 == t0 допустимо: вырожденная (плоская) клетка фантомной колонки —
+   * стенка на mesh-границе сетки обязана быть достижима для марша (§852) */
+  if (t1 < t0) return 0;
+  *h0 = t0;
+  *h1 = t1;
+  return 1;
+}
+
+static double front_rho(const front_ctx *fc, int32_t p) {
+  return fc->o->rho < 0 ? fc->kd[p] : fc->o->rho;
+}
+
+static double front_cos(const front_ctx *fc, int32_t p) {
+  const double *om = fc->om;
+  return fabs(om[0] * fc->nrm[3 * (int64_t)p] + om[1] * fc->nrm[3 * (int64_t)p + 1] +
+              om[2] * fc->nrm[3 * (int64_t)p + 2]);
+}
+
+/* коробка узла (уровень l, позиция pos; l<0 — лист) с ЗАЖИМОМ в сцену:
+ * на нечётных сетках клетки уровней шире домена (А1567 — за доменом
+ * сегментов не остаётся, остаток носителя уходит в lost) */
+static void front_node_box(const front_ctx *fc, int32_t l, int32_t pos, double blo[3],
+                           double bhi[3]) {
+  const hz_pyr *py = fc->py;
+  int64_t d[3], id;
+  double side;
+  int ax;
+  if (l < 0) {
+    d[0] = py->nx;
+    d[1] = py->ny;
+    d[2] = py->nz;
+    side = py->cell;
+    id = py->leaf_id[pos];
+  } else {
+    hz_pyr_level_dims(py, l, d);
+    side = py->cell * (double)((int64_t)1 << (l + 1));
+    id = py->lev[l][pos].id;
+  }
+  blo[0] = py->lo[0] + (double)(id % d[0]) * side;
+  blo[1] = py->lo[1] + (double)((id / d[0]) % d[1]) * side;
+  blo[2] = py->lo[2] + (double)(id / (d[0] * d[1])) * side;
+  for (ax = 0; ax < 3; ax++) {
+    bhi[ax] = blo[ax] + side;
+    if (bhi[ax] > fc->hi[ax]) bhi[ax] = fc->hi[ax];
+  }
+}
+
+/* собрать куски поддерева (уровень l, позиция pos; l<0 — лист) в fc->pbuf */
+static int front_gather(front_ctx *fc, int32_t l, int32_t pos, int32_t *n) {
+  const hz_pyr *py = fc->py;
+  typedef struct {
+    int32_t l, pos;
+  } fp;
+  fp stk[2048]; /* глубина·8: nlev ≤ 254 — стек на кадре C, без аллокации */
+  int64_t sp = 0;
+  if ((py->nlev + 2) * 8 > 2048) return 2;
+  int32_t cnt = 0;
+  int rc = 0;
+  *n = 0;
+  if (!stk) return 2;
+  stk[sp].l = l;
+  stk[sp].pos = pos;
+  sp++;
+  while (sp > 0) {
+    int32_t cl, cpos, u;
+    sp--;
+    cl = stk[sp].l;
+    cpos = stk[sp].pos;
+    if (cl < 0) {
+      int32_t nb = fc->bstart[cpos + 1] - fc->bstart[cpos];
+      const int32_t *bp = fc->bpids + fc->bstart[cpos];
+      if (nb > 0) {
+        if (cnt + nb > fc->pbufcap) {
+          int64_t nc = fc->pbufcap ? fc->pbufcap * 2 : 64;
+          int32_t *nb2;
+          while (nc < cnt + nb)
+            nc *= 2;
+          nb2 = (int32_t *)realloc(fc->pbuf, (size_t)nc * sizeof *nb2);
+          if (!nb2) {
+            rc = 2;
+            break;
+          }
+          fc->pbuf = nb2;
+          fc->pbufcap = nc;
+        }
+        for (u = 0; u < nb; u++)
+          fc->pbuf[cnt++] = bp[u];
+      }
+      continue;
+    }
+    {
+      int64_t pd[3], cd[3], kid = py->lev[cl][cpos].id, ci[3];
+      int cx, cy, cz;
+      int32_t cl2 = cl - 1;
+      hz_pyr_level_dims(py, cl, pd);
+      if (cl2 < 0) {
+        cd[0] = py->nx;
+        cd[1] = py->ny;
+        cd[2] = py->nz;
+      } else
+        hz_pyr_level_dims(py, cl2, cd);
+      ci[0] = kid % pd[0];
+      ci[1] = (kid / pd[0]) % pd[1];
+      ci[2] = kid / (pd[0] * pd[1]);
+      for (cz = 0; cz < 2; cz++)
+        for (cy = 0; cy < 2; cy++)
+          for (cx = 0; cx < 2; cx++) {
+            int64_t qx = 2 * ci[0] + cx, qy = 2 * ci[1] + cy, qz = 2 * ci[2] + cz;
+            int64_t id = qx + cd[0] * (qy + cd[1] * qz);
+            int32_t found;
+            if (qx >= cd[0] || qy >= cd[1] || qz >= cd[2]) continue;
+            if (cl2 < 0)
+              found = hz_pyr_leaf_pos(py, id);
+            else
+              found = hz_pyr_node_pos(py, cl2, id);
+            if (found < 0) continue; /* ПУСТ-ребёнок: кусков нет */
+            stk[sp].l = cl2;
+            stk[sp].pos = found;
+            sp++;
+          }
+    }
+  }
+  if (rc) return rc;
+  *n = cnt;
+  return 0;
+}
+
+/* предикат А1566: bbox куска целиком внутри клетки (без допусков) */
+static int front_contained(const double tribox[6], const double blo[3], const double bhi[3]) {
+  int ax;
+  for (ax = 0; ax < 3; ax++)
+    if (!(tribox[ax] >= blo[ax]) || !(tribox[3 + ax] <= bhi[ax])) return 0;
+  return 1;
+}
+
+/* взаимодействие трубки с материальной клеткой на отрезке [tin,tout].
+ * ps/n — куски; blo/bhi — клетка. Точные события (кроссирующие куски, при
+ * xint=1 — все) старше клеточного перехвата: геометрия перекрывает модель. */
+static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const double blo[3],
+                           const double bhi[3], double tin, double tout, double *a, double *b) {
+  const hz_pyr *py = fc->py;
+  double csec = py->cell * py->cell; /* сечение БАЗОВОЙ клетки — инвариант А1563 */
+  double csecnode = (bhi[1] - blo[1]) * (bhi[2] - blo[2]); /* сечение клетки узла: тень в T */
+  double *an = NULL, *wt = NULL;
+  double cntot = 0.0, swt = 0.0, Lsurf = 0.0, tbest = -1.0, anb = 0.0;
+  int32_t u, pbest = -1;
+  double ai = *a, bi = *b, Lin = ai + bi;
+  int has_cont = 0;
+
+  if (n <= 0) return;
+  if (fc->tau0) { /* НК: слой не поглощает и не излучает — трубка не тронута */
+    return;
+  }
+  fc->nmat++;
+  if (n > fc->abufcap) {
+    int64_t nc = fc->abufcap ? fc->abufcap * 2 : 64;
+    double *na, *nw;
+    while (nc < n) nc *= 2;
+    na = (double *)realloc(fc->abuf, (size_t)nc * sizeof *na);
+    if (!na) goto done;
+    fc->abuf = na;
+    nw = (double *)realloc(fc->wbuf, (size_t)nc * sizeof *nw);
+    if (!nw) goto done;
+    fc->wbuf = nw;
+    fc->abufcap = nc;
+  }
+  an = fc->abuf;
+  wt = fc->wbuf; /* нет памяти: сегмент проходится насквозь */
+  for (u = 0; u < n; u++) {
+    double cs = front_cos(fc, ps[u]);
+    an[u] = fc->area[ps[u]] * cs; /* тень куска на сечении трубки */
+    wt[u] = cs * an[u];           /* вес депозита: тень с косинусом */
+  }
+  /* 1. ТОЧНОЕ пересечение (А1566 fail closed; G1(a) при xint=1): ближайшее
+   * unstamped-попадание кроссирующего куска — событие сегмента, §851-семантика. */
+  for (u = 0; u < n; u++) {
+    int32_t p = ps[u];
+    int32_t tri = py->pcs[p].tri;
+    double tt;
+    if (!fc->o->xint && front_contained(fc->o->tribox + 6 * (int64_t)tri, blo, bhi)) continue;
+    if (fc->pstamp[p] == fc->pkey) {
+      fc->nstamp++; /* кратность 1 на (кусок, направление) — А1564 */
+      continue;
+    }
+    tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)tri);
+    /* tt >= tin: стенка может лежать РОВНО на плоскости клетки/домена (§852:
+     * коробка на границе сетки) — отрезок включается с обоих концов; двойной
+     * счёт стыка гасится штампом (кусок × трубка) */
+    if (tt >= tin && tt <= tout && (tbest < 0.0 || tt < tbest)) {
+      tbest = tt;
+      pbest = p;
+      anb = front_cos(fc, p);
+    }
+  }
+  (void)anb;
+  if (pbest >= 0) {
+    double Lh;
+    if (fc->noprop) {
+      *a = 0.0;
+      *b = 0.0;
+      goto done;
+    } /* НК: фронт не переносится */
+    if (Lin > 0.0) fc->pstamp[pbest] = fc->pkey;
+    if (Lin > 0.0) {
+      /* Φ = w·L·csec — инвариант трубки (А1563); |cos| входит ЧЕРЕЗ ЧИСЛО
+       * трубок, пересекающих кусок (A·cos/csec), поэтому G2 (ρ=0 → E=πLe)
+       * держится при любой клетке */
+      /* вклад трубки в ОБЛУЧЁННОСТЬ куска: Φ/A (мощность на его площадь) */
+      fc->Ed[pbest] += fc->w_d * Lin * csec * fc->axcos / fc->area[pbest];
+      fc->depA += ai; /* родительская доля трубки погашена целиком (G6) */
+      fc->absorbed += fc->w_d * Lin * csec;
+      fc->ndep++;
+      Lh = fc->le + front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI);
+      fc->recycled += fc->w_d * (Lh - fc->le) * csec;
+    }
+    fc->emitted += fc->w_d * fc->le * csec;
+    *a = 0.0;
+    *b = fc->le + front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI);
+    goto done;
+  }
+  /* 2. Клеточный перехват §846 — ТОЛЬКО контейнированные unstamped (А1566).
+   * Нормировка по wt: Σ депозитов = f·вход (тождество G6), а на одной
+   * пластине f=1 депозит = w·L·cos — совпадает с точной веткой и §851. */
+  for (u = 0; u < n; u++) {
+    int32_t p = ps[u];
+    if (fc->o->xint) break; /* контейнированных нет — весь сегмент точный */
+    if (fc->pstamp[p] == fc->pkey) continue;
+    if (!front_contained(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri, blo, bhi)) continue;
+    has_cont = 1;
+    cntot += an[u];
+    swt += wt[u];
+    Lsurf += (fc->le + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI)) * wt[u];
+  }
+  if (has_cont && swt > 0.0) {
+    double T = 1.0 - cntot / csecnode, f;
+    if (T < 0.0) T = 0.0;
+    if (T > 1.0) T = 1.0;
+    if (fc->tau0) T = 1.0; /* НК: слой не взаимодействует */
+    f = 1.0 - T;
+    if (f > 0.0) {
+      Lsurf /= swt;
+      for (u = 0; u < n; u++) {
+        int32_t p = ps[u];
+        if (fc->o->xint) break;
+        if (fc->pstamp[p] == fc->pkey) continue;
+        if (!front_contained(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri, blo, bhi)) continue;
+        fc->Ed[p] += fc->w_d * Lin * f * csec * fc->axcos * wt[u] / swt / fc->area[p];
+      }
+      fc->depA += f * ai;
+      fc->absorbed += fc->w_d * Lin * f * csec;
+      fc->recycled += fc->w_d * f * (Lsurf - fc->le) * csec;
+      fc->emitted += fc->w_d * fc->le * f * csec;
+      *a = T * ai;
+      *b = T * bi + f * Lsurf;
+      if (fc->noprop) { /* НК: фронт не переносится */
+        *a = 0.0;
+        *b = 0.0;
+      }
+      goto done;
+    }
+  }
+  /* прозрачная клетка: носитель не тронут */
+  if (fc->noprop) {
+    *a = 0.0;
+    *b = 0.0;
+  }
+done:
+  }
+
+/* марш трубки через узел (уровень l, позиция pos; l<0 — лист) на отрезке
+ * [tin,tout]; carry a/b сквозной — сечение трубки не делится (А1563) */
+static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, double tout, double *a,
+                        double *b) {
+  const hz_pyr *py = fc->py;
+  double blo[3], bhi[3];
+  if (l < 0) { /* лист: базовая клетка */
+    if (fc->cfront) fc->ncellfront++;
+    front_node_box(fc, -1, pos, blo, bhi);
+    front_interact(fc, fc->bpids + fc->bstart[pos], fc->bstart[pos + 1] - fc->bstart[pos], blo, bhi,
+                   tin, tout, a, b);
+    return;
+  }
+  {
+    /* МАТЕРИАЛЕН ⟺ max ℓ_p поддерева ≥ уровень узла (лист — уровень 0,
+     * уровень l — parents of leaves = l+1): марш дробит фронт ДО уровня
+     * ℓ_p куска; узлы глубже нужного — промежуточные (спуск), крупнее —
+     * фронт уже поглощён на уровне ℓ_p и сюда не доходит. */
+    uint8_t m = py->lev_lp[l][pos];
+    if (m != 255 && (int32_t)m >= l + 1) {
+      int32_t n = 0;
+      if (front_gather(fc, l, pos, &n) != 0) return;
+      front_node_box(fc, l, pos, blo, bhi);
+      front_interact(fc, fc->pbuf, n, blo, bhi, tin, tout, a, b);
+      return;
+    }
+  }
+  /* ПРОМЕЖУТОЧНЫЙ: спуск — продолжение DDA на детском уровне */
+  fc->ndesc++;
+  if (l == 0) {
+    /* спуск на ЛИСТЬЯ: узел уровня-0 покрывает 2³ БАЗОВЫХ клетки —
+     * перечисляются сами базовые клетки (id уровня-0 ≠ id базы;
+     * без этого на нечётных сетках терялся весь хвост трубки) */
+    int64_t pd0[3], kid0 = py->lev[0][pos].id, ci0[3];
+    double c0[8], c1[8];
+    int32_t cpos[8];
+    int n = 0, u, v, i;
+    int cx, cy, cz;
+    double a_in = *a, dep_snap = fc->depA;
+    hz_pyr_level_dims(py, 0, pd0);
+    ci0[0] = kid0 % pd0[0];
+    ci0[1] = (kid0 / pd0[0]) % pd0[1];
+    ci0[2] = kid0 / (pd0[0] * pd0[1]);
+    for (cz = 0; cz < 2; cz++)
+      for (cy = 0; cy < 2; cy++)
+        for (cx = 0; cx < 2; cx++) {
+          int64_t bx = 2 * ci0[0] + cx, by = 2 * ci0[1] + cy, bz = 2 * ci0[2] + cz;
+          double cblo[3], cbhi[3], h0, h1;
+          int32_t found;
+          int64_t id;
+          if (bx >= py->nx || by >= py->ny || bz >= py->nz) continue;
+          id = bx + py->nx * (by + py->ny * bz);
+          cblo[0] = py->lo[0] + (double)bx * py->cell;
+          cblo[1] = py->lo[1] + (double)by * py->cell;
+          cblo[2] = py->lo[2] + (double)bz * py->cell;
+          cbhi[0] = cblo[0] + py->cell;
+          cbhi[1] = cblo[1] + py->cell;
+          cbhi[2] = cblo[2] + py->cell;
+          for (u = 0; u < 3; u++)
+            if (cbhi[u] > fc->hi[u]) cbhi[u] = fc->hi[u];
+          if (!front_box_seg(cblo, cbhi, fc->org, fc->om, tin, tout, &h0, &h1)) continue;
+          found = hz_pyr_leaf_pos(py, id);
+          if (found < 0) {
+            fc->njump++; /* ПУСТ: прыжок одним шагом по tmax клетки (А1569) */
+            continue;
+          }
+          c0[n] = h0;
+          c1[n] = h1;
+          cpos[n] = found;
+          n++;
+        }
+    for (u = 1; u < n; u++) {
+      double s = c0[u], s1 = c1[u];
+      int32_t pu = cpos[u];
+      for (v = u; v > 0 && c0[v - 1] > s; v--) {
+        c0[v] = c0[v - 1];
+        c1[v] = c1[v - 1];
+        cpos[v] = cpos[v - 1];
+      }
+      c0[v] = s;
+      c1[v] = s1;
+      cpos[v] = pu;
+    }
+    for (i = 0; i < n; i++)
+      front_visit(fc, -1, cpos[i], c0[i], c1[i], a, b);
+    if (!fc->noprop && fabs(a_in - (fc->depA - dep_snap) - *a) > 1e-9 * (1.0 + fabs(a_in)))
+      fc->g6viol++;
+    return;
+  }
+  {
+    int64_t pd[3], cd[3], kid = py->lev[l][pos].id, ci[3];
+    int32_t cl = l - 1;
+    double side2 = py->cell * (double)((int64_t)1 << l); /* сторона ребёнка */
+    double c0[8], c1[8];
+    int32_t cpos[8];
+    int n = 0, u, v, i;
+    int cx, cy, cz;
+    double a_in = *a, dep_snap = fc->depA;
+    hz_pyr_level_dims(py, l, pd);
+    if (cl < 0) {
+      cd[0] = py->nx;
+      cd[1] = py->ny;
+      cd[2] = py->nz;
+    } else
+      hz_pyr_level_dims(py, cl, cd);
+    ci[0] = kid % pd[0];
+    ci[1] = (kid / pd[0]) % pd[1];
+    ci[2] = kid / (pd[0] * pd[1]);
+    for (cz = 0; cz < 2; cz++)
+      for (cy = 0; cy < 2; cy++)
+        for (cx = 0; cx < 2; cx++) {
+          int64_t qx = 2 * ci[0] + cx, qy = 2 * ci[1] + cy, qz = 2 * ci[2] + cz;
+          double cblo[3], cbhi[3], h0, h1;
+          int32_t found;
+          int64_t id;
+          if (qx >= cd[0] || qy >= cd[1] || qz >= cd[2]) continue;
+          id = qx + cd[0] * (qy + cd[1] * qz);
+          cblo[0] = py->lo[0] + (double)qx * side2;
+          cblo[1] = py->lo[1] + (double)qy * side2;
+          cblo[2] = py->lo[2] + (double)qz * side2;
+          cbhi[0] = cblo[0] + side2;
+          cbhi[1] = cblo[1] + side2;
+          cbhi[2] = cblo[2] + side2;
+          for (u = 0; u < 3; u++)
+            if (cbhi[u] > fc->hi[u]) cbhi[u] = fc->hi[u];
+          if (!front_box_seg(cblo, cbhi, fc->org, fc->om, tin, tout, &h0, &h1)) continue;
+          if (cl < 0)
+            found = hz_pyr_leaf_pos(py, id);
+          else
+            found = hz_pyr_node_pos(py, cl, id);
+          if (found < 0) {
+            fc->njump++; /* ПУСТ: прыжок одним шагом по tmax ребёнка (А1569) */
+            continue;
+          }
+          c0[n] = h0;
+          c1[n] = h1;
+          cpos[n] = found;
+          n++;
+        }
+    /* порядок по ходу луча (n ≤ 8, вставками) */
+    for (u = 1; u < n; u++) {
+      double s = c0[u], s1 = c1[u];
+      int32_t pu = cpos[u];
+      for (v = u; v > 0 && c0[v - 1] > s; v--) {
+        c0[v] = c0[v - 1];
+        c1[v] = c1[v - 1];
+        cpos[v] = cpos[v - 1];
+      }
+      c0[v] = s;
+      c1[v] = s1;
+      cpos[v] = pu;
+    }
+    for (i = 0; i < n; i++) {
+      front_visit(fc, cl, cpos[i], c0[i], c1[i], a, b);
+    }
+    /* G6: родительская доля сохраняется: a_in = Σdep_a(дети) + a_out */
+    if (!fc->noprop && fabs(a_in - (fc->depA - dep_snap) - *a) > 1e-9 * (1.0 + fabs(a_in)))
+      fc->g6viol++;
+  }
+}
+
+/* одна трубка: прибор «до» (полный базовый DDA), затем иерархический марш */
+static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double *lostB) {
+  const hz_pyr *py = fc->py;
+  double h0, h1, a = 0.0, b = 0.0;
+  int q;
+  for (q = 0; q < 3; q++)
+    fc->org[q] = py->lo[q] + ((double)cc[q] + 0.5) * py->cell;
+  if (!front_box_seg(py->lo, fc->hi, fc->org, fc->om, -1e30, 1e30, &h0, &h1)) return;
+  /* прибор «до»: число базовых клеток полным DDA (стоимость §851 vc=1) */
+  {
+    double tmax[3], tdelta[3], sent = h0;
+    int64_t cell[3], stepv[3];
+    for (q = 0; q < 3; q++) {
+      double pos = fc->org[q];
+      if (fabs(fc->om[q]) < 1e-30) {
+        tmax[q] = 1e30;
+        tdelta[q] = 0.0;
+        stepv[q] = 0;
+      } else {
+        double boundary = fc->om[q] > 0.0 ? py->lo[q] + ((double)cc[q] + 1.0) * py->cell
+                                          : py->lo[q] + (double)cc[q] * py->cell;
+        stepv[q] = fc->om[q] > 0.0 ? 1 : -1;
+        tdelta[q] = py->cell / fabs(fc->om[q]);
+        tmax[q] = (boundary - pos) / fc->om[q];
+        if (tmax[q] < 0.0) tmax[q] = 0.0;
+      }
+      cell[q] = cc[q];
+    }
+    for (;;) {
+      double tn = tmax[0];
+      if (tmax[1] < tn) tn = tmax[1];
+      if (tmax[2] < tn) tn = tmax[2];
+      if (fc->cbase) fc->ncellbase++;
+      if (tn > 1e29 || sent >= h1) break;
+      sent = tn;
+      if (tmax[0] <= tmax[1] && tmax[0] <= tmax[2]) {
+        tmax[0] += tdelta[0];
+        cell[0] += stepv[0];
+      } else if (tmax[1] <= tmax[2]) {
+        tmax[1] += tdelta[1];
+        cell[1] += stepv[1];
+      } else {
+        tmax[2] += tdelta[2];
+        cell[2] += stepv[2];
+      }
+      if (cell[0] < 0 || cell[1] < 0 || cell[2] < 0 || cell[0] >= py->nx || cell[1] >= py->ny ||
+          cell[2] >= py->nz)
+        break;
+    }
+  }
+  if (py->nlev == 0) { /* пирамиды нет: базовый DDA, взаимодействие на листах */
+    double tmax[3], tdelta[3], sent = h0;
+    int64_t cell[3], stepv[3];
+    for (q = 0; q < 3; q++) {
+      double pos = fc->org[q];
+      if (fabs(fc->om[q]) < 1e-30) {
+        tmax[q] = 1e30;
+        tdelta[q] = 0.0;
+        stepv[q] = 0;
+      } else {
+        double boundary = fc->om[q] > 0.0 ? py->lo[q] + ((double)cc[q] + 1.0) * py->cell
+                                          : py->lo[q] + (double)cc[q] * py->cell;
+        stepv[q] = fc->om[q] > 0.0 ? 1 : -1;
+        tdelta[q] = py->cell / fabs(fc->om[q]);
+        tmax[q] = (boundary - pos) / fc->om[q];
+        if (tmax[q] < 0.0) tmax[q] = 0.0;
+      }
+      cell[q] = cc[q];
+    }
+    for (;;) {
+      int32_t pos;
+      double tn = tmax[0], te = sent;
+      if (tmax[1] < tn) tn = tmax[1];
+      if (tmax[2] < tn) tn = tmax[2];
+      if (tn > 1e29) tn = h1;
+      pos = hz_pyr_leaf_pos(py, cell[0] + py->nx * (cell[1] + py->ny * cell[2]));
+      if (pos >= 0 && tn > te) front_visit(fc, -1, pos, te, tn, &a, &b);
+      if (tn >= h1) break;
+      sent = tn;
+      if (tmax[0] <= tmax[1] && tmax[0] <= tmax[2]) {
+        tmax[0] += tdelta[0];
+        cell[0] += stepv[0];
+      } else if (tmax[1] <= tmax[2]) {
+        tmax[1] += tdelta[1];
+        cell[1] += stepv[1];
+      } else {
+        tmax[2] += tdelta[2];
+        cell[2] += stepv[2];
+      }
+      if (cell[0] < 0 || cell[1] < 0 || cell[2] < 0 || cell[0] >= py->nx || cell[1] >= py->ny ||
+          cell[2] >= py->nz)
+        break;
+    }
+  } else {
+    front_visit(fc, py->nlev - 1, 0, h0, h1, &a, &b);
+    /* G6 на корне: вошедшая (нулевая — тёмный вход) доля = Σdep + вышедшая */
+    if (!fc->noprop && fabs(0.0 - fc->depA - a) > 1e-9 * (1.0 + fabs(a))) fc->g6viol++;
+  }
+  if (a > 0.0 || b > 0.0)
+    fc->nlostseg++; /* остаток ушёл за границу домена — в lost, не исчез (А1567) */
+  *lostA += a;
+  *lostB += b;
+}
+
+/* направление целиком: трубки = линии базовой сетки (дедупликация штампом
+ * клетки, как §851) */
+static void front_dir(front_ctx *fc, int32_t *stampv) {
+  const hz_pyr *py = fc->py;
+  int32_t ax;
+  int32_t f[3];
+  for (ax = 0; ax < 3; ax++) {
+    int64_t n = ax == 0 ? py->nx : (ax == 1 ? py->ny : py->nz);
+    if (fabs(fc->om[ax]) < 1e-30) {
+      f[ax] = -1;
+      continue;
+    }
+    f[ax] = fc->om[ax] > 0.0 ? 0 : (int32_t)(n - 1);
+  }
+  for (ax = 0; ax < 3; ax++) {
+    int64_t b1, b2;
+    int32_t bxA = (ax + 1) % 3, bxB = (ax + 2) % 3;
+    int64_t nb1, nb2;
+    if (f[ax] < 0) continue;
+    fc->ax = ax; /* семейство трубок: вход через грань оси ax */
+    nb1 = bxA == 0 ? py->nx : (bxA == 1 ? py->ny : py->nz);
+    nb2 = bxB == 0 ? py->nx : (bxB == 1 ? py->ny : py->nz);
+    for (b1 = 0; b1 < nb1; b1++)
+      for (b2 = 0; b2 < nb2; b2++) {
+        int64_t cc[3], id;
+        double lostA = 0.0, lostB = 0.0;
+        cc[ax] = f[ax];
+        cc[bxA] = b1;
+        cc[bxB] = b2;
+        id = cc[0] + py->nx * (cc[1] + py->ny * cc[2]);
+        if (stampv[id] == fc->mark) continue; /* трубка уже шла (другая семья) */
+        fc->axcos = fabs(fc->om[fc->ax]);
+        stampv[id] = fc->mark;
+        fc->pkey = ((int64_t)fc->mark << 32) | (uint32_t)fc->ntube++;
+        fc->depA = 0.0; /* G6 — по РОДИТЕЛЬСКОЙ доле ЭТОЙ трубки */
+        front_tube(fc, cc, &lostA, &lostB);
+        if (lostA > 0.0 || lostB > 0.0) fc->lost += (lostA + lostB) * py->cell * py->cell;
       }
   }
 }
@@ -551,6 +1237,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   hz_sw_walk *walks = NULL;
   hz_sw_dir *tab = NULL;
   int32_t *stampv = NULL; /* §851: штампы визитов линий [ncells] */
+  int64_t *pstamp = NULL; /* §852/А1564: штамп (трубка × кусок) [nt] */
+  int32_t *bstart = NULL, *bpids = NULL, *fillb = NULL; /* §852/А1566: bbox-индекс */
   int nd = 0, d, it, rc = 0;
   double csec;
 
@@ -558,6 +1246,10 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   if (!py || !area || !nrm || !kd || !o) return 1;
   if (o->iters <= 0) return 1;
   if (!py->pcs || nt != py->nt) return 1;
+  if (o->mode == 2 && o->vc && !o->trivert) return 1; /* §852: нужно точное пересечение */
+  if (o->mode == 3 && (!o->trivert || !o->tribox || !o->lp || !o->domhi))
+    return 1;                                 /* §852: фронт */
+  if (o->mode == 3 && !py->leaf_lp) return 1; /* §852/А1567: per-node max ℓ_p не задан */
   /* §843: режим 0 (скалярный марш §835) определён только на легаси-наборах */
   if (o->mode == 0 && o->ndirs != 6 && o->ndirs != 26) return 1;
   rc = hz_sw_dir_table(o->ndirs, &tab, &nd);
@@ -618,12 +1310,103 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
    * Латеральная изоляция и «стороны» возникают сами — разметка компонент
    * не нужна (упрощение против первой редакции плана). Штампы исключают
    * двойные визиты клетки. */
-  if (o->mode == 2 && o->vc) {
+  if ((o->mode == 2 && o->vc) || o->mode == 3) {
     int64_t ncells = (int64_t)py->nx * py->ny * py->nz;
     stampv = (int32_t *)calloc((size_t)ncells, sizeof *stampv);
     if (!stampv) {
       rc = 2;
       goto done;
+    }
+  }
+  if (o->mode == 3) { /* §852/А1564: штамп кратности 1 на (кусок, направление) */
+    pstamp = (int64_t *)calloc((size_t)nt, sizeof *pstamp);
+    bstart = (int32_t *)calloc((size_t)py->nleaf + 1, sizeof *bstart);
+    if (!pstamp || !bstart) {
+      rc = 2;
+      goto done;
+    }
+    /* bbox-индекс А1566: слот s пересекает клетку листа, если bbox его
+     * ИСХОДНОГО треугольника задевает клетку (два прохода counting-sort) */
+    {
+      int64_t lx = (int64_t)ceil((o->domhi[0] - py->lo[0]) / py->cell) - 1;
+      int64_t ly = (int64_t)ceil((o->domhi[1] - py->lo[1]) / py->cell) - 1;
+      int64_t lz = (int64_t)ceil((o->domhi[2] - py->lo[2]) / py->cell) - 1;
+      int32_t li3;
+      int64_t total = 0;
+      for (int32_t s = 0; s < nt; s++) {
+        int32_t tri = py->pcs[s].tri;
+        int64_t x[2], y[2], z[2];
+        /* максимум на плоскости сетки (стенка на границе) — в ПОСЛЕДНЮЮ
+         * реальную клетку: ceil−1; минимум — floor (§852) */
+        x[0] = (int64_t)((o->tribox[6 * (int64_t)tri + 0] - py->lo[0]) / py->cell);
+        x[1] = (int64_t)ceil((o->tribox[6 * (int64_t)tri + 3] - py->lo[0]) / py->cell) - 1;
+        y[0] = (int64_t)((o->tribox[6 * (int64_t)tri + 1] - py->lo[1]) / py->cell);
+        y[1] = (int64_t)ceil((o->tribox[6 * (int64_t)tri + 4] - py->lo[1]) / py->cell) - 1;
+        z[0] = (int64_t)((o->tribox[6 * (int64_t)tri + 2] - py->lo[2]) / py->cell);
+        z[1] = (int64_t)ceil((o->tribox[6 * (int64_t)tri + 5] - py->lo[2]) / py->cell) - 1;
+        if (x[0] < 0) x[0] = 0;
+        if (x[1] < x[0]) x[1] = x[0];
+        if (x[1] > lx) x[1] = lx;
+        if (x[0] > lx) x[0] = lx;
+        if (y[0] < 0) y[0] = 0;
+        if (y[1] < y[0]) y[1] = y[0];
+        if (y[1] > ly) y[1] = ly;
+        if (y[0] > ly) y[0] = ly;
+        if (z[0] < 0) z[0] = 0;
+        if (z[1] < z[0]) z[1] = z[0];
+        if (z[1] > lz) z[1] = lz;
+        if (z[0] > lz) z[0] = lz;
+        for (int64_t iz = z[0]; iz <= z[1]; iz++)
+          for (int64_t iy = y[0]; iy <= y[1]; iy++)
+            for (int64_t ix = x[0]; ix <= x[1]; ix++) {
+              int32_t pos = hz_pyr_leaf_pos(py, ix + py->nx * (iy + py->ny * iz));
+              if (pos >= 0) bstart[pos + 1]++;
+            }
+      }
+      for (li3 = 0; li3 < py->nleaf; li3++) {
+        bstart[li3 + 1] += bstart[li3];
+      }
+      total = bstart[py->nleaf];
+      bpids = (int32_t *)malloc((size_t)(total > 0 ? total : 1) * sizeof *bpids);
+      fillb = (int32_t *)malloc((size_t)(py->nleaf + 1) * sizeof *fillb);
+      if (!bpids || !fillb) {
+        rc = 2;
+        goto done;
+      }
+      for (li3 = 0; li3 < py->nleaf; li3++)
+        fillb[li3] = bstart[li3];
+      for (int32_t s = 0; s < nt; s++) {
+        int32_t tri = py->pcs[s].tri;
+        int64_t x[2], y[2], z[2];
+        /* максимум на плоскости сетки (стенка на границе) — в ПОСЛЕДНЮЮ
+         * реальную клетку: ceil−1; минимум — floor (§852) */
+        x[0] = (int64_t)((o->tribox[6 * (int64_t)tri + 0] - py->lo[0]) / py->cell);
+        x[1] = (int64_t)ceil((o->tribox[6 * (int64_t)tri + 3] - py->lo[0]) / py->cell) - 1;
+        y[0] = (int64_t)((o->tribox[6 * (int64_t)tri + 1] - py->lo[1]) / py->cell);
+        y[1] = (int64_t)ceil((o->tribox[6 * (int64_t)tri + 4] - py->lo[1]) / py->cell) - 1;
+        z[0] = (int64_t)((o->tribox[6 * (int64_t)tri + 2] - py->lo[2]) / py->cell);
+        z[1] = (int64_t)ceil((o->tribox[6 * (int64_t)tri + 5] - py->lo[2]) / py->cell) - 1;
+        if (x[0] < 0) x[0] = 0;
+        if (x[1] < x[0]) x[1] = x[0];
+        if (x[1] > lx) x[1] = lx;
+        if (x[0] > lx) x[0] = lx;
+        if (y[0] < 0) y[0] = 0;
+        if (y[1] < y[0]) y[1] = y[0];
+        if (y[1] > ly) y[1] = ly;
+        if (y[0] > ly) y[0] = ly;
+        if (z[0] < 0) z[0] = 0;
+        if (z[1] < z[0]) z[1] = z[0];
+        if (z[1] > lz) z[1] = lz;
+        if (z[0] > lz) z[0] = lz;
+        for (int64_t iz = z[0]; iz <= z[1]; iz++)
+          for (int64_t iy = y[0]; iy <= y[1]; iy++)
+            for (int64_t ix = x[0]; ix <= x[1]; ix++) {
+              int32_t pos = hz_pyr_leaf_pos(py, ix + py->nx * (iy + py->ny * iz));
+              if (pos >= 0) bpids[fillb[pos]++] = s;
+            }
+      }
+      free(fillb);
+      fillb = NULL;
     }
   }
 
@@ -643,8 +1426,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
          * входных гранях; латеральная изоляция и стороны возникают сами */
         sw_line_acc la = {0, 0, 0, 0, 0, 0, 0};
         int32_t mark = (int32_t)(it * (nd + 1) + d + 1);
-        sw_line_sweep_dir(py, om, w_d, o->le, kd, area, nrm, Eprev, Ed, csec, o->rho, o->noprop,
-                          stampv, mark, &la);
+        sw_line_sweep_dir(py, om, w_d, o->le, kd, area, nrm, Eprev, Ed, o->rho, o->trivert,
+                          o->noprop, stampv, mark, &la);
         absorbed += la.absorbed;
         emitted += la.emitted;
         recycled += la.recycled;
@@ -652,6 +1435,51 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         st->nvisit += la.nvisit;
         st->ndep += la.ndep;
         st->traffic = la.ncell * 40; /* §851: грубая модель трафика лучевого свипа */
+        continue;
+      }
+      if (o->mode == 3) {
+        /* §852: МАТЕРИАЛЬНЫЙ ФРОНТ НА ПИРАМИДЕ — иерархический марш:
+         * ПУСТ-прыжок по tmax узла / материальное взаимодействие на
+         * LOD-уровне куска / спуск-продолжение DDA (А1563/А1566/А1569). */
+        front_ctx fc;
+        int32_t mark = (int32_t)(it * (nd + 1) + d + 1);
+        memset(&fc, 0, sizeof fc);
+        fc.py = py;
+        fc.o = o;
+        fc.area = area;
+        fc.nrm = nrm;
+        fc.kd = kd;
+        fc.Eprev = Eprev;
+        fc.Ed = Ed;
+        fc.om = om;
+        fc.w_d = w_d;
+        fc.le = o->le;
+        fc.noprop = o->noprop;
+        fc.tau0 = o->tau0;
+        fc.pstamp = pstamp;
+        fc.bstart = bstart;
+        fc.bpids = bpids;
+        fc.mark = mark;
+        fc.cbase = (it == 0); /* прибор А1569 — геометрия статична, хватит раза */
+        fc.cfront = (it == 0);
+        fc.hi[0] = o->domhi[0]; /* меш-граница, не сеточная (§852) */
+        fc.hi[1] = o->domhi[1];
+        fc.hi[2] = o->domhi[2];
+        front_dir(&fc, stampv);
+        absorbed += fc.absorbed;
+        emitted += fc.emitted;
+        recycled += fc.recycled;
+        lost += fc.lost;
+        st->g6viol += fc.g6viol;
+        st->njump += fc.njump;
+        st->nmat += fc.nmat;
+        st->ndesc += fc.ndesc;
+        st->ncellbase += fc.ncellbase;
+        st->ncellfront += fc.ncellfront;
+        st->nstamp += fc.nstamp;
+        st->nlostseg += fc.nlostseg;
+        st->traffic = (fc.nmat + fc.ndesc + fc.njump) * 32 + fc.ncellfront * 40;
+        free(fc.pbuf);
         continue;
       }
       double L = 0.0;
@@ -790,7 +1618,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     st->recycled = recycled;
     st->absorbed = absorbed;
     st->lost = lost;
-    st->traffic = (int64_t)nd * ((int64_t)nt * 36 + (int64_t)walks[0].n * 40);
+    if (o->mode != 3) st->traffic = (int64_t)nd * ((int64_t)nt * 36 + (int64_t)walks[0].n * 40);
     if (e_hist) e_hist[it] = st->e_avg;
   }
 
@@ -801,6 +1629,10 @@ done:
   free(vindex);
   free(bits);
   free(tab);
+  free(pstamp); /* §852/А1564 */
+  free(stampv);
+  free(bstart);
+  free(bpids);
   if (walks) {
     for (d = 0; d < nd; d++)
       sw_free_walk(&walks[d]);

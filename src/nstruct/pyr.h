@@ -82,6 +82,14 @@ typedef struct {
   int32_t *nlev_nodes;
   int32_t nlev; /* уровней над листом; 0, если лист один на всю сцену */
 
+  /* §852 (А1567): per-node max ℓ_p. Кусок несёт LOD-уровень ℓ_p (сдвиг
+   * относительно листа: ℓ_p = 0 — материален уже на листе). Узел уровня ℓ
+   * (сторона cell·2^(ℓ+1)) МАТЕРИАЛЕН ⟺ max ℓ_p его поддерева ≤ ℓ+1;
+   * лист материален ⟺ max ℓ_p его кусков = 0. Хранится байтом на узел,
+   * считается ОДНИМ подъёмом в hz_pyr_set_lp; NULL до вызова. */
+  uint8_t *leaf_lp; /* [nleaf] — max ℓ_p кусков листа; 255, если кусков нет */
+  uint8_t **lev_lp; /* [nlev] — параллельно lev */
+
   int32_t *perm; /* §839: перестановка Morton (слот → исходный кусок); NULL до Morton */
 
   /* счётчики отчёта */
@@ -117,6 +125,15 @@ int hz_pyr_permute(hz_pyr *py, void *base, size_t elem);
 int hz_pyr_build(hz_pyr *py, int32_t nt, const double *tri_min, const double *tri_max,
                  const double *centroid, const int32_t *mtl, const double lo[3], const double hi[3],
                  double cell);
+
+/* §852: LOD-уровни кусков и per-node max ℓ_p (А1567). lp — [nt] сдвигов
+ * (ℓ_p; 0 — материален на листе) в порядке ИСХОДНЫХ треугольников. Один
+ * подъём: лист — max по своим кускам, внутренний узел — max по существующим
+ * детям. Куски с ℓ_p выше самого крупного уровня пирамиды ОБРАБАТЫВАЮТСЯ
+ * НА ЛИСТЕ (ℓ_p := 0, агрегатов нет — А1568) и считаются в *nup (печатаемый
+ * счётчик; молчаливый клэмп вверх запрещён). Требует построенного CSR
+ * (после hz_pyr_build/Morton). Возврат 0/не-0 (аргументы, память). */
+int hz_pyr_set_lp(hz_pyr *py, const uint8_t *lp, int32_t *nup);
 
 /* НК: скрестить куски с шагом stride (или только кусок 0 при stride == 1).
  * Возвращает число скрещённых. */
@@ -160,6 +177,12 @@ void hz_pyr_unmark_aggr(hz_pyr *py);
 
 /* §849: позиция листа по линейному id клетки (двоичный поиск); -1 — пусто. */
 int32_t hz_pyr_leaf_pos(const hz_pyr *py, int64_t id);
+
+/* §852: публичные обёртки для марша фронта: позиция узла уровня l по
+ * линейному id СВОЕГО уровня (-1 — ПУСТ) и размеры сетки уровня l
+ * (0 — уровень родителей листов, сторона клетки cell·2^(l+1)). */
+int32_t hz_pyr_node_pos(const hz_pyr *py, int32_t l, int64_t id);
+void hz_pyr_level_dims(const hz_pyr *py, int32_t l, int64_t d[3]);
 
 void hz_pyr_free(hz_pyr *py);
 

@@ -713,7 +713,6 @@ static int front_gather(front_ctx *fc, int32_t l, int32_t pos, int32_t *n) {
   int32_t cnt = 0;
   int rc = 0;
   *n = 0;
-  if (!stk) return 2;
   stk[sp].l = l;
   stk[sp].pos = pos;
   sp++;
@@ -790,12 +789,17 @@ static int front_contained(const double tribox[6], const double blo[3], const do
 }
 
 /* взаимодействие трубки с материальной клеткой на отрезке [tin,tout].
- * ps/n — куски; blo/bhi — клетка. Точные события (кроссирующие куски, при
- * xint=1 — все) старше клеточного перехвата: геометрия перекрывает модель. */
+ * ps/n — куски; blo/bhi — клетка. isleaf — отрезок листа (базовая клетка):
+ * только там законен клеточный T-перехват (А1566 в окне «bbox ⊆ базовая
+ * клетка»); на узловом отрезке (isleaf=0) — только точное пересечение,
+ * А1573. Точные события (кроссирующие куски, при xi=1 — все) старше
+ * клеточного перехвата: геометрия перекрывает модель. */
 static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const double blo[3],
-                           const double bhi[3], double tin, double tout, double *a, double *b) {
+                           const double bhi[3], double tin, double tout, double *a, double *b,
+                           int isleaf) {
   const hz_pyr *py = fc->py;
-  double csec = py->cell * py->cell; /* сечение БАЗОВОЙ клетки — инвариант А1563 */
+  const int xi = fc->o->xint || !isleaf; /* узловой отрезок — всегда точно */
+  double csec = py->cell * py->cell;     /* сечение БАЗОВОЙ клетки — инвариант А1563 */
   double csecnode = (bhi[1] - blo[1]) * (bhi[2] - blo[2]); /* сечение клетки узла: тень в T */
   double *an = NULL, *wt = NULL;
   double cntot = 0.0, swt = 0.0, Lsurf = 0.0, tbest = -1.0, anb = 0.0;
@@ -811,7 +815,8 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
   if (n > fc->abufcap) {
     int64_t nc = fc->abufcap ? fc->abufcap * 2 : 64;
     double *na, *nw;
-    while (nc < n) nc *= 2;
+    while (nc < n)
+      nc *= 2;
     na = (double *)realloc(fc->abuf, (size_t)nc * sizeof *na);
     if (!na) goto done;
     fc->abuf = na;
@@ -832,12 +837,17 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
   for (u = 0; u < n; u++) {
     int32_t p = ps[u];
     int32_t tri = py->pcs[p].tri;
-    double tt;
-    if (!fc->o->xint && front_contained(fc->o->tribox + 6 * (int64_t)tri, blo, bhi)) continue;
+    double tt, bh0, bh1;
+    if (!xi && front_contained(fc->o->tribox + 6 * (int64_t)tri, blo, bhi)) continue;
     if (fc->pstamp[p] == fc->pkey) {
       fc->nstamp++; /* кратность 1 на (кусок, направление) — А1564 */
       continue;
     }
+    /* пре-фильтр bbox×сегмент (цена А1573 на узловом пути): треугольник ⊆
+     * своего bbox, отсечение консервативно, результата не меняет */
+    if (!front_box_seg(fc->o->tribox + 6 * (int64_t)tri, fc->o->tribox + 6 * (int64_t)tri + 3,
+                       fc->org, fc->om, tin, tout, &bh0, &bh1))
+      continue;
     tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)tri);
     /* tt >= tin: стенка может лежать РОВНО на плоскости клетки/домена (§852:
      * коробка на границе сетки) — отрезок включается с обоих концов; двойной
@@ -874,12 +884,16 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
     *b = fc->le + front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI);
     goto done;
   }
-  /* 2. Клеточный перехват §846 — ТОЛЬКО контейнированные unstamped (А1566).
-   * Нормировка по wt: Σ депозитов = f·вход (тождество G6), а на одной
-   * пластине f=1 депозит = w·L·cos — совпадает с точной веткой и §851. */
+  /* 2. Клеточный перехват §846 — ТОЛЬКО контейнированные unstamped и ТОЛЬКО
+   * на листовом отрезке (А1566+А1573: окно валидности «bbox ⊆ БАЗОВАЯ
+   * клетка»; на узле T-перехват раздаёт сечение узла кускам, мимо которых
+   * трубка прошла — расходимость лестницы lp>=2, замерено до правки:
+   * cavity05 lp=2 E 3.43→6.05 за 6 итераций). Нормировка по wt:
+   * Σ депозитов = f·вход (тождество G6), а на одной пластине f=1 депозит =
+   * w·L·cos — совпадает с точной веткой и §851. */
   for (u = 0; u < n; u++) {
     int32_t p = ps[u];
-    if (fc->o->xint) break; /* контейнированных нет — весь сегмент точный */
+    if (xi) break; /* контейнированных нет — весь сегмент точный */
     if (fc->pstamp[p] == fc->pkey) continue;
     if (!front_contained(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri, blo, bhi)) continue;
     has_cont = 1;
@@ -897,7 +911,7 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
       Lsurf /= swt;
       for (u = 0; u < n; u++) {
         int32_t p = ps[u];
-        if (fc->o->xint) break;
+        if (xi) break;
         if (fc->pstamp[p] == fc->pkey) continue;
         if (!front_contained(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri, blo, bhi)) continue;
         fc->Ed[p] += fc->w_d * Lin * f * csec * fc->axcos * wt[u] / swt / fc->area[p];
@@ -921,7 +935,7 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
     *b = 0.0;
   }
 done:
-  }
+}
 
 /* марш трубки через узел (уровень l, позиция pos; l<0 — лист) на отрезке
  * [tin,tout]; carry a/b сквозной — сечение трубки не делится (А1563) */
@@ -933,7 +947,7 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
     if (fc->cfront) fc->ncellfront++;
     front_node_box(fc, -1, pos, blo, bhi);
     front_interact(fc, fc->bpids + fc->bstart[pos], fc->bstart[pos + 1] - fc->bstart[pos], blo, bhi,
-                   tin, tout, a, b);
+                   tin, tout, a, b, 1);
     return;
   }
   {
@@ -946,7 +960,13 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
       int32_t n = 0;
       if (front_gather(fc, l, pos, &n) != 0) return;
       front_node_box(fc, l, pos, blo, bhi);
-      front_interact(fc, fc->pbuf, n, blo, bhi, tin, tout, a, b);
+      /* А1573: на узловом отрезке клеточный T-перехват НЕзаконен — bbox куска
+       * ⊆ узел не означает, что трубка задевает его тень; перехват раздаёт
+       * сечение узла кускам, мимо которых трубка прошла (расходимость
+       * ~×1.5/итерацию на cavity05 lp=2). Узел — только точное пересечение.
+       * Предикат А1566 «bbox ⊆ клетка» валиден ТОЛЬКО на листовом отрезке
+       * (bbox ⊆ БАЗОВАЯ клетка). */
+      front_interact(fc, fc->pbuf, n, blo, bhi, tin, tout, a, b, 0);
       return;
     }
   }
@@ -1480,6 +1500,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         st->nlostseg += fc.nlostseg;
         st->traffic = (fc.nmat + fc.ndesc + fc.njump) * 32 + fc.ncellfront * 40;
         free(fc.pbuf);
+        free(fc.abuf); /* скретч растёт только на узловом пути (lp>=2, А1573) */
+        free(fc.wbuf);
         continue;
       }
       double L = 0.0;

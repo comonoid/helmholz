@@ -35,6 +35,8 @@ int main(int argc, char **argv) {
   int xint = 0;  /* §852/G1(a): 1 — всегда точное пересечение */
   int screw = 0; /* НК А1572: скрестить куски с шагом screw (детекторы>0) */
   int nphi = 0, nmu = 0;
+  int has_recv = 0; /* blocked-beam (А1566): recv=X:<x0>:<x1> — приёмник-слэб */
+  double recv0 = 0.0, recv1 = 0.0;
   double t0, t1;
   hz_objmesh m;
   hz_pyr py;
@@ -75,6 +77,10 @@ int main(int argc, char **argv) {
       xint = atoi(argv[i] + 5); /* §852/G1(a): точное пересечение везде */
     } else if (strncmp(argv[i], "screw=", 6) == 0) {
       screw = atoi(argv[i] + 6); /* НК А1572 */
+    } else if (strncmp(argv[i], "recv=", 5) == 0) {
+      /* А1566-фальсификатор: средняя E по кускам, чей ИСХОДНЫЙ центроид в
+       * слэбе по оси X (приёмник за перегородкой) */
+      if (sscanf(argv[i] + 5, "X:%lf:%lf", &recv0, &recv1) == 2) has_recv = 1;
     } else if (strncmp(argv[i], "mode=", 5) == 0) {
       mode = atoi(argv[i] + 5); /* §845: 2 — объёмный фронт */
     } else if (strncmp(argv[i], "cmp=", 4) == 0)
@@ -364,6 +370,23 @@ int main(int argc, char **argv) {
       printf("[%s] справочно, непрерывная физика: 2πLe/(1−ρ) = %.3f\n", mname,
              2.0 * M_PI * le / (1.0 - rr));
     }
+    if (has_recv) {
+      /* А1566-фальсификатор: приёмник — куски с ИСХОДНЫМ центроидом в слэбе
+       * recv0<=x<=recv1 (за перегородкой); средняя E площадь-взвешенная */
+      double esum = 0.0, asum = 0.0;
+      int nrecv = 0;
+      for (i = 0; i < m.nt; i++) {
+        int32_t tri = py.pcs[i].tri;
+        double cx = cent[3 * (int64_t)tri];
+        if (cx >= recv0 && cx <= recv1) {
+          esum += (double)py.pcs[i].e * area[i];
+          asum += area[i];
+          nrecv++;
+        }
+      }
+      printf("[pyrfront] ПРИЁМНИК x∈[%.4g,%.4g]: кусков %d, E_avg = %.6g (Σ=%.6g)\n", recv0, recv1,
+             nrecv, asum > 0 ? esum / asum : 0.0, esum);
+    }
   }
 
   /* сличение со старым путём (§837-P): дамп E по индексу куска */
@@ -427,9 +450,9 @@ int main(int argc, char **argv) {
   free(cmax);
   free(mtl);
   free(hist);
-  free((void *)so.trivert);
-  free((void *)so.tribox);
-  free((void *)so.lp);
+  free((void *)(uintptr_t)so.trivert);
+  free((void *)(uintptr_t)so.tribox);
+  free((void *)(uintptr_t)so.lp);
   hz_pyr_free(&py);
   hz_obj_free(&m);
   return 0;

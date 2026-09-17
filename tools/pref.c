@@ -336,17 +336,7 @@ int main(int argc, char **argv) {
     }
     cell = maxdim / (double)(1 << lev);
   }
-  { /* §852: вершины треугольников для точного пересечения лучевого свипа */
-    double *tv9 = (double *)malloc((size_t)m.nt * 9 * sizeof *tv9);
-    int32_t ti;
-    if (!tv9) { fprintf(stderr, "нет памяти на trivert\n"); return 2; }
-    for (ti = 0; ti < m.nt; ti++) {
-      double pp[3][3], aa;
-      hz_obj_tri(&m, ti, pp);
-      for (aa = 0; aa < 9; aa++) tv9[9 * (int64_t)ti + (int32_t)aa] = pp[0][aa];
-    }
-    so.trivert = tv9;
-  }
+  /* §852: вершины/боксы/ℓ_p заполняются в блоке СВЕРКИ ниже (после memset so) */
   if (hz_pyr_build(&py, m.nt, cmin, cmax, cent, mtl, m.lo, m.hi, cell) != 0) {
     fprintf(stderr, "pref: пирамида не построилась\n");
     return 2;
@@ -443,15 +433,58 @@ int main(int argc, char **argv) {
            eavg_ref, eavg_ref / (2.0 * M_PI * le / (1.0 - rr)), miss_in, miss_out, t1 - t0);
   }
 
-  /* --- СВИП на том же носителе и СВЕРКА с эталоном --- */
+  /* --- СВИП на том же носителе и СВЕРКА с эталоном ---
+   * mode=3 (§852): полный набор точного пересечения — trivert/tribox/lp/domhi
+   * + per-node max ℓ_p; раньше здесь был mode=2+vc без trivert (упал бы и со
+   * старым порядком: memset ниже стирал заполненный до него so.trivert). */
   memset(&so, 0, sizeof so);
   so.le = le;
   so.rho = rho;
   so.iters = iters;
   so.ndirs = 26;
-  so.mode = 2;
+  so.mode = 3;
   so.build = 1;
   so.vc = 1;
+  {
+    /* §852: trivert/tribox в порядке ИСХОДНЫХ треугольников (pcs[].tri) */
+    double *tv9 = (double *)malloc((size_t)m.nt * 9 * sizeof *tv9);
+    double *tb6 = (double *)malloc((size_t)m.nt * 6 * sizeof *tb6);
+    uint8_t *lparr = (uint8_t *)malloc((size_t)m.nt);
+    int32_t ti;
+    if (!tv9 || !tb6 || !lparr) {
+      fprintf(stderr, "нет памяти на trivert/tribox/lp\n");
+      return 2;
+    }
+    for (ti = 0; ti < m.nt; ti++) {
+      double pp[3][3];
+      int32_t aa, a2;
+      hz_obj_tri(&m, ti, pp);
+      for (aa = 0; aa < 9; aa++)
+        tv9[9 * (int64_t)ti + aa] = ((const double *)pp)[aa];
+      for (a2 = 0; a2 < 3; a2++) {
+        double lo = pp[0][a2], hi = pp[0][a2];
+        int v;
+        for (v = 1; v < 3; v++) {
+          if (pp[v][a2] < lo) lo = pp[v][a2];
+          if (pp[v][a2] > hi) hi = pp[v][a2];
+        }
+        tb6[6 * (int64_t)ti + a2] = lo;
+        tb6[6 * (int64_t)ti + 3 + a2] = hi;
+      }
+      lparr[ti] = 0; /* ℓ_p = 0: сверка на рабочем уровне листьев */
+    }
+    so.trivert = tv9;
+    so.tribox = tb6;
+    so.lp = lparr;
+    so.domhi = m.hi;
+  }
+  {
+    int32_t nup = 0;
+    if (hz_pyr_set_lp(&py, (const uint8_t *)so.lp, &nup) != 0) {
+      fprintf(stderr, "pref: per-node max lp не построился\n");
+      return 2;
+    }
+  }
   for (i = 0; i < m.nt; i++)
     py.pcs[i].e = 0.0f;
   if (hz_sw_run(&py, m.nt, area, nrm, kd, &so, &st, NULL) != 0) {

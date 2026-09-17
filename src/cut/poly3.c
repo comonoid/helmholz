@@ -29,6 +29,9 @@ static int on_plane(double s) {
 }
 #pragma GCC diagnostic pop
 
+/* каноническая форма плоскости — определена ниже, нужна box'у (Р-7б) */
+static void plane_canon(hz_hspace *p);
+
 void hz_frame_plane(const hz_frame *fr, const double n[3], double off, hz_hspace *h) {
   /* мир = o + u∘i, значит n·x <= off  <=>  Σ(n_a u_a) i_a <= off - n·o */
   double d = 0.0;
@@ -51,9 +54,14 @@ static const int8_t box_face[6][4] = {
 };
 
 int hz_poly3_box(hz_poly3 *p, const int32_t lo[3], const int32_t hi[3]) {
+  /* внешние нормали граней в ПОРЯДКЕ box_face: -x,+x,-y,+y,-z,+z;
+   * off — целое, переводится в double точно */
+  static const int8_t bn[6][3] = {{-1, 0, 0}, {1, 0, 0},  {0, -1, 0},
+                                  {0, 1, 0},  {0, 0, -1}, {0, 0, 1}};
   for (int a = 0; a < 3; a++)
     if (hi[a] <= lo[a]) return HZ_P3_EMPTY;
   p->nv = 8;
+  p->nfb = 0;
   for (int c = 0; c < 8; c++)
     for (int a = 0; a < 3; a++)
       p->v[c][a] = (double)((c >> a) & 1 ? hi[a] : lo[a]);
@@ -62,7 +70,18 @@ int hz_poly3_box(hz_poly3 *p, const int32_t lo[3], const int32_t hi[3]) {
     p->fsrc[f] = ~(int32_t)f;
     p->floff[f] = 4 * (int32_t)f;
     for (int k = 0; k < 4; k++)
-      p->fl[4 * f + k] = box_face[f][k];
+      p->fl[4 * f + k] = (int32_t)box_face[f][k];
+    /* Р-7б: плоскость грани коробки в КАНОНИЧЕСКОЙ ФОРМЕ (plane_canon):
+     * одна и та же стена у соседей слева/справа получает ОДНИ БИТЫ —
+     * (-1,0,0),-4 и (1,0,0),+4 обязаны свестись к одному представлению. */
+    hz_hspace bf;
+    for (int a = 0; a < 3; a++)
+      bf.n[a] = (double)bn[f][a];
+    bf.off = (double)(f & 1 ? hi[f >> 1] : -lo[f >> 1]);
+    plane_canon(&bf);
+    for (int a = 0; a < 3; a++)
+      p->fn[f][a] = bf.n[a];
+    p->foff[f] = bf.off;
   }
   p->floff[6] = 24;
   return HZ_P3_OK;
@@ -105,6 +124,147 @@ static void edge_cross(const hz_poly3 *in, const double *s, int32_t a, int32_t b
     out[k] = in->v[p][k] + t * (in->v[q][k] - in->v[p][k]);
 }
 
+/* --- Р-7б: каноническая вершина из ТРЁХ плоскостей ------------------------- */
+
+/* КАНОНИЧЕСКАЯ ФОРМА ПЛОСКОСТИ (Г52, найдено тестом 2a, а не угадано).
+ * Одна и та же геометрическая плоскость приходит с РАЗНЫМИ битами: стена x=4
+ * у соседа слева есть (-1,0,0),-4 (грань lo), у соседа справа — (1,0,0),+4
+ * (грань hi); у дополнения фасет стоит перевёрнутым. «Канонический порядок»
+ * тройки бессмыслен, пока сами ЗНАЧЕНИЯ не каноничны: Крамер по (-1,0,0),-4 и
+ * по (1,0,0),+4 расходится на ulp, и побитовость 2a умирает. Форма: первая
+ * НЕНУЛЕВАЯ компонента нормали положительна; (n,off) переворачиваются ВМЕСТЕ —
+ * в IEEE отрицание точно, геометрия плоскости не меняется. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-equal"
+static void plane_canon(hz_hspace *p) {
+  for (int k = 0; k < 3; k++) {
+    if (p->n[k] != 0.0) { /* как on_plane: ноль здесь точный, допуска нет */
+      if (p->n[k] < 0.0) {
+        for (int c = 0; c < 3; c++)
+          p->n[c] = -p->n[c];
+        p->off = -p->off;
+      }
+      return;
+    }
+  }
+}
+#pragma GCC diagnostic pop
+
+/* Канонический порядок плоскостей ПО ЗНАЧЕНИЯМ (Г52). Значения bitwise-одинаковы
+ * у всех ячеек (Г20) и приведены к канонической форме plane_canon, порядок по
+ * координатам вершин от ячейки не зависит — значит тройка у соседей любых
+ * уровней упорядочена ОДИННАКОВО, и выражение вершины у них одно и то же до
+ * последнего бита. Только < и >: равенство не различаем, для упорядочивания оно
+ * и не нужно. */
+static int plane_less(const hz_hspace *p, const hz_hspace *q) {
+  for (int k = 0; k < 3; k++) {
+    if (p->n[k] < q->n[k]) return 1;
+    if (q->n[k] < p->n[k]) return 0;
+  }
+  return p->off < q->off;
+}
+
+/* Определитель 3x3 [c0; c1; c2] (строки). */
+static double det3(const double a[3], const double b[3], const double c[3]) {
+  return a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2]) +
+         a[2] * (b[0] * c[1] - b[1] * c[0]);
+}
+
+/* Вершина пересечения ребра (a,b) с новым полупространством h: точка лежит на
+ * ТРЁХ плоскостях — h и двух граней, делящих ребро, — и решается по Крамеру,
+ * а НЕ интерполяцией вдоль ребра. Интерполяция у соседей РАЗНЫХ уровней берёт
+ * РАЗНЫЕ рёбра (Г50) и потому не даёт побитового совпадения; тройка плоскостей
+ * у обеих сторон ОДНА (те же плоскости bitwise, Г20), канонический порядок по
+ * plane_less от ячейки не зависит (Г52) — совпадение по построению.
+ *
+ * Г53: плохая обусловленность никуда не девается. det == 0 (параллельность) и
+ * вершина ВНЕ отрезка (вырожденный Крамер) — не допуски, а ОТКАЗ: возвращаемся
+ * к канонической интерполяции ребра edge_cross, которая здесь верна по
+ * построению (точка между концами ребра). Старое поведение — безопасный тыл:
+ * побитовость внутри уровня она уже обеспечивает (Г39), а на плохо
+ * обусловленной тройке Крамер дал бы вершину далеко от тела. Порог не
+ * назначается: сравнение идёт с bbox КОНЦОВ ребра, то есть с координатами,
+ * уже побитово общими у соседей. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-equal"
+static int cramer_in_edge_box(const hz_hspace T[3], const double pa[3], const double pb[3],
+                              double out[3]) {
+  double off[3], det;
+  for (int k = 0; k < 3; k++)
+    off[k] = T[k].off;
+  det = det3(T[0].n, T[1].n, T[2].n);
+  if (det == 0.0) return 0; /* параллельность — точный отказ, не допуск */
+  for (int k = 0; k < 3; k++) {
+    double tmp[3][3], d;
+    for (int r = 0; r < 3; r++)
+      for (int c = 0; c < 3; c++)
+        tmp[r][c] = c == k ? off[r] : T[r].n[c];
+    d = det3(tmp[0], tmp[1], tmp[2]);
+    out[k] = d / det + 0.0; /* +0.0 гасит -0.0: memcmp у 2a различает нули */
+    if (!(out[k] >= pa[k]) || !(out[k] <= pb[k])) return 0; /* вне ребра — отказ Г53 */
+  }
+  return 1;
+}
+#pragma GCC diagnostic pop
+
+static int edge_vertex(const hz_poly3 *in, const double *s, int32_t a, int32_t b,
+                       const hz_hspace *h, double out[3]) {
+  /* две грани, делящие ребро: любая грань, содержащая ОБА конца, содержит и
+   * весь отрезок (выпуклость), поэтому её плоскость проходит через линию ребра.
+   * Берём ДВЕ минимальные по plane_less — на манифолдном ребре их ровно две,
+   * при вырождении выбор всё равно детерминирован и от ячейки не зависит.
+   * Линейный поиск по петлям: nf <= HZ_P3_MAXF, длина петли <= HZ_P3_MAXFL. */
+  hz_hspace g[2];
+  int ng = 0;
+  for (int32_t f = 0; f < in->nf; f++) {
+    int32_t b0 = in->floff[f], k = in->floff[f + 1] - b0;
+    int ha = 0, hb = 0;
+    for (int32_t e = 0; e < k && !(ha && hb); e++) {
+      ha |= in->fl[b0 + e] == a;
+      hb |= in->fl[b0 + e] == b;
+    }
+    if (!(ha && hb)) continue;
+    hz_hspace pf;
+    for (int c = 0; c < 3; c++)
+      pf.n[c] = in->fn[f][c];
+    pf.off = in->foff[f];
+    if (ng < 2) {
+      g[ng++] = pf;
+    } else {
+      /* держим две минимальные: больший из g выкидываем */
+      int i = plane_less(&g[0], &g[1]) ? 1 : 0; /* g[i] — больший */
+      if (plane_less(&pf, &g[i])) g[i] = pf;
+    }
+  }
+  if (ng == 2) {
+    /* канонический порядок тройки по plane_less (Г52), затем Крамер.
+     * Текущее h тоже канонизируется: оно приходит как есть (у дополнения —
+     * перевёрнутым), а у обеих сторон тройка обязана состоять из ОДНИХ БИТОВ. */
+    hz_hspace hc = *h;
+    plane_canon(&hc);
+    hz_hspace T[3] = {g[0], g[1], hc};
+    /* сортировка вставками по plane_less (по возрастанию) */
+    for (int i = 1; i < 3; i++) {
+      hz_hspace t = T[i];
+      int j = i - 1;
+      while (j >= 0 && plane_less(&t, &T[j])) {
+        T[j + 1] = T[j];
+        j--;
+      }
+      T[j + 1] = t;
+    }
+    const double *pa = in->v[a], *pb = in->v[b];
+    double lo[3], hi2[3];
+    for (int c = 0; c < 3; c++) {
+      lo[c] = pa[c] < pb[c] ? pa[c] : pb[c];
+      hi2[c] = pa[c] < pb[c] ? pb[c] : pa[c];
+    }
+    if (cramer_in_edge_box(T, lo, hi2, out)) return 1;
+  }
+  edge_cross(in, s, a, b, out);
+  return 0;
+}
+
 int hz_poly3_clip(const hz_poly3 *in, const hz_hspace *h, int32_t hid, hz_poly3 *out) {
   double s[HZ_P3_MAXV];
   for (int32_t i = 0; i < in->nv; i++) {
@@ -125,6 +285,7 @@ int hz_poly3_clip(const hz_poly3 *in, const hz_hspace *h, int32_t hid, hz_poly3 
 
   out->nv = 0;
   out->nf = 0;
+  out->nfb = in->nfb; /* счётчик fallback'ов переносится вместе с телом */
   out->floff[0] = 0;
 
   int32_t cap_a[HZ_P3_MAXF], cap_b[HZ_P3_MAXF];
@@ -161,7 +322,7 @@ int hz_poly3_clip(const hz_poly3 *in, const hz_hspace *h, int32_t hid, hz_poly3 
           }
         if (found < 0) {
           if (out->nv >= HZ_P3_MAXV || nx >= HZ_P3_MAXV) return HZ_P3_ECAPACITY;
-          edge_cross(in, s, a, b, out->v[out->nv]);
+          if (!edge_vertex(in, s, a, b, h, out->v[out->nv])) out->nfb++;
           on[out->nv] = 1u;
           found = out->nv++;
           xa[nx] = p;
@@ -186,6 +347,9 @@ int hz_poly3_clip(const hz_poly3 *in, const hz_hspace *h, int32_t hid, hz_poly3 
     for (int32_t e = 0; e < m; e++)
       out->fl[base + e] = loop[e];
     out->fsrc[out->nf] = in->fsrc[f];
+    for (int c = 0; c < 3; c++) /* Р-7б: плоскость грани переносится с ней */
+      out->fn[out->nf][c] = in->fn[f][c];
+    out->foff[out->nf] = in->foff[f];
     out->nf++;
     out->floff[out->nf] = base + m;
 
@@ -241,6 +405,18 @@ int hz_poly3_clip(const hz_poly3 *in, const hz_hspace *h, int32_t hid, hz_poly3 
     }
     if (nl >= 3) {
       out->fsrc[out->nf] = hid;
+      /* Р-7б: крышка лежит на плоскости отсечения; хранится в канонической
+       * форме (plane_canon), чтобы у дополнения — с перевёрнутым h — биты сошлись */
+      {
+        hz_hspace cf;
+        for (int c = 0; c < 3; c++)
+          cf.n[c] = h->n[c];
+        cf.off = h->off;
+        plane_canon(&cf);
+        for (int c = 0; c < 3; c++)
+          out->fn[out->nf][c] = cf.n[c];
+        out->foff[out->nf] = cf.off;
+      }
       out->nf++;
       out->floff[out->nf] = base + nl;
     }

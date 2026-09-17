@@ -291,13 +291,327 @@ static int aggr_mvol_rec(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, 
   return 0;
 }
 
+/* --- ХВОСТ «ДВА ТЕЛА»: ФЛЮИД КАК ДОПОЛНЕНИЕ ОБЪЕДИНЕНИЯ (08-11) ---
+ *
+ * Материал записи есть ПЕРЕСЕЧЕНИЕ полуплоскостей, то есть ОДНО выпуклое тело.
+ * Когда веер ячейки несёт фасеты РАЗНЫХ тел (разные `surf`), материал = ОБЪЕДИ-
+ * НЕНИЕ тел B_g, и
+ *
+ *     флюид = complement(∪ B_g) = ∩_g complement(B_g).
+ *
+ * Считается БЕЗ ПРАВКИ ЯДРА, тем же инвариантом, что у hz_poly3_complement:
+ * внешность тела B_g разбита на ВЫПУКЛЫЕ НЕПЕРЕСЕКАЮЩИЕСЯ области
+ * region_j = {h_0..h_{j-1} влёт, h_j вывят}; пересечение текущего разбиения P
+ * с каждой (последовательным клипом куска теми же полуплоскостями,
+ * hz_poly3_clip) снова даёт точное разбиение — куски не пересекаются, объём
+ * не дублируется. Крышки получают метку CUT3_INNER: внутренние грани флюида в
+ * раздаче по сторонам коробки не участвуют (тот же контракт, что у complement).
+ * Группировка полуплоскостей идёт по surf фасета; все surf < 0 (плоскости,
+ * заданные прямо, DC-фасеты) — ОДНА группа, их пересечение и есть одна
+ * выпуклая стенка-слэб (контракт §772). */
+static int cut3_up_push(hz_poly3 **arr, int *n, int *cap, const hz_poly3 *src) {
+  if (*n == *cap) {
+    int nc = *cap ? *cap * 2 : 8;
+    hz_poly3 *na = realloc(*arr, (size_t)nc * sizeof(hz_poly3));
+    if (na == NULL) return 1; /* отказ памяти — fail closed у вызывающего */
+    *arr = na;
+    *cap = nc;
+  }
+  (*arr)[(*n)++] = *src;
+  return 0;
+}
+
+/* Возврат: массив ровно *nout кусков (heap, освобождает вызывающий) либо NULL
+ * при отказе памяти/ядра — fail closed, вызывающий считает ячейку в nbad. */
+static hz_poly3 *cut3_union_fluid(const int32_t lo[3], const int32_t hi[3], const hz_hspace *h,
+                                  const int *grp, int ng, int nh, int *nout) {
+  hz_poly3 *cur = calloc(1, sizeof(hz_poly3));
+  if (cur == NULL) return NULL;
+  int ncur = 0, ccur = 1;
+  if (hz_poly3_box(cur, lo, hi) != HZ_P3_OK) {
+    free(cur);
+    return NULL;
+  }
+  ncur = 1;
+  for (int g = 0; g < ng; g++) {
+    int idx[HZ_P3_MAXH], m = 0;
+    for (int j = 0; j < nh; j++)
+      if (grp[j] == g) idx[m++] = j;
+    hz_poly3 *nxt = NULL;
+    int nn = 0, cnxt = 0;
+    for (int p = 0; p < ncur; p++) {
+      for (int t = 0; t < m; t++) {
+        hz_poly3 q = cur[p], r;
+        int ok = 1;
+        for (int s = 0; s < t && ok; s++) {
+          int st2 = hz_poly3_clip(&q, &h[idx[s]], CUT3_INNER, &r);
+          if (st2 == HZ_P3_EMPTY) {
+            ok = 0;
+            break;
+          }
+          if (st2 != HZ_P3_OK) {
+            free(nxt);
+            free(cur);
+            return NULL;
+          }
+          q = r;
+        }
+        if (!ok) continue; /* влёт h_0..h_{t-1} опустошил кусок: region пуст */
+        hz_hspace hn;
+        for (int a = 0; a < 3; a++)
+          hn.n[a] = -h[idx[t]].n[a];
+        hn.off = -h[idx[t]].off;
+        int st2 = hz_poly3_clip(&q, &hn, CUT3_INNER, &r);
+        if (st2 == HZ_P3_EMPTY) continue;
+        if (st2 != HZ_P3_OK) {
+          free(nxt);
+          free(cur);
+          return NULL;
+        }
+        if (cut3_up_push(&nxt, &nn, &cnxt, &r)) { /* отказ памяти — fail closed */
+          free(nxt);
+          free(cur);
+          return NULL;
+        }
+      }
+    }
+    free(cur);
+    cur = nxt;
+    ncur = nn;
+    ccur = cnxt;
+    if (ncur == 0) break; /* объединение тел покрыло коробку целиком */
+  }
+  if (ncur == 0) { /* пустой флюид — законный ответ, массив ненулевой длины */
+    *nout = 0;
+    free(cur);
+    return calloc(1, sizeof(hz_poly3)); /* не NULL: NULL означает отказ */
+  }
+  if (ncur < ccur) { /* сжать до фактического числа */
+    hz_poly3 *na = realloc(cur, (size_t)ncur * sizeof(hz_poly3));
+    if (na != NULL) cur = na;
+  }
+  *nout = ncur;
+  return cur;
+}
+
+/* --- К50: ГЛАДКИЕ НОРМАЛИ ЭЛЕМЕНТОВ (решение пользователя, 08-11) ---------
+ *
+ * Тело считается ПРИМИТИВОМ: где у фасета есть родитель (surf >= 0), нормаль
+ * элемента берётся У ПРИМИТИВА в центроиде — для сферы это точная (x − c)/r, и
+ * огранка на диффузных и зеркальных шарах исчезает: сбор (К15) и развёртка
+ * смотрят на ОДНО И ТО ЖЕ тело, а не на два разных.
+ *
+ * Где материал задан ЯВНО (surf < 0 — прямые плоскости, DC-фасеты), работает
+ * ФОНГОВА интерполяция: нормаль вершины = нормализованная сумма мировых
+ * плоскостных нормалей всех кусков, делящих эту вершину ТОЧНО (Г3: смежные
+ * куски делят ребро побитово, поэтому точное совпадение координат — надёжный
+ * ключ без допусков); нормаль элемента = нормализованное среднее вершинных
+ * нормалей его полигона. Геометрия элемента остаётся фасетной (полигон, массы,
+ * нулевой вектор) — гладкой делается только ЗАТЕНЕНИЕ. */
+
+typedef struct {
+  double key[3]; /* вершина в единицах кадра — точный ключ, без допуска */
+  double n[3];   /* сумма мировых плоскостных нормалей смежных кусков */
+  uint8_t used;
+} cut3_vn;
+
+typedef struct {
+  cut3_vn *e;
+  int32_t cap; /* степень двойки */
+} cut3_phong;
+
+static uint64_t cut3_vn_hash(const double key[3]) {
+  const unsigned char *b = (const unsigned char *)key;
+  uint64_t h = 1469598103934665603ull; /* FNV-1a по 24 байтам трёх double */
+  for (int i = 0; i < 24; i++) {
+    h ^= b[i];
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+/* ключ сравнивается ПОБИТОВО (memcmp): совпадение координат здесь — контракт
+ * Г3 «смежные куски делят ребро побитово», вещественное сравнение не нужно */
+static cut3_vn *cut3_vn_get(cut3_phong *t, const double key[3]) {
+  int32_t i = (int32_t)(cut3_vn_hash(key) & (uint64_t)(t->cap - 1));
+  for (int32_t step = 0; step < t->cap; step++) {
+    cut3_vn *e = &t->e[i];
+    if (!e->used) {
+      e->used = 1;
+      for (int a = 0; a < 3; a++)
+        e->key[a] = key[a];
+      return e;
+    }
+    if (memcmp(e->key, key, sizeof e->key) == 0) return e;
+    i = (i + 1) & (t->cap - 1);
+  }
+  return NULL; /* таблица мала по построению (cap >= 4·вершин) */
+}
+
+static const cut3_vn *cut3_vn_find(const cut3_phong *t, const double key[3]) {
+  int32_t i = (int32_t)(cut3_vn_hash(key) & (uint64_t)(t->cap - 1));
+  for (int32_t step = 0; step < t->cap; step++) {
+    const cut3_vn *e = &t->e[i];
+    if (!e->used) return NULL;
+    if (memcmp(e->key, key, sizeof e->key) == 0) return e;
+    i = (i + 1) & (t->cap - 1);
+  }
+  return NULL;
+}
+
+static int cut3_phong_init(const hz_facettab *ft, const hz_frame *fr, cut3_phong *t) {
+  int64_t count = 0;
+  for (int32_t i = 0; i < ft->n; i++) {
+    const hz_facet *f = &ft->f[i];
+    if (f->surf < 0 && f->bounded && f->tnv >= 3) count += f->tnv;
+  }
+  int32_t cap = 16;
+  while (cap < 4 * count)
+    cap <<= 1;
+  t->cap = cap;
+  t->e = calloc((size_t)cap, sizeof(cut3_vn));
+  if (t->e == NULL) return 1;
+  for (int32_t i = 0; i < ft->n; i++) {
+    const hz_facet *f = &ft->f[i];
+    if (f->surf >= 0 || !f->bounded || f->tnv < 3) continue;
+    /* плоскостная нормаль в МИР — в единицах метрика неверна (Г21) */
+    double wn[3], nm = 0.0;
+    for (int a = 0; a < 3; a++) {
+      wn[a] = f->n[a] / fr->u[a];
+      nm += wn[a] * wn[a];
+    }
+    nm = sqrt(nm);
+    for (int a = 0; a < 3; a++)
+      wn[a] /= nm;
+    for (int v = 0; v < f->tnv; v++) {
+      cut3_vn *e = cut3_vn_get(t, f->tv[v]);
+      if (e == NULL) return 1;
+      for (int a = 0; a < 3; a++)
+        e->n[a] += wn[a];
+    }
+  }
+  for (int32_t i = 0; i < cap; i++) {
+    cut3_vn *e = &t->e[i];
+    double nm = 0.0;
+    for (int a = 0; a < 3; a++)
+      nm += e->n[a] * e->n[a];
+    if (nm > 0.0) {
+      nm = sqrt(nm);
+      for (int a = 0; a < 3; a++)
+        e->n[a] /= nm;
+    }
+  }
+  return 0;
+}
+
+/* нормаль ПРИМИТИВА в мировой точке; 0 — примитив не сфера */
+static int cut3_prim_normal(const hz_surftab *st, int32_t surf, const double xw[3], double out[3]) {
+  if (st == NULL || surf < 0 || surf >= st->n) return 0;
+  const hz_surf *s = &st->s[surf];
+  if (s->kind != HZ_SURF_SPHERE) return 0;
+  double d[3], nm = 0.0;
+  for (int a = 0; a < 3; a++) {
+    d[a] = xw[a] - s->p[a];
+    nm += d[a] * d[a];
+  }
+  nm = sqrt(nm);
+  if (!(nm > 0.0)) return 0;
+  for (int a = 0; a < 3; a++)
+    out[a] = d[a] / nm;
+  return 1;
+}
+
+/* ГЛАДКАЯ НОРМАЛЬ ЭЛЕМЕНТА. Приоритет: примитив-родитель (точно в центроиде
+ * элемента); затем Фонг по ЯВНОЙ поверхности — нормаль интерполируется между
+ * треугольниками: нормаль вершины = сумма плоскостей смежных кусков (ключ
+ * вершины побитовый, Г3), нормаль в центроиде элемента = барицентрическая
+ * смесь углов ИСХОДНОГО треугольника (углы резаного полигона — новые точки,
+ * их в таблице нет); иначе остаётся плоскостная flat. Ориентация — по flat
+ * (наружу из материала уже задано плоскостью). */
+static void cut3_smooth_normal(const hz_surftab *st, const cut3_phong *phong, const hz_frame *fr,
+                               int32_t surf, const hz_facet *facet, const double (*v)[3], int nv,
+                               const double flat[3], double out[3]) {
+  (void)fr;
+  for (int a = 0; a < 3; a++)
+    out[a] = flat[a];
+  if (nv < 1) return;
+  double cen[3] = {0, 0, 0};
+  for (int i = 0; i < nv; i++)
+    for (int a = 0; a < 3; a++)
+      cen[a] += v[i][a];
+  for (int a = 0; a < 3; a++)
+    cen[a] /= (double)nv;
+  double sn[3] = {0, 0, 0};
+  int have = cut3_prim_normal(st, surf, cen, sn);
+  if (!have && surf < 0 && phong->e != NULL && facet != NULL && facet->tnv >= 3) {
+    if (facet->tnv == 3) {
+      /* барицентрические веса центроида в исходном треугольнике */
+      const double *A = facet->tv[0], *B = facet->tv[1], *C = facet->tv[2];
+      double v0[3], v1[3], v2[3];
+      for (int a = 0; a < 3; a++) {
+        v0[a] = B[a] - A[a];
+        v1[a] = C[a] - A[a];
+        v2[a] = cen[a] - A[a];
+      }
+      double d00 = 0, d01 = 0, d11 = 0, d20 = 0, d21 = 0;
+      for (int a = 0; a < 3; a++) {
+        d00 += v0[a] * v0[a];
+        d01 += v0[a] * v1[a];
+        d11 += v1[a] * v1[a];
+        d20 += v2[a] * v0[a];
+        d21 += v2[a] * v1[a];
+      }
+      double den = d00 * d11 - d01 * d01;
+      if (fabs(den) > 0.0) { /* вырожденный треугольник не даёт весов */
+        double w1 = (d11 * d20 - d01 * d21) / den;
+        double w2 = (d00 * d21 - d01 * d20) / den;
+        double w[3] = {1.0 - w1 - w2, w1, w2};
+        for (int i = 0; i < 3; i++) {
+          if (w[i] < 0.0) w[i] = 0.0;
+          const cut3_vn *e = cut3_vn_find(phong, facet->tv[i]);
+          if (e == NULL) continue;
+          for (int a = 0; a < 3; a++)
+            sn[a] += w[i] * e->n[a];
+        }
+      }
+    } else {
+      for (int i = 0; i < facet->tnv; i++) {
+        const cut3_vn *e = cut3_vn_find(phong, facet->tv[i]);
+        if (e == NULL) continue;
+        for (int a = 0; a < 3; a++)
+          sn[a] += e->n[a];
+      }
+    }
+    double nm = 0.0;
+    for (int a = 0; a < 3; a++)
+      nm += sn[a] * sn[a];
+    if (nm > 0.0) {
+      nm = sqrt(nm);
+      for (int a = 0; a < 3; a++)
+        sn[a] /= nm;
+      have = 1;
+    }
+  }
+  if (!have) return;
+  double dot = sn[0] * flat[0] + sn[1] * flat[1] + sn[2] * flat[2];
+  double sgn = dot < 0.0 ? -1.0 : 1.0;
+  for (int a = 0; a < 3; a++)
+    out[a] = sgn * sn[a];
+}
+
 int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const hz_cutmap *cm,
                   const uint8_t *solid_in) {
-  return tr3_cut_build2(cu, m, ft, cm, solid_in, NULL, NULL);
+  return tr3_cut_build3(cu, m, ft, cm, solid_in, NULL, NULL, NULL);
 }
 
 int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const hz_cutmap *cm,
                    const uint8_t *solid_in, tr3_leaf_solid_fn leaf_solid, void *lsctx) {
+  return tr3_cut_build3(cu, m, ft, cm, solid_in, leaf_solid, lsctx, NULL);
+}
+
+int tr3_cut_build3(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const hz_cutmap *cm,
+                   const uint8_t *solid_in, tr3_leaf_solid_fn leaf_solid, void *lsctx,
+                   const hz_surftab *st) {
   memset(cu, 0, sizeof *cu);
   cu->m = m;
   cu->mvol = calloc((size_t)m->ncell, sizeof(double[4][4]));
@@ -338,6 +652,20 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
 
   if (ft == NULL || cm == NULL) return 0;
 
+  /* К50: таблица Фонга — только если есть ЯВНЫЕ ограниченные куски */
+  cut3_phong phong = {.e = NULL, .cap = 0};
+  for (int32_t i = 0; i < ft->n; i++) {
+    const hz_facet *f = &ft->f[i];
+    if (f->surf < 0 && f->bounded && f->tnv >= 3) {
+      if (cut3_phong_init(ft, &m->fr, &phong)) {
+        free(phong.e);
+        tr3_cut_free(cu);
+        return 1;
+      }
+      break;
+    }
+  }
+
   /* Грани полностью твёрдых ячеек обнуляются ПОСЛЕ разбора разрезанных, иначе
    * порядок обхода решал бы, чей вклад уцелеет. */
   /* --- ячейки с границей: флюидная часть и поверхностные элементы --- */
@@ -377,8 +705,44 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
       }
       nh = nr > 0 ? nr : 0;
       aggr8 = leaf_solid != NULL && nh > 0;
+      /* Ограничение ОБЪЕДИНЕНИЯ на грубые ячейки: агрегация §782 режет веер
+       * как ПЕРЕСЕЧЕНИЕ. Фасеты разных тел в поддереве грубой ячейки здесь
+       * объединением не обрабатываются — помечаются в nbad, чтобы молча не
+       * пройти. */
+      if (nr > 0) {
+        int32_t keys[HZ_P3_MAXH];
+        int nk = 0;
+        for (int j = 0; j < nr; j++) {
+          int32_t fi2 = refs772[j] >= 0 ? refs772[j] : ~refs772[j];
+          int32_t key = (fi2 >= 0 && fi2 < ft->n) ? ft->f[fi2].surf : (int32_t)-1;
+          int seen = 0;
+          for (int q = 0; q < nk && !seen; q++)
+            seen = keys[q] == key;
+          if (!seen && nk < HZ_P3_MAXH) keys[nk++] = key;
+          if (nk > 1) break;
+        }
+        if (nk > 1) cu->nbad++;
+      }
     }
     if (nh <= 0 && !over8) continue;
+    /* ХВОСТ «ДВА ТЕЛА»: группировка полуплоскостей по телу (surf фасета).
+     * Больше одной группы — материал ячейки есть ОБЪЕДИНЕНИЕ тел, и флюид
+     * считается как ∩ дополнений (ниже). surf < 0 — одна общая группа: их
+     * пересечение и есть одна выпуклая стенка (контракт §772). */
+    int grp[HZ_P3_MAXH], ng = 0, gkey[HZ_P3_MAXH];
+    int multi = 0;
+    if (rec != NULL && !over8) {
+      for (int j = 0; j < nh; j++) {
+        int32_t fi = hid[j] >= 0 ? hid[j] : ~hid[j];
+        int32_t key = (fi >= 0 && fi < ft->n) ? ft->f[fi].surf : (int32_t)-1;
+        int g2 = 0;
+        while (g2 < ng && gkey[g2] != key)
+          g2++;
+        if (g2 == ng) gkey[ng++] = key;
+        grp[j] = g2;
+      }
+      multi = ng > 1;
+    }
     /* УСЛОВИЕ 1:1 (записано в заголовке): грань сетки у разрезанной ячейки
      * обязана совпадать с гранью коробки, иначе флюидную часть пришлось бы ещё
      * и обрезать прямоугольником. Проверяется, а не предполагается. */
@@ -388,6 +752,10 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
         cu->nbad++;
       }
     }
+    /* К50: исходные идентификаторы фасетов — ДО затирания метками CUT3_INNER */
+    int32_t fid0[HZ_P3_MAXH];
+    for (int j = 0; j < nh; j++)
+      fid0[j] = hid[j] >= 0 ? hid[j] : ~hid[j];
     for (int j = 0; j < nh; j++) {
       hid[j] = CUT3_INNER;
       hflip[j] = CUT3_INNER;
@@ -403,6 +771,7 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
         sizeof(
             hz_poly3)); /* nh=0 при over8: не нулевой буфер — анализатор строил ложный over-read */
     if (pieces == NULL) {
+      free(phong.e);
       tr3_cut_free(cu);
       return 1;
     }
@@ -418,16 +787,32 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
        * коробки не гоняется вовсе (предел §773). */
       memset(cu->mvol[c], 0, 16 * sizeof(double));
       if (aggr_mvol_rec(cu, m, ft, cm, leaf_solid, lsctx, m->node[c], lo, m->csize[c], c3, hh, c)) {
+        free(phong.e);
         free(pieces);
         tr3_cut_free(cu);
         return 1;
       }
     }
     int npc = 0;
-    if (!aggr8 && !over8 &&
-        hz_poly3_complement(pieces, nh, &npc, lo, hi, h, hid, hflip, nh) != HZ_P3_OK)
+    if (multi) {
+      /* ОБЪЕДИНЕНИЕ: прежний буфер (ёмкости nh) не годится — число кусков
+       * дополнения объединения может его превышать, поэтому буфер выдаёт
+       * сам алгоритм. Отказ → fail closed: ячейка считается в nbad и
+       * остаётся полной коробкой (элементы по записи строятся ниже). */
+      free(pieces);
+      pieces = cut3_union_fluid(lo, hi, h, grp, ng, nh, &npc);
+      if (pieces == NULL) {
+        npc = 0;
+        cu->nbad++;
+        multi = 0; /* дальше живём по пути over8: полная коробка */
+        over8 = 1;
+      } else {
+        cu->nunion++;
+      }
+    } else if (!aggr8 && !over8 &&
+               hz_poly3_complement(pieces, nh, &npc, lo, hi, h, hid, hflip, nh) != HZ_P3_OK)
       npc = 0;
-    if (npc > nh)
+    if (!multi && npc > nh)
       npc = 0; /* невозможно по контракту complement (max = nh);
                 * страховка от ложного over-read анализатора */
     /* Р-8: запись целиком из ОГРАНИЧЕННЫХ кусков? (нужно ниже дважды) */
@@ -439,7 +824,7 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
     }
     int degen8 = 0;
     if (!aggr8 && !over8 && npc == 0) {
-      if (allb8 && (solid_in == NULL || !solid_in[c])) {
+      if (!multi && allb8 && (solid_in == NULL || !solid_in[c])) {
         /* Р-8: union-рез КУСОЧНОЙ записи съел коробку целиком — у кусков
          * объёма нет, «сплошная» здесь ложь того же класса, что дыры §779
          * (замерено: топ-дыры cavity с долей флюида ровно 0.000). Ячейка
@@ -480,7 +865,7 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
      * поверхности выходила завышенной: замкнутость флюида ломалась на 9.9 при
      * площади грани порядка 1. Материал же даёт свои грани прямо: у hz_poly3_cut
      * грань с fsrc >= 0 И ЕСТЬ кусок фасета. */
-    if (!aggr8 && !over8) { /* §782: у агрегата все фасеты кусочные — mat-путь пуст */
+    if (!aggr8 && !over8 && !multi) { /* §782: у агрегата все фасеты кусочные — mat-путь пуст */
       hz_poly3 mat;
       int32_t hid2[HZ_P3_MAXH] = {0};
       for (int j = 0; j < nh; j++)
@@ -533,7 +918,19 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
           nm2 = sqrt(nm2);
           for (int a = 0; a < 3; a++)
             se.n[a] = nw[a] / nm2;
+          /* К50: ЗАТЕНЕНИЕ — по гладкой нормали (см. cut3_smooth_normal) */
+          {
+            double flat[3] = {se.n[0], se.n[1], se.n[2]};
+            int32_t fidx_m = (src >= 0 && src < nh) ? fid0[src] : (int32_t)-1;
+            int32_t skey = (fidx_m >= 0 && fidx_m < ft->n) ? ft->f[fidx_m].surf : (int32_t)-1;
+            const hz_facet *fmax = (fidx_m >= 0 && fidx_m < ft->n) ? &ft->f[fidx_m] : NULL;
+            cut3_smooth_normal(st, &phong, &m->fr, skey, fmax, vw, nv, flat, se.n);
+            if (getenv("C3D") && skey >= 0 && cu->nse < 3)
+              fprintf(stderr, "MAT: skey=%d flat=(%.3f,%.3f,%.3f) out=(%.3f,%.3f,%.3f)\n", skey,
+                      flat[0], flat[1], flat[2], se.n[0], se.n[1], se.n[2]);
+          }
           if (push_se(cu, &se)) {
+            free(phong.e);
             free(pieces);
             tr3_cut_free(cu);
             return 1;
@@ -594,7 +991,13 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
       nm8 = sqrt(nm8);
       for (int a = 0; a < 3; a++)
         se.n[a] = nw8[a] / nm8;
+      /* К50: ЗАТЕНЕНИЕ — по гладкой нормали (см. cut3_smooth_normal) */
+      {
+        double flat[3] = {se.n[0], se.n[1], se.n[2]};
+        cut3_smooth_normal(st, &phong, &m->fr, fp8->surf, fp8, vw8, nv8, flat, se.n);
+      }
       if (push_se(cu, &se)) {
+        free(phong.e);
         free(pieces);
         tr3_cut_free(cu);
         return 1;
@@ -708,6 +1111,8 @@ int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const 
     }
     free(pieces);
   }
+  free(phong.e); /* К50: элементы построены — таблица Фонга больше не нужна */
+  phong.e = NULL;
 
   if (solid_in != NULL)
     for (int32_t c = 0; c < m->ncell; c++) {

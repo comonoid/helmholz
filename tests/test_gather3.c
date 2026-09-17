@@ -660,6 +660,71 @@ int main(void) {
     }
   }
 
+  /* ---------------------------------------------------------------- К45 ---
+   * СРЕДА ВДОЛЬ ЛУЧА: ослабление и вклад рассеяния ВМЕСТЕ. Эталон — замкнутая
+   * форма для ОДНОРОДНОЙ среды и ОДНОРОДНОГО φ на луче, не задевающем тела:
+   *
+   *     L = e^{−σ_t·D}·L_стенки + (σ_s/4πσ_t)·(1 − e^{−σ_t·D})·φ.
+   *
+   * ПРЕДСКАЗАНИЯ: вакуум и σ_t = 0 обязаны дать прежнее число ПОБИТОВО
+   * (негативный контроль встроен: NULL-указатели — прежний марш);
+   * ослабление БЕЗ подсветки обязано занизить ответ — ровно тот дефект,
+   * которым план запрещал чинить К45 половинным путём. */
+  {
+    const double ST = 0.015, SS = 0.012, PHI = 3.7;
+    double *sigt = calloc((size_t)r.m.ncell, sizeof(double));
+    double *sigs = calloc((size_t)r.m.ncell, sizeof(double));
+    double *phiv = calloc((size_t)r.m.ncell * 4, sizeof(double));
+    check(sigt != NULL && sigs != NULL && phiv != NULL, "К45: буферы");
+    for (int32_t c = 0; c < r.m.ncell; c++) {
+      sigt[c] = ST;
+      sigs[c] = SS;
+      phiv[4 * c] = PHI;
+    }
+    tr3_gather g45 = {.sc = &scn,
+                      .m = &r.m,
+                      .cut = &r.cut,
+                      .bout = r.bout,
+                      .sout = r.sout,
+                      .wallidx = r.wallidx,
+                      .nwall = NC,
+                      .maxbounce = 0,
+                      .sig_t = sigt,
+                      .sig_s = sigs,
+                      .phi = phiv};
+    tr3_gather g45n = g45; /* то же БЕЗ подсветки: негативный контроль */
+    g45n.sig_s = NULL;
+    const double o[3] = {2.0, 0.5, 14.0}, d[3] = {0.0, 1.0, 0.0};
+    const double D = 15.5;                             /* до стенки y = 16, тела луч не задевает */
+    double v0 = tr3_gather_ray(&gg, o, d, NULL, NULL); /* вакуум, прежний путь */
+    /* СНАЧАЛА нулевая среда (и σ_t = 0, и σ_s = 0): побитовое совпадение */
+    for (int32_t c = 0; c < r.m.ncell; c++) {
+      sigt[c] = 0.0;
+      sigs[c] = 0.0;
+    }
+    double v45z = tr3_gather_ray(&g45, o, d, NULL, NULL);
+    check(v0 == v45z, "К45: сигм нули — прежнее число ПОБИТОВО");
+    /* теперь ненулевая однородная среда против замкнутой формы */
+    for (int32_t c = 0; c < r.m.ncell; c++) {
+      sigt[c] = ST;
+      sigs[c] = SS;
+    }
+    double v45 = tr3_gather_ray(&g45, o, d, NULL, NULL);
+    double vns = tr3_gather_ray(&g45n, o, d, NULL, NULL);
+    double exact =
+        exp(-ST * D) * L + (SS / (4.0 * 3.14159265358979323846 * ST)) * (1.0 - exp(-ST * D)) * PHI;
+    double e45 = fabs(v45 - exact);
+    printf("  [К45] вакуум %.15e; среда %.15e, замкнутая форма %.15e, |Д| = %.3e; "
+           "без подсветки %.15e\n",
+           v0, v45, exact, e45, vns);
+    check(e45 < 1e-13, "К45: однородная среда — замкнутая форма точна до 1e-13");
+    check(v45 > vns && vns < v0,
+          "К45: ослабление без подсветки ОБЯЗАНО занижать (дефект половинного пути)");
+    free(sigt);
+    free(sigs);
+    free(phiv);
+  }
+
   rig_free(&r);
   printf("%s: %d/%d\n", g_fail ? "FAILURES" : "ok", g_total - g_fail, g_total);
   return g_fail != 0;

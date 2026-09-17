@@ -24,7 +24,14 @@ void hz_ray3_stats_print(const char *tag) {
 }
 
 static int tr3_march_body(const tr3_scene *sc, const double o[3], const double d[3], double tmax,
-                          tr3_hit *h);
+                          tr3_hit *h, tr3_seg_fn seg_fn, void *seg_ctx);
+
+/* К45: сообщить наблюдателю средовый отрезок [ta, tb] узла `ni`. Ставится ровно
+ * там, где марш копит τ, — тогда наблюдатель видит ТЕ ЖЕ отрезки, по которым
+ * шло накопление, и два интеграла (τ и вклад рассеяния) не могут разъехаться. */
+static void seg_emit(tr3_seg_fn seg_fn, void *seg_ctx, int32_t ni, double ta, double tb) {
+  if (seg_fn != NULL && tb > ta) seg_fn(seg_ctx, ni, ta, tb);
+}
 
 /* Пересечение луча со СЛОЕМ [lo, hi] по оси a. Возвращает 0, если пусто. */
 static int slab(double p0, double dd, double lo, double hi, double *t0, double *t1) {
@@ -86,13 +93,21 @@ int tr3_march(const tr3_scene *sc, const double o[3], const double d[3], double 
   /* §829: счёт — одной точкой, в обёртке; сумма шагов читается из готового hit,
    * поэтому место возврата не важно. */
   atomic_fetch_add_explicit(&g_stat_march, 1, memory_order_relaxed);
-  int rc = tr3_march_body(sc, o, d, tmax, h);
+  int rc = tr3_march_body(sc, o, d, tmax, h, NULL, NULL);
+  atomic_fetch_add_explicit(&g_stat_march_steps, h->nsteps, memory_order_relaxed);
+  return rc;
+}
+
+int tr3_march_sink(const tr3_scene *sc, const double o[3], const double d[3], double tmax,
+                   tr3_hit *h, tr3_seg_fn seg_fn, void *seg_ctx) {
+  atomic_fetch_add_explicit(&g_stat_march, 1, memory_order_relaxed);
+  int rc = tr3_march_body(sc, o, d, tmax, h, seg_fn, seg_ctx);
   atomic_fetch_add_explicit(&g_stat_march_steps, h->nsteps, memory_order_relaxed);
   return rc;
 }
 
 static int tr3_march_body(const tr3_scene *sc, const double o[3], const double d[3], double tmax,
-                          tr3_hit *h) {
+                          tr3_hit *h, tr3_seg_fn seg_fn, void *seg_ctx) {
   memset(h, 0, sizeof *h);
   h->facet = -1;
   h->surf = -1;
@@ -211,6 +226,7 @@ static int tr3_march_body(const tr3_scene *sc, const double o[3], const double d
           h->p[a] = o[a] + bt * d[a];
         }
         h->tau += (sc->sigma != NULL ? sc->sigma[ni] : 0.0) * (bt - t);
+        seg_emit(seg_fn, seg_ctx, ni, t, bt);
         return 0;
       }
       nh = 0; /* ни один примитив эту ячейку не задел — поверхности здесь нет */
@@ -263,6 +279,7 @@ static int tr3_march_body(const tr3_scene *sc, const double o[3], const double d
         for (int a = 0; a < 3; a++)
           h->p[a] = o[a] + h->t * d[a];
         h->tau += (sc->sigma != NULL ? sc->sigma[ni] : 0.0) * (h->t - t);
+        seg_emit(seg_fn, seg_ctx, ni, t, h->t);
         return 0;
       }
     }
@@ -271,6 +288,7 @@ static int tr3_march_body(const tr3_scene *sc, const double o[3], const double d
      * точна, а при постоянной по ячейке σ она вырождается в σ·длину. Это
      * частный случай уже проверенного, а не новая формула. */
     if (sc->sigma != NULL) h->tau += sc->sigma[ni] * (texit - t);
+    seg_emit(seg_fn, seg_ctx, ni, t, texit);
 
     if (axis < 0) break; /* луч параллелен всем осям — невозможно при |d| = 1 */
     /* ЦЕЛОЧИСЛЕННЫЙ ШАГ ЧЕРЕЗ ГРАНЬ, без ε. По оси выхода координата шагает

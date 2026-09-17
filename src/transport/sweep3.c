@@ -299,6 +299,102 @@ static double corner_min(const double c[4]) {
   return mn;
 }
 
+/* --- К41/К42: ПОЛОЖИТЕЛЬНОСТЬ И ОТКАТ ПО САМОМУ ЭЛЕМЕНТУ, А НЕ ПО ЯЧЕЙКЕ ---
+ *
+ * К41. Хранимое лежит на ПЛОСКОМ ЭЛЕМЕНТЕ (грань сетки либо поверхностный
+ * элемент), а проверялось по УГЛАМ ЯЧЕЙКИ — множеству, которое элемент не
+ * покрывает. Консервативно: наклоны, положительные на всём элементе, но
+ * уводящие дальний угол ячейки в минус, срезались зря; измерено, запас
+ * сужался до `0.6c` вместо `c`. У DG1 экстремум на выпуклом элементе
+ * достигается в ВЕРШИНЕ, поэтому честная проверка — по вершинам многоугольника
+ * элемента. Значение полинома в мировой точке — тот же базис ячейки, что у
+ * `dg1_at` в сборе (одна формула на обе стороны стыка).
+ *
+ * К42. Откат при отрицательности был ЖЁСТКИЙ — до константы целиком, тогда как
+ * объёмный ограничитель (строка 0 ячейки) давно режет НАКЛОНЫ коэффициентом α
+ * в замкнутой форме, удерживая строку баланса. Здесь та же форма: наклоны
+ * сжимаются на α, свободный член пересчитывается из СТРОКИ 0 МАССЫ ЭЛЕМЕНТА
+ * (`fmm[0][·]·ee′ = rr[0]`), то есть среднее по элементу сохраняется ТОЧНО, а
+ * α выводится, а не ищется бисекцией — условие линейно по α:
+ *
+ *     min_p [ c00 − α·kk/M00 + α·s(p) ] ≥ 0,   s(p) = наклонная часть,
+ *     α = c00 / (kk/M00 − min_p s(p)),         зажим в [0, 1].
+ *
+ * При α = 0 (или вырожденном знаменателе) остаётся прежний константный откат
+ * — отказ в закрытую сторону никуда не делся. */
+
+/* значение DG1-полинома ячейки `c` в мировой точке x */
+double tr3_elem_val_at(const tr3_mesh *m, int32_t c, const double e[4], const double x[3]) {
+  double s = (double)m->csize[c], v = e[0];
+  for (int a = 0; a < 3; a++) {
+    double xu = (x[a] - m->fr.o[a]) / m->fr.u[a];
+    v += e[a + 1] * ((xu - ((double)m->clo[c][a] + 0.5 * s)) / s);
+  }
+  return v;
+}
+
+/* минимум ПОЛИНОМА e по вершинам элемента (мировые точки v[0..nv-1]) */
+double tr3_elem_min_poly(const tr3_mesh *m, int32_t c, const double e[4], const double (*v)[3],
+                         int nv) {
+  double mn = 1e300;
+  for (int i = 0; i < nv; i++) {
+    double x = tr3_elem_val_at(m, c, e, v[i]);
+    if (x < mn) mn = x;
+  }
+  return mn;
+}
+
+/* минимум НАКЛОННОЙ части (без свободного члена) по тем же вершинам */
+static double elem_min_slopes(const tr3_mesh *m, int32_t c, const double e[4], const double (*v)[3],
+                              int nv) {
+  double z[4] = {0.0, e[1], e[2], e[3]};
+  return tr3_elem_min_poly(m, c, z, v, nv);
+}
+
+/* К42: мягкий откат. Возвращает 1 — откат применён (ee перезаписан); 0 — α = 1,
+ * срезка не понадобилась (вызывается УЖЕ внутри ветви отрицательности, так что
+ * ноль здесь означает «отрицательность жила за пределами элемента» — до К41
+ * этот случай честно резался, теперь не резется вовсе). */
+int tr3_elem_rollback(const tr3_mesh *m, int32_t c, const double fmm[4][4], double rr0,
+                      const double (*v)[3], int nv, double ee[4]) {
+  const double m00 = fmm[0][0];
+  if (!(m00 > 0.0) || nv < 1) { /* вырожденная масса: константный откат */
+    ee[0] = rr0 / m00;
+    ee[1] = ee[2] = ee[3] = 0.0;
+    return 1;
+  }
+  double kk = 0.0;
+  for (int j = 1; j < 4; j++)
+    kk += fmm[0][j] * ee[j];
+  const double c00 = rr0 / m00;
+  const double smin = elem_min_slopes(m, c, ee, v, nv);
+  double alpha;
+  if (smin >= 0.0) {
+    /* наклонная часть минимум по элементу НЕ понижает: срезать нечего */
+    alpha = 1.0;
+  } else {
+    const double den = kk / m00 - smin;
+    if (den > 0.0) {
+      alpha = c00 / den;
+      if (alpha > 1.0) alpha = 1.0;
+      if (alpha < 0.0) alpha = 0.0;
+    } else {
+      alpha = 0.0; /* спасти наклон нельзя: лечит только константа */
+    }
+  }
+  /* α ∈ [0,1]: наклоны сжимаются, свободный член держит строку 0 массы. */
+  const double c0 = c00 - alpha * kk / m00;
+  /* «что-то изменилось» — через разность, не через == : гейт запрещает
+   * прямое сравнение вещественных, а точная равенство здесь возможно. */
+  const int changed = (alpha < 1.0) || (fabs(c0 - ee[0]) > 0.0);
+  if (changed) {
+    for (int j = 1; j < 4; j++)
+      ee[j] *= alpha;
+    ee[0] = c0;
+  }
+  return changed;
+}
+
 int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr3_stats *st) {
   const tr3_mesh *m = p->m;
   const tr3_dirs *d = p->d;
@@ -1407,36 +1503,35 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         /* ДВА РАЗНЫХ УСЛОВИЯ, И ТОЛЬКО ВТОРОЕ ЕСТЬ НЕЛИНЕЙНОСТЬ — К86.
          * Вырождение элемента есть свойство ГЕОМЕТРИИ: множество вырожденных
          * элементов от поля не зависит вовсе, и откат на них ЛИНЕЕН. А
-         * `corner_min < 0` есть свойство ПОЛЯ, то есть переключатель, и он
+         * отрицательность есть свойство ПОЛЯ, то есть переключатель, и он
          * обязан подчиняться `p->limiter` наравне с объёмным. Прежде он стоял
          * безусловно, и потому выключение ограничителя оператор линейным НЕ
          * ДЕЛАЛО: Крылов решал не ту систему и приходил к другому ответу
          * (невязка сошедшегося ответа Неймана под его оператором была 1.000). */
         int fb_geom_f = tr3_project_plane(fmm, rr, nul, ee) != 0;
-        if (fb_geom_f || (p->limiter && corner_min(ee) < 0.0)) {
+        /* К41: проверка по углам грани, а не по углам ячейки (грань и есть
+         * элемент; вершины прямоугольника дают экстремум линейной функции). */
+        double fvc[4][3];
+        tr3_face_corners(m, f, fvc);
+        if (fb_geom_f) {
           nfb++;
-          /* §677: КАКОГО РОДА ОТКАТ. Геометрический считается отдельно от
-           * полевого — только второй способен дрожать от такта к такту, и
-           * только он может давать предельный цикл. ЩЕПКА определяется по
-           * флюидному объёму ЯЧЕЙКИ, к которой грань принадлежит с наветренной
-           * стороны: порог `1 %` целой ячейки — не магический, он ровно тот, по
-           * которому §675 назвал максимум `φ` сидящим на щепке. */
-          if (fb_geom_f)
-            nfb_fg++;
-          else {
-            nfb_fp++;
-            if (cu != NULL && m->f[f].ca >= 0) {
-              double vfl = cu->mvol[m->f[f].ca][0][0];
-              double s3 = (double)m->csize[m->f[f].ca];
-              double vcell = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
-              if (vcell > 0.0 && vfl < 0.01 * vcell) nfb_thin++;
-            }
-          }
-          /* ОТКАЗ В ЗАКРЫТУЮ СТОРОНУ: либо элемент выродился геометрически, либо
-           * проекция ушла в минус. Тогда остаётся ТОЧНОЕ среднее по грани —
-           * константа, представимая в любом случае. Порога в критерии нет. */
+          nfb_fg++;
+          /* ОТКАЗ В ЗАКРЫТУЮ СТОРОНУ: элемент выродился геометрически, и
+           * остаётся ТОЧНОЕ среднее по грани — константа. */
           ee[0] = binf[f * 4] / fmm[0][0];
           ee[1] = ee[2] = ee[3] = 0.0;
+        } else if (p->limiter && tr3_elem_min_poly(m, cown, ee, fvc, 4) < 0.0) {
+          nfb_fp++;
+          if (cu != NULL && m->f[f].ca >= 0) {
+            double vfl = cu->mvol[m->f[f].ca][0][0];
+            double s3 = (double)m->csize[m->f[f].ca];
+            double vcell = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+            if (vcell > 0.0 && vfl < 0.01 * vcell) nfb_thin++;
+          }
+          /* К42: мягкий откат — наклоны сжимаются на α, среднее по грани
+           * держится строкой 0; константный откат остаётся при α = 0. */
+          if (tr3_elem_rollback(m, cown, fmm, binf[f * 4], fvc, 4, ee)) nfb++;
+          nfb_ep++;
         }
         /* §746: ПРИНЦИП МАКСИМУМА ДЛЯ ГРАНИ — та же граница, что у элементов
          * (§735): E(x) ≤ hsum·max|L| по вкладчикам (bfmax). Проекция DG1 на
@@ -1497,9 +1592,16 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
           double rr2[4], ee2[4];
           for (int j = 0; j < 4; j++)
             rr2[j] = mspin[((size_t)mfid[f] * (size_t)nd + (size_t)mm2) * 4 + (size_t)j];
-          if (tr3_project_plane(fmm, rr2, nul, ee2) != 0 || (p->limiter && corner_min(ee2) < 0.0)) {
+          int fb_geom_m = tr3_project_plane(fmm, rr2, nul, ee2) != 0;
+          /* К41/К42: то же, что у ламбертовой грани — проверка по ВЕРШИНАМ
+           * грани и мягкая срезка наклонов со строкой 0 массы. */
+          double fvc2[4][3];
+          tr3_face_corners(m, f, fvc2);
+          if (fb_geom_m) {
             ee2[0] = rr2[0] / fmm[0][0];
             ee2[1] = ee2[2] = ee2[3] = 0.0;
+          } else if (p->limiter && tr3_elem_min_poly(m, m->f[f].ca, ee2, fvc2, 4) < 0.0) {
+            tr3_elem_rollback(m, m->f[f].ca, fmm, rr2[0], fvc2, 4, ee2);
           }
           int mr = d->mir[(size_t)ax * (size_t)nd + (size_t)mm2];
           for (int j = 0; j < 4; j++)
@@ -1538,19 +1640,36 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
         double safe = fabs(rr[0]) > 0.0 ? fabs(rr[0]) / fmm[0][0] : 0.0;
         gdbg[e] = safe > 0.0 ? nee / safe : 0.0;
       }
-      if (fb_geom_e || (p->limiter && corner_min(ee) < 0.0)) {
+      /* К41: минимум ПО ЭЛЕМЕНТУ (его вершины в `se->v`; при nv = 0 вершины не
+       * поместились — тогда проверка по ячейке остаётся консервативной). */
+      int elemneg = 0;
+      if (p->limiter) {
+        if (se->nv >= 3)
+          elemneg = tr3_elem_min_poly(m, se->cell, ee, se->v, se->nv) < 0.0;
+        else
+          elemneg = corner_min(ee) < 0.0;
+      }
+      if (fb_geom_e) {
         ee[0] = sinf[e * 4] / fmm[0][0];
         ee[1] = ee[2] = ee[3] = 0.0;
         nfb++;
-        if (fb_geom_e)
-          nfb_eg++;
-        else {
-          nfb_ep++;
-          double vfl = cu->mvol[se->cell][0][0];
-          double s3 = (double)m->csize[se->cell];
-          double vcell = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
-          if (vcell > 0.0 && vfl < 0.01 * vcell) nfb_thin++;
+        nfb_eg++;
+      } else if (elemneg) {
+        double vfl = cu->mvol[se->cell][0][0];
+        double s3 = (double)m->csize[se->cell];
+        double vcell = s3 * s3 * s3 * m->fr.u[0] * m->fr.u[1] * m->fr.u[2];
+        if (vcell > 0.0 && vfl < 0.01 * vcell) nfb_thin++;
+        /* К42: мягкий откат — наклоны сжимаются на α, среднее по элементу
+         * держится строкой 0 массы; константный откат остаётся при α = 0.
+         * Вершины на элементе есть только при nv ≥ 3; иначе — константа. */
+        if (se->nv >= 3) {
+          if (tr3_elem_rollback(m, se->cell, fmm, sinf[e * 4], se->v, se->nv, ee)) nfb++;
+        } else {
+          ee[0] = sinf[e * 4] / fmm[0][0];
+          ee[1] = ee[2] = ee[3] = 0.0;
+          nfb++;
         }
+        nfb_ep++;
       }
       /* §735: ПРИНЦИП МАКСИМУМА ДЛЯ ОБЛУЧЁННОСТИ: E(x) = ∫L|ω·n|dω ≤
        * hs_se · max|L| по вкладывавшим направлениям (semax). Проекция DG1 на
@@ -2152,6 +2271,7 @@ int tr3_sweep_solve(const tr3_problem *p, int maxit, double tol, double *phi, tr
      * Умолчание reltol = 0 оставляет абсолютный критерий БЕЗ ИЗМЕНЕНИЯ — мир
      * без ключей посимвольно прежний. Вырожденный stmax = 0 (нет источников)
      * сводится к абсолюту: резид тогда тоже нулевой. */
+    if (p->pass_fn != NULL) p->pass_fn(p->pass_ctx, it, phi);
     if (p->reltol > 0.0 ? resid < p->reltol * (stmax > 0.0 ? stmax : 1.0) : resid < tol) break;
 
     /* ОСТАНОВКА ПО ЗАСТОЮ, А НЕ ТОЛЬКО ПО ДОПУСКУ — К81.

@@ -80,6 +80,10 @@ typedef struct {
   int32_t nsebig;            /* элементов, чей многоугольник НЕ ПОМЕСТИЛСЯ (nv = 0) */
   int32_t nrezover;          /* §794: клеток с веером > HZ_P3_MAXH — рез отказан к
                               * полному флюиду, элементы построены по записи */
+  /* ХВОСТ «ДВА ТЕЛА» (08-11): ячеек, чей веер несёт фасеты РАЗНЫХ тел и чей
+   * флюид посчитан как дополнение ОБЪЕДИНЕНИЯ тел (∩ дополнений по телам), а
+   * не как дополнение пересечения-материала. */
+  int32_t nunion;
 } tr3_cut;
 
 /* ft/cm могут быть NULL — тогда всё вырождается в коробки, и развёртка работает
@@ -104,6 +108,16 @@ int tr3_cut_build(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const h
 typedef int (*tr3_leaf_solid_fn)(void *ctx, const int32_t lo[3], int32_t size);
 int tr3_cut_build2(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const hz_cutmap *cm,
                    const uint8_t *solid_in, tr3_leaf_solid_fn leaf_solid, void *lsctx);
+/* К50 (решение пользователя): ТЕЛО СЧИТАЕТСЯ ПРИМИТИВОМ. Нормаль поверхностного
+ * элемента берётся У ПРИМИТИВА в центроиде элемента (для сферы — точно), а у
+ * ЯВНО заданных поверхностей (surf < 0) — ФОНГОВОЙ интерполяцией по вершинам
+ * треугольников (нормаль вершины = сумма плоскостей смежных кусков, нормаль
+ * элемента = среднее вершин его полигона). Геометрия элемента (полигон, массы,
+ * нулевой вектор) остаётся фасетной — гладкой делается только ЗАТЕНЕНИЕ.
+ * st = NULL или build/build2 — прежнее поведение: нормаль плоскости фасета. */
+int tr3_cut_build3(tr3_cut *cu, const tr3_mesh *m, const hz_facettab *ft, const hz_cutmap *cm,
+                   const uint8_t *solid_in, tr3_leaf_solid_fn leaf_solid, void *lsctx,
+                   const hz_surftab *st);
 void tr3_cut_free(tr3_cut *cu);
 
 #endif

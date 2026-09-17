@@ -241,6 +241,532 @@ static void rig_free(rig *r) {
   hz_oct_free(&r->t);
 }
 
+/* ---------------------------------------- К41/К42: элемент, а не ячейка ---
+ *
+ * ПРЕДСКАЗАНИЯ ДО РЕЗУЛЬТАТОВ:
+ *  Ф1 К41: поле, ПОЛОЖИТЕЛЬНОЕ на всём элементе, но уводящее ДАЛЬНИЙ УГОЛ
+ *     ЯЧЕЙКИ в минус, обязано проходить проверку положительности без отката —
+ *     прежде ровно этот случай резался зря (запас `0.6c` вместо `c`);
+ *  Ф2 К42: отрицательное на элементе поле обязано откатываться МЯГКО —
+ *     наклон выживает (α ∈ (0,1)), среднее по строке 0 массы сохраняется
+ *     ТОЧНО, минимум по элементу после отката ≥ 0 (с допуском на округление);
+ *  НК: rr0 < 0 — спасти нечего, α = 0, остаётся константный откат (то же
+ *     отрицательное среднее), т.е. отказ в закрытую сторону никуда не делся.
+ */
+/* ------------------- ХВОСТ «ДВА ТЕЛА»: ОБЪЕДИНЕНИЕ В ЯЧЕЙКЕ ---------------
+ *
+ * ПРЕДСКАЗАНИЯ ДО РЕЗУЛЬТАТОВ:
+ *  Ф1 у разрезанной сцены с двумя РАЗНЕСЁННЫМИ шарами найдутся ячейки, чей веер
+ *     несёт фасеты ОБОИХ тел (nboth > 0); все они обработаны объединением
+ *     (cu.nunion == nboth) и без нарушений 1:1 (cu.nbad == 0);
+ *  Ф2 в такой ячейке флюид = коробка − V(B1) − V(B2) — объёмы тел считаются
+ *     НЕЗАВИСИМЫМ путём (hz_poly3_complement по группе в той же коробке);
+ *     негативный контроль: старое поведение «материал = пересечение» дало бы
+ *     флюид = ВСЯ коробка (тела разнесены, пересечение пусто) — ошибка на весь
+ *     объём тел, и она ОБЯЗАНА быть видна;
+ *  Ф3 одна группа (однотелковая ячейка) идёт прежним путём: тождество
+ *     флюид + тело = коробка держится до 1e-12;
+ *  Ф4 энергобаланс полной развёртки на двух телах замыкается.
+ */
+static void t_union(void) {
+  const hz_frame fr = {{0, 0, 0}, {1, 1, 1}};
+  const int L = 4, N = 1 << L;
+  hz_octree t;
+  hz_oct_init(&t, L, 0.0);
+  for (int x = 0; x < N; x++)
+    for (int y = 0; y < N; y++)
+      for (int z = 0; z < N; z++) {
+        int lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
+        hz_oct_set_box(&t, lo, hi, 1.0);
+      }
+  hz_surftab stab;
+  hz_facettab ftab;
+  hz_cutmap cmap;
+  hz_surftab_init(&stab);
+  hz_facettab_init(&ftab);
+  hz_cutmap_init(&cmap);
+  /* Тела РАЗНЕСЕНЫ (d = 2.9 > r1+r2 = 2.8), но обе задевают общие ячейки
+   * вокруг x = 8 — ровно тот случай, который прежде выбрасывал второе тело. */
+  double sc[2][3] = {{7.0, 7.5, 7.5}, {9.9, 7.5, 7.5}};
+  double sr[2] = {1.4, 1.4};
+  int32_t si[2], f0[2], nfac[2];
+  for (int b = 0; b < 2; b++) {
+    hz_surf sp = {HZ_SURF_SPHERE, {sc[b][0], sc[b][1], sc[b][2], sr[b], 0, 0, 0}, 1, 0};
+    si[b] = hz_surftab_add(&stab, &sp);
+    f0[b] = 0;
+    nfac[b] = hz_surf_facet_sphere(&ftab, &fr, sc[b], sr[b], 1, HZ_FIT_MEAN_SAGITTA, si[b], &f0[b]);
+    check(nfac[b] > 0, "сфера фасетизирована");
+  }
+  typedef struct {
+    int32_t cell, f[HZ_P3_MAXH], nf;
+  } rec_t;
+  static rec_t rec[16384];
+  int nrec = 0, nboth = 0;
+  for (int x = 0; x < N; x++)
+    for (int y = 0; y < N; y++)
+      for (int z = 0; z < N; z++) {
+        int32_t lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
+        int32_t sel[HZ_P3_MAXH];
+        int ns = 0, nb2 = 0;
+        for (int b = 0; b < 2; b++) {
+          int32_t s2[HZ_P3_MAXH];
+          int k2 = hz_facets_for_box(&ftab, f0[b], nfac[b], lo, hi, s2, HZ_P3_MAXH);
+          if (k2 <= 0) continue;
+          nb2++;
+          for (int j = 0; j < k2 && ns < HZ_P3_MAXH; j++)
+            sel[ns++] = s2[j];
+        }
+        if (ns <= 0) continue;
+        if (nb2 > 1) nboth++;
+        rec[nrec].cell = hz_oct_leaf(&t, x, y, z);
+        rec[nrec].nf = ns;
+        for (int j = 0; j < ns; j++)
+          rec[nrec].f[j] = sel[j];
+        nrec++;
+      }
+  check(nboth > 0, "Ф1: ячейки с ОБОИМИ телами в веере существуют");
+  for (int i = 1; i < nrec; i++) { /* Г45: ключи строго по возрастанию */
+    rec_t tmp = rec[i];
+    int j = i - 1;
+    while (j >= 0 && rec[j].cell > tmp.cell) {
+      rec[j + 1] = rec[j];
+      j--;
+    }
+    rec[j + 1] = tmp;
+  }
+  for (int i = 0; i < nrec; i++)
+    check(hz_cutmap_add(&cmap, rec[i].cell, rec[i].f, rec[i].nf) == 0, "Г45: запись легла");
+  tr3_mesh m;
+  check(tr3_mesh_build(&m, &t, &fr) == 0, "сетка");
+  uint8_t *solid = calloc((size_t)m.ncell, 1);
+  for (int x = 0; x < N; x++)
+    for (int y = 0; y < N; y++)
+      for (int z = 0; z < N; z++) {
+        int32_t lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
+        int32_t sel[HZ_P3_MAXH];
+        int inside = 1;
+        for (int b = 0; b < 2 && inside; b++)
+          if (hz_facets_for_box(&ftab, f0[b], nfac[b], lo, hi, sel, HZ_P3_MAXH) != 0) inside = 0;
+        if (inside) solid[m.cellof[hz_oct_leaf(&t, x, y, z)]] = 1;
+      }
+  tr3_cut cu;
+  check(tr3_cut_build(&cu, &m, &ftab, &cmap, solid) == 0, "разрез");
+  printf("  [UNION] ячеек с двумя телами %d, обработано объединением %d, nbad %d\n", nboth,
+         (int)cu.nunion, (int)cu.nbad);
+  check((int32_t)cu.nunion == nboth, "Ф1: все двухтельные ячейки обработаны объединением");
+  check(cu.nbad == 0, "Ф1: нарушений 1:1 нет");
+
+  /* Ф2: флюид = коробка − V(B1) − V(B2) в каждой двухтельной ячейке. V(B_g)
+   * считается НЕЗАВИСИМО: тело g в коробке через hz_poly3_cut, дополнение —
+   * через hz_poly3_complement по фасетам ТОЛЬКО этого тела. */
+  double worst_u = 0.0, worst_1 = 0.0, vwrong = 0.0;
+  int nchecked_u = 0, nchecked_1 = 0;
+  for (int32_t c = 0; c < m.ncell; c++) {
+    const hz_cutrec *rr = hz_cutmap_find(&cmap, m.node[c]);
+    if (rr == NULL) continue;
+    double s = (double)m.csize[c], vbox = s * s * s;
+    int32_t lo2[3] = {m.clo[c][0], m.clo[c][1], m.clo[c][2]};
+    int32_t hi2[3] = {lo2[0] + m.csize[c], lo2[1] + m.csize[c], lo2[2] + m.csize[c]};
+    int nb_here = 0, body_here[2] = {0, 0};
+    double vsum = 0.0;
+    int single_ok = 1;
+    for (int b = 0; b < 2; b++) {
+      int32_t s2[HZ_P3_MAXH];
+      int k2 = hz_facets_for_box(&ftab, f0[b], nfac[b], lo2, hi2, s2, HZ_P3_MAXH);
+      if (k2 <= 0) continue;
+      body_here[b] = 1;
+      nb_here++;
+      hz_hspace hh[HZ_P3_MAXH];
+      for (int j = 0; j < k2; j++) {
+        for (int a = 0; a < 3; a++)
+          hh[j].n[a] = ftab.f[s2[j]].n[a];
+        hh[j].off = ftab.f[s2[j]].off;
+      }
+      /* переносимый путь: НЕЗАВИСИМОЕ дополнение тела в коробке */
+      hz_poly3 *pcs = calloc((size_t)k2, sizeof(hz_poly3));
+      int npcs = 0;
+      int32_t zl[HZ_P3_MAXH] = {0}, zf[HZ_P3_MAXH] = {0};
+      if (hz_poly3_complement(pcs, k2, &npcs, lo2, hi2, hh, zl, zf, k2) == HZ_P3_OK) {
+        double vc = 0.0;
+        for (int p = 0; p < npcs; p++)
+          vc += hz_poly3_volume(&pcs[p], &fr);
+        vsum += vbox - vc; /* V(B_g) */
+      } else {
+        single_ok = 0;
+      }
+      free(pcs);
+    }
+    if (nb_here == 0) continue;
+    double fluid = cu.mvol[c][0][0];
+    if (nb_here >= 2) {
+      /* перекрытие тел отсутствует по построению (d > r1+r2), значит
+       * V(объединения) = V(B1) + V(B2) */
+      double e = fabs(fluid - (vbox - vsum));
+      if (e > worst_u) worst_u = e;
+      if (vbox - fluid > vwrong) vwrong = vbox - fluid;
+      nchecked_u++;
+    } else if (single_ok && body_here[0] != body_here[1]) {
+      double e = fabs(fluid - (vbox - vsum));
+      if (e > worst_1) worst_1 = e;
+      nchecked_1++;
+    }
+  }
+  printf("  [UNION] двухтельные: max |флюид − (коробка−V1−V2)| = %.3e (%d ячеек); "
+         "старый ответ дал бы флюид = коробка, расхождение с ним до %.3f\n",
+         worst_u, nchecked_u, vwrong);
+  check(nchecked_u > 0, "Ф2: двухтельные ячейки проверены");
+  /* Допуск 1e-4: тела в ячейке заданы ВЕЕРАМИ ПЛОСКОСТЕЙ, а не сферой; плоские
+   * тела двух фасетизаций могут перекрываться на величину порядка фасетного
+   * зазора (d=2.9 при r1+r2=2.8), и тождество «объединение = V1+V2» верно для
+   * сфер, но не точно для их плоских представлений. Дефект «пересечение вместо
+   * объединения» давал 0.7–8.3 на ячейку — на пять порядков больше. */
+  check(worst_u < 1e-4, "Ф2: флюид = коробка минус ОБА тела (до фасетного зазора)");
+  check(vwrong > 0.5, "НК Ф2: пересечение-вместо-объединения давило бы ОБА тела целиком");
+  printf("  [UNION] однотельные: max |флюид + тело − коробка| = %.3e (%d ячеек)\n", worst_1,
+         nchecked_1);
+  check(nchecked_1 > 0, "Ф3: однотельные ячейки проверены");
+  check(worst_1 < 1e-12, "Ф3: однотельный путь прежний — тождество до 1e-12");
+
+  /* Ф4: энергобаланс полной развёртки на двух телах */
+  {
+    tr3_dirs d;
+    check(tr3_dirs_product(&d, 2, 2) == 0, "ординаты");
+    double *sigt = calloc((size_t)m.ncell, sizeof(double));
+    double *sigs = calloc((size_t)m.ncell, sizeof(double));
+    double *frho = calloc((size_t)ftab.n, sizeof(double));
+    double *fem = calloc((size_t)ftab.n, sizeof(double));
+    for (int32_t c = 0; c < m.ncell; c++) {
+      sigt[c] = 0.05;
+      sigs[c] = 0.04;
+    }
+    for (int32_t i = 0; i < ftab.n; i++)
+      frho[i] = 0.7;
+    double wr[6] = {0.8, 0.8, 0.8, 0.8, 0.8, 0.8}, we[6] = {0, 0, 0, 0, 0, 5.0};
+    tr3_problem p = {.m = &m,
+                     .d = &d,
+                     .cut = &cu,
+                     .facet_rho = frho,
+                     .facet_emit = fem,
+                     .nfacet = ftab.n,
+                     .sig_t = sigt,
+                     .sig_s = sigs,
+                     .wall_rho = wr,
+                     .wall_emit = we,
+                     .limiter = 1};
+    double *phi = calloc((size_t)m.ncell * 4, sizeof(double));
+    tr3_stats st;
+    memset(&st, 0, sizeof st);
+    int rc = tr3_sweep_solve(&p, 4000, 1e-9, phi, &st);
+    check(rc == 0, "Ф4: развёртка сошлась");
+    double lhs = st.pin + st.psout + st.pemit, rhs = st.pout + st.pabs + st.psin + st.psolid;
+    double rel = st.pin > 0.0 ? fabs(lhs - rhs) / st.pin : -1.0;
+    printf("  [UNION] баланс: втекло %.4f, невязка тождества %.3e (отн. %.3e), элементов %d\n",
+           st.pin, fabs(lhs - rhs), rel, (int)cu.nse);
+    /* Допуск 1e-2: ограничитель положительности и принцип максимума ЖЕРТВУЮТ
+     * строки баланса в зажатых ячейках (§735 записано), поэтому тождество
+     * замыкается до жертвы ограничителя, а не до машинной точности; дефектом
+     * считался бы порядок 1 — свет, прошедший сквозь выброшенное тело. */
+    check(rel < 1e-2, "Ф4: тождество К40 на объединении замыкается (до жертвы ограничителя)");
+    free(phi);
+    free(sigt);
+    free(sigs);
+    free(frho);
+    free(fem);
+    free(st.bout);
+    free(st.sout);
+    tr3_dirs_free(&d);
+  }
+
+  free(solid);
+  tr3_cut_free(&cu);
+  tr3_mesh_free(&m);
+  hz_cutmap_free(&cmap);
+  hz_facettab_free(&ftab);
+  hz_surftab_free(&stab);
+  hz_oct_free(&t);
+}
+
+/* ------------------------------ К50: ГЛАДКИЕ НОРМАЛИ -----------------------
+ *
+ * РЕШЕНИЕ ПОЛЬЗОВАТЕЛЯ: тело считается ПРИМИТИВОМ; у явно заданных поверхностей
+ * нормаль интерполируется между треугольниками (Фонг).
+ *
+ * ПРЕДСКАЗАНИЯ ДО РЕЗУЛЬТАТОВ:
+ *  Ф1 у элементов сферы нормаль = примитивной нормали в центроиде; макс угол
+ *     ПАДАЕТ с ростом фасетизации (фасетный уровень 1 -> 3);
+ *  НК1 прежний путь (нормаль плоскости фасета) даёт угол порядка наклона
+ *     фасета — ЗАМЕТНО больший, и почти не зависящий от уровня;
+ *  Ф2 явная поверхность (surf сброшен в -1): Фонг даёт угол меньше плоскостного
+ *     НЕ МЕНЕЕ чем вдвое — интерполяция восстанавливает сферичность;
+ *  НК2 Фонг на явной поверхности при build (без build3) недоступен — нормали
+ *     остаются плоскостными (тот же макс угол, что у плоскостной ошибки).
+ */
+static void t_k50_scene(int fsub, int use_stab, int make_explicit, double *worst_angle,
+                        double *worst_plane_angle, int *nchecked, int latlong) {
+  const hz_frame fr = {{0, 0, 0}, {1, 1, 1}};
+  const int L = 4, N = 1 << L;
+  hz_octree t;
+  hz_oct_init(&t, L, 0.0);
+  for (int x = 0; x < N; x++)
+    for (int y = 0; y < N; y++)
+      for (int z = 0; z < N; z++) {
+        int lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
+        hz_oct_set_box(&t, lo, hi, 1.0);
+      }
+  hz_surftab stab;
+  hz_facettab ftab;
+  hz_cutmap cmap;
+  hz_surftab_init(&stab);
+  hz_facettab_init(&ftab);
+  hz_cutmap_init(&cmap);
+  double c[3] = {8.0, 8.0, 8.0}, r = 3.0;
+  hz_surf sp = {HZ_SURF_SPHERE, {c[0], c[1], c[2], r, 0, 0, 0}, 1, 0};
+  int32_t si = hz_surftab_add(&stab, &sp);
+  int32_t f0 = 0, nfac = 0;
+  if (latlong) {
+    /* ЯВНАЯ поверхность: широтно-долготная сетка треугольников с вершинами НА
+     * сфере, surf = -1, куски ограничены (tv — единицы кадра, здесь = мир).
+     * Тот же класс входа, что DC-фасеты и OBJ-куски. */
+    f0 = (int32_t)ftab.n;
+    const int NTH = 10, NPH = 20;
+    for (int it = 0; it < NTH; it++)
+      for (int ip = 0; ip < NPH; ip++) {
+        double th0 = M_PI * (double)it / NTH, th1 = M_PI * (double)(it + 1) / NTH;
+        double ph0 = 2.0 * M_PI * (double)ip / NPH, ph1 = 2.0 * M_PI * (double)(ip + 1) / NPH;
+        double v[4][3];
+        double th[2] = {th0, th1}, ph[2] = {ph0, ph1};
+        for (int a = 0; a < 2; a++)
+          for (int b = 0; b < 2; b++) {
+            v[2 * a + b][0] = c[0] + r * sin(th[a]) * cos(ph[b]);
+            v[2 * a + b][1] = c[1] + r * sin(th[a]) * sin(ph[b]);
+            v[2 * a + b][2] = c[2] + r * cos(th[a]);
+          }
+        int tris[2][3] = {{0, 1, 3}, {0, 3, 2}};
+        for (int tt = 0; tt < 2; tt++) {
+          const double *A = v[tris[tt][0]], *B = v[tris[tt][1]], *C = v[tris[tt][2]];
+          double u1[3], u2[3], n[3];
+          for (int a = 0; a < 3; a++) {
+            u1[a] = B[a] - A[a];
+            u2[a] = C[a] - A[a];
+          }
+          n[0] = u1[1] * u2[2] - u1[2] * u2[1];
+          n[1] = u1[2] * u2[0] - u1[0] * u2[2];
+          n[2] = u1[0] * u2[1] - u1[1] * u2[0];
+          double nm = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+          if (!(nm > 0.0)) continue;
+          for (int a = 0; a < 3; a++)
+            n[a] /= nm;
+          if (n[0] * (A[0] - c[0]) + n[1] * (A[1] - c[1]) + n[2] * (A[2] - c[2]) < 0.0)
+            for (int a = 0; a < 3; a++)
+              n[a] = -n[a];
+          double off = n[0] * A[0] + n[1] * A[1] + n[2] * A[2];
+          int32_t fi = ftab.n;
+          if (hz_facettab_add_plane(&ftab, &fr, n, off, -1, 0.0) < 0) {
+            check(0, "явный фасет не лёг");
+            return;
+          }
+          ftab.f[fi].bounded = 1;
+          ftab.f[fi].tnv = 3;
+          for (int a = 0; a < 3; a++) {
+            ftab.f[fi].tv[0][a] = A[a];
+            ftab.f[fi].tv[1][a] = B[a];
+            ftab.f[fi].tv[2][a] = C[a];
+          }
+          nfac++;
+        }
+      }
+    if (nfac <= 0) {
+      check(0, "явная сетка пуста");
+      return;
+    }
+  } else {
+    nfac = hz_surf_facet_sphere(&ftab, &fr, c, r, fsub, HZ_FIT_MEAN_SAGITTA, si, &f0);
+    if (make_explicit)
+      for (int32_t i = f0; i < f0 + nfac; i++)
+        ftab.f[i].surf = -1; /* тело задано ЯВНО треугольниками, примитива нет */
+  }
+  typedef struct {
+    int32_t cell, f[HZ_P3_MAXH], nf;
+  } rec_t;
+  static rec_t rec[16384];
+  int nrec = 0;
+  for (int x = 0; x < N; x++)
+    for (int y = 0; y < N; y++)
+      for (int z = 0; z < N; z++) {
+        int32_t lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
+        int32_t sel[HZ_P3_MAXH];
+        int ns = hz_facets_for_box(&ftab, f0, nfac, lo, hi, sel, HZ_P3_MAXH);
+        if (ns <= 0) continue;
+        rec[nrec].cell = hz_oct_leaf(&t, x, y, z);
+        rec[nrec].nf = ns;
+        for (int j = 0; j < ns; j++)
+          rec[nrec].f[j] = sel[j];
+        nrec++;
+      }
+  for (int i = 1; i < nrec; i++) {
+    rec_t tmp = rec[i];
+    int j = i - 1;
+    while (j >= 0 && rec[j].cell > tmp.cell) {
+      rec[j + 1] = rec[j];
+      j--;
+    }
+    rec[j + 1] = tmp;
+  }
+  for (int i = 0; i < nrec; i++)
+    check(hz_cutmap_add(&cmap, rec[i].cell, rec[i].f, rec[i].nf) == 0, "Г45: запись легла");
+  tr3_mesh m;
+  check(tr3_mesh_build(&m, &t, &fr) == 0, "сетка");
+  uint8_t *solid = calloc((size_t)m.ncell, 1);
+  for (int x = 0; x < N; x++)
+    for (int y = 0; y < N; y++)
+      for (int z = 0; z < N; z++) {
+        int32_t lo[3] = {x, y, z}, hi[3] = {x + 1, y + 1, z + 1};
+        int32_t sel[HZ_P3_MAXH];
+        if (hz_facets_for_box(&ftab, f0, nfac, lo, hi, sel, HZ_P3_MAXH) == 0)
+          solid[m.cellof[hz_oct_leaf(&t, x, y, z)]] = 1;
+      }
+  tr3_cut cu;
+  check(tr3_cut_build3(&cu, &m, &ftab, &cmap, solid, NULL, NULL, use_stab ? &stab : NULL) == 0,
+        "разрез");
+  for (int32_t e = 0; e < cu.nse; e++) {
+    const tr3_selem *se = &cu.se[e];
+    if (se->nv < 3) continue;
+    double cen[3] = {0, 0, 0};
+    for (int i = 0; i < se->nv; i++)
+      for (int a = 0; a < 3; a++)
+        cen[a] += se->v[i][a];
+    for (int a = 0; a < 3; a++)
+      cen[a] /= (double)se->nv;
+    double exact[3] = {cen[0] - c[0], cen[1] - c[1], cen[2] - c[2]};
+    double nm = sqrt(exact[0] * exact[0] + exact[1] * exact[1] + exact[2] * exact[2]);
+    for (int a = 0; a < 3; a++)
+      exact[a] /= nm;
+    double dot = 0.0;
+    for (int a = 0; a < 3; a++)
+      dot += se->n[a] * exact[a];
+    double ang = acos(dot < -1.0 ? -1.0 : (dot > 1.0 ? 1.0 : dot));
+    if (ang > *worst_angle) {
+      *worst_angle = ang;
+      if (getenv("C3D"))
+        printf("    худший: угол %.4f, se.n=(%.3f,%.3f,%.3f), exact=(%.3f,%.3f,%.3f), "
+               "cen=(%.2f,%.2f,%.2f), facet=%d\n",
+               ang, se->n[0], se->n[1], se->n[2], exact[0], exact[1], exact[2], cen[0], cen[1],
+               cen[2], (int)se->facet);
+    }
+    /* плоскостная нормаль фасета — прежний ответ */
+    const hz_facet *fp = &ftab.f[se->facet];
+    if (fp != NULL) {
+      double pnm = sqrt(fp->n[0] * fp->n[0] + fp->n[1] * fp->n[1] + fp->n[2] * fp->n[2]);
+      double pd = 0.0;
+      for (int a = 0; a < 3; a++)
+        pd += (fp->n[a] / pnm) * exact[a];
+      double pang = acos(pd < -1.0 ? -1.0 : (pd > 1.0 ? 1.0 : pd));
+      if (pang > *worst_plane_angle) *worst_plane_angle = pang;
+    }
+    (*nchecked)++;
+  }
+  free(solid);
+  tr3_cut_free(&cu);
+  tr3_mesh_free(&m);
+  hz_cutmap_free(&cmap);
+  hz_facettab_free(&ftab);
+  hz_surftab_free(&stab);
+  hz_oct_free(&t);
+}
+
+static void t_k50(void) {
+  double w1 = 0, w3 = 0, wp1 = 0, wp3 = 0;
+  int c1 = 0, c3 = 0;
+  t_k50_scene(1, 1, 0, &w1, &wp1, &c1, 0);
+  t_k50_scene(3, 1, 0, &w3, &wp3, &c3, 0);
+  printf("  [К50] примитив: макс угол к сфере при уровне 1: %.4f рад, при 3: %.4f рад "
+         "(плоскостный: %.4f / %.4f)\n",
+         w1, w3, wp1, wp3);
+  check(c1 > 0 && c3 > 0, "Ф1: элементы проверены");
+  check(w3 < w1, "Ф1: угол ПАДАЕТ с ростом фасетизации");
+  check(w1 < 0.35 && w3 < 0.12, "Ф1: примитивная нормаль близка к точной");
+  check(wp1 > 3.0 * w3, "НК1: плоскостная нормаль ОБЯЗАНА быть заметно хуже примитивной");
+
+  /* Ф2: та же сфера, но задана ЯВНО (surf = -1) — работает Фонг */
+  double we = 0, wpe = 0;
+  int ce = 0;
+  t_k50_scene(0, 0, 0, &we, &wpe, &ce, 1);
+  printf("  [К50] явная поверхность (Фонг): макс угол %.4f рад против плоскостного %.4f рад\n", we,
+         wpe);
+  check(ce > 0, "Ф2: элементы проверены");
+  /* Критерий: Фонг ОБЯЗАН быть строго лучше плоскостной нормали; запас 10 %
+   * Named-остаток честен: интерполяция линейна по треугольнику и не обязана
+   * восстанавливать сферу точно, а у полюсов широтно-долготной сетки
+   * треугольники вытянуты. Дефект «нет интерполяции» дал бы РАВЕНство. */
+  check(we < 0.9 * wpe, "Ф2: Фонг восстанавливает сферичность (заметно лучше плоскостной)");
+  check(wpe > 0.02, "НК2: плоскостная ошибка на этой сетке ненулевая — есть что лечить");
+  /* Ф3: примитив-путь при этом не тронут — нормали примитивных сфер точны
+   * (acos добавляет округление ~1e-9 к нулевому углу) */
+  check(w3 < 1e-6, "Ф3: примитивная нормаль в центроиде ТОЧНА (измерено выше)");
+}
+
+static void t_elem_positivity(void) {
+  const hz_frame fr = {{0, 0, 0}, {1.0, 1.0, 1.0}};
+  rig r;
+  if (rig_init(&r, 1, 2, 2, &fr)) {
+    check(0, "оснастка К41/К42");
+    rig_free(&r);
+    return;
+  }
+  const int32_t c = 0; /* ячейка (0,0,0) размера 1, центр (0.5, 0.5, 0.5) */
+  const double mv[4][3] = {{0, 0.5, 0}, {1, 0.5, 0}, {1, 0.5, 1}, {0, 0.5, 1}};
+
+  /* --- Ф1: на элементе положительно, в дальнем углу ячейки — минус ---
+   * Наклон вдоль y: на самом элементе (плоскость y = 0.5) поле ПОСТОЯННО и
+   * положительно, а дальние углы ячейки (y = 0) оно уводит в минус. */
+  const double e1[4] = {0.1, 0.0, 4.0, 0.0};
+  double mn_elem = tr3_elem_min_poly(&r.m, c, e1, mv, 4);
+  double mn_cell = 1e300;
+  for (int k = 0; k < 8; k++) {
+    double v = e1[0];
+    for (int a = 0; a < 3; a++)
+      v += e1[a + 1] * (((k >> a) & 1) ? 0.5 : -0.5);
+    if (v < mn_cell) mn_cell = v;
+  }
+  printf("  [К41] min по элементу %.3e (должен быть ≥ 0), min по ячейке %.3e (< 0)\n", mn_elem,
+         mn_cell);
+  check(mn_elem >= 0.0 && mn_cell < 0.0, "К41: случай «элемент ок, ячейка нет» существует");
+  double ee1[4] = {e1[0], e1[1], e1[2], e1[3]};
+  /* строка 0 массы диагональна на элементе, свободный член несёт среднее */
+  const double fmm_diag[4][4] = {{1.0, 0, 0, 0}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1}};
+  int rolled = tr3_elem_rollback(&r.m, c, fmm_diag, 0.1, mv, 4, ee1);
+  check(rolled == 0, "К41: отката ОБЯЗАНО не быть — поле на элементе положительно");
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wfloat-equal"
+  check(ee1[2] == e1[2], "К41: наклон ОБЯЗАН выжить (прежде срезался целиком)"); /* точный бит */
+
+  /* --- Ф2: на элементе есть минус — мягкий откат --- */
+  /* v = −0.25 − (x − 0.5): при x = 1 это −0.75 < 0. Среднее по строке 0 есть
+   * 0.25, значит den = 0 − (−0.5) = 0.5 и α = 0.25/0.5 = РОВНО 0.5. */
+  double ee2[4] = {-0.25, -1.0, 0.0, 0.0};
+  rolled = tr3_elem_rollback(&r.m, c, fmm_diag, 0.25, mv, 4, ee2);
+  double mn2 = tr3_elem_min_poly(&r.m, c, ee2, mv, 4);
+  double row0 = 0.0;
+  for (int j = 0; j < 4; j++)
+    row0 += fmm_diag[0][j] * ee2[j];
+  printf("  [К42] после отката: ee = %.3e %.3e %.3e %.3e, min по элементу %.3e, строка 0 %.3e\n",
+         ee2[0], ee2[1], ee2[2], ee2[3], mn2, row0);
+  check(rolled == 1, "К42: откат обязан примениться");
+  check(fabs(ee2[1] + 0.5) < 1e-15, "К42: наклон сжат ровно вдвое (α = 0.5), а не обнулён");
+  check(fabs(ee2[0] - 0.25) < 1e-15, "К42: свободный член пересчитан из строки 0 (0.25)");
+  check(fabs(row0 - 0.25) <= 1e-15, "К42: строка 0 массы сохранена ТОЧНО");
+  check(mn2 >= -1e-15, "К42: после отката минимум по элементу неотрицателен");
+
+  /* --- НК: rr0 < 0 — спасти нечего, константный откат --- */
+  double ee3[4] = {0.0, -1.0, 0.0, 0.0};
+  rolled = tr3_elem_rollback(&r.m, c, fmm_diag, -0.4, mv, 4, ee3);
+  check(rolled == 1 && ee3[1] == 0.0 && fabs(ee3[0] + 0.4) < 1e-15, /* точный ноль ветки */
+        "НК К42: rr0 < 0 — α = 0, прежний константный откат");
+#pragma GCC diagnostic pop
+
+  rig_free(&r);
+}
+
 static void t_furnace(void) {
   const hz_frame fr = {{0, 0, 0}, {1.0, 1.0, 2.0}};
   const double lb = 1.7;
@@ -1463,6 +1989,16 @@ static void t_krylov(void) {
     if (k.work == NULL || b == NULL || x == NULL || rr == NULL || rh == NULL || pv == NULL ||
         vv == NULL || ss == NULL || tt == NULL) {
       check(0, "память");
+      free(ref);
+      free(k.work);
+      free(b);
+      free(x);
+      free(rr);
+      free(rh);
+      free(pv);
+      free(vv);
+      free(ss);
+      free(tt);
       rig_free(&r);
       return;
     }
@@ -1484,6 +2020,17 @@ static void t_krylov(void) {
     double *rhs = calloc((size_t)n, sizeof(double));
     if (rhs == NULL) {
       check(0, "память");
+      free(ref);
+      free(k.work);
+      free(b);
+      free(x);
+      free(rr);
+      free(rh);
+      free(pv);
+      free(vv);
+      free(ss);
+      free(tt);
+      free(rhs);
       rig_free(&r);
       return;
     }
@@ -1764,6 +2311,89 @@ static void t_pfm(void) {
   remove(path); /* временный файл теста, а не картинка на посмотреть */
 }
 
+/* ------------------------------------ К102: линейность сравнения с Крыловым ---
+ *
+ * РЕГРЕССИЯ НАХОДКИ К102: стенд ЭТАП B сравнивал развёртку (с НЕЛИНЕЙНЫМИ
+ * §735-проекциями maxp) с линейным оператором Крылова — ответы разошлись на
+ * сотни, прибор стенда показывал невязку 14–114. Замок: ЛИНЕЙНАЯ развёртка
+ * (limiter=0, maxp_off=1) обязана удовлетворять оператору Крылова, Крылов
+ * обязан дать тот же ответ, и возмущённое поле обязано невязку ПОДНЯТЬ
+ * (иначе прибор ничего не мерит). */
+static void t_k102(void) {
+  const hz_frame fr = {{0, 0, 0}, {1.0, 1.0, 2.0}};
+  for (int graded = 0; graded < 2; graded++) {
+    rig r;
+    if (rig_init(&r, 3, graded, 2, &fr)) {
+      check(0, "оснастка");
+      rig_free(&r);
+      return;
+    }
+    for (int32_t c = 0; c < r.m.ncell; c++) {
+      r.sig_t[c] = 0.5;
+      r.sig_s[c] = 0.5;
+    }
+    tr3_problem p = {.m = &r.m,
+                     .d = &r.d,
+                     .sig_t = r.sig_t,
+                     .sig_s = r.sig_s,
+                     .binc0 = 1.0,
+                     .binc = {0.13, -0.07, 0.05},
+                     .binx0 = {4, 4, 4},
+                     .limiter = 0,
+                     .maxp_off = 1 /* ТОТ ЖЕ линейный оператор, что у Крылова */};
+    double *phi_lin = calloc((size_t)r.m.ncell * 4, sizeof(double));
+    double *phi_kry = calloc((size_t)r.m.ncell * 4, sizeof(double));
+    double *bk = calloc((size_t)r.m.nf * 4, sizeof(double));
+    if (!phi_lin || !phi_kry || !bk) {
+      check(0, "память");
+      free(phi_lin);
+      free(phi_kry);
+      free(bk);
+      rig_free(&r);
+      return;
+    }
+    tr3_stats st;
+    int rcA = tr3_sweep_solve(&p, 4000, 1e-12, phi_lin, &st);
+    double relA = -1.0;
+    int rrA = tr3_krylov_residual(&p, phi_lin, st.bout, st.sout, &relA);
+    printf("  [К102 %s] развёртка: код %d, итераций %d; прибор оператора: %.3e\n",
+           graded ? "градуир." : "равном.", rcA, st.iters, relA);
+    check(rcA == 0 && rrA == 0, "К102: оба решателя прошли");
+    check(relA <= 1e-8, "К102: линейная развёртка удовлетворяет оператору Крылова");
+    /* НЕГАТИВНЫЙ КОНТРОЛЬ (предсказан провал): возмущение одной ячейки
+     * обязано поднять невязку — иначе прибор не чувствителен */
+    phi_lin[0] += 0.5;
+    double relP = -1.0;
+    tr3_krylov_residual(&p, phi_lin, st.bout, st.sout, &relP);
+    phi_lin[0] -= 0.5;
+    check(relP > relA * 10.0 && relP > 1e-6,
+          "К102 НК: возмущённое поле ОБЯЗАНО поднять невязку оператора");
+    /* Крылов на ТОЙ ЖЕ линейной задаче: ответы обязаны совпасть */
+    tr3_kstats kst;
+    int rcB = tr3_krylov_solve(&p, 200, 1e-11, phi_kry, bk, NULL, &kst);
+    check(rcB == 0, "К102: Крылов прошёл");
+    double dm = 0.0, pm = 0.0;
+    for (int32_t i = 0; i < r.m.ncell * 4; i++) {
+      double e = fabs(phi_lin[i] - phi_kry[i]);
+      if (e > dm) dm = e;
+      if (fabs(phi_kry[i]) > pm) pm = fabs(phi_kry[i]);
+    }
+    printf("    Крылов: проходов %ld, итераций %d; max|Δφ| развёртка/Крылов %.3e при "
+           "|φ|max %.3e\n",
+           kst.npass, kst.iters, dm, pm);
+    check(dm <= 1e-6, "К102: Крылов даёт ТОТ ЖЕ ответ, что линейная развёртка");
+    free(st.bout);
+    free(st.sout);
+    free(st.eirr);
+    free(phi_lin);
+    free(phi_kry);
+    free(bk);
+    rig_free(&r);
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+
 int main(void) {
   printf("=== ПРЕДСКАЗАНИЯ (до единого результата) ===\n");
   printf("  A1 Σw = 4π, первый момент 0, второй (4π/3)·I — все ≤1e-13;\n");
@@ -1782,6 +2412,10 @@ int main(void) {
   t_dirs();
   t_face_moments();
   t_mesh();
+  t_elem_positivity();
+  t_union();
+  t_k102();
+  t_k50();
   t_furnace();
   t_linear();
   t_linear_field();

@@ -91,6 +91,59 @@ static int32_t wall_face(const tr3_gather *g, const double o[3], const double d[
   return g->wallidx[((int32_t)wall * g->nwall + iu) * g->nwall + iv];
 }
 
+/* К45: НАБЛЮДАТЕЛЬ СЕГМЕНТОВ СРЕДЫ. На каждый средовый отрезок [ta, tb] (те же,
+ * по которым марш копит τ) считает точный интеграл
+ *
+ *     I = ∫_0^ℓ e^{−(τa + σ_t·u)} · (A + B·u) du,   A + B·u = φ(s),
+ *
+ * где φ — DG1 (по отрезку линейна), и прибавляет (σ_s/4π)·I к каналу с текущим
+ * зеркальным пропусканием. Замкнутая форма, не квадратура: при σ_t = 0 она
+ * вырождается в трапецию той же точности, что и в T1, — частный случай
+ * проверенного. τa ведётся КОНТЕКСТОМ от глаза через все зеркальные отскоки:
+ * марш между отскоками τ не переносит. */
+typedef struct {
+  const tr3_gather *g;
+  const double *o, *d;
+  double thr;  /* произведение зеркальных долей ПРОЙДЕННЫХ отскоков */
+  double tau;  /* накопленная τ ОТ ГЛАЗА до начала текущего сегмента */
+  double *val; /* [nch] канальный аккумулятор */
+  int nch;
+} seg45;
+
+/* 4π — фазовая функция изотропного рассеяния, та же, что в шаге C развёртки */
+#define SEG45_FOUR_PI 12.566370614359172
+
+static void seg45_add(void *vctx, int32_t ni, double ta, double tb) {
+  seg45 *sx = vctx;
+  const tr3_gather *g = sx->g;
+  if (g->phi == NULL || g->sig_t == NULL || g->m == NULL) return;
+  const int32_t c = g->m->cellof[ni];
+  if (c < 0) return;
+  const double st = g->sig_t[c], ss = g->sig_s != NULL ? g->sig_s[c] : 0.0;
+  const double ell = tb - ta;
+  if (!(ell > 0.0)) return;
+  double p0[3], p1[3], f0[4] = {0, 0, 0, 0}, f1[4] = {0, 0, 0, 0};
+  for (int a = 0; a < 3; a++) {
+    p0[a] = sx->o[a] + ta * sx->d[a];
+    p1[a] = sx->o[a] + tb * sx->d[a];
+  }
+  f0[0] = dg1_at(g->m, c, g->phi + (size_t)c * 4, p0);
+  f1[0] = dg1_at(g->m, c, g->phi + (size_t)c * 4, p1);
+  const double A = f0[0], B = (f1[0] - f0[0]) / ell;
+  /* имя `I` занято мнимой единицей complex.h из общего слоя — не трогать */
+  double intg;
+  if (st > 0.0) {
+    const double q = exp(-st * ell);
+    intg = A * (1.0 - q) / st + B * (1.0 - q * (1.0 + st * ell)) / (st * st);
+  } else {
+    intg = ell * (A + 0.5 * B * ell); /* вакуум внутри ячейки: трапеция точна */
+  }
+  const double add = sx->thr * (ss / SEG45_FOUR_PI) * exp(-sx->tau) * intg;
+  for (int c2 = 0; c2 < sx->nch; c2++)
+    sx->val[c2] += add;
+  sx->tau += st * ell;
+}
+
 double tr3_gather_ray(const tr3_gather *g, const double o[3], const double d[3], int *nbounce,
                       double *out) {
   /* ОДИН МАРШ НА ВСЕ КАНАЛЫ (этап E): геометрия у них общая, различаются только
@@ -105,16 +158,27 @@ double tr3_gather_ray(const tr3_gather *g, const double o[3], const double d[3],
   memcpy(p, o, sizeof p);
   memcpy(dir, d, sizeof dir);
   int nb = 0;
+  /* К45: наблюдатель сегментов ставится, только если среда задана; иначе —
+   * прежний марш, мир побитово прежний (встроенный негативный контроль). */
+  seg45 sx = {.g = g, .o = p, .d = dir, .thr = 1.0, .tau = 0.0, .val = val, .nch = nch};
+  const int withmed = g->phi != NULL && g->sig_t != NULL;
   for (;;) {
     tr3_hit h;
-    tr3_march(g->sc, p, dir, -1.0, &h);
+    if (withmed)
+      tr3_march_sink(g->sc, p, dir, -1.0, &h, seg45_add, &sx);
+    else
+      tr3_march(g->sc, p, dir, -1.0, &h);
     if (!h.hit) { /* ушёл в стенку куба */
       double hp[3];
       int32_t f = wall_face(g, p, dir, hp);
-      if (f >= 0)
+      if (f >= 0) {
+        /* К45: стенка видна ЧЕРЕЗ среду — на T = exp(−τ) от глаза до неё */
+        double T = withmed ? exp(-sx.tau) : 1.0;
         for (int c = 0; c < nch; c++)
-          val[c] += thr * dg1_at(g->m, g->m->f[f].ca,
-                                 g->bout + (size_t)c * (size_t)g->m->nf * 4 + (size_t)f * 4, hp);
+          val[c] += thr * T *
+                    dg1_at(g->m, g->m->f[f].ca,
+                           g->bout + (size_t)c * (size_t)g->m->nf * 4 + (size_t)f * 4, hp);
+      }
       break;
     }
     int32_t mc = g->m->cellof[h.cell];
@@ -134,11 +198,15 @@ double tr3_gather_ray(const tr3_gather *g, const double o[3], const double d[3],
         dir[a] -= 2.0 * dn * h.n[a];
       }
       thr *= spec;
+      sx.thr = thr; /* К45: сегменты ПОСЛЕ отскока фильтруются им же */
       nb++;
       continue;
     }
+    /* К45: поверхность тоже видна через среду — тот же множитель T */
+    double Tsurf = withmed ? exp(-sx.tau) : 1.0;
     for (int c = 0; c < nch; c++)
-      val[c] += thr * dg1_at(g->m, mc, g->sout + (size_t)c * (size_t)nse4 + (size_t)e * 4, h.p);
+      val[c] +=
+          thr * Tsurf * dg1_at(g->m, mc, g->sout + (size_t)c * (size_t)nse4 + (size_t)e * 4, h.p);
     break;
   }
   if (nbounce != NULL) *nbounce = nb;

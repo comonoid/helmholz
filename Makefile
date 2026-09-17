@@ -111,6 +111,10 @@ build/test_sweep3: tests/test_sweep3.c src/transport/sweep3.c src/transport/mesh
 	  src/transport/mesh3.c src/transport/dirs3.c src/transport/tet3.c src/transport/cut3.c src/transport/quad.c \
 	  src/cut/poly3.c src/octree.c src/transport/cam3.c src/transport/ray3.c src/cut/surf.c src/image.c -lm'
 
+build/test_xfer3: tests/test_xfer3.c src/transport/xfer3.c src/transport/xfer3.h \
+                src/transport/mesh3.c src/octree.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_xfer3.c src/transport/xfer3.c src/transport/mesh3.c src/octree.c -lm'
+
 build/test_gather3: tests/test_gather3.c src/transport/gather3.c src/transport/gather3.h \
                     src/transport/mesh3.c src/transport/cut3.c src/transport/tet3.c \
                     src/transport/ray3.c src/transport/cam3.c src/cut/poly3.c src/cut/surf.c \
@@ -304,20 +308,20 @@ build/pfmdiff: tools/pfmdiff.c | build
 
 # ПОЛНОЦЕННЫЙ РЕНДЕР линии переноса. Картинки пишутся в img/, а НЕ в build/:
 # build — только артефакты сборки, и мусорить в нём нельзя.
-build/render3: tools/render3.c src/transport/gather3.c src/transport/krylov3.c src/transport/raster3.c src/transport/sweep3.c src/transport/mesh3.c src/transport/cut3.c \
+build/render3: tools/render3.c src/transport/gather3.c src/transport/krylov3.c src/transport/raster3.c src/transport/sweep3.c src/transport/mesh3.c src/transport/cut3.c src/transport/xfer3.c \
                src/transport/dirs3.c src/transport/tet3.c src/transport/quad.c \
                src/transport/ray3.c src/transport/cam3.c src/cut/poly3.c src/cut/surf.c \
                src/octree.c src/image.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/render3.c src/transport/gather3.c src/transport/krylov3.c src/transport/raster3.c src/transport/sweep3.c src/transport/mesh3.c \
 	  src/transport/cut3.c src/transport/dirs3.c src/transport/tet3.c src/transport/quad.c \
 	  src/transport/ray3.c src/transport/cam3.c src/cut/poly3.c src/cut/surf.c src/octree.c \
-	  src/image.c -lm'
+	  src/transport/xfer3.c src/image.c -lm'
 
 # fast tests (seconds..minutes)
 test: check-fp build/test_octree build/test_octfmt build/test_poly3 build/test_surf \
       build/test_facet build/test_qef build/test_dc build/test_dcwalk \
       build/test_sweep build/test_rte2d build/test_ray3 build/test_scat1d build/test_tet3 \
-      build/test_sweep3 build/test_gather3 build/test_polygon build/test_oven build/test_bounce
+      build/test_sweep3 build/test_gather3 build/test_xfer3 build/test_polygon build/test_oven build/test_bounce
 	./build/test_octree
 	./build/test_octfmt
 	./build/test_poly3
@@ -333,6 +337,7 @@ test: check-fp build/test_octree build/test_octfmt build/test_poly3 build/test_s
 	./build/test_tet3
 	./build/test_sweep3
 	./build/test_gather3
+	./build/test_xfer3
 	./build/test_polygon
 	./build/test_oven
 	./build/test_bounce

@@ -34,6 +34,10 @@ int main(int argc, char **argv) {
   int lp = 0;    /* §852: LOD-уровень кусков ℓ_p (единый; лестница G1) */
   int xint = 0;  /* §852/G1(a): 1 — всегда точное пересечение */
   int screw = 0; /* НК А1572: скрестить куски с шагом screw (детекторы>0) */
+  int walk = 0;  /* А1576: 1 — точный многопопадный проход (модель «реальные
+                  * пересечения»); 0 — схема §852 (перехват под предикатом) */
+  int useke = 0; /* А1576: 1 — per-piece le из Ke материалов (плюс глобальный
+                  * le); 0 — прежний мир (глобальный le) */
   int nphi = 0, nmu = 0;
   int has_recv = 0; /* blocked-beam (А1566): recv=X:<x0>:<x1> — приёмник-слэб */
   double recv0 = 0.0, recv1 = 0.0;
@@ -45,6 +49,7 @@ int main(int argc, char **argv) {
   double *area = NULL, *nrm = NULL, *kd = NULL, *cent = NULL, *cmin = NULL, *cmax = NULL;
   int32_t *mtl = NULL;
   double *hist = NULL;
+  double *lep9 = NULL; /* А1576: per-piece эмиссия (Ke) в порядке ИСХОДНЫХ */
   double cell;
 
   for (i = 1; i < argc; i++) {
@@ -77,6 +82,10 @@ int main(int argc, char **argv) {
       xint = atoi(argv[i] + 5); /* §852/G1(a): точное пересечение везде */
     } else if (strncmp(argv[i], "screw=", 6) == 0) {
       screw = atoi(argv[i] + 6); /* НК А1572 */
+    } else if (strncmp(argv[i], "walk=", 5) == 0) {
+      walk = atoi(argv[i] + 5); /* А1576: модель «реальные пересечения» */
+    } else if (strncmp(argv[i], "ke=", 3) == 0) {
+      useke = atoi(argv[i] + 3); /* А1576: per-piece le из Ke */
     } else if (strncmp(argv[i], "recv=", 5) == 0) {
       /* А1566-фальсификатор: средняя E по кускам, чей ИСХОДНЫЙ центроид в
        * слэбе по оси X (приёмник за перегородкой) */
@@ -218,6 +227,23 @@ int main(int argc, char **argv) {
     so.domhi = m.hi;
     so.lp = lparr;
     so.xint = xint;
+    so.walk = walk;
+    if (useke) {
+      /* А1576: per-piece эмиссия = СРЕДНЕЕ Ke материала (прецедент
+       * скаляризации pfield.c) ПЛЮС глобальный le — на сценах с Ke=0
+       * побитово прежний мир. Порядок — ИСХОДНЫЕ треугольники, переставится
+       * вместе с area/nrm/kd под Morton ниже. */
+      lep9 = (double *)malloc((size_t)m.nt * sizeof *lep9);
+      if (!lep9) {
+        fprintf(stderr, "нет памяти на lep\n");
+        return 2;
+      }
+      for (int32_t tq = 0; tq < m.nt; tq++) {
+        const double *kq = m.mtl[m.fm[tq]].ke3;
+        lep9[tq] = (kq[0] + kq[1] + kq[2]) / 3.0 + le;
+      }
+      so.lep = lep9;
+    }
   }
   if (hz_pyr_build(&py, m.nt, cmin, cmax, cent, mtl, m.lo, m.hi, cell) != 0) {
     fprintf(stderr, "swee3: пирамида не построилась\n");
@@ -232,7 +258,8 @@ int main(int argc, char **argv) {
      * на месте (А1491: соответствие кусок↔треугольник — pcs[].tri) */
     if (hz_pyr_permute(&py, area, sizeof *area) != 0 ||
         hz_pyr_permute(&py, nrm, 3 * sizeof *nrm) != 0 ||
-        hz_pyr_permute(&py, kd, sizeof *kd) != 0) {
+        hz_pyr_permute(&py, kd, sizeof *kd) != 0 ||
+        (lep9 && hz_pyr_permute(&py, lep9, sizeof(double)) != 0)) {
       fprintf(stderr, "swee3: перестановка не прошла\n");
       return 2;
     }

@@ -603,6 +603,7 @@ typedef struct {
   const double *om;
   double org[3]; /* центр входной клетки трубки */
   double w_d, le, axcos;
+  const double *lep; /* А1576: per-piece эмиссия (Ke); NULL — глобальный le */
   int noprop, tau0, ax;
   int64_t *pstamp; /* штамп (трубка × кусок × направление × итерация), А1564: гасит
                     * повторный депозит ОДНОЙ трубки на ту же оболочку (вход и
@@ -664,6 +665,12 @@ static int front_box_seg(const double blo[3], const double bhi[3], const double 
 
 static double front_rho(const front_ctx *fc, int32_t p) {
   return fc->o->rho < 0 ? fc->kd[p] : fc->o->rho;
+}
+
+/* А1576: эмиссия куска — per-piece (Ke) плюс глобальный le; при lep=NULL
+ * (умолчание) поведение побитово прежнее */
+static double front_le(const front_ctx *fc, int32_t p) {
+  return fc->le + (fc->lep ? (double)fc->lep[p] : 0.0);
 }
 
 static double front_cos(const front_ctx *fc, int32_t p) {
@@ -876,12 +883,12 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
       fc->depA += ai; /* родительская доля трубки погашена целиком (G6) */
       fc->absorbed += fc->w_d * Lin * csec;
       fc->ndep++;
-      Lh = fc->le + front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI);
+      Lh = front_le(fc, pbest) + front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI);
       fc->recycled += fc->w_d * (Lh - fc->le) * csec;
     }
-    fc->emitted += fc->w_d * fc->le * csec;
+    fc->emitted += fc->w_d * front_le(fc, pbest) * csec;
     *a = 0.0;
-    *b = fc->le + front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI);
+    *b = front_le(fc, pbest) + front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI);
     goto done;
   }
   /* 2. Клеточный перехват §846 — ТОЛЬКО контейнированные unstamped и ТОЛЬКО
@@ -899,7 +906,7 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
     has_cont = 1;
     cntot += an[u];
     swt += wt[u];
-    Lsurf += (fc->le + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI)) * wt[u];
+    Lsurf += (front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI)) * wt[u];
   }
   if (has_cont && swt > 0.0) {
     double T = 1.0 - cntot / csecnode, f;
@@ -937,6 +944,104 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
 done:
 }
 
+/* А1576: точный МНОГОПОПАДНЫЙ проход сегмента (лист или узел): все
+ * пересечения unstamped кусков с отрезком [tin,tout] по ходу трубки
+ * (сортировка по t). У walk лестница ℓ_p плоская по построению — одна и та
+ * же последовательность событий при любой сегментации (штамп А1564 гасит
+ * дубли куска и повторы на стыках). Сключительно под ключом walk=1: модель
+ * «только реальные пересечения» не совпадает с перехватной на стенках,
+ * не выровненных по сетке (box: 0.88 против 4.17), — выбор за
+ * фальсификатором А1576. */
+static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double tin, double tout,
+                           double *a, double *b) {
+  const hz_pyr *py = fc->py;
+  double csec = py->cell * py->cell; /* сечение БАЗОВОЙ клетки — инвариант А1563 */
+  double ai = *a, bi = *b, Lin = ai + bi;
+  double *ht;
+  int32_t *hp;
+  int32_t u;
+  int64_t nh = 0, i;
+  if (n <= 0) return;
+  if (fc->tau0) return; /* НК: слой не взаимодействует */
+  fc->nmat++;
+  if (fc->noprop) { /* НК: фронт не переносится */
+    *a = 0.0;
+    *b = 0.0;
+    return;
+  }
+  if (n > fc->abufcap) {
+    int64_t nc = fc->abufcap ? fc->abufcap * 2 : 64;
+    double *na, *nw;
+    while (nc < n)
+      nc *= 2;
+    na = (double *)realloc(fc->abuf, (size_t)nc * sizeof *na);
+    if (!na) return;
+    fc->abuf = na;
+    nw = (double *)realloc(fc->wbuf, (size_t)nc * sizeof *nw);
+    if (!nw) return;
+    fc->wbuf = nw;
+    fc->abufcap = nc;
+  }
+  ht = fc->abuf;
+  hp = (int32_t *)fc->wbuf; /* n int32 ≤ n double — места хватает */
+  for (u = 0; u < n; u++) {
+    int32_t p = ps[u];
+    int32_t tri = py->pcs[p].tri;
+    double tt;
+    if (fc->pstamp[p] == fc->pkey) {
+      fc->nstamp++; /* кратность 1 на (кусок, направление) — А1564 */
+      continue;
+    }
+    tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)tri);
+    /* Оба конца включены; от двойного события на стыке сегментов спасает
+     * ШТАМП: кусок штампуется при первом же событии (проход депозита
+     * ниже), повтор в следующем сегменте отбрасывается — событие
+     * обрабатывается ровно один раз, поэтому лестница ℓ_p плоская. */
+    if (tt >= tin && tt <= tout) {
+      ht[nh] = tt;
+      hp[nh] = p;
+      nh++;
+    }
+  }
+  /* сортировка по ходу трубки (попаданий мало, вставками) */
+  for (i = 1; i < nh; i++) {
+    double t = ht[i];
+    int32_t p = hp[i];
+    int64_t v;
+    for (v = i; v > 0 && ht[v - 1] > t; v--) {
+      ht[v] = ht[v - 1];
+      hp[v] = hp[v - 1];
+    }
+    ht[v] = t;
+    hp[v] = p;
+  }
+  {
+    int first = 1;
+    for (i = 0; i < nh; i++) {
+      int32_t p = hp[i];
+      double Lh;
+      if (fc->pstamp[p] == fc->pkey) continue; /* дубль куска (список/стык) */
+      /* ШТАМП при любом событии: пересечение обрабатывается один раз */
+      fc->pstamp[p] = fc->pkey;
+      if (first) { /* родительская доля трубки погашена первой поверхностью (G6) */
+        fc->depA += ai;
+        first = 0;
+      }
+      fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos / fc->area[p];
+      fc->absorbed += fc->w_d * Lin * csec;
+      fc->emitted += fc->w_d * front_le(fc, p) * csec;
+      Lh = front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI);
+      fc->recycled += fc->w_d * (Lh - fc->le) * csec;
+      fc->ndep++;
+      Lin = Lh;
+    }
+    if (nh > 0) {
+      *a = 0.0;
+      *b = Lin;
+    }
+  }
+}
+
 /* марш трубки через узел (уровень l, позиция pos; l<0 — лист) на отрезке
  * [tin,tout]; carry a/b сквозной — сечение трубки не делится (А1563) */
 static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, double tout, double *a,
@@ -946,8 +1051,12 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
   if (l < 0) { /* лист: базовая клетка */
     if (fc->cfront) fc->ncellfront++;
     front_node_box(fc, -1, pos, blo, bhi);
-    front_interact(fc, fc->bpids + fc->bstart[pos], fc->bstart[pos + 1] - fc->bstart[pos], blo, bhi,
-                   tin, tout, a, b, 1);
+    if (fc->o->walk) /* А1576: точный многопопадный проход */
+      front_seg_walk(fc, fc->bpids + fc->bstart[pos], fc->bstart[pos + 1] - fc->bstart[pos], tin,
+                     tout, a, b);
+    else
+      front_interact(fc, fc->bpids + fc->bstart[pos], fc->bstart[pos + 1] - fc->bstart[pos], blo,
+                     bhi, tin, tout, a, b, 1);
     return;
   }
   {
@@ -966,7 +1075,10 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
        * ~×1.5/итерацию на cavity05 lp=2). Узел — только точное пересечение.
        * Предикат А1566 «bbox ⊆ клетка» валиден ТОЛЬКО на листовом отрезке
        * (bbox ⊆ БАЗОВАЯ клетка). */
-      front_interact(fc, fc->pbuf, n, blo, bhi, tin, tout, a, b, 0);
+      if (fc->o->walk) /* А1576: точный многопопадный проход */
+        front_seg_walk(fc, fc->pbuf, n, tin, tout, a, b);
+      else
+        front_interact(fc, fc->pbuf, n, blo, bhi, tin, tout, a, b, 0);
       return;
     }
   }
@@ -1474,6 +1586,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.om = om;
         fc.w_d = w_d;
         fc.le = o->le;
+        fc.lep = o->lep; /* А1576: per-piece эмиссия (NULL — прежний мир) */
         fc.noprop = o->noprop;
         fc.tau0 = o->tau0;
         fc.pstamp = pstamp;

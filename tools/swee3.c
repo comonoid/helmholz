@@ -480,6 +480,7 @@ int main(int argc, char **argv) {
   free((void *)(uintptr_t)so.trivert);
   free((void *)(uintptr_t)so.tribox);
   free((void *)(uintptr_t)so.lp);
+  free(lep9); /* А1576: per-piece эмиссия */
   hz_pyr_free(&py);
   hz_obj_free(&m);
   return 0;

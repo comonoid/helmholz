@@ -856,13 +856,18 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
                        fc->org, fc->om, tin, tout, &bh0, &bh1))
       continue;
     tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)tri);
-    /* tt >= tin: стенка может лежать РОВНО на плоскости клетки/домена (§852:
-     * коробка на границе сетки) — отрезок включается с обоих концов; двойной
-     * счёт стыка гасится штампом (кусок × трубка) */
-    if (tt >= tin && tt <= tout && (tbest < 0.0 || tt < tbest)) {
-      tbest = tt;
-      pbest = p;
-      anb = front_cos(fc, p);
+    /* tt ≈ [tin,tout] с ДОПУСКОМ sl (единицы ulp арифметики ray-tri против
+     * box-сегмента): стенка, лежащая РОВНО на конце сегмента (вход домена!),
+     * иначе теряется — трубка остаётся тёмной и теряет ВЕСЬ депозит
+     * (А1577: фальсификатор lev=5, E_half вдвое занижена). Двойной счёт
+     * стыка гасится штампом (кусок × трубка) */
+    {
+      double sl = 1e-9 * (fabs(tin) + fabs(tout) + 1.0);
+      if (tt >= tin - sl && tt <= tout + sl && (tbest < 0.0 || tt < tbest)) {
+        tbest = tt;
+        pbest = p;
+        anb = front_cos(fc, p);
+      }
     }
   }
   (void)anb;
@@ -997,10 +1002,13 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
      * ШТАМП: кусок штампуется при первом же событии (проход депозита
      * ниже), повтор в следующем сегменте отбрасывается — событие
      * обрабатывается ровно один раз, поэтому лестница ℓ_p плоская. */
-    if (tt >= tin && tt <= tout) {
-      ht[nh] = tt;
-      hp[nh] = p;
-      nh++;
+    {
+      double sl = 1e-9 * (fabs(tin) + fabs(tout) + 1.0);
+      if (tt >= tin - sl && tt <= tout + sl) {
+        ht[nh] = tt;
+        hp[nh] = p;
+        nh++;
+      }
     }
   }
   /* сортировка по ходу трубки (попаданий мало, вставками) */

@@ -60936,5 +60936,5 @@ recv-пути: 0/0; `make test` EXIT=0 (13 наборов). Якоря lp=0/2 ca
 обмена стенка-слой (§854(3)).
 
 **ГЕЙТ:** clang-format; ccheck CLEAN (sweep.c/sweep.h/swee3.c); ASAN+UBSAN
-на walk/ke-пути: 0/0; `make test` EXIT=0 — см. финальную строку отчёта. Прежний мир
+на walk/ke-пути: 0/0; `make test` EXIT=0 (13 наборов, job bash-178, 11-09). Прежний мир
 побитово: lep=NULL/walk=0 — якоря воспроизведены.

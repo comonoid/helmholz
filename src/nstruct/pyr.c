@@ -400,8 +400,22 @@ void hz_pyr_verify(const hz_pyr *py, int32_t nt, const double *tri_min, const do
  * Куски с ℓ_p выше самого крупного уровня ОБРАБАТЫВАЮТСЯ НА ЛИСТЕ
  * (ℓ_p := 0) — агрегатов нет (А1568), но счётчик обязателен: молчаливый
  * клэмп вверх = скрытая агрегация. Вызывать ПОСЛЕ hz_pyr_morton. */
+void hz_pyr_clear_lp(hz_pyr *py) {
+  int32_t l;
+  if (!py) return;
+  free(py->leaf_lp); /* NULL безопасен; повторный set_lp обязан сбросить */
+  py->leaf_lp = NULL;
+  if (py->lev_lp) {
+    for (l = 0; l < py->nlev; l++)
+      free(py->lev_lp[l]);
+    free(py->lev_lp);
+    py->lev_lp = NULL;
+  }
+}
+
 int hz_pyr_set_lp(hz_pyr *py, const uint8_t *lp, int32_t *nup) {
   int32_t l, li, u, up = 0;
+  hz_pyr_clear_lp(py); /* §862: повторный вызов (адаптивные этажи) валиден */
   if (!py || !lp || py->nt <= 0 || py->nleaf <= 0) return 1;
   if (py->nlev > 254) return 1; /* ℓ_p живёт в байте; уровней столько не бывает */
 

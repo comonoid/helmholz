@@ -679,6 +679,15 @@ static double front_cos(const front_ctx *fc, int32_t p) {
               om[2] * fc->nrm[3 * (int64_t)p + 2]);
 }
 
+/* §862: приращение дробного аккумулятора детальности Δ(материал,угол):
+ * темнее материал (ρ) и скользящее падение (1−cosθ, cosθ — к НОРМАЛИ куска)
+ * — быстрее набор этажа. Нет lpacc — нет операции (битово прежний мир). */
+static void sw_accum(front_ctx *fc, int32_t p) {
+  if (!fc->o->lpacc) return;
+  fc->o->lpacc[p] +=
+      fc->o->cdelta * front_rho(fc, p) * (1.0 - front_cos(fc, p) / (2.0 * fc->area[p]));
+}
+
 /* коробка узла (уровень l, позиция pos; l<0 — лист) с ЗАЖИМОМ в сцену:
  * на нечётных сетках клетки уровней шире домена (А1567 — за доменом
  * сегментов не остаётся, остаток носителя уходит в lost) */
@@ -894,6 +903,7 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
     fc->emitted += fc->w_d * front_le(fc, pbest) * csec;
     *a = 0.0;
     *b = front_le(fc, pbest) + front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI);
+    sw_accum(fc, pbest); /* §862 */
     goto done;
   }
   /* 2. Клеточный перехват §846 — ТОЛЬКО контейнированные unstamped и ТОЛЬКО
@@ -927,6 +937,7 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
         if (fc->pstamp[p] == fc->pkey) continue;
         if (!front_contained(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri, blo, bhi)) continue;
         fc->Ed[p] += fc->w_d * Lin * f * csec * fc->axcos * wt[u] / swt / fc->area[p];
+        sw_accum(fc, p); /* §862 */
       }
       fc->depA += f * ai;
       fc->absorbed += fc->w_d * Lin * f * csec;
@@ -1041,6 +1052,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
       Lh = front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI);
       fc->recycled += fc->w_d * (Lh - fc->le) * csec;
       fc->ndep++;
+      sw_accum(fc, p); /* §862 */
       Lin = Lh;
     }
     if (nh > 0) {
@@ -1449,6 +1461,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   int32_t *bstart = NULL, *bpids = NULL, *fillb = NULL; /* §852/А1566: bbox-индекс */
   int nd = 0, d, it, rc = 0;
   double csec;
+  uint8_t *lpflo = NULL; /* §862: этажи (когда задан lpacc) */
 
   memset(st, 0, sizeof *st);
   if (!py || !area || !nrm || !kd || !o) return 1;
@@ -1773,9 +1786,28 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     st->lost = lost;
     if (o->mode != 3) st->traffic = (int64_t)nd * ((int64_t)nt * 36 + (int64_t)walks[0].n * 40);
     if (e_hist) e_hist[it] = st->e_avg;
+    if (o->mode == 3 && o->lpacc) { /* §862: этаж = целая часть аккумулятора */
+      int32_t nup = 0;
+      if (!lpflo) {
+        lpflo = (uint8_t *)malloc((size_t)nt);
+        if (!lpflo) {
+          rc = 2;
+          goto done;
+        }
+      }
+      for (p = 0; p < nt; p++) {
+        double fl = o->lpacc[p];
+        lpflo[p] = fl >= 255.0 ? 255 : (uint8_t)fl;
+      }
+      if (hz_pyr_set_lp(py, lpflo, &nup) != 0) {
+        rc = 2;
+        goto done;
+      }
+    }
   }
 
 done:
+  free(lpflo); /* §862 */
   free(Ed);
   free(Eprev);
   free(order);

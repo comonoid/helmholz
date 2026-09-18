@@ -28,16 +28,19 @@ int main(int argc, char **argv) {
   const char *path = NULL, *cmpfile = NULL;
   double scale = 1.0, le = 1.0, rho = -1.0;
   int iters = 20, lev = 6, tau0 = 0, noprop = 0, ndirs = 6, mort = 1, i, ax;
-  int mode = 1;  /* §845: 2 — объёмный фронт (L на клетку, марш-порядок) */
-  int build = 0; /* §845-в: строитель похода (1 — прямой сортировочный) */
-  int vc = 1;    /* §851: компоненты пустоты по умолчанию включены */
-  int lp = 0;    /* §852: LOD-уровень кусков ℓ_p (единый; лестница G1) */
-  int xint = 0;  /* §852/G1(a): 1 — всегда точное пересечение */
-  int screw = 0; /* НК А1572: скрестить куски с шагом screw (детекторы>0) */
-  int walk = 0;  /* А1576: 1 — точный многопопадный проход (модель «реальные
-                  * пересечения»); 0 — схема §852 (перехват под предикатом) */
-  int useke = 0; /* А1576: 1 — per-piece le из Ke материалов (плюс глобальный
-                  * le); 0 — прежний мир (глобальный le) */
+  int mode = 1;         /* §845: 2 — объёмный фронт (L на клетку, марш-порядок) */
+  int build = 0;        /* §845-в: строитель похода (1 — прямой сортировочный) */
+  int vc = 1;           /* §851: компоненты пустоты по умолчанию включены */
+  int lp = 0;           /* §852: LOD-уровень кусков ℓ_p (единый; лестница G1) */
+  int adapt = 0;        /* §862: 1 — дробный аккумулятор детальности */
+  double *lpacc = NULL; /* §862: аккумулятор [nt], живёт до конца main */
+  double cdelta = 1.0;  /* §862: вес приращения Δ(материал,угол) */
+  int xint = 0;         /* §852/G1(a): 1 — всегда точное пересечение */
+  int screw = 0;        /* НК А1572: скрестить куски с шагом screw (детекторы>0) */
+  int walk = 0;         /* А1576: 1 — точный многопопадный проход (модель «реальные
+                         * пересечения»); 0 — схема §852 (перехват под предикатом) */
+  int useke = 0;        /* А1576: 1 — per-piece le из Ke материалов (плюс глобальный
+                         * le); 0 — прежний мир (глобальный le) */
   int nphi = 0, nmu = 0;
   int has_recv = 0; /* blocked-beam (А1566): recv=X:<x0>:<x1> — приёмник-слэб */
   double recv0 = 0.0, recv1 = 0.0;
@@ -78,6 +81,10 @@ int main(int argc, char **argv) {
       vc = atoi(argv[i] + 3); /* §851: 0 — старая однокомпонентная логика */
     } else if (strncmp(argv[i], "lp=", 3) == 0) {
       lp = atoi(argv[i] + 3); /* §852: ℓ_p кусков */
+    } else if (strncmp(argv[i], "adapt=", 6) == 0) {
+      adapt = atoi(argv[i] + 6); /* §862 */
+    } else if (strncmp(argv[i], "cdelta=", 7) == 0) {
+      cdelta = atof(argv[i] + 7); /* §862 */
     } else if (strncmp(argv[i], "xint=", 5) == 0) {
       xint = atoi(argv[i] + 5); /* §852/G1(a): точное пересечение везде */
     } else if (strncmp(argv[i], "screw=", 6) == 0) {
@@ -198,9 +205,10 @@ int main(int argc, char **argv) {
     double *tv9 = (double *)malloc((size_t)m.nt * 9 * sizeof *tv9);
     double *tb6 = (double *)malloc((size_t)m.nt * 6 * sizeof *tb6);
     uint8_t *lparr = (uint8_t *)malloc((size_t)m.nt);
+    if (adapt) lpacc = (double *)calloc((size_t)m.nt, sizeof *lpacc); /* §862 */
     int32_t ti;
-    if (!tv9 || !tb6 || !lparr) {
-      fprintf(stderr, "нет памяти на trivert/tribox/lp\n");
+    if (!tv9 || !tb6 || !lparr || (adapt && !lpacc)) {
+      fprintf(stderr, "нет памяти на trivert/tribox/lp/lpacc\n");
       return 2;
     }
     for (ti = 0; ti < m.nt; ti++) {
@@ -226,6 +234,12 @@ int main(int argc, char **argv) {
     so.tribox = tb6;
     so.domhi = m.hi;
     so.lp = lparr;
+    if (adapt) { /* §862: дробный аккумулятор детальности */
+      for (ti = 0; ti < (int)m.nt; ti++)
+        lpacc[ti] = (double)lp;
+      so.lpacc = lpacc;
+      so.cdelta = cdelta;
+    }
     so.xint = xint;
     so.walk = walk;
     if (useke) {
@@ -480,6 +494,20 @@ int main(int argc, char **argv) {
   free((void *)(uintptr_t)so.trivert);
   free((void *)(uintptr_t)so.tribox);
   free((void *)(uintptr_t)so.lp);
+  if (lpacc) { /* §862: гистограмма этажей на последней итерации */
+    int fl, cnt[16] = {0}, maxfl = 0;
+    for (i = 0; i < (int)m.nt; i++) {
+      fl = (int)lpacc[i];
+      if (fl > 15) fl = 15;
+      cnt[fl]++;
+      if (fl > maxfl) maxfl = fl;
+    }
+    printf("ЛОД-АДАПТ: cdelta=%.3g этажи", cdelta);
+    for (fl = 0; fl <= maxfl; fl++)
+      printf(" %d:%d", fl, cnt[fl]);
+    printf(")\n");
+    free(lpacc);
+  }
   free(lep9); /* А1576: per-piece эмиссия */
   hz_pyr_free(&py);
   hz_obj_free(&m);

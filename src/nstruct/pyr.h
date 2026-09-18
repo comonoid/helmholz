@@ -134,6 +134,10 @@ int hz_pyr_build(hz_pyr *py, int32_t nt, const double *tri_min, const double *tr
  * счётчик; молчаливый клэмп вверх запрещён). Требует построенного CSR
  * (после hz_pyr_build/Morton). Возврат 0/не-0 (аргументы, память). */
 int hz_pyr_set_lp(hz_pyr *py, const uint8_t *lp, int32_t *nup);
+/* §862: сброс per-node ℓ_p (leaf_lp/lev_lp) — повторный hz_pyr_set_lp
+ * (адаптивный аккумулятор детальности) обязан вызывать перед каждым
+ * пересчётом; без этого — утечка. Идемпотентно. */
+void hz_pyr_clear_lp(hz_pyr *py);
 
 /* НК: скрестить куски с шагом stride (или только кусок 0 при stride == 1).
  * Возвращает число скрещённых. */

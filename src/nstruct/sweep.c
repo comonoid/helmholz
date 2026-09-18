@@ -1137,7 +1137,12 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
     for (u = 1; u < n; u++) {
       double s = c0[u], s1 = c1[u];
       int32_t pu = cpos[u];
-      for (v = u; v > 0 && c0[v - 1] > s; v--) {
+      /* А1578: при равных c0 вперёд идёт вырожденный (h0==h1) сегмент —
+       * клетка за плоской стенкой; иначе её подхват выполнялся после
+       * всего марша и депонировал Lh на саму входную стенку */
+      for (v = u; v > 0 && (c0[v - 1] > s || (fc->o->walk && !(c0[v - 1] < s) && !(s < c0[v - 1]) &&
+                                              c1[v - 1] > s1));
+           v--) {
         c0[v] = c0[v - 1];
         c1[v] = c1[v - 1];
         cpos[v] = cpos[v - 1];
@@ -1206,7 +1211,12 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
     for (u = 1; u < n; u++) {
       double s = c0[u], s1 = c1[u];
       int32_t pu = cpos[u];
-      for (v = u; v > 0 && c0[v - 1] > s; v--) {
+      /* А1578: при равных c0 вперёд идёт вырожденный (h0==h1) сегмент —
+       * клетка за плоской стенкой; иначе её подхват выполнялся после
+       * всего марша и депонировал Lh на саму входную стенку */
+      for (v = u; v > 0 && (c0[v - 1] > s || (fc->o->walk && !(c0[v - 1] < s) && !(s < c0[v - 1]) &&
+                                              c1[v - 1] > s1));
+           v--) {
         c0[v] = c0[v - 1];
         c1[v] = c1[v - 1];
         cpos[v] = cpos[v - 1];
@@ -1369,6 +1379,64 @@ static void front_dir(front_ctx *fc, int32_t *stampv) {
   }
 }
 
+/* А1578: индекс клетки по оси — ТА ЖЕ конвенция, что pyr_axis_index в pyr.c
+ * (floor с клэмпом к сетке): клетки, помеченные pyr, гарантированно листья, и
+ * марш их достигает (фантомную колонку у max-грани домена — вырожденным
+ * сегментом [h,h], §852). Прежний span «floor…ceil−1» с клэмпом к домену клал
+ * кусок плоской max-грани в слой, где листа чаще нет, — кусок выпадал из
+ * bbox-индекса, и стенка теряла депозиты (А1578: 0.22 события/трубку). */
+static void sw_index_emit(int32_t pos, int32_t s, int32_t *bstart, int32_t *bpids, int32_t *fillb) {
+  if (bpids)
+    bpids[fillb[pos]++] = s;
+  else
+    bstart[pos + 1]++;
+}
+
+static void sw_index_piece(const hz_pyr *py, const hz_sw_opts *o, int32_t s, int fb,
+                           int32_t *bstart, int32_t *bpids, int32_t *fillb) {
+  int32_t tri = py->pcs[s].tri;
+  int64_t lim[3], lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};
+  lim[0] = py->nx;
+  lim[1] = py->ny;
+  lim[2] = py->nz;
+  for (int ax = 0; ax < 3; ax++) {
+    double cmin = o->tribox[6 * (int64_t)tri + ax];
+    double cmax = o->tribox[6 * (int64_t)tri + 3 + ax];
+    double dom = o->domhi[ax] - py->lo[ax];
+    lo[ax] = (int64_t)((cmin - py->lo[ax]) / py->cell);
+    hi[ax] = (int64_t)ceil((cmax - py->lo[ax]) / py->cell) - 1;
+    if (lo[ax] < 0) lo[ax] = 0;
+    if (hi[ax] < lo[ax]) hi[ax] = lo[ax];
+    if (hi[ax] > (int64_t)ceil(dom / py->cell) - 1) hi[ax] = (int64_t)ceil(dom / py->cell) - 1;
+    if (lo[ax] > (int64_t)ceil(dom / py->cell) - 1) lo[ax] = (int64_t)ceil(dom / py->cell) - 1;
+  }
+  for (int64_t iz = lo[2]; iz <= hi[2]; iz++)
+    for (int64_t iy = lo[1]; iy <= hi[1]; iy++)
+      for (int64_t ix = lo[0]; ix <= hi[0]; ix++) {
+        int32_t pos = hz_pyr_leaf_pos(py, ix + py->nx * (iy + py->ny * iz));
+        if (pos >= 0) {
+          sw_index_emit(pos, s, bstart, bpids, fillb);
+          continue;
+        }
+        if (!fb) continue;
+        for (int ax = 0; ax < 3; ax++) {
+          int64_t nb[3];
+          nb[0] = ix;
+          nb[1] = iy;
+          nb[2] = iz;
+          for (int sgn = -1; sgn <= 1; sgn += 2) {
+            int64_t mx = nb[ax];
+            nb[ax] = mx + sgn;
+            if (nb[ax] >= 0 && nb[ax] < lim[ax]) {
+              int32_t npos = hz_pyr_leaf_pos(py, nb[0] + py->nx * (nb[1] + py->ny * nb[2]));
+              if (npos >= 0) sw_index_emit(npos, s, bstart, bpids, fillb);
+            }
+            nb[ax] = mx;
+          }
+        }
+      }
+}
+
 int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, const double *kd,
               const hz_sw_opts *o, hz_sw_stat *st, double *e_hist) {
   double *Ed = NULL, *Eprev = NULL;
@@ -1468,41 +1536,11 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     /* bbox-индекс А1566: слот s пересекает клетку листа, если bbox его
      * ИСХОДНОГО треугольника задевает клетку (два прохода counting-sort) */
     {
-      int64_t lx = (int64_t)ceil((o->domhi[0] - py->lo[0]) / py->cell) - 1;
-      int64_t ly = (int64_t)ceil((o->domhi[1] - py->lo[1]) / py->cell) - 1;
-      int64_t lz = (int64_t)ceil((o->domhi[2] - py->lo[2]) / py->cell) - 1;
       int32_t li3;
       int64_t total = 0;
-      for (int32_t s = 0; s < nt; s++) {
-        int32_t tri = py->pcs[s].tri;
-        int64_t x[2], y[2], z[2];
-        /* максимум на плоскости сетки (стенка на границе) — в ПОСЛЕДНЮЮ
-         * реальную клетку: ceil−1; минимум — floor (§852) */
-        x[0] = (int64_t)((o->tribox[6 * (int64_t)tri + 0] - py->lo[0]) / py->cell);
-        x[1] = (int64_t)ceil((o->tribox[6 * (int64_t)tri + 3] - py->lo[0]) / py->cell) - 1;
-        y[0] = (int64_t)((o->tribox[6 * (int64_t)tri + 1] - py->lo[1]) / py->cell);
-        y[1] = (int64_t)ceil((o->tribox[6 * (int64_t)tri + 4] - py->lo[1]) / py->cell) - 1;
-        z[0] = (int64_t)((o->tribox[6 * (int64_t)tri + 2] - py->lo[2]) / py->cell);
-        z[1] = (int64_t)ceil((o->tribox[6 * (int64_t)tri + 5] - py->lo[2]) / py->cell) - 1;
-        if (x[0] < 0) x[0] = 0;
-        if (x[1] < x[0]) x[1] = x[0];
-        if (x[1] > lx) x[1] = lx;
-        if (x[0] > lx) x[0] = lx;
-        if (y[0] < 0) y[0] = 0;
-        if (y[1] < y[0]) y[1] = y[0];
-        if (y[1] > ly) y[1] = ly;
-        if (y[0] > ly) y[0] = ly;
-        if (z[0] < 0) z[0] = 0;
-        if (z[1] < z[0]) z[1] = z[0];
-        if (z[1] > lz) z[1] = lz;
-        if (z[0] > lz) z[0] = lz;
-        for (int64_t iz = z[0]; iz <= z[1]; iz++)
-          for (int64_t iy = y[0]; iy <= y[1]; iy++)
-            for (int64_t ix = x[0]; ix <= x[1]; ix++) {
-              int32_t pos = hz_pyr_leaf_pos(py, ix + py->nx * (iy + py->ny * iz));
-              if (pos >= 0) bstart[pos + 1]++;
-            }
-      }
+      int fb = (o->walk != 0); /* А1578: фолбэк соседних листьев — только walk */
+      for (int32_t s = 0; s < nt; s++)
+        sw_index_piece(py, o, s, fb, bstart, NULL, NULL);
       for (li3 = 0; li3 < py->nleaf; li3++) {
         bstart[li3 + 1] += bstart[li3];
       }
@@ -1515,36 +1553,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       }
       for (li3 = 0; li3 < py->nleaf; li3++)
         fillb[li3] = bstart[li3];
-      for (int32_t s = 0; s < nt; s++) {
-        int32_t tri = py->pcs[s].tri;
-        int64_t x[2], y[2], z[2];
-        /* максимум на плоскости сетки (стенка на границе) — в ПОСЛЕДНЮЮ
-         * реальную клетку: ceil−1; минимум — floor (§852) */
-        x[0] = (int64_t)((o->tribox[6 * (int64_t)tri + 0] - py->lo[0]) / py->cell);
-        x[1] = (int64_t)ceil((o->tribox[6 * (int64_t)tri + 3] - py->lo[0]) / py->cell) - 1;
-        y[0] = (int64_t)((o->tribox[6 * (int64_t)tri + 1] - py->lo[1]) / py->cell);
-        y[1] = (int64_t)ceil((o->tribox[6 * (int64_t)tri + 4] - py->lo[1]) / py->cell) - 1;
-        z[0] = (int64_t)((o->tribox[6 * (int64_t)tri + 2] - py->lo[2]) / py->cell);
-        z[1] = (int64_t)ceil((o->tribox[6 * (int64_t)tri + 5] - py->lo[2]) / py->cell) - 1;
-        if (x[0] < 0) x[0] = 0;
-        if (x[1] < x[0]) x[1] = x[0];
-        if (x[1] > lx) x[1] = lx;
-        if (x[0] > lx) x[0] = lx;
-        if (y[0] < 0) y[0] = 0;
-        if (y[1] < y[0]) y[1] = y[0];
-        if (y[1] > ly) y[1] = ly;
-        if (y[0] > ly) y[0] = ly;
-        if (z[0] < 0) z[0] = 0;
-        if (z[1] < z[0]) z[1] = z[0];
-        if (z[1] > lz) z[1] = lz;
-        if (z[0] > lz) z[0] = lz;
-        for (int64_t iz = z[0]; iz <= z[1]; iz++)
-          for (int64_t iy = y[0]; iy <= y[1]; iy++)
-            for (int64_t ix = x[0]; ix <= x[1]; ix++) {
-              int32_t pos = hz_pyr_leaf_pos(py, ix + py->nx * (iy + py->ny * iz));
-              if (pos >= 0) bpids[fillb[pos]++] = s;
-            }
-      }
+      for (int32_t s = 0; s < nt; s++)
+        sw_index_piece(py, o, s, fb, NULL, bpids, fillb);
       free(fillb);
       fillb = NULL;
     }

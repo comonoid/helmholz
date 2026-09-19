@@ -650,7 +650,11 @@ typedef struct {
   sw_agg *ag;          /* §863/шаг 2: таблица групп (NULL — путь не активен) */
   double *abuf, *wbuf; /* скретч взаимодействия: без аллокаций на событие */
   int64_t abufcap;
-  double hi[3];      /* верх сцены (клетки уровней шире домена на нечётных сетках) */
+  double hi[3]; /* верх сцены (клетки уровней шире домена на нечётных сетках) */
+  /* §864/Б1: кэш размеров уровней (статичны на прогон; иначе level_dims —
+   * 22–37 млн вызовов). Владелец — hz_sw_run, fc только ссылается. */
+  int64_t (*fld)[3];
+  uint8_t *fldok;
   double lost;       /* поток за границей домена, w·csec-единицы */
   int64_t ncellbase; /* базовых клеток полным DDA («до», прибор А1569) */
   int cbase, cfront; /* прибор считается на первой итерации (геометрия статична) */
@@ -740,11 +744,22 @@ static void sw_accum(front_ctx *fc, int32_t p, double edep) {
   if (fc->o->lphits) fc->o->lphits[p] += 1.0; /* §862-диаг: ранжир (а) */
 }
 
+/* §864/Б1: размеры уровня из кэша (статичны на прогон) */
+static void front_ldims(front_ctx *fc, int32_t l, int64_t d[3]) {
+  if (!fc->fldok[l]) {
+    hz_pyr_level_dims(fc->py, l, fc->fld[l]);
+    fc->fldok[l] = 1;
+  }
+  d[0] = fc->fld[l][0];
+  d[1] = fc->fld[l][1];
+  d[2] = fc->fld[l][2];
+}
+
 /* коробка узла (уровень l, позиция pos; l<0 — лист) с ЗАЖИМОМ в сцену:
  * на нечётных сетках клетки уровней шире домена (А1567 — за доменом
  * сегментов не остаётся, остаток носителя уходит в lost) */
-static void front_node_box(const front_ctx *fc, int32_t l, int32_t pos, double blo[3],
-                           double bhi[3]) {
+static void front_node_box(front_ctx *fc, int32_t l, int32_t pos, double blo[3],
+                           double bhi[3]) { /* fc не const: кэш размеров §864/Б1 */
   const hz_pyr *py = fc->py;
   int64_t d[3], id;
   double side;
@@ -756,7 +771,7 @@ static void front_node_box(const front_ctx *fc, int32_t l, int32_t pos, double b
     side = py->cell;
     id = py->leaf_id[pos];
   } else {
-    hz_pyr_level_dims(py, l, d);
+    front_ldims(fc, l, d); /* §864/Б1: кэш размеров уровней */
     side = py->cell * (double)((int64_t)1 << (l + 1));
     id = py->lev[l][pos].id;
   }
@@ -1176,88 +1191,86 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
                      bhi, tin, tout, a, b, 1);
     return;
   }
-  {
-    /* МАТЕРИАЛЕН ⟺ max ℓ_p поддерева ≥ уровень узла (лист — уровень 0,
-     * уровень l — parents of leaves = l+1): марш дробит фронт ДО уровня
-     * ℓ_p куска; узлы глубже нужного — промежуточные (спуск), крупнее —
-     * фронт уже поглощён на уровне ℓ_p и сюда не доходит. */
-    uint8_t m = py->lev_lp[l][pos];
-    if (m != 255 && (int32_t)m >= l + 1) {
-      int32_t n = 0;
-      const int32_t *ps = fc->pbuf;
-      int64_t cid = -1;
-      if (fc->o->walk && fc->nstart) cid = (int64_t)fc->ncluster0 + fc->noff[l] + pos;
-      if (cid >= 0 && fc->nstart[cid] >= 0) {
-        /* §863: список узла уже собран — gather не повторяем */
-        ps = fc->nstore + fc->nstart[cid];
-        n = fc->nlen[cid];
-      } else {
-        if (front_gather(fc, l, pos, &n) != 0) return;
-        if (cid >= 0 && *fc->nstore_n + n <= fc->nstore_cap) {
-          /* §863/шаг 2 (агрегация, этап 0): ДЕДУПЛИКАЦИЯ — кусок, чей bbox
-           * накрывает несколько листов узла, попадал в список многократно;
-           * штамп А1564 гасил дубли на депозите, но ray-tri по ним считался.
-           * Порядок списка не важен: попадания сортируются по tt. */
-          /* сортировка по (материал, id): группы агрегации идут подряд */
-          for (int32_t q = 1; q < n; q++) {
-            int32_t v = fc->pbuf[q], w2 = q;
-            while (w2 > 0 &&
-                   (py->pcs[fc->pbuf[w2 - 1]].mtl > py->pcs[v].mtl ||
-                    (py->pcs[fc->pbuf[w2 - 1]].mtl == py->pcs[v].mtl && fc->pbuf[w2 - 1] > v))) {
-              fc->pbuf[w2] = fc->pbuf[w2 - 1];
-              w2--;
-            }
-            fc->pbuf[w2] = v;
+  /* МАТЕРИАЛЕН ⟺ max ℓ_p поддерева ≥ уровень узла (лист — уровень 0,
+   * уровень l — parents of leaves = l+1): марш дробит фронт ДО уровня
+   * ℓ_p куска; узлы глубже нужного — промежуточные (спуск), крупнее —
+   * фронт уже поглощён на уровне ℓ_p и сюда не доходит. */
+  uint8_t m = py->lev_lp[l][pos];
+  if (m != 255 && (int32_t)m >= l + 1) {
+    int32_t n = 0;
+    const int32_t *ps = fc->pbuf;
+    int64_t cid = -1;
+    if (fc->o->walk && fc->nstart) cid = (int64_t)fc->ncluster0 + fc->noff[l] + pos;
+    if (cid >= 0 && fc->nstart[cid] >= 0) {
+      /* §863: список узла уже собран — gather не повторяем */
+      ps = fc->nstore + fc->nstart[cid];
+      n = fc->nlen[cid];
+    } else {
+      if (front_gather(fc, l, pos, &n) != 0) return;
+      if (cid >= 0 && *fc->nstore_n + n <= fc->nstore_cap) {
+        /* §863/шаг 2 (агрегация, этап 0): ДЕДУПЛИКАЦИЯ — кусок, чей bbox
+         * накрывает несколько листов узла, попадал в список многократно;
+         * штамп А1564 гасил дубли на депозите, но ray-tri по ним считался.
+         * Порядок списка не важен: попадания сортируются по tt. */
+        /* сортировка по (материал, id): группы агрегации идут подряд */
+        for (int32_t q = 1; q < n; q++) {
+          int32_t v = fc->pbuf[q], w2 = q;
+          while (w2 > 0 &&
+                 (py->pcs[fc->pbuf[w2 - 1]].mtl > py->pcs[v].mtl ||
+                  (py->pcs[fc->pbuf[w2 - 1]].mtl == py->pcs[v].mtl && fc->pbuf[w2 - 1] > v))) {
+            fc->pbuf[w2] = fc->pbuf[w2 - 1];
+            w2--;
           }
-          int32_t un = 0;
-          for (int32_t q = 0; q < n; q++)
-            if (un == 0 || fc->pbuf[un - 1] != fc->pbuf[q]) fc->pbuf[un++] = fc->pbuf[q];
-          n = un;
-          int64_t st = *fc->nstore_n;
-          if (fc->agg) { /* §863/шаг 2: список = ГИДЫ групп (по материалу) */
-            int64_t g0 = 0;
-            n = 0;
-            int one = fc->o->agg >= 2; /* agg=2: одна группа на список */
-            while (g0 < un) {
-              int32_t mtl0 = py->pcs[fc->pbuf[g0]].mtl;
-              int64_t g1 = g0;
-              int32_t gid;
-              while (g1 < un && (one || py->pcs[fc->pbuf[g1]].mtl == mtl0))
-                g1++;
-              gid = sw_group_make(fc, g0, g1);
-              if (gid < 0) break; /* нет памяти: узел без кэша группы */
-              fc->nstore[st + n] = gid;
-              n++;
-              g0 = g1;
-            }
-            *fc->nstore_n = st + n;
-            fc->nstart[cid] = st;
-            fc->nlen[cid] = n;
-            ps = fc->nstore + st;
-          } else {
-            for (int32_t q = 0; q < n; q++)
-              fc->nstore[st + q] = fc->pbuf[q];
+          fc->pbuf[w2] = v;
+        }
+        int32_t un = 0;
+        for (int32_t q = 0; q < n; q++)
+          if (un == 0 || fc->pbuf[un - 1] != fc->pbuf[q]) fc->pbuf[un++] = fc->pbuf[q];
+        n = un;
+        int64_t st = *fc->nstore_n;
+        if (fc->agg) { /* §863/шаг 2: список = ГИДЫ групп (по материалу) */
+          int64_t g0 = 0;
+          n = 0;
+          int one = fc->o->agg >= 2; /* agg=2: одна группа на список */
+          while (g0 < un) {
+            int32_t mtl0 = py->pcs[fc->pbuf[g0]].mtl;
+            int64_t g1 = g0;
+            int32_t gid;
+            while (g1 < un && (one || py->pcs[fc->pbuf[g1]].mtl == mtl0))
+              g1++;
+            gid = sw_group_make(fc, g0, g1);
+            if (gid < 0) break; /* нет памяти: узел без кэша группы */
+            fc->nstore[st + n] = gid;
+            n++;
+            g0 = g1;
           }
           *fc->nstore_n = st + n;
           fc->nstart[cid] = st;
           fc->nlen[cid] = n;
           ps = fc->nstore + st;
-        } /* магазин полон: работаем по pbuf без кэша (прежний путь) */
-        fc->agg_list = fc->agg; /* узловой список отсортирован (mtl,id) */
-      }
-      front_node_box(fc, l, pos, blo, bhi);
-      /* А1573: на узловом отрезке клеточный T-перехват НЕзаконен — bbox куска
-       * ⊆ узел не означает, что трубка задевает его тень; перехват раздаёт
-       * сечение узла кускам, мимо которых трубка прошла (расходимость
-       * ~×1.5/итерацию на cavity05 lp=2). Узел — только точное пересечение.
-       * Предикат А1566 «bbox ⊆ клетка» валиден ТОЛЬКО на листовом отрезке
-       * (bbox ⊆ БАЗОВАЯ клетка). */
-      if (fc->o->walk) /* А1576: точный многопопадный проход */
-        front_seg_walk(fc, ps, n, tin, tout, a, b);
-      else
-        front_interact(fc, fc->pbuf, n, blo, bhi, tin, tout, a, b, 0);
-      return;
+        } else {
+          for (int32_t q = 0; q < n; q++)
+            fc->nstore[st + q] = fc->pbuf[q];
+        }
+        *fc->nstore_n = st + n;
+        fc->nstart[cid] = st;
+        fc->nlen[cid] = n;
+        ps = fc->nstore + st;
+      } /* магазин полон: работаем по pbuf без кэша (прежний путь) */
+      fc->agg_list = fc->agg; /* узловой список отсортирован (mtl,id) */
     }
+    front_node_box(fc, l, pos, blo, bhi);
+    /* А1573: на узловом отрезке клеточный T-перехват НЕзаконен — bbox куска
+     * ⊆ узел не означает, что трубка задевает его тень; перехват раздаёт
+     * сечение узла кускам, мимо которых трубка прошла (расходимость
+     * ~×1.5/итерацию на cavity05 lp=2). Узел — только точное пересечение.
+     * Предикат А1566 «bbox ⊆ клетка» валиден ТОЛЬКО на листовом отрезке
+     * (bbox ⊆ БАЗОВАЯ клетка). */
+    if (fc->o->walk) /* А1576: точный многопопадный проход */
+      front_seg_walk(fc, ps, n, tin, tout, a, b);
+    else
+      front_interact(fc, fc->pbuf, n, blo, bhi, tin, tout, a, b, 0);
+    return;
   }
   /* ПРОМЕЖУТОЧНЫЙ: спуск — продолжение DDA на детском уровне */
   fc->ndesc++;
@@ -1271,7 +1284,8 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
     int n = 0, u, v, i;
     int cx, cy, cz;
     double a_in = *a, dep_snap = fc->depA;
-    hz_pyr_level_dims(py, 0, pd0);
+    hz_pyr_node *pnode = &py->lev[0][pos]; /* §864/Б1: Existence-маска детей */
+    front_ldims(fc, 0, pd0);
     ci0[0] = kid0 % pd0[0];
     ci0[1] = (kid0 / pd0[0]) % pd0[1];
     ci0[2] = kid0 / (pd0[0] * pd0[1]);
@@ -1284,6 +1298,13 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
           int64_t id;
           if (bx >= py->nx || by >= py->ny || bz >= py->nz) continue;
           id = bx + py->nx * (by + py->ny * bz);
+          /* §864/Б1: существование листа — бит-тест ДО box_seg: пустая клетка
+           * обходится без слэб-теста и двоичного поиска (А1569). Маска узла
+           * построена по тем же листьям — ответ совпадает с hz_pyr_leaf_pos. */
+          if (!(pnode->chmask & (1u << (cx | (cy << 1) | (cz << 2))))) {
+            fc->njump++; /* ПУСТ: прыжок одним шагом (А1569) */
+            continue;
+          }
           cblo[0] = py->lo[0] + (double)bx * py->cell;
           cblo[1] = py->lo[1] + (double)by * py->cell;
           cblo[2] = py->lo[2] + (double)bz * py->cell;
@@ -1335,7 +1356,8 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
     int n = 0, u, v, i;
     int cx, cy, cz;
     double a_in = *a, dep_snap = fc->depA;
-    hz_pyr_level_dims(py, l, pd);
+    hz_pyr_node *pnode = &py->lev[l][pos]; /* §864/Б1: Existence-маска детей */
+    front_ldims(fc, l, pd);
     if (cl < 0) {
       cd[0] = py->nx;
       cd[1] = py->ny;
@@ -1354,6 +1376,13 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
           int64_t id;
           if (qx >= cd[0] || qy >= cd[1] || qz >= cd[2]) continue;
           id = qx + cd[0] * (qy + cd[1] * qz);
+          /* §864/Б1: существование узла-ребёнка — бит-тест ДО box_seg (А1569):
+           * маска узла построена подъёмом при построении пирамиды и совпадает
+           * с ответом hz_pyr_node_pos. Пустой ребёнок — один бит-тест. */
+          if (!(pnode->chmask & (1u << (cx | (cy << 1) | (cz << 2))))) {
+            fc->njump++; /* ПУСТ: прыжок одним шагом по tmax ребёнка (А1569) */
+            continue;
+          }
           cblo[0] = py->lo[0] + (double)qx * side2;
           cblo[1] = py->lo[1] + (double)qy * side2;
           cblo[2] = py->lo[2] + (double)qz * side2;
@@ -1688,6 +1717,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   int32_t *nlen = NULL, *nstore = NULL;
   int64_t nstore_n = 0, nstore_cap = 0, ncluster = 0;
   int64_t noff[257] = {0};
+  int64_t (*fld)[3] = NULL; /* §864/Б1: кэш размеров уровней (257 уровней max) */
+  uint8_t *fldok = NULL;
   sw_agg ag; /* §863/шаг 2: таблица групп агрегации */
   memset(&ag, 0, sizeof ag);
   int nd = 0, d, it, rc = 0;
@@ -1716,7 +1747,11 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   vindex = (int32_t *)malloc((size_t)py->nleaf * sizeof *vindex);
   bits = (uint64_t *)malloc((size_t)((py->nleaf + 63) >> 6) * sizeof *bits);
   walks = (hz_sw_walk *)calloc((size_t)nd, sizeof *walks);
-  if (!Ed || !Eprev || !order || !vindex || !bits || !walks) {
+  if (o->mode == 3) { /* §864/Б1: кэш размеров уровней для марша фронта */
+    fld = (int64_t (*)[3])calloc(257, sizeof *fld);
+    fldok = (uint8_t *)calloc(257, sizeof *fldok);
+  }
+  if (!Ed || !Eprev || !order || !vindex || !bits || !walks || (o->mode == 3 && (!fld || !fldok))) {
     rc = 2;
     goto done;
   }
@@ -1889,6 +1924,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.nstore_cap = nstore_cap;
         fc.ncluster = (int32_t)ncluster;
         fc.ncluster0 = py->nleaf;
+        fc.fld = fld; /* §864/Б1: кэш размеров уровней */
+        fc.fldok = fldok;
         fc.agg = o->agg;
         fc.ag = &ag;
         for (int32_t l2 = 0; l2 < py->nlev; l2++)
@@ -2088,6 +2125,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
 
 done:
   free(lpflo); /* §862 */
+  free(fld);   /* §864/Б1 */
+  free(fldok);
   free(Ed);
   free(Eprev);
   free(order);

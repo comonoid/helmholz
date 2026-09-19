@@ -295,6 +295,19 @@ int hz_pyr_build(hz_pyr *py, int32_t nt, const double *tri_min, const double *tr
     for (u = 0; u < w; u++) {
       lvl[u].id = par[u];
       lvl[u].state = HZ_PYR_FINE; /* агрегатов в §833 нет */
+      lvl[u].chmask = 0;
+    }
+    /* §864/Б1: Existence-маска детей — один подъём по ИСТОЧНИКАМ уровня
+     * (на первом витке это листья): бит (cx | cy<<1 | cz<<2) родителя.
+     * Двоичный поиск родителя — цена построения, марш платит бит-тестом. */
+    for (u = 0; u < ncur; u++) {
+      int64_t id = cur[u];
+      int64_t ix = id % pnx, iy = (id / pnx) % pny, iz = id / (pnx * pny);
+      int64_t pid = (ix >> 1) + cnx * ((iy >> 1) + cny * (iz >> 1));
+      int32_t pi = pyr_find(par, w, pid);
+      if (pi >= 0)
+        lvl[pi].chmask |=
+            (uint8_t)(1u << ((int)(ix & 1) | ((int)(iy & 1) << 1) | ((int)(iz & 1) << 2)));
     }
     py->lev = (hz_pyr_node **)realloc(py->lev, (size_t)(py->nlev + 1) * sizeof *py->lev);
     py->nlev_nodes =

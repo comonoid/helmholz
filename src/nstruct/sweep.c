@@ -620,6 +620,17 @@ typedef struct {
   const int32_t *bpids;  /* слоты кусков */
   int32_t *pbuf;         /* куски материального узла (растёт по нужде) */
   int64_t pbufcap;
+  /* §863: кэш списков кусков УЗЛОВ — gather обходил поддерево на каждую
+   * трубку; теперь список узла собирается ОДИН РАЗ и живёт в nstore.
+   * nstart/nlen/nstore/nstore_n принадлежат hz_sw_run (переживают fc). */
+  int64_t *nstart;   /* [ncluster]: позиция в nstore или -1 — не собран */
+  int32_t *nlen;     /* [ncluster]: длина списка */
+  int32_t *nstore;   /* магазин списков */
+  int64_t *nstore_n; /* указатель на счётчик заполнения магазина */
+  int64_t nstore_cap;
+  int32_t ncluster;
+  int64_t noff[256];   /* смещение уровня в нумерации кластеров узлов */
+  int32_t ncluster0;   /* nleaf: кластеры листов идут первыми */
   double *abuf, *wbuf; /* скретч взаимодействия: без аллокаций на событие */
   int64_t abufcap;
   double hi[3];      /* верх сцены (клетки уровней шире домена на нечётных сетках) */
@@ -1110,7 +1121,25 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
     uint8_t m = py->lev_lp[l][pos];
     if (m != 255 && (int32_t)m >= l + 1) {
       int32_t n = 0;
-      if (front_gather(fc, l, pos, &n) != 0) return;
+      const int32_t *ps = fc->pbuf;
+      int64_t cid = -1;
+      if (fc->o->walk && fc->nstart) cid = (int64_t)fc->ncluster0 + fc->noff[l] + pos;
+      if (cid >= 0 && fc->nstart[cid] >= 0) {
+        /* §863: список узла уже собран — gather не повторяем */
+        ps = fc->nstore + fc->nstart[cid];
+        n = fc->nlen[cid];
+      } else {
+        if (front_gather(fc, l, pos, &n) != 0) return;
+        if (cid >= 0 && *fc->nstore_n + n <= fc->nstore_cap) {
+          int64_t st = *fc->nstore_n;
+          for (int32_t q = 0; q < n; q++)
+            fc->nstore[st + q] = fc->pbuf[q];
+          *fc->nstore_n = st + n;
+          fc->nstart[cid] = st;
+          fc->nlen[cid] = n;
+          ps = fc->nstore + st;
+        } /* магазин полон: работаем по pbuf без кэша (прежний путь) */
+      }
       front_node_box(fc, l, pos, blo, bhi);
       /* А1573: на узловом отрезке клеточный T-перехват НЕзаконен — bbox куска
        * ⊆ узел не означает, что трубка задевает его тень; перехват раздаёт
@@ -1119,7 +1148,7 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
        * Предикат А1566 «bbox ⊆ клетка» валиден ТОЛЬКО на листовом отрезке
        * (bbox ⊆ БАЗОВАЯ клетка). */
       if (fc->o->walk) /* А1576: точный многопопадный проход */
-        front_seg_walk(fc, fc->pbuf, n, tin, tout, a, b);
+        front_seg_walk(fc, ps, n, tin, tout, a, b);
       else
         front_interact(fc, fc->pbuf, n, blo, bhi, tin, tout, a, b, 0);
       return;
@@ -1482,6 +1511,11 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   int32_t *stampv = NULL; /* §851: штампы визитов линий [ncells] */
   int64_t *pstamp = NULL; /* §852/А1564: штамп (трубка × кусок) [nt] */
   int32_t *bstart = NULL, *bpids = NULL, *fillb = NULL; /* §852/А1566: bbox-индекс */
+  /* §863: кэш списков кусков узлов (владелец — прогон, переживает fc) */
+  int64_t *nstart = NULL;
+  int32_t *nlen = NULL, *nstore = NULL;
+  int64_t nstore_n = 0, nstore_cap = 0, ncluster = 0;
+  int64_t noff[257] = {0};
   int nd = 0, d, it, rc = 0;
   double csec;
   uint8_t *lpflo = NULL; /* §862: этажи (когда задан lpacc) */
@@ -1565,6 +1599,23 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   if (o->mode == 3) { /* §852/А1564: штамп кратности 1 на (кусок, направление) */
     pstamp = (int64_t *)calloc((size_t)nt, sizeof *pstamp);
     bstart = (int32_t *)calloc((size_t)py->nleaf + 1, sizeof *bstart);
+    if (o->walk) { /* §863: кэш списков кусков узлов */
+      ncluster = (int64_t)py->nleaf;
+      for (int32_t l2 = 0; l2 < py->nlev; l2++) {
+        noff[l2] = ncluster - (int64_t)py->nleaf;
+        ncluster += py->nlev_nodes[l2];
+      }
+      nstart = (int64_t *)malloc((size_t)ncluster * sizeof *nstart);
+      nlen = (int32_t *)malloc((size_t)ncluster * sizeof *nlen);
+      nstore_cap = (int64_t)1 << 22; /* 16 млн слотов = 64 МБ; сверх — прежний путь */
+      nstore = (int32_t *)malloc((size_t)nstore_cap * sizeof *nstore);
+      if (!nstart || !nlen || !nstore) {
+        rc = 2;
+        goto done;
+      }
+      for (int64_t ci = 0; ci < ncluster; ci++)
+        nstart[ci] = -1;
+    }
     if (!pstamp || !bstart) {
       rc = 2;
       goto done;
@@ -1647,6 +1698,15 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.bstart = bstart;
         fc.bpids = bpids;
         fc.mark = mark;
+        fc.nstart = nstart;
+        fc.nlen = nlen;
+        fc.nstore = nstore;
+        fc.nstore_n = &nstore_n;
+        fc.nstore_cap = nstore_cap;
+        fc.ncluster = (int32_t)ncluster;
+        fc.ncluster0 = py->nleaf;
+        for (int32_t l2 = 0; l2 < py->nlev; l2++)
+          fc.noff[l2] = noff[l2];
         fc.cbase = (it == 0); /* прибор А1569 — геометрия статична, хватит раза */
         fc.cfront = (it == 0);
         fc.hi[0] = o->domhi[0]; /* меш-граница, не сеточная (§852) */
@@ -1839,6 +1899,9 @@ done:
   free(tab);
   free(pstamp); /* §852/А1564 */
   free(stampv);
+  free(nstart); /* §863 */
+  free(nlen);
+  free(nstore);
   free(bstart);
   free(bpids);
   if (walks) {

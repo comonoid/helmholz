@@ -28,19 +28,21 @@ int main(int argc, char **argv) {
   const char *path = NULL, *cmpfile = NULL;
   double scale = 1.0, le = 1.0, rho = -1.0;
   int iters = 20, lev = 6, tau0 = 0, noprop = 0, ndirs = 6, mort = 1, i, ax;
-  int mode = 1;         /* §845: 2 — объёмный фронт (L на клетку, марш-порядок) */
-  int build = 0;        /* §845-в: строитель похода (1 — прямой сортировочный) */
-  int vc = 1;           /* §851: компоненты пустоты по умолчанию включены */
-  int lp = 0;           /* §852: LOD-уровень кусков ℓ_p (единый; лестница G1) */
-  int adapt = 0;        /* §862: 1 — дробный аккумулятор детальности */
-  double *lpacc = NULL; /* §862: аккумулятор [nt], живёт до конца main */
-  double cdelta = 1.0;  /* §862: вес приращения Δ(материал,угол) */
-  int xint = 0;         /* §852/G1(a): 1 — всегда точное пересечение */
-  int screw = 0;        /* НК А1572: скрестить куски с шагом screw (детекторы>0) */
-  int walk = 0;         /* А1576: 1 — точный многопопадный проход (модель «реальные
-                         * пересечения»); 0 — схема §852 (перехват под предикатом) */
-  int useke = 0;        /* А1576: 1 — per-piece le из Ke материалов (плюс глобальный
-                         * le); 0 — прежний мир (глобальный le) */
+  int mode = 1;          /* §845: 2 — объёмный фронт (L на клетку, марш-порядок) */
+  int build = 0;         /* §845-в: строитель похода (1 — прямой сортировочный) */
+  int vc = 1;            /* §851: компоненты пустоты по умолчанию включены */
+  int lp = 0;            /* §852: LOD-уровень кусков ℓ_p (единый; лестница G1) */
+  int adapt = 0;         /* §862: 1 — дробный аккумулятор детальности */
+  double *lpacc = NULL;  /* §862: аккумулятор [nt], живёт до конца main */
+  double *lphits = NULL; /* §862-диаг: счётчик событий [nt] */
+  int dumpE = 0;         /* §862-диаг: дамп per-piece E последней итерации */
+  double cdelta = 1.0;   /* §862: вес приращения Δ(материал,угол) */
+  int xint = 0;          /* §852/G1(a): 1 — всегда точное пересечение */
+  int screw = 0;         /* НК А1572: скрестить куски с шагом screw (детекторы>0) */
+  int walk = 0;          /* А1576: 1 — точный многопопадный проход (модель «реальные
+                          * пересечения»); 0 — схема §852 (перехват под предикатом) */
+  int useke = 0;         /* А1576: 1 — per-piece le из Ke материалов (плюс глобальный
+                          * le); 0 — прежний мир (глобальный le) */
   int nphi = 0, nmu = 0;
   int has_recv = 0; /* blocked-beam (А1566): recv=X:<x0>:<x1> — приёмник-слэб */
   double recv0 = 0.0, recv1 = 0.0;
@@ -85,6 +87,8 @@ int main(int argc, char **argv) {
       adapt = atoi(argv[i] + 6); /* §862 */
     } else if (strncmp(argv[i], "cdelta=", 7) == 0) {
       cdelta = atof(argv[i] + 7); /* §862 */
+    } else if (strncmp(argv[i], "dumpE=", 6) == 0) {
+      dumpE = atoi(argv[i] + 6); /* §862-диаг */
     } else if (strncmp(argv[i], "xint=", 5) == 0) {
       xint = atoi(argv[i] + 5); /* §852/G1(a): точное пересечение везде */
     } else if (strncmp(argv[i], "screw=", 6) == 0) {
@@ -205,7 +209,12 @@ int main(int argc, char **argv) {
     double *tv9 = (double *)malloc((size_t)m.nt * 9 * sizeof *tv9);
     double *tb6 = (double *)malloc((size_t)m.nt * 6 * sizeof *tb6);
     uint8_t *lparr = (uint8_t *)malloc((size_t)m.nt);
-    if (adapt) lpacc = (double *)calloc((size_t)m.nt, sizeof *lpacc); /* §862 */
+    if (adapt) lpacc = (double *)calloc((size_t)m.nt, sizeof *lpacc);   /* §862 */
+    if (adapt) lphits = (double *)calloc((size_t)m.nt, sizeof *lphits); /* §862-диаг */
+    if (adapt && !lphits) {
+      fprintf(stderr, "нет памяти на lphits\n");
+      return 2;
+    }
     int32_t ti;
     if (!tv9 || !tb6 || !lparr || (adapt && !lpacc)) {
       fprintf(stderr, "нет памяти на trivert/tribox/lp/lpacc\n");
@@ -239,6 +248,8 @@ int main(int argc, char **argv) {
         lpacc[ti] = (double)lp;
       so.lpacc = lpacc;
       so.cdelta = cdelta;
+      so.lphits = lphits;
+      so.lpapply = (adapt == 1); /* adapt=2 — пассивная диагностика */
     }
     so.xint = xint;
     so.walk = walk;
@@ -494,6 +505,10 @@ int main(int argc, char **argv) {
   free((void *)(uintptr_t)so.trivert);
   free((void *)(uintptr_t)so.tribox);
   free((void *)(uintptr_t)so.lp);
+  if (dumpE) /* §862-диаг: нагрузка куска, последняя итерация */
+    for (i = 0; i < (int)m.nt; i++)
+      printf("E1 p=%d tri=%d e=%.8g hits=%.0f sdelta=%.8g\n", i, py.pcs[i].tri, (double)py.pcs[i].e,
+             lphits ? lphits[i] : 0.0, lpacc ? lpacc[i] : 0.0);
   if (lpacc) { /* §862: гистограмма этажей на последней итерации */
     int fl, cnt[16] = {0}, maxfl = 0;
     for (i = 0; i < (int)m.nt; i++) {
@@ -507,6 +522,7 @@ int main(int argc, char **argv) {
       printf(" %d:%d", fl, cnt[fl]);
     printf(")\n");
     free(lpacc);
+    free(lphits);
   }
   free(lep9); /* А1576: per-piece эмиссия */
   hz_pyr_free(&py);

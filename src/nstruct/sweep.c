@@ -686,6 +686,7 @@ static void sw_accum(front_ctx *fc, int32_t p) {
   if (!fc->o->lpacc) return;
   fc->o->lpacc[p] +=
       fc->o->cdelta * front_rho(fc, p) * (1.0 - front_cos(fc, p) / (2.0 * fc->area[p]));
+  if (fc->o->lphits) fc->o->lphits[p] += 1.0; /* §862-диаг: ранжир (а) */
 }
 
 /* коробка узла (уровень l, позиция pos; l<0 — лист) с ЗАЖИМОМ в сцену:
@@ -1786,7 +1787,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     st->lost = lost;
     if (o->mode != 3) st->traffic = (int64_t)nd * ((int64_t)nt * 36 + (int64_t)walks[0].n * 40);
     if (e_hist) e_hist[it] = st->e_avg;
-    if (o->mode == 3 && o->lpacc) { /* §862: этаж = целая часть аккумулятора */
+    if (o->mode == 3 && o->lpacc && o->lpapply) { /* §862: этаж = целая часть */
       int32_t nup = 0;
       if (!lpflo) {
         lpflo = (uint8_t *)malloc((size_t)nt);

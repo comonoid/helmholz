@@ -1131,6 +1131,22 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
       } else {
         if (front_gather(fc, l, pos, &n) != 0) return;
         if (cid >= 0 && *fc->nstore_n + n <= fc->nstore_cap) {
+          /* §863/шаг 2 (агрегация, этап 0): ДЕДУПЛИКАЦИЯ — кусок, чей bbox
+           * накрывает несколько листов узла, попадал в список многократно;
+           * штамп А1564 гасил дубли на депозите, но ray-tri по ним считался.
+           * Порядок списка не важен: попадания сортируются по tt. */
+          for (int32_t q = 1; q < n; q++) {
+            int32_t v = fc->pbuf[q], w2 = q;
+            while (w2 > 0 && fc->pbuf[w2 - 1] > v) {
+              fc->pbuf[w2] = fc->pbuf[w2 - 1];
+              w2--;
+            }
+            fc->pbuf[w2] = v;
+          }
+          int32_t un = 0;
+          for (int32_t q = 0; q < n; q++)
+            if (un == 0 || fc->pbuf[un - 1] != fc->pbuf[q]) fc->pbuf[un++] = fc->pbuf[q];
+          n = un;
           int64_t st = *fc->nstore_n;
           for (int32_t q = 0; q < n; q++)
             fc->nstore[st + q] = fc->pbuf[q];

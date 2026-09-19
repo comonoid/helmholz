@@ -1075,10 +1075,18 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
      * ответ группы определяется Σплощадью и средним материалом). hp хранит
      * НАЧАЛО группы; штамп — на представителе. */
     double sl = 1e-9 * (fabs(tin) + fabs(tout) + 1.0);
+    double bh0, bh1;
     for (u = 0; u < n; u++) {
       int32_t gid = ps[u];
       int32_t rep = fc->ag->grep[gid];
       if (fc->pstamp[rep] != fc->pkey) {
+        /* §864: префильтр bbox×сегмент — тот же консервативный отсекатель, что
+         * в front_interact: треугольник ⊆ своего bbox, нет пересечения отрезка
+         * с bbox — попадания в [tin,tout] не существует, результата не меняет */
+        if (!front_box_seg(fc->o->tribox + 6 * (int64_t)py->pcs[rep].tri,
+                           fc->o->tribox + 6 * (int64_t)py->pcs[rep].tri + 3, fc->org, fc->om,
+                           tin, tout, &bh0, &bh1))
+          continue;
         double tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[rep].tri);
         if (tt >= tin - sl && tt <= tout + sl) {
           ht[nh] = tt;
@@ -1093,11 +1101,17 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
     for (u = 0; u < n; u++) {
       int32_t p = ps[u];
       int32_t tri = py->pcs[p].tri;
-      double tt;
+      double tt, bh0, bh1;
       if (fc->pstamp[p] == fc->pkey) {
         fc->nstamp++; /* кратность 1 на (кусок, направление) — А1564 */
         continue;
       }
+      /* §864: префильтр bbox×сегмент — консервативный отсекатель (как во
+       * front_interact): треугольник ⊆ bbox, отрезок мимо bbox — мимо и
+       * треугольника */
+      if (!front_box_seg(fc->o->tribox + 6 * (int64_t)tri, fc->o->tribox + 6 * (int64_t)tri + 3,
+                         fc->org, fc->om, tin, tout, &bh0, &bh1))
+        continue;
       tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)tri);
       /* Оба конца включены; от двойного события на стыке сегментов спасает
        * ШТАМП: кусок штампуется при первом же событии (проход депозита

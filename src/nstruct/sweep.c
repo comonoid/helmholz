@@ -682,10 +682,31 @@ static double front_cos(const front_ctx *fc, int32_t p) {
 /* §862: приращение дробного аккумулятора детальности Δ(материал,угол):
  * темнее материал (ρ) и скользящее падение (1−cosθ, cosθ — к НОРМАЛИ куска)
  * — быстрее набор этажа. Нет lpacc — нет операции (битово прежний мир). */
-static void sw_accum(front_ctx *fc, int32_t p) {
+static void sw_accum(front_ctx *fc, int32_t p, double edep) {
   if (!fc->o->lpacc) return;
-  fc->o->lpacc[p] +=
-      fc->o->cdelta * front_rho(fc, p) * (1.0 - front_cos(fc, p) / (2.0 * fc->area[p]));
+  {
+    double rho = front_rho(fc, p);
+    double ct = front_cos(fc, p) / (2.0 * fc->area[p]); /* |cos| к нормали куска */
+    double d;
+    switch (fc->o->accum_mode) {
+    case 1:
+      d = edep * rho * (1.0 - ct);
+      break;
+    case 2:
+      d = edep * rho;
+      break;
+    case 3:
+      d = edep * (1.0 - ct);
+      break;
+    case 4:
+      d = edep;
+      break;
+    default:
+      d = rho * (1.0 - ct);
+      break; /* §862: форма за событие */
+    }
+    fc->o->lpacc[p] += fc->o->cdelta * d;
+  }
   if (fc->o->lphits) fc->o->lphits[p] += 1.0; /* §862-диаг: ранжир (а) */
 }
 
@@ -904,7 +925,7 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
     fc->emitted += fc->w_d * front_le(fc, pbest) * csec;
     *a = 0.0;
     *b = front_le(fc, pbest) + front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI);
-    sw_accum(fc, pbest); /* §862 */
+    sw_accum(fc, pbest, fc->w_d * Lin * csec * fc->axcos / fc->area[pbest]); /* §862 */
     goto done;
   }
   /* 2. Клеточный перехват §846 — ТОЛЬКО контейнированные unstamped и ТОЛЬКО
@@ -938,7 +959,8 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
         if (fc->pstamp[p] == fc->pkey) continue;
         if (!front_contained(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri, blo, bhi)) continue;
         fc->Ed[p] += fc->w_d * Lin * f * csec * fc->axcos * wt[u] / swt / fc->area[p];
-        sw_accum(fc, p); /* §862 */
+        sw_accum(fc, p,
+                 fc->w_d * Lin * f * csec * fc->axcos * wt[u] / swt / fc->area[p]); /* §862 */
       }
       fc->depA += f * ai;
       fc->absorbed += fc->w_d * Lin * f * csec;
@@ -1053,7 +1075,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
       Lh = front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI);
       fc->recycled += fc->w_d * (Lh - fc->le) * csec;
       fc->ndep++;
-      sw_accum(fc, p); /* §862 */
+      sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos / fc->area[p]); /* §862 */
       Lin = Lh;
     }
     if (nh > 0) {

@@ -37,6 +37,7 @@ int main(int argc, char **argv) {
   double *lphits = NULL; /* §862-диаг: счётчик событий [nt] */
   int dumpE = 0;         /* §862-диаг: дамп per-piece E последней итерации */
   double cdelta = 1.0;   /* §862: вес приращения Δ(материал,угол) */
+  int amode = 0;         /* §862-диаг: форма Δ (см. sweep.h accum_mode) */
   int xint = 0;          /* §852/G1(a): 1 — всегда точное пересечение */
   int screw = 0;         /* НК А1572: скрестить куски с шагом screw (детекторы>0) */
   int walk = 0;          /* А1576: 1 — точный многопопадный проход (модель «реальные
@@ -87,6 +88,8 @@ int main(int argc, char **argv) {
       adapt = atoi(argv[i] + 6); /* §862 */
     } else if (strncmp(argv[i], "cdelta=", 7) == 0) {
       cdelta = atof(argv[i] + 7); /* §862 */
+    } else if (strncmp(argv[i], "amode=", 6) == 0) {
+      amode = atoi(argv[i] + 6); /* §862-диаг */
     } else if (strncmp(argv[i], "dumpE=", 6) == 0) {
       dumpE = atoi(argv[i] + 6); /* §862-диаг */
     } else if (strncmp(argv[i], "xint=", 5) == 0) {
@@ -248,6 +251,7 @@ int main(int argc, char **argv) {
         lpacc[ti] = (double)lp;
       so.lpacc = lpacc;
       so.cdelta = cdelta;
+      so.accum_mode = amode;
       so.lphits = lphits;
       so.lpapply = (adapt == 1); /* adapt=2 — пассивная диагностика */
     }
@@ -513,6 +517,9 @@ int main(int argc, char **argv) {
     int fl, cnt[16] = {0}, maxfl = 0;
     for (i = 0; i < (int)m.nt; i++) {
       fl = (int)lpacc[i];
+      if (fl < 0)
+        fl = 0; /* §862-диаг: вклад бывает < 0 (отрицательные
+                 * Lin-депозиты) — вне гистограммы, не в стёк */
       if (fl > 15) fl = 15;
       cnt[fl]++;
       if (fl > maxfl) maxfl = fl;

@@ -595,6 +595,20 @@ static void sw_line_sweep_dir(const hz_pyr *py, const double om[3], double w_d, 
  * новая энергия, в тождество не входит); нарушение — счётчик, на чистом
  * прогоне 0. Носитель — пара (a, b): a — родительская доля радианса,
  * b — порождённая (эмиссия кусков); депозиты делятся в той же пропорции. */
+/* §863/шаг 2: статичные группы агрегации (владелец — hz_sw_run). Группа =
+ * (материал × узел): представитель ray-tri, константы A/le/ρ предвычислены,
+ * энергия депозита копится на группу (O(1) на попадание) и раздаётся членам
+ * после итерации. Eprev-среднее пересчитывается раз в итерацию (SE). */
+typedef struct {
+  int64_t ng, ngcap;
+  int32_t *grep;            /* представитель группы */
+  double *gA, *gleA, *grA;  /* площадь, средние le и ρ (статичные) */
+  double *gSE, *gacc, *gwt; /* ΣEprev·a, Σedep, Σedep·(1−cosθ) — на итерацию */
+  int64_t *ggoff;
+  int32_t *ggcnt, *gmem;
+  int64_t gmem_n, gmem_cap;
+} sw_agg;
+
 typedef struct {
   const hz_pyr *py;
   const hz_sw_opts *o;
@@ -633,6 +647,7 @@ typedef struct {
   int32_t ncluster0;   /* nleaf: кластеры листов идут первыми */
   int agg;             /* §863: ключ o->agg */
   int agg_list;        /* текущий список — узловой (отсортирован, годен для групп) */
+  sw_agg *ag;          /* §863/шаг 2: таблица групп (NULL — путь не активен) */
   double *abuf, *wbuf; /* скретч взаимодействия: без аллокаций на событие */
   int64_t abufcap;
   double hi[3];      /* верх сцены (клетки уровней шире домена на нечётных сетках) */
@@ -644,6 +659,8 @@ typedef struct {
   double absorbed, emitted, recycled;
   int64_t g6viol, njump, nmat, ndesc, ncellfront, nstamp, nlostseg, ndep;
 } front_ctx;
+
+static int32_t sw_group_make(front_ctx *fc, int64_t g0, int64_t g1); /* §863 */
 
 /* отрезок [h0,h1] луча (org, om) в коробке, пересечённый с [tin,tout];
  * 0 — пусто */
@@ -1042,27 +1059,20 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
      * депозит и Lh — площадь-взвешенно по членам (диффузная доля отклика:
      * ответ группы определяется Σплощадью и средним материалом). hp хранит
      * НАЧАЛО группы; штамп — на представителе. */
-    int64_t g0 = 0;
     double sl = 1e-9 * (fabs(tin) + fabs(tout) + 1.0);
-    int one = fc->agg >= 2; /* agg=2: одна группа на список — кусков меньше
-                             * (диффузное приближение поверх материалов) */
-    while (g0 < n) {
-      int32_t rep = ps[g0];
-      int32_t mtl0 = py->pcs[rep].mtl;
-      int64_t g1 = g0;
-      while (g1 < n && (one || py->pcs[ps[g1]].mtl == mtl0))
-        g1++;
+    for (u = 0; u < n; u++) {
+      int32_t gid = ps[u];
+      int32_t rep = fc->ag->grep[gid];
       if (fc->pstamp[rep] != fc->pkey) {
         double tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[rep].tri);
         if (tt >= tin - sl && tt <= tout + sl) {
           ht[nh] = tt;
-          hp[nh] = (int32_t)g0;
+          hp[nh] = (int32_t)u;
           nh++;
         }
       } else {
         fc->nstamp++;
       }
-      g0 = g1;
     }
   } else
     for (u = 0; u < n; u++) {
@@ -1104,34 +1114,22 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
     for (i = 0; i < nh; i++) {
       int32_t p = hp[i];
       double Lh;
-      if (fc->agg && fc->agg_list) { /* §863/шаг 2: депозит группы по членам */
-        int32_t rep = ps[p];
-        int32_t mtl0 = py->pcs[rep].mtl;
-        double A = 0.0, leA = 0.0, rA = 0.0, epA = 0.0, edep;
-        int64_t g1 = p;
+      if (fc->agg && fc->agg_list && fc->ag) { /* §863/шаг 2: O(1) на попадание */
+        int32_t gid = ps[p];
+        int32_t rep = fc->ag->grep[gid];
+        double A = fc->ag->gA[gid], edep;
         if (fc->pstamp[rep] == fc->pkey) continue;
         fc->pstamp[rep] = fc->pkey;
         if (first) {
           fc->depA += ai;
           first = 0;
         }
-        int one2 = fc->agg >= 2;
-        while (g1 < n && (one2 || py->pcs[ps[g1]].mtl == mtl0)) {
-          double am = fc->area[ps[g1]];
-          A += am;
-          leA += front_le(fc, ps[g1]) * am;
-          rA += front_rho(fc, ps[g1]) * am;
-          epA += fc->Eprev[ps[g1]] * am;
-          g1++;
-        }
         edep = fc->w_d * Lin * csec * fc->axcos / A;
-        for (int32_t q = (int32_t)p; q < (int32_t)g1; q++) {
-          fc->Ed[ps[q]] += edep;     /* каждому члену: Σ = вклад трубки целиком */
-          sw_accum(fc, ps[q], edep); /* §862 */
-        }
+        fc->ag->gacc[gid] += edep; /* раздача членам — после итерации */
+        fc->ag->gwt[gid] += edep * (1.0 - front_cos(fc, rep) / (2.0 * fc->area[rep]));
         fc->absorbed += fc->w_d * Lin * csec;
-        fc->emitted += fc->w_d * leA / A * csec;
-        Lh = leA / A + (rA / A) * epA / (2.0 * M_PI);
+        fc->emitted += fc->w_d * fc->ag->gleA[gid] * csec;
+        Lh = fc->ag->gleA[gid] + fc->ag->grA[gid] * fc->ag->gSE[gid] / (A * 2.0 * M_PI);
         fc->recycled += fc->w_d * (Lh - fc->le) * csec;
         fc->ndep++;
         Lin = Lh;
@@ -1216,8 +1214,30 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
             if (un == 0 || fc->pbuf[un - 1] != fc->pbuf[q]) fc->pbuf[un++] = fc->pbuf[q];
           n = un;
           int64_t st = *fc->nstore_n;
-          for (int32_t q = 0; q < n; q++)
-            fc->nstore[st + q] = fc->pbuf[q];
+          if (fc->agg) { /* §863/шаг 2: список = ГИДЫ групп (по материалу) */
+            int64_t g0 = 0;
+            n = 0;
+            int one = fc->o->agg >= 2; /* agg=2: одна группа на список */
+            while (g0 < un) {
+              int32_t mtl0 = py->pcs[fc->pbuf[g0]].mtl;
+              int64_t g1 = g0;
+              int32_t gid;
+              while (g1 < un && (one || py->pcs[fc->pbuf[g1]].mtl == mtl0))
+                g1++;
+              gid = sw_group_make(fc, g0, g1);
+              if (gid < 0) break; /* нет памяти: узел без кэша группы */
+              fc->nstore[st + n] = gid;
+              n++;
+              g0 = g1;
+            }
+            *fc->nstore_n = st + n;
+            fc->nstart[cid] = st;
+            fc->nlen[cid] = n;
+            ps = fc->nstore + st;
+          } else {
+            for (int32_t q = 0; q < n; q++)
+              fc->nstore[st + q] = fc->pbuf[q];
+          }
           *fc->nstore_n = st + n;
           fc->nstart[cid] = st;
           fc->nlen[cid] = n;
@@ -1534,6 +1554,73 @@ static void front_dir(front_ctx *fc, int32_t *stampv) {
  * сегментом [h,h], §852). Прежний span «floor…ceil−1» с клэмпом к домену клал
  * кусок плоской max-грани в слой, где листа чаще нет, — кусок выпадал из
  * bbox-индекса, и стенка теряла депозиты (А1578: 0.22 события/трубку). */
+/* §863/шаг 2: создать группу из pbuf[g0..g1) (отсортирован по (mtl,id));
+ * возвращает gid или -1 (нет памяти). */
+static int32_t sw_group_make(front_ctx *fc, int64_t g0, int64_t g1) {
+  sw_agg *ag = fc->ag;
+  if (ag->ng == ag->ngcap) {
+    int64_t nc = ag->ngcap ? ag->ngcap * 2 : 1024;
+    int32_t *np, *nc2;
+    double *na, *nl, *nr, *ns, *nc3, *nw;
+    int64_t *no;
+    np = (int32_t *)realloc(ag->grep, (size_t)nc * sizeof *np);
+    na = (double *)realloc(ag->gA, (size_t)nc * sizeof *na);
+    nl = (double *)realloc(ag->gleA, (size_t)nc * sizeof *nl);
+    nr = (double *)realloc(ag->grA, (size_t)nc * sizeof *nr);
+    ns = (double *)realloc(ag->gSE, (size_t)nc * sizeof *ns);
+    nc3 = (double *)realloc(ag->gacc, (size_t)nc * sizeof *nc3);
+    nw = (double *)realloc(ag->gwt, (size_t)nc * sizeof *nw);
+    no = (int64_t *)realloc(ag->ggoff, (size_t)nc * sizeof *no);
+    nc2 = (int32_t *)realloc(ag->ggcnt, (size_t)nc * sizeof *nc2);
+    if (!np || !na || !nl || !nr || !ns || !nc3 || !nw || !no || !nc2) return -1;
+    ag->grep = np;
+    ag->gA = na;
+    ag->gleA = nl;
+    ag->grA = nr;
+    ag->gSE = ns;
+    ag->gacc = nc3;
+    ag->gwt = nw;
+    ag->ggoff = no;
+    ag->ggcnt = nc2;
+    ag->ngcap = nc;
+  }
+  {
+    int32_t gid = (int32_t)ag->ng;
+    int32_t rep = fc->pbuf[g0];
+    double A = 0, leA = 0, rA = 0;
+    int64_t q;
+    if (ag->gmem_n + (g1 - g0) > ag->gmem_cap) {
+      int64_t nc = ag->gmem_cap ? ag->gmem_cap * 2 : 4096;
+      int32_t *nm;
+      while (nc < ag->gmem_n + (g1 - g0))
+        nc *= 2;
+      nm = (int32_t *)realloc(ag->gmem, (size_t)nc * sizeof *nm);
+      if (!nm) return -1;
+      ag->gmem = nm;
+      ag->gmem_cap = nc;
+    }
+    ag->ggoff[gid] = ag->gmem_n;
+    for (q = g0; q < g1; q++) {
+      int32_t m = fc->pbuf[q];
+      double am = fc->area[m];
+      ag->gmem[ag->gmem_n++] = m;
+      A += am;
+      leA += front_le(fc, m) * am;
+      rA += front_rho(fc, m) * am;
+    }
+    ag->ggcnt[gid] = (int32_t)(g1 - g0);
+    ag->grep[gid] = rep;
+    ag->gA[gid] = A;
+    ag->gleA[gid] = leA / A;
+    ag->grA[gid] = rA / A;
+    ag->gSE[gid] = 0.0; /* пересчитывается на итерацию */
+    ag->gacc[gid] = 0.0;
+    ag->gwt[gid] = 0.0;
+    ag->ng++;
+    return gid;
+  }
+}
+
 static void sw_index_emit(int32_t pos, int32_t s, int32_t *bstart, int32_t *bpids, int32_t *fillb) {
   if (bpids)
     bpids[fillb[pos]++] = s;
@@ -1601,6 +1688,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   int32_t *nlen = NULL, *nstore = NULL;
   int64_t nstore_n = 0, nstore_cap = 0, ncluster = 0;
   int64_t noff[257] = {0};
+  sw_agg ag; /* §863/шаг 2: таблица групп агрегации */
+  memset(&ag, 0, sizeof ag);
   int nd = 0, d, it, rc = 0;
   double csec;
   uint8_t *lpflo = NULL; /* §862: этажи (когда задан lpacc) */
@@ -1738,6 +1827,16 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     memset(Ed, 0, (size_t)nt * sizeof *Ed);
     for (p = 0; p < nt; p++)
       Eprev[p] = py->pcs[p].e;
+    if (o->mode == 3 && o->agg && ag.ng > 0) { /* §863: ΣEprev·a групп */
+      for (int64_t g = 0; g < ag.ng; g++) {
+        double s = 0;
+        for (int32_t q = 0; q < ag.ggcnt[g]; q++) {
+          int32_t m = ag.gmem[ag.ggoff[g] + q];
+          s += Eprev[m] * area[m];
+        }
+        ag.gSE[g] = s;
+      }
+    }
     for (d = 0; d < nd; d++) {
       const double *om = tab[d].om;
       double w_d = tab[d].w;
@@ -1791,6 +1890,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.ncluster = (int32_t)ncluster;
         fc.ncluster0 = py->nleaf;
         fc.agg = o->agg;
+        fc.ag = &ag;
         for (int32_t l2 = 0; l2 < py->nlev; l2++)
           fc.noff[l2] = noff[l2];
         fc.cbase = (it == 0); /* прибор А1569 — геометрия статична, хватит раза */
@@ -1941,6 +2041,17 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
           if (o->noprop) L = 0.0;
         }
         lost += L * csec;
+      }
+    }
+    if (o->mode == 3 && o->agg && ag.ng > 0) { /* §863: раздача вкладов групп */
+      for (int64_t g = 0; g < ag.ng; g++) {
+        for (int32_t q = 0; q < ag.ggcnt[g]; q++) {
+          int32_t m = ag.gmem[ag.ggoff[g] + q];
+          Ed[m] += ag.gacc[g]; /* edep одинаков всем членам: Σ = вклад группы */
+          if (o->lpacc) o->lpacc[m] += o->cdelta * (o->rho >= 0.0 ? o->rho : kd[m]) * ag.gwt[g];
+        }
+        ag.gacc[g] = 0.0;
+        ag.gwt[g] = 0.0;
       }
     }
     for (p = 0; p < nt; p++) {

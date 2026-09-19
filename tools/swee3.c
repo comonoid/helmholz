@@ -38,6 +38,7 @@ int main(int argc, char **argv) {
   int dumpE = 0;         /* §862-диаг: дамп per-piece E последней итерации */
   double cdelta = 1.0;   /* §862: вес приращения Δ(материал,угол) */
   int amode = 0;         /* §862-диаг: форма Δ (см. sweep.h accum_mode) */
+  int agg = 0;           /* §863/шаг 2: агрегация кусков в узловых списках */
   int xint = 0;          /* §852/G1(a): 1 — всегда точное пересечение */
   int screw = 0;         /* НК А1572: скрестить куски с шагом screw (детекторы>0) */
   int walk = 0;          /* А1576: 1 — точный многопопадный проход (модель «реальные
@@ -88,6 +89,8 @@ int main(int argc, char **argv) {
       adapt = atoi(argv[i] + 6); /* §862 */
     } else if (strncmp(argv[i], "cdelta=", 7) == 0) {
       cdelta = atof(argv[i] + 7); /* §862 */
+    } else if (strncmp(argv[i], "agg=", 4) == 0) {
+      agg = atoi(argv[i] + 4); /* §863/шаг 2 */
     } else if (strncmp(argv[i], "amode=", 6) == 0) {
       amode = atoi(argv[i] + 6); /* §862-диаг */
     } else if (strncmp(argv[i], "dumpE=", 6) == 0) {
@@ -252,6 +255,7 @@ int main(int argc, char **argv) {
       so.lpacc = lpacc;
       so.cdelta = cdelta;
       so.accum_mode = amode;
+      so.agg = agg;
       so.lphits = lphits;
       so.lpapply = (adapt == 1); /* adapt=2 — пассивная диагностика */
     }

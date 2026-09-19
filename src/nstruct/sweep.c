@@ -631,6 +631,8 @@ typedef struct {
   int32_t ncluster;
   int64_t noff[256];   /* смещение уровня в нумерации кластеров узлов */
   int32_t ncluster0;   /* nleaf: кластеры листов идут первыми */
+  int agg;             /* §863: ключ o->agg */
+  int agg_list;        /* текущий список — узловой (отсортирован, годен для групп) */
   double *abuf, *wbuf; /* скретч взаимодействия: без аллокаций на событие */
   int64_t abufcap;
   double hi[3];      /* верх сцены (клетки уровней шире домена на нечётных сетках) */
@@ -1034,28 +1036,55 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
   }
   ht = fc->abuf;
   hp = (int32_t *)fc->wbuf; /* n int32 ≤ n double — места хватает */
-  for (u = 0; u < n; u++) {
-    int32_t p = ps[u];
-    int32_t tri = py->pcs[p].tri;
-    double tt;
-    if (fc->pstamp[p] == fc->pkey) {
-      fc->nstamp++; /* кратность 1 на (кусок, направление) — А1564 */
-      continue;
+  if (fc->agg && fc->agg_list) {
+    /* §863/шаг 2: АГРЕГАЦИЯ — список узла отсортирован (mtl,id), группы
+     * односоставных кусков идут подряд. ray-tri по ПРЕДСТАВИТЕЛЮ группы;
+     * депозит и Lh — площадь-взвешенно по членам (диффузная доля отклика:
+     * ответ группы определяется Σплощадью и средним материалом). hp хранит
+     * НАЧАЛО группы; штамп — на представителе. */
+    int64_t g0 = 0;
+    double sl = 1e-9 * (fabs(tin) + fabs(tout) + 1.0);
+    while (g0 < n) {
+      int32_t rep = ps[g0];
+      int32_t mtl0 = py->pcs[rep].mtl;
+      int64_t g1 = g0;
+      while (g1 < n && py->pcs[ps[g1]].mtl == mtl0)
+        g1++;
+      if (fc->pstamp[rep] != fc->pkey) {
+        double tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[rep].tri);
+        if (tt >= tin - sl && tt <= tout + sl) {
+          ht[nh] = tt;
+          hp[nh] = (int32_t)g0;
+          nh++;
+        }
+      } else {
+        fc->nstamp++;
+      }
+      g0 = g1;
     }
-    tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)tri);
-    /* Оба конца включены; от двойного события на стыке сегментов спасает
-     * ШТАМП: кусок штампуется при первом же событии (проход депозита
-     * ниже), повтор в следующем сегменте отбрасывается — событие
-     * обрабатывается ровно один раз, поэтому лестница ℓ_p плоская. */
-    {
-      double sl = 1e-9 * (fabs(tin) + fabs(tout) + 1.0);
-      if (tt >= tin - sl && tt <= tout + sl) {
-        ht[nh] = tt;
-        hp[nh] = p;
-        nh++;
+  } else
+    for (u = 0; u < n; u++) {
+      int32_t p = ps[u];
+      int32_t tri = py->pcs[p].tri;
+      double tt;
+      if (fc->pstamp[p] == fc->pkey) {
+        fc->nstamp++; /* кратность 1 на (кусок, направление) — А1564 */
+        continue;
+      }
+      tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)tri);
+      /* Оба конца включены; от двойного события на стыке сегментов спасает
+       * ШТАМП: кусок штампуется при первом же событии (проход депозита
+       * ниже), повтор в следующем сегменте отбрасывается — событие
+       * обрабатывается ровно один раз, поэтому лестница ℓ_p плоская. */
+      {
+        double sl = 1e-9 * (fabs(tin) + fabs(tout) + 1.0);
+        if (tt >= tin - sl && tt <= tout + sl) {
+          ht[nh] = tt;
+          hp[nh] = p;
+          nh++;
+        }
       }
     }
-  }
   /* сортировка по ходу трубки (попаданий мало, вставками) */
   for (i = 1; i < nh; i++) {
     double t = ht[i];
@@ -1073,6 +1102,38 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
     for (i = 0; i < nh; i++) {
       int32_t p = hp[i];
       double Lh;
+      if (fc->agg && fc->agg_list) { /* §863/шаг 2: депозит группы по членам */
+        int32_t rep = ps[p];
+        int32_t mtl0 = py->pcs[rep].mtl;
+        double A = 0.0, leA = 0.0, rA = 0.0, epA = 0.0, edep;
+        int64_t g1 = p;
+        if (fc->pstamp[rep] == fc->pkey) continue;
+        fc->pstamp[rep] = fc->pkey;
+        if (first) {
+          fc->depA += ai;
+          first = 0;
+        }
+        while (g1 < n && py->pcs[ps[g1]].mtl == mtl0) {
+          double am = fc->area[ps[g1]];
+          A += am;
+          leA += front_le(fc, ps[g1]) * am;
+          rA += front_rho(fc, ps[g1]) * am;
+          epA += fc->Eprev[ps[g1]] * am;
+          g1++;
+        }
+        edep = fc->w_d * Lin * csec * fc->axcos / A;
+        for (int32_t q = (int32_t)p; q < (int32_t)g1; q++) {
+          fc->Ed[ps[q]] += edep;     /* каждому члену: Σ = вклад трубки целиком */
+          sw_accum(fc, ps[q], edep); /* §862 */
+        }
+        fc->absorbed += fc->w_d * Lin * csec;
+        fc->emitted += fc->w_d * leA / A * csec;
+        Lh = leA / A + (rA / A) * epA / (2.0 * M_PI);
+        fc->recycled += fc->w_d * (Lh - fc->le) * csec;
+        fc->ndep++;
+        Lin = Lh;
+        continue;
+      }
       if (fc->pstamp[p] == fc->pkey) continue; /* дубль куска (список/стык) */
       /* ШТАМП при любом событии: пересечение обрабатывается один раз */
       fc->pstamp[p] = fc->pkey;
@@ -1102,7 +1163,8 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
                         double *b) {
   const hz_pyr *py = fc->py;
   double blo[3], bhi[3];
-  if (l < 0) { /* лист: базовая клетка */
+  if (l < 0) {        /* лист: базовая клетка */
+    fc->agg_list = 0; /* листовой список не отсортирован по материалу */
     if (fc->cfront) fc->ncellfront++;
     front_node_box(fc, -1, pos, blo, bhi);
     if (fc->o->walk) /* А1576: точный многопопадный проход */
@@ -1135,9 +1197,12 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
            * накрывает несколько листов узла, попадал в список многократно;
            * штамп А1564 гасил дубли на депозите, но ray-tri по ним считался.
            * Порядок списка не важен: попадания сортируются по tt. */
+          /* сортировка по (материал, id): группы агрегации идут подряд */
           for (int32_t q = 1; q < n; q++) {
             int32_t v = fc->pbuf[q], w2 = q;
-            while (w2 > 0 && fc->pbuf[w2 - 1] > v) {
+            while (w2 > 0 &&
+                   (py->pcs[fc->pbuf[w2 - 1]].mtl > py->pcs[v].mtl ||
+                    (py->pcs[fc->pbuf[w2 - 1]].mtl == py->pcs[v].mtl && fc->pbuf[w2 - 1] > v))) {
               fc->pbuf[w2] = fc->pbuf[w2 - 1];
               w2--;
             }
@@ -1155,6 +1220,7 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
           fc->nlen[cid] = n;
           ps = fc->nstore + st;
         } /* магазин полон: работаем по pbuf без кэша (прежний путь) */
+        fc->agg_list = fc->agg; /* узловой список отсортирован (mtl,id) */
       }
       front_node_box(fc, l, pos, blo, bhi);
       /* А1573: на узловом отрезке клеточный T-перехват НЕзаконен — bbox куска
@@ -1721,6 +1787,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.nstore_cap = nstore_cap;
         fc.ncluster = (int32_t)ncluster;
         fc.ncluster0 = py->nleaf;
+        fc.agg = o->agg;
         for (int32_t l2 = 0; l2 < py->nlev; l2++)
           fc.noff[l2] = noff[l2];
         fc.cbase = (it == 0); /* прибор А1569 — геометрия статична, хватит раза */

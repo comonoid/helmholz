@@ -1044,11 +1044,13 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
      * НАЧАЛО группы; штамп — на представителе. */
     int64_t g0 = 0;
     double sl = 1e-9 * (fabs(tin) + fabs(tout) + 1.0);
+    int one = fc->agg >= 2; /* agg=2: одна группа на список — кусков меньше
+                             * (диффузное приближение поверх материалов) */
     while (g0 < n) {
       int32_t rep = ps[g0];
       int32_t mtl0 = py->pcs[rep].mtl;
       int64_t g1 = g0;
-      while (g1 < n && py->pcs[ps[g1]].mtl == mtl0)
+      while (g1 < n && (one || py->pcs[ps[g1]].mtl == mtl0))
         g1++;
       if (fc->pstamp[rep] != fc->pkey) {
         double tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[rep].tri);
@@ -1113,7 +1115,8 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
           fc->depA += ai;
           first = 0;
         }
-        while (g1 < n && py->pcs[ps[g1]].mtl == mtl0) {
+        int one2 = fc->agg >= 2;
+        while (g1 < n && (one2 || py->pcs[ps[g1]].mtl == mtl0)) {
           double am = fc->area[ps[g1]];
           A += am;
           leA += front_le(fc, ps[g1]) * am;

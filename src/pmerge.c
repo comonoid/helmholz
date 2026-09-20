@@ -181,6 +181,17 @@ static void pbox(const hz_polyset *ps, const hz_objmesh *m, int32_t k, double lo
  * Упёрлись — ОТКАЗ и счётчик; в докладе это «вырожденный конус» (А101). */
 #define PM_CONEIT 32
 
+/* МАСШТАБ КОРОБКИ ОТСЕВА (§114). `0` читается как `1` — точная мажоранта.
+ * Значение меньше единицы делает её ЗАНИЖЕННОЙ, то есть уже не мажорантой: это
+ * негативный контроль шага О44, и он ОБЯЗАН испортить выход. */
+static double pm_mmbox(const hz_mergecfg *cfg) {
+  return (cfg->mmbox > 0.0) ? cfg->mmbox : 1.0;
+}
+
+static int pm_mmsite(const hz_mergecfg *cfg) {
+  return (cfg->mmsite != 0) ? cfg->mmsite : 7;
+}
+
 /* Состояние минимаксного решателя — замер, а не отладка (А89: сходимость этой
  * формы обмена НЕ доказана, значит её надо мерить). */
 static int pm_solve4(double A[4][4], double rhs[4], double x[4]) {
@@ -306,7 +317,7 @@ static int pm_ref4(const double ref[4][3], double *pa, double *pb, double *pc, d
  * пары (А93), а проверяется потом по ВСЕМ. */
 static int pm_minimax(const hz_polyset *ps, const int32_t *mem, int32_t nm, double n[3],
                       const double org[3], double *off, int64_t *nwork, hz_mergestat *ms,
-                      int quarter) {
+                      int quarter, double mmbox, int mmsite) {
   double eu[3], ev[3];
   {
     int ax = 0;
@@ -327,10 +338,20 @@ static int pm_minimax(const hz_polyset *ps, const int32_t *mem, int32_t nm, doub
   }
 /* Один проход по опорным точкам группы: `(u, v, w)` считаются на лету, а не
  * материализуются — проходов будет несколько, а памяти на группу нет. */
-#define PM_MM_FOREACH(BODY)                                                                        \
+/* ОТСЕВ ЧЛЕНА ПО КОРОБКЕ (§114, шаг О44). `SKIP` — выражение, вычисляемое ОДИН
+ * раз на член; истинно — член пропускается целиком. Отсев ТОЧЕН, а не
+ * мажорантен в смысле Г40/Г44: он не подменяет величину, а доказывает, что в
+ * этом члене её рекорда нет. При `quarter != 0` (негативный контроль §28) отсев
+ * выключается — там число точек само есть часть величины (А290). */
+#define PM_MM_FOREACH_S(SKIP, BODY)                                                                \
   do {                                                                                             \
     for (int32_t i_ = 0; i_ < nm; i_++) {                                                          \
       const hz_poly *P_ = &ps->p[mem[i_]];                                                         \
+      if (ms != NULL) ms->nmm_seen++;                                                              \
+      if (!quarter && (SKIP)) {                                                                    \
+        if (ms != NULL) ms->nmm_skip++;                                                            \
+        continue;                                                                                  \
+      }                                                                                            \
       const double *S_ = ps->sup + (size_t)P_->s0 * 3;                                             \
       for (int32_t q_ = 0; q_ < P_->nsup; q_++) {                                                  \
         if (quarter &&                                                                             \
@@ -346,6 +367,21 @@ static int pm_minimax(const hz_polyset *ps, const int32_t *mem, int32_t nm, doub
     }                                                                                              \
   } while (0)
 
+  /* РАЗМАХ АФФИННОЙ ФУНКЦИИ ПО КОРОБКЕ ЧЛЕНА — замкнутая форма (§114).
+   * `g` — градиент в мире, `c0` — значение в `org`; отдаёт `[base−rad, base+rad]`,
+   * куда попадают ВСЕ опорные точки члена. */
+#define PM_BOXRANGE(P_, g, c0, base, rad)                                                          \
+  do {                                                                                             \
+    (base) = (c0);                                                                                 \
+    (rad) = 0.0;                                                                                   \
+    for (int a_ = 0; a_ < 3; a_++) {                                                               \
+      double ct_ = 0.5 * ((P_)->slo[a_] + (P_)->shi[a_]);                                          \
+      double hf_ = 0.5 * ((P_)->shi[a_] - (P_)->slo[a_]);                                          \
+      (base) += (g)[a_] * (ct_ - org[a_]);                                                         \
+      (rad) += fabs((g)[a_]) * hf_ * mmbox;                                                        \
+    }                                                                                              \
+  } while (0)
+
   /* Начальная четвёрка — крайние точки по `w` и по `u`: они почти наверняка
    * опорные, и вырожденность такой четвёрки ловится отказом системы. */
   double ref[4][3];
@@ -353,33 +389,49 @@ static int pm_minimax(const hz_polyset *ps, const int32_t *mem, int32_t nm, doub
   {
     double wlo = 1e300, whi = -1e300, ulo = 1e300, uhi = -1e300;
     double rw0[3] = {0, 0, 0}, rw1[3] = {0, 0, 0}, ru0[3] = {0, 0, 0}, ru1[3] = {0, 0, 0};
-    PM_MM_FOREACH({
-      if (pw < wlo) {
-        wlo = pw;
-        rw0[0] = pu;
-        rw0[1] = pv;
-        rw0[2] = pw;
-      }
-      if (pw > whi) {
-        whi = pw;
-        rw1[0] = pu;
-        rw1[1] = pv;
-        rw1[2] = pw;
-      }
-      if (pu < ulo) {
-        ulo = pu;
-        ru0[0] = pu;
-        ru0[1] = pv;
-        ru0[2] = pw;
-      }
-      if (pu > uhi) {
-        uhi = pu;
-        ru1[0] = pu;
-        ru1[1] = pv;
-        ru1[2] = pw;
-      }
-      have++;
-    });
+    /* `have` СЧИТАЕТСЯ ОТДЕЛЬНО И ЗА `O(1)` НА ЧЛЕН (А290): при отсеве проход по
+     * точкам перестаёт быть счётчиком, а `have < 4` — это ОТКАЗ решателя, и
+     * ложное срабатывание там означало бы отказ на группе в тысячи точек. */
+    if (!quarter)
+      for (int32_t i_ = 0; i_ < nm; i_++)
+        have += ps->p[mem[i_]].nsup;
+    PM_MM_FOREACH_S(
+        /* Член пропускается, только если не может улучшить НИ ОДНУ из четырёх
+         * крайних величин: `pw` (градиент `n`) и `pu` (градиент `eu`). */
+        ({
+          double bw_, rw_, bu_, ru_;
+          PM_BOXRANGE(P_, n, 0.0, bw_, rw_);
+          PM_BOXRANGE(P_, eu, 0.0, bu_, ru_);
+          (mmsite & 1) && !(bw_ - rw_ < wlo) && !(bw_ + rw_ > whi) && !(bu_ - ru_ < ulo) &&
+              !(bu_ + ru_ > uhi);
+        }),
+        {
+          if (pw < wlo) {
+            wlo = pw;
+            rw0[0] = pu;
+            rw0[1] = pv;
+            rw0[2] = pw;
+          }
+          if (pw > whi) {
+            whi = pw;
+            rw1[0] = pu;
+            rw1[1] = pv;
+            rw1[2] = pw;
+          }
+          if (pu < ulo) {
+            ulo = pu;
+            ru0[0] = pu;
+            ru0[1] = pv;
+            ru0[2] = pw;
+          }
+          if (pu > uhi) {
+            uhi = pu;
+            ru1[0] = pu;
+            ru1[1] = pv;
+            ru1[2] = pw;
+          }
+          if (quarter) have++;
+        });
     if (have < 4) return 1;
     for (int c = 0; c < 3; c++) {
       ref[0][c] = rw0[c];
@@ -398,15 +450,27 @@ static int pm_minimax(const hz_polyset *ps, const int32_t *mem, int32_t nm, doub
   int it = 0;
   for (; it < PM_MMEXCH; it++) {
     double worst = -1.0, wp[3] = {0, 0, 0};
-    PM_MM_FOREACH({
-      double r = fabs(pw - a * pu - b * pv - cc);
-      if (r > worst) {
-        worst = r;
-        wp[0] = pu;
-        wp[1] = pv;
-        wp[2] = pw;
-      }
-    });
+    /* `r = |pw − a·pu − b·pv − cc| = |(x − org)·N − cc|`, то есть МОДУЛЬ
+     * АФФИННОЙ функции мировой точки с градиентом `N = n − a·eu − b·ev`.
+     * Максимум модуля по коробке члена — `|base| + rad`; не больше рекорда,
+     * значит нарушителя в этом члене нет. */
+    double Nw[3];
+    for (int c_ = 0; c_ < 3; c_++)
+      Nw[c_] = n[c_] - a * eu[c_] - b * ev[c_];
+    PM_MM_FOREACH_S(({
+                      double bs_, rd_;
+                      PM_BOXRANGE(P_, Nw, -cc, bs_, rd_);
+                      fabs(bs_) + rd_ <= worst;
+                    }),
+                    {
+                      double r = fabs(pw - a * pu - b * pv - cc);
+                      if (r > worst) {
+                        worst = r;
+                        wp[0] = pu;
+                        wp[1] = pv;
+                        wp[2] = pw;
+                      }
+                    });
     if (nwork != NULL) *nwork += have;
     if (!(worst > t)) break; /* ни одна точка не хуже опорных — оптимум */
     /* ОБМЕН: нарушитель заменяет одну из четырёх, берётся замена с наибольшим
@@ -447,7 +511,8 @@ static int pm_minimax(const hz_polyset *ps, const int32_t *mem, int32_t nm, doub
     if (it > ms->nmm_exch_max) ms->nmm_exch_max = it;
     if (it >= PM_MMEXCH) ms->nmm_cap++;
   }
-#undef PM_MM_FOREACH
+#undef PM_MM_FOREACH_S
+#undef PM_BOXRANGE
   /* Мировая плоскость: `N = n − a·eu − b·ev`, нормируется. */
   double N[3];
   for (int c = 0; c < 3; c++)
@@ -561,7 +626,7 @@ static void pm_shape(const hz_polyset *ps, const int32_t *mem, int32_t nm, const
 
 static double group_plane(const hz_polyset *ps, const int32_t *mem, int32_t nm, double n[3],
                           double *off, int64_t *nwork, hz_mergestat *mmst, int quarter,
-                          double conemax, double *pcone) {
+                          double conemax, double *pcone, double mmbox, int mmsite) {
   double s = 0.0, ns[3] = {0, 0, 0}, org[3] = {0, 0, 0};
   for (int32_t i = 0; i < nm; i++) {
     const hz_poly *P = &ps->p[mem[i]];
@@ -675,7 +740,7 @@ static double group_plane(const hz_polyset *ps, const int32_t *mem, int32_t nm, 
    * отказе берётся прежняя плоскость — с ней слияние просто останется тем, чем
    * было до О11. */
   double nav[3] = {n[0], n[1], n[2]}, offav = *off;
-  if (pm_minimax(ps, mem, nm, n, org, off, nwork, mmst, quarter) != 0) return 1e300;
+  if (pm_minimax(ps, mem, nm, n, org, off, nwork, mmst, quarter, mmbox, mmsite) != 0) return 1e300;
   {
     int okc = 1;
     for (int32_t i = 0; i < nm && okc; i++) {
@@ -693,6 +758,19 @@ static double group_plane(const hz_polyset *ps, const int32_t *mem, int32_t nm, 
   double dmax = 0.0;
   for (int32_t i = 0; i < nm; i++) {
     const hz_poly *P = &ps->p[mem[i]];
+    /* ТОТ ЖЕ ОТСЕВ, ЧТО В МИНИМАКСЕ (§114): здесь аффинная функция — само
+     * `(x·n − off)`, градиент `n`. Член, у которого `|base| + rad ≤ dmax`,
+     * рекорда не содержит. `quarter` этот цикл не касается вовсе — он и так
+     * идёт по всем точкам. */
+    if (!quarter && (mmsite & 4)) {
+      double bs = -*off, rd = 0.0;
+      for (int a = 0; a < 3; a++) {
+        double ct = 0.5 * (P->slo[a] + P->shi[a]), hf = 0.5 * (P->shi[a] - P->slo[a]);
+        bs += n[a] * ct;
+        rd += fabs(n[a]) * hf * mmbox;
+      }
+      if (fabs(bs) + rd <= dmax) continue;
+    }
     if (nwork != NULL) *nwork += P->nsup;
     const double *S = ps->sup + (size_t)P->s0 * 3;
     for (int32_t q = 0; q < P->nsup; q++) {
@@ -942,8 +1020,8 @@ static int pm_emit(pm_plist *L, const hz_polyset *ps, const double *bb, int32_t 
         int32_t mm[2] = {a, b};
         double gn[3], goff;
         st->ngate_exact++;
-        qg =
-            group_plane(ps, mm, 2, gn, &goff, &st->nwork_tri, st, cfg->quarter, cfg->conemax, NULL);
+        qg = group_plane(ps, mm, 2, gn, &goff, &st->nwork_tri, st, cfg->quarter, cfg->conemax, NULL,
+                         pm_mmbox(cfg), pm_mmsite(cfg));
         if (qg > dgate) {
           st->nrej_geom++;
           return 0;
@@ -1421,7 +1499,7 @@ int hz_merge(hz_pseglist *so, const hz_objmesh *m, const hz_pseglist *si, const 
     {
       double n[3], off, cone = 0.0;
       double q = group_plane(ps, mem, nm, n, &off, &st->nwork_merge_sup, st, cfg->quarter,
-                             cfg->conemax, &cone);
+                             cfg->conemax, &cone, pm_mmbox(cfg), pm_mmsite(cfg));
       const double dgate = (cfg->dgate > 0.0) ? cfg->dgate : cfg->delta;
       if (cfg->use_geom && !cfg->random && !cfg->noexact && !(q < dgate)) {
         st->nrej_geom++;

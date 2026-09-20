@@ -994,6 +994,26 @@ int hz_poly_build_ex(hz_polyset *ps, const hz_objmesh *m, const hz_pseglist *sg,
     }
   }
   ps->np = nseg;
+  /* МИРОВАЯ КОРОБКА ОПОРНОГО МНОЖЕСТВА (§114, шаг О44) — одним проходом по уже
+   * готовым точкам, а НЕ из `uvlo/uvhi` (А291): те построены по краю, то есть по
+   * проекции, и опорных точек не накрывают. Тот же класс дефекта, что аудит §12
+   * нашёл у коробки полигона. Пустое опорное множество даёт `slo > shi`, и это
+   * не ложный ноль, а вечный запрет пропуска: у такого полигона не пропускается
+   * ничего, потому что пропускать нечего. */
+  for (int32_t k = 0; k < ps->np; k++) {
+    hz_poly *P = &ps->p[k];
+    for (int a = 0; a < 3; a++) {
+      P->slo[a] = 1e300;
+      P->shi[a] = -1e300;
+    }
+    const double *S = ps->sup + (size_t)P->s0 * 3;
+    for (int32_t q = 0; q < P->nsup; q++)
+      for (int a = 0; a < 3; a++) {
+        double x = S[(size_t)q * 3 + (size_t)a];
+        if (x < P->slo[a]) P->slo[a] = x;
+        if (x > P->shi[a]) P->shi[a] = x;
+      }
+  }
   free(lbuf);
   free(sbuf);
   free(sidx);

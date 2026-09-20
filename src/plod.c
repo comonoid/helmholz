@@ -985,6 +985,8 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
       mc.dgate = (L->radmul > 1.0) ? dlev : 0.0;
       mc.target = 0; /* цель по числу — БЮДЖЕТ, а не критерий (§46) */
     }
+    mc.mmbox = cf->mmbox;
+    mc.mmsite = cf->mmsite;
     mc.use_geom = 1;
     mc.use_overlap = 1;
     mc.bands = L->bands;
@@ -992,8 +994,12 @@ int hz_lod_build_merge(hz_lod *L, const hz_objmesh *m, const hz_pseglist *sg, co
     hz_mergestat st;
     double tlev = lod_now_s();
     if (hz_merge(&so, m, &cs, &cp, &mc, &st) != 0) break;
-    fprintf(stderr, "   лестница: уровень %d, допуск %.4f м: %d -> %d участков за %.1f с\n", lev,
-            dlev, cs.nseg, so.nseg, lod_now_s() - tlev);
+    fprintf(stderr,
+            "   лестница: уровень %d, допуск %.4f м: %d -> %d участков за %.1f с; "
+            "отсев члена по коробке %lld/%lld = %.3f (§114)\n",
+            lev, dlev, cs.nseg, so.nseg, lod_now_s() - tlev, (long long)st.nmm_skip,
+            (long long)st.nmm_seen,
+            (st.nmm_seen > 0) ? (double)st.nmm_skip / (double)st.nmm_seen : 0.0);
     for (int q = 0; q < 12; q++)
       L->dih_hist[q] += st.dih_hist[q];
     L->ndih_conv += st.ndih_conv;

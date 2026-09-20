@@ -315,7 +315,8 @@ typedef struct {
 
 int main(int argc, char **argv) {
   int city = 0, scanonly = 0, lev = 9, ptleaf = 256, R = 64, psamp = 1, w = 1920;
-  double trimax = 0.0;
+  double trimax = 0.0, mmbox = 0.0;
+  int mmsite = 0;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "city") == 0) city = 1;
     if (strcmp(argv[i], "scan") == 0) scanonly = 1;
@@ -324,6 +325,10 @@ int main(int argc, char **argv) {
     if (strncmp(argv[i], "hemi=", 5) == 0) R = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "psamp=", 6) == 0) psamp = (int)strtol(argv[i] + 6, NULL, 10);
     if (strncmp(argv[i], "tri=", 4) == 0) trimax = strtod(argv[i] + 4, NULL);
+    /* НК шага О44: заниженная коробка отсева — мажоранта перестаёт быть
+     * мажорантой, и слепок разметки обязан разойтись. */
+    if (strncmp(argv[i], "mmbox=", 6) == 0) mmbox = strtod(argv[i] + 6, NULL);
+    if (strncmp(argv[i], "site=", 5) == 0) mmsite = (int)strtol(argv[i] + 5, NULL, 10);
     if (strncmp(argv[i], "w=", 2) == 0) w = (int)strtol(argv[i] + 2, NULL, 10);
   }
   if (psamp < 1) psamp = 1;
@@ -462,13 +467,28 @@ int main(int argc, char **argv) {
   lc.maxlev = lev;
   lc.radmul = 4.0;
   lc.base = 1.4142;
+  lc.mmbox = mmbox;
+  lc.mmsite = mmsite;
   if (hz_lod_build_merge(&L, &m, &sg, &ps, &lc) != 0) {
     fprintf(stderr, "отказ лестницы\n");
     return 1;
   }
   double t_lod = now_s() - t0;
+  /* СЛЕПОК РАЗМЕТКИ, А НЕ ЧИСЛО УЧАСТКОВ (А292, §5/А6): то же число групп
+   * получается разным разбиением, и счёт этого не ловит. FNV-1a по всему
+   * `lab` (`nlev × np`). */
+  uint64_t hsh = 1469598103934665603ull;
+  for (size_t q = 0; q < (size_t)L.nlev * (size_t)L.np; q++) {
+    uint32_t v = (uint32_t)L.lab[q];
+    for (int b = 0; b < 4; b++) {
+      hsh ^= (v >> (8 * b)) & 0xffu;
+      hsh *= 1099511628211ull;
+    }
+  }
   printf("== ЛЕСТНИЦА: уровней %d, узлов %d, за %.1f с (ε = %.3e рад)\n", L.nlev, L.nnd, t_lod,
          eps);
+  printf("== СЛЕПОК РАЗМЕТКИ (FNV-1a по lab, nlev×np): %016llx  [коробка отсева ×%.2f]\n",
+         (unsigned long long)hsh, (mmbox > 0.0) ? mmbox : 1.0);
 
   int32_t *cut = malloc((size_t)L.np * sizeof *cut);
   double *pt = malloc(3 * (size_t)L.nnd * sizeof *pt);

@@ -655,6 +655,9 @@ typedef struct {
    * 22–37 млн вызовов). Владелец — hz_sw_run, fc только ссылается. */
   int64_t (*fld)[3];
   uint8_t *fldok;
+  double *pbuf_t;
+  int32_t *pbuf_p;
+  int64_t pbuf_n, pbuf_cap;
   double lost;       /* поток за границей домена, w·csec-единицы */
   int64_t ncellbase; /* базовых клеток полным DDA («до», прибор А1569) */
   int cbase, cfront; /* прибор считается на первой итерации (геометрия статична) */
@@ -1084,8 +1087,8 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
          * в front_interact: треугольник ⊆ своего bbox, нет пересечения отрезка
          * с bbox — попадания в [tin,tout] не существует, результата не меняет */
         if (!front_box_seg(fc->o->tribox + 6 * (int64_t)py->pcs[rep].tri,
-                           fc->o->tribox + 6 * (int64_t)py->pcs[rep].tri + 3, fc->org, fc->om,
-                           tin, tout, &bh0, &bh1))
+                           fc->o->tribox + 6 * (int64_t)py->pcs[rep].tri + 3, fc->org, fc->om, tin,
+                           tout, &bh0, &bh1))
           continue;
         double tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[rep].tri);
         if (tt >= tin - sl && tt <= tout + sl) {
@@ -1446,6 +1449,121 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
   }
 }
 
+/* §865/А1580 (path=1): попадания клетки в список полного пути трубки */
+static void path_collect(front_ctx *fc, int32_t l, int32_t pos, double tin, double tout) {
+  const hz_pyr *py = fc->py;
+  const int32_t *ps;
+  int32_t n = 0, u;
+  double blo[3], bhi[3];
+  if (l < 0) {
+    ps = fc->bpids + fc->bstart[pos];
+    n = fc->bstart[pos + 1] - fc->bstart[pos];
+  } else {
+    int64_t cid;
+    front_node_box(fc, l, pos, blo, bhi);
+    if (front_gather(fc, l, pos, &n) != 0) return;
+    cid = (int64_t)fc->ncluster0 + fc->noff[l] + pos;
+    if (cid >= 0 && fc->nstart[cid] >= 0) {
+      ps = fc->nstore + fc->nstart[cid];
+      n = fc->nlen[cid];
+    } else
+      ps = fc->pbuf;
+  }
+  for (u = 0; u < n; u++) {
+    int32_t p = ps[u];
+    double tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[p].tri);
+    if (!(tt >= tin) || !(tt <= tout)) continue;
+    if (fc->pstamp[p] == fc->pkey) continue;
+    if (fc->pbuf_n == fc->pbuf_cap) {
+      int64_t nc = fc->pbuf_cap ? fc->pbuf_cap * 2 : 256;
+      double *nt = (double *)realloc(fc->pbuf_t, (size_t)nc * sizeof *nt);
+      int32_t *np = (int32_t *)realloc(fc->pbuf_p, (size_t)nc * sizeof *np);
+      if (!nt || !np) return;
+      fc->pbuf_t = nt;
+      fc->pbuf_p = np;
+      fc->pbuf_cap = nc;
+    }
+    fc->pstamp[p] = fc->pkey;
+    fc->pbuf_t[fc->pbuf_n] = tt;
+    fc->pbuf_p[fc->pbuf_n] = p;
+    fc->pbuf_n++;
+  }
+}
+
+/* §865/А1580 (path=1): DDA уровня jt (jt<0 — листья) внутри [tin,tout] */
+static void path_dda(front_ctx *fc, int32_t l, double tin, double tout, const double blo[3],
+                     const double bhi[3]) {
+  const hz_pyr *py = fc->py;
+  const double *om = fc->om;
+  double side, tmax[3], tdelta[3], te = tin;
+  int64_t g[3], dim[3], stepmax, s, pitch1, pitch2;
+  int ax;
+  if (l < 0) {
+    side = py->cell;
+    dim[0] = py->nx;
+    dim[1] = py->ny;
+    dim[2] = py->nz;
+  } else {
+    side = py->cell * (double)((int64_t)1 << (l + 1));
+    front_ldims(fc, l, dim);
+  }
+  for (ax = 0; ax < 3; ax++) {
+    double p = fc->org[ax] + om[ax] * tin;
+    int64_t gg;
+    if (p < blo[ax]) p = blo[ax];
+    if (p > bhi[ax]) p = bhi[ax];
+    gg = (int64_t)floor((p - py->lo[ax]) / side);
+    if (gg < 0) gg = 0;
+    if (gg >= dim[ax]) gg = dim[ax] - 1;
+    g[ax] = gg;
+    if (fabs(om[ax]) < 1e-30) {
+      tmax[ax] = 1e30;
+      tdelta[ax] = 0.0;
+    } else {
+      double plane = py->lo[ax] + (double)(g[ax] + (om[ax] > 0.0 ? 1 : 0)) * side;
+      tmax[ax] = (plane - fc->org[ax]) / om[ax];
+      if (tmax[ax] < tin) tmax[ax] = tin;
+      tdelta[ax] = side / fabs(om[ax]);
+    }
+  }
+  pitch1 = l < 0 ? py->nx : dim[0];
+  pitch2 = l < 0 ? py->ny : dim[1]; /* id = g0 + pitch1*(g1 + pitch2*g2) */
+  stepmax = dim[0] + dim[1] + dim[2] + 8;
+  for (s = 0; s < stepmax; s++) {
+    double tn = tmax[0];
+    int axm;
+    int64_t id;
+    int32_t pos;
+    if (tmax[1] < tn) tn = tmax[1];
+    if (tmax[2] < tn) tn = tmax[2];
+    axm = (tmax[0] <= tmax[1] && tmax[0] <= tmax[2]) ? 0 : (tmax[1] <= tmax[2] ? 1 : 2);
+    if (tn > tout) tn = tout;
+    if (g[0] >= 0 && g[1] >= 0 && g[2] >= 0 && g[0] < dim[0] && g[1] < dim[1] && g[2] < dim[2]) {
+      id = g[0] + pitch1 * (g[1] + pitch2 * g[2]);
+      pos = l < 0 ? hz_pyr_leaf_pos(py, id) : hz_pyr_node_pos(py, l, id);
+      if (getenv("HZ_PATH") && fc->ntube == 1500 && (s < 4 || s > 60))
+        fprintf(stderr, "STEP s=%lld g=(%lld,%lld,%lld) te=%.5g tn=%.5g leaf=%d\n", (long long)s,
+                (long long)g[0], (long long)g[1], (long long)g[2], te, tn, pos);
+      if (pos >= 0)
+        path_collect(fc, l, pos, te, tn);
+      else
+        fc->njump++;
+    }
+    if (tn >= tout) break;
+    te = tn;
+    if (axm == 0) {
+      tmax[0] += tdelta[0];
+      g[0] += om[0] > 0.0 ? 1 : -1;
+    } else if (axm == 1) {
+      tmax[1] += tdelta[1];
+      g[1] += om[1] > 0.0 ? 1 : -1;
+    } else {
+      tmax[2] += tdelta[2];
+      g[2] += om[2] > 0.0 ? 1 : -1;
+    }
+  }
+}
+
 /* одна трубка: прибор «до» (полный базовый DDA), затем иерархический марш */
 static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double *lostB) {
   const hz_pyr *py = fc->py;
@@ -1539,6 +1657,41 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
           cell[2] >= py->nz)
         break;
     }
+  } else if (fc->o->path) { /* §865/А1580: марш полного пути */
+    uint8_t m = py->lev_lp[py->nlev - 1][0];
+    int32_t jt = (m == 255 || m == 0) ? -1 : (int32_t)m - 1;
+    double csec = py->cell * py->cell;
+    int64_t i;
+    double Lin = 0.0;
+    fc->nmat++;
+    fc->pbuf_n = 0;
+    path_dda(fc, jt, h0, h1, py->lo, fc->hi);
+    for (i = 1; i < fc->pbuf_n; i++) {
+      double tv = fc->pbuf_t[i];
+      int32_t pv = fc->pbuf_p[i];
+      int64_t v = i;
+      while (v > 0 && fc->pbuf_t[v - 1] > tv) {
+        fc->pbuf_t[v] = fc->pbuf_t[v - 1];
+        fc->pbuf_p[v] = fc->pbuf_p[v - 1];
+        v--;
+      }
+      fc->pbuf_t[v] = tv;
+      fc->pbuf_p[v] = pv;
+    }
+    for (i = 0; i < fc->pbuf_n; i++) {
+      int32_t p = fc->pbuf_p[i];
+      double Lh;
+      fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos / fc->area[p];
+      fc->absorbed += fc->w_d * Lin * csec;
+      fc->emitted += fc->w_d * front_le(fc, p) * csec;
+      Lh = front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI);
+      fc->recycled += fc->w_d * (Lh - fc->le) * csec;
+      fc->ndep++;
+      sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos / fc->area[p]);
+      Lin = Lh;
+    }
+    a = 0.0;
+    b = Lin;
   } else {
     front_visit(fc, py->nlev - 1, 0, h0, h1, &a, &b);
     /* G6 на корне: вошедшая (нулевая — тёмный вход) доля = Σdep + вышедшая */
@@ -1966,6 +2119,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         free(fc.pbuf);
         free(fc.abuf); /* скретч растёт только на узловом пути (lp>=2, А1573) */
         free(fc.wbuf);
+        free(fc.pbuf_t);
+        free(fc.pbuf_p);
         continue;
       }
       double L = 0.0;

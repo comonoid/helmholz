@@ -42,10 +42,11 @@ int main(int argc, char **argv) {
                           * группа на список (диффузное приближение) */
   int xint = 0;          /* §852/G1(a): 1 — всегда точное пересечение */
   int screw = 0;         /* НК А1572: скрестить куски с шагом screw (детекторы>0) */
-  int walk = 0;          /* А1576: 1 — точный многопопадный проход (модель «реальные
-                          * пересечения»); 0 — схема §852 (перехват под предикатом) */
-  int useke = 0;         /* А1576: 1 — per-piece le из Ke материалов (плюс глобальный
-                          * le); 0 — прежний мир (глобальный le) */
+  int pmod = 0;
+  int walk = 0;  /* А1576: 1 — точный многопопадный проход (модель «реальные
+                  * пересечения»); 0 — схема §852 (перехват под предикатом) */
+  int useke = 0; /* А1576: 1 — per-piece le из Ke материалов (плюс глобальный
+                  * le); 0 — прежний мир (глобальный le) */
   int nphi = 0, nmu = 0;
   int has_recv = 0; /* blocked-beam (А1566): recv=X:<x0>:<x1> — приёмник-слэб */
   double recv0 = 0.0, recv1 = 0.0;
@@ -102,6 +103,8 @@ int main(int argc, char **argv) {
       screw = atoi(argv[i] + 6); /* НК А1572 */
     } else if (strncmp(argv[i], "walk=", 5) == 0) {
       walk = atoi(argv[i] + 5); /* А1576: модель «реальные пересечения» */
+    } else if (strncmp(argv[i], "path=", 5) == 0) {
+      pmod = atoi(argv[i] + 5);
     } else if (strncmp(argv[i], "ke=", 3) == 0) {
       useke = atoi(argv[i] + 3); /* А1576: per-piece le из Ke */
     } else if (strncmp(argv[i], "recv=", 5) == 0) {
@@ -262,6 +265,7 @@ int main(int argc, char **argv) {
     }
     so.xint = xint;
     so.walk = walk;
+    so.path = pmod;
     if (useke) {
       /* А1576: per-piece эмиссия = СРЕДНЕЕ Ke материала (прецедент
        * скаляризации pfield.c) ПЛЮС глобальный le — на сценах с Ke=0

@@ -64,6 +64,8 @@ int main(int argc, char **argv) {
   int32_t *mtl = NULL;
   double *hist = NULL;
   double *lep9 = NULL; /* А1576: per-piece эмиссия (Ke) в порядке ИСХОДНЫХ */
+  double *ks = NULL;   /* §873: per-piece зеркальная доля (среднее ks3); NULL — прежний мир */
+  double ksf = 0.0;    /* §873: множитель ks (шаг 2 не реализован — ksf>0 запрещён) */
   double cell;
 
   for (i = 1; i < argc; i++) {
@@ -116,6 +118,8 @@ int main(int argc, char **argv) {
       walk = atoi(argv[i] + 5); /* А1576: модель «реальные пересечения» */
     } else if (strncmp(argv[i], "path=", 5) == 0) {
       pmod = atoi(argv[i] + 5);
+    } else if (strncmp(argv[i], "ksf=", 4) == 0) {
+      ksf = atof(argv[i] + 4); /* §873: множитель ks; >0 без шага 2 — отказ */
     } else if (strncmp(argv[i], "ke=", 3) == 0) {
       useke = atoi(argv[i] + 3); /* А1576: per-piece le из Ke */
     } else if (strncmp(argv[i], "recv=", 5) == 0) {
@@ -304,6 +308,22 @@ int main(int argc, char **argv) {
       }
       so.lep = lep9;
     }
+    { /* §873 шаг 1: per-piece зеркальная доля = среднее ks3 материала (тот же
+       * прецедент усреднения, что kd). Пока шаг 2 (зеркальный хоп) не
+       * реализован, ksf > 0 — отказ запуска (fail closed: отделять долю
+       * без продолжения значило бы терять энергию); печать ниже —
+       * потребитель поля ks уже на шаге 1. */
+      if (ksf > 0.0) {
+        fprintf(stderr, "swee3: ksf>0 требует зеркального хопа (T4 шаг 2) - отказ\n");
+        return 2;
+      }
+      ks = (double *)calloc((size_t)m.nt, sizeof *ks);
+      if (!ks) {
+        fprintf(stderr, "нет памяти на ks\n");
+        return 2;
+      }
+      so.ks = ks;
+    }
   }
   if (hz_pyr_build(&py, m.nt, cmin, cmax, cent, mtl, m.lo, m.hi, cell) != 0) {
     fprintf(stderr, "swee3: пирамида не построилась\n");
@@ -359,6 +379,17 @@ int main(int argc, char **argv) {
            vd.d_cell, vd.d_csr, vd.d_bbox, vd.d_empty);
   }
 
+  { /* §873 шаг 1: доклад зеркальности сцены (потребитель поля ks) */
+    int32_t nm = 0;
+    double mx = 0.0;
+    for (int32_t tq = 0; tq < m.nt; tq++) {
+      const double *kq = m.mtl[m.fm[tq]].ks3;
+      double k = (kq[0] + kq[1] + kq[2]) / 3.0;
+      if (k > 0.0) nm++;
+      if (k > mx) mx = k;
+    }
+    printf("   зеркальных кусков (ks>0): %d из %d, max ks=%.3g\n", nm, m.nt, mx);
+  }
   printf("== swee3 %s: nt=%d клетка %.4g м, it=%d le=%.3g rho=%s dirs=%d%s%s\n", path, m.nt, cell,
          iters, le, rho < 0 ? "kd" : "ovr", ndirs, tau0 ? " tau0" : "", noprop ? " noprop" : "");
   printf("   листья: занятых %d, с кусками %d — пустых в обходе %d (по 24 Б на визит)\n", py.nleaf,

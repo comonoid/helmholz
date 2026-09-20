@@ -1537,8 +1537,19 @@ static void path_collect_list(front_ctx *fc, const int32_t *ps, int32_t n, doubl
   }
 }
 
+/* §865/раунд 14: статическое перекрытие tribox [minx,miny,minz,maxx,maxy,
+ * maxz] и бокса [blo,bhi] — без луча; касание засчитывается (разделение
+ * только при строгом >), так что фильтр списка узла попаданий не теряет */
+static int tri_box_overlap(const double *tb, const double blo[3], const double bhi[3]) {
+  int ax;
+  for (ax = 0; ax < 3; ax++)
+    if (tb[ax] > bhi[ax] || tb[ax + 3] < blo[ax]) return 0;
+  return 1;
+}
+
 /* §865/А1580 (path=1): выбор списка кусков клетки/узла и сбор попаданий */
 static void path_collect(front_ctx *fc, int32_t l, int32_t pos, double tin, double tout) {
+  const hz_pyr *py = fc->py;
   const int32_t *ps;
   int32_t n = 0;
   double blo[3], bhi[3];
@@ -1554,6 +1565,18 @@ static void path_collect(front_ctx *fc, int32_t l, int32_t pos, double tin, doub
       n = fc->nlen[cid];
     } else {
       if (front_gather(fc, l, pos, &n) != 0) return;
+      /* §865/раунд 14: обрезка списка по боксу узла ДО записи в кэш — кусок
+       * вне бокса узла попасть в марше этого узла не может (точка попадания
+       * лежала бы в обоих боксax); фильтр статичен по геометрии — один раз */
+      {
+        int32_t m = 0, q;
+        for (q = 0; q < n; q++) {
+          int32_t p = fc->pbuf[q];
+          if (tri_box_overlap(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri, blo, bhi))
+            fc->pbuf[m++] = p;
+        }
+        n = m;
+      }
       ps = fc->pbuf;
       if (cid >= 0 && *fc->nstore_n + n <= fc->nstore_cap) {
         /* кэшируем собранный список (как ветка material во front_visit) */
@@ -2081,7 +2104,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     if (o->path) { /* §865/раунд 13: кэш «кусок × трубка» — только path=1 */
       pc_t = (int64_t *)calloc((size_t)nt, sizeof *pc_t);
       pc_rs = (int64_t *)calloc((size_t)nt, sizeof *pc_rs);
-      pc_bh = (double *)malloc((size_t)2 * nt * sizeof *pc_bh);
+      pc_bh = (double *)malloc((size_t)nt * 2 * sizeof *pc_bh);
       pc_tt = (double *)malloc((size_t)nt * sizeof *pc_tt);
       /* нет памяти → кэш остаётся NULL, path_collect_list идёт прежним путём
        * (fail closed: без новых массивов корректность не хуже раунда 12) */

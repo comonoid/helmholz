@@ -2402,12 +2402,25 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         }
       }
       { /* §866: этаж = min(floor(lpacc), lpceil), отрицательный вклад — 0
-         * (раньше (uint8_t) от отрицательного double — UB); приборы смены */
+         * (раньше (uint8_t) от отрицательного double — UB); приборы смены.
+         * §868: lpnorm — относительный энерговклад fl = cdelta·lpacc/mean */
         int64_t nchg = 0;
         int32_t h[16] = {0}, q;
+        double mean = 0.0;
+        if (o->lpnorm)
+          for (p = 0; p < nt; p++)
+            mean += o->lpacc[p];
+        if (o->lpnorm && nt > 0) mean /= (double)nt;
         for (p = 0; p < nt; p++) {
           double fl = o->lpacc[p];
-          int32_t fi = fl >= 255.0 ? 255 : (fl < 0.0 ? 0 : (int32_t)fl);
+          int32_t fi;
+          if (o->lpnorm) { /* §868: база + относительный вклад, монотонно */
+            fl = mean > 0.0 ? (double)o->lpbase + o->cdelta * fl / mean : (double)o->lpbase;
+            fi = (int32_t)fl;
+            if (fi < o->lpbase) fi = o->lpbase;
+          } else {
+            fi = fl >= 255.0 ? 255 : (fl < 0.0 ? 0 : (int32_t)fl);
+          }
           if (o->lpceil > 0 && fi > o->lpceil) fi = o->lpceil;
           if (lpflo[p] != (uint8_t)fi) nchg++;
           lpflo[p] = (uint8_t)fi;

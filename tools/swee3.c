@@ -28,21 +28,25 @@ int main(int argc, char **argv) {
   const char *path = NULL, *cmpfile = NULL;
   double scale = 1.0, le = 1.0, rho = -1.0;
   int iters = 20, lev = 6, tau0 = 0, noprop = 0, ndirs = 6, mort = 1, i, ax;
-  int mode = 1;          /* §845: 2 — объёмный фронт (L на клетку, марш-порядок) */
-  int build = 0;         /* §845-в: строитель похода (1 — прямой сортировочный) */
-  int vc = 1;            /* §851: компоненты пустоты по умолчанию включены */
-  int lp = 0;            /* §852: LOD-уровень кусков ℓ_p (единый; лестница G1) */
-  int adapt = 0;         /* §862: 1 — дробный аккумулятор детальности */
-  int lpceil = 0;        /* §866: потолок адаптивного этажа (0 — без) */
-  double *lpacc = NULL;  /* §862: аккумулятор [nt], живёт до конца main */
-  double *lphits = NULL; /* §862-диаг: счётчик событий [nt] */
-  int dumpE = 0;         /* §862-диаг: дамп per-piece E последней итерации */
-  double cdelta = 1.0;   /* §862: вес приращения Δ(материал,угол) */
-  int amode = 0;         /* §862-диаг: форма Δ (см. sweep.h accum_mode) */
-  int agg = 0;           /* §863/шаг 2: 1 — группы по материалу; 2 — одна
-                          * группа на список (диффузное приближение) */
-  int xint = 0;          /* §852/G1(a): 1 — всегда точное пересечение */
-  int screw = 0;         /* НК А1572: скрестить куски с шагом screw (детекторы>0) */
+  int mode = 1;                       /* §845: 2 — объёмный фронт (L на клетку, марш-порядок) */
+  int build = 0;                      /* §845-в: строитель похода (1 — прямой сортировочный) */
+  int vc = 1;                         /* §851: компоненты пустоты по умолчанию включены */
+  int lp = 0;                         /* §852: LOD-уровень кусков ℓ_p (единый; лестница G1) */
+  int adapt = 0;                      /* §862: 1 — дробный аккумулятор детальности */
+  int lpceil = 0;                     /* §866: потолок адаптивного этажа (0 — без) */
+  int lppol = 0;                      /* §868: политика ℓ_p: 0 — единый (битово);
+                                       * 1 — энерговклад с потолком (§866) */
+  int cdelta_set = 0, lpceil_set = 0; /* явные ключи перекрывают политику */
+  int so_lpnorm = 0;                  /* §868: относительная нормировка (включает политика) */
+  double *lpacc = NULL;               /* §862: аккумулятор [nt], живёт до конца main */
+  double *lphits = NULL;              /* §862-диаг: счётчик событий [nt] */
+  int dumpE = 0;                      /* §862-диаг: дамп per-piece E последней итерации */
+  double cdelta = 1.0;                /* §862: вес приращения Δ(материал,угол) */
+  int amode = 0;                      /* §862-диаг: форма Δ (см. sweep.h accum_mode) */
+  int agg = 0;                        /* §863/шаг 2: 1 — группы по материалу; 2 — одна
+                                       * группа на список (диффузное приближение) */
+  int xint = 0;                       /* §852/G1(a): 1 — всегда точное пересечение */
+  int screw = 0;                      /* НК А1572: скрестить куски с шагом screw (детекторы>0) */
   int pmod = 0;
   int walk = 0;  /* А1576: 1 — точный многопопадный проход (модель «реальные
                   * пересечения»); 0 — схема §852 (перехват под предикатом) */
@@ -92,8 +96,12 @@ int main(int argc, char **argv) {
       adapt = atoi(argv[i] + 6); /* §862 */
     } else if (strncmp(argv[i], "lpceil=", 7) == 0) {
       lpceil = atoi(argv[i] + 7); /* §866: потолок этажа */
+      lpceil_set = 1;
+    } else if (strncmp(argv[i], "lppol=", 6) == 0) {
+      lppol = atoi(argv[i] + 6); /* §868: поэлементная политика ℓ_p */
     } else if (strncmp(argv[i], "cdelta=", 7) == 0) {
       cdelta = atof(argv[i] + 7); /* §862 */
+      cdelta_set = 1;
     } else if (strncmp(argv[i], "agg=", 4) == 0) {
       agg = atoi(argv[i] + 4); /* §863/шаг 2 */
     } else if (strncmp(argv[i], "amode=", 6) == 0) {
@@ -124,6 +132,14 @@ int main(int argc, char **argv) {
       scale = atof(argv[i] + 6);
     else
       path = argv[i];
+  }
+  if (lppol == 1) { /* §868: политика «энерговклад с потолком» (§866) —
+                     * резолюция ДО аллокаций (adapt включает lpacc) */
+    adapt = 1;
+    amode = 4;
+    so_lpnorm = 1; /* §868: относительный энерговклад */
+    if (!cdelta_set) cdelta = 1.0;
+    if (!lpceil_set) lpceil = lp + 1;
   }
   if (!path) {
     fprintf(stderr, "use: swee3 <scene.obj> [it=N] [rho=F] [le=F] [tau0] [noprop] "
@@ -258,7 +274,7 @@ int main(int argc, char **argv) {
     so.lp = lparr;
     if (adapt) { /* §862: дробный аккумулятор детальности */
       for (ti = 0; ti < (int)m.nt; ti++)
-        lpacc[ti] = (double)lp;
+        lpacc[ti] = 0.0; /* §868: копим депозиты от нуля; база — lpbase */
       so.lpacc = lpacc;
       so.cdelta = cdelta;
       so.accum_mode = amode;
@@ -266,6 +282,8 @@ int main(int argc, char **argv) {
       so.lphits = lphits;
       so.lpapply = (adapt == 1); /* adapt=2 — пассивная диагностика */
       so.lpceil = lpceil;        /* §866 */
+      so.lpnorm = so_lpnorm;     /* §868 */
+      so.lpbase = lp;            /* §868: база политики — стартовый lp */
     }
     so.xint = xint;
     so.walk = walk;

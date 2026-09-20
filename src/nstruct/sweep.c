@@ -658,6 +658,13 @@ typedef struct {
   double *pbuf_t;
   int32_t *pbuf_p;
   int64_t pbuf_n, pbuf_cap;
+  /* §865/раунд 13: per-трубочный кэш «кусок проверен» — bbox t-интервал по
+   * ВСЕЙ трубке и результат ray-tri; штамп pkey. Владелец hz_sw_run. */
+  int64_t *pc_t;     /* [nt]: штамп валидности pc_bh */
+  int64_t *pc_rs;    /* [nt]: штамп валидности pc_tt */
+  double *pc_bh;     /* [2*nt]: bbox t-интервал куска на трубке (пустой: 1,0) */
+  double *pc_tt;     /* [nt]: кэш sw_ray_tri_raw */
+  double pth0, pth1; /* границы трубки [h0,h1] для кэша (§865/раунд 13) */
   double lost;       /* поток за границей домена, w·csec-единицы */
   int64_t ncellbase; /* базовых клеток полным DDA («до», прибор А1569) */
   int cbase, cfront; /* прибор считается на первой итерации (геометрия статична) */
@@ -1454,16 +1461,65 @@ static void path_collect_list(front_ctx *fc, const int32_t *ps, int32_t n, doubl
                               double tout) {
   const hz_pyr *py = fc->py;
   int32_t u;
+  /* §865/раунд 13: кэш «кусок × трубка» выключен (нет памяти при постройке —
+   * fail closed) → прежний путь: bbox×сегмент + ray-tri на каждый визит */
+  if (!fc->pc_t || !fc->pc_rs || !fc->pc_bh || !fc->pc_tt) {
+    for (u = 0; u < n; u++) {
+      int32_t p = ps[u];
+      double tt, bh0, bh1;
+      if (fc->pstamp[p] == fc->pkey) continue; /* штамп ДО ray-tri (А1564) */
+      /* §865: префильтр bbox×сегмент — консервативный, результата не меняет */
+      if (!front_box_seg(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri,
+                         fc->o->tribox + 6 * (int64_t)py->pcs[p].tri + 3, fc->org, fc->om, tin,
+                         tout, &bh0, &bh1))
+        continue;
+      tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[p].tri);
+      if (!(tt >= tin) || !(tt <= tout)) continue;
+      if (fc->pbuf_n == fc->pbuf_cap) {
+        int64_t nc = fc->pbuf_cap ? fc->pbuf_cap * 2 : 256;
+        double *nt = (double *)realloc(fc->pbuf_t, (size_t)nc * sizeof *nt);
+        int32_t *np = (int32_t *)realloc(fc->pbuf_p, (size_t)nc * sizeof *np);
+        if (!nt || !np) return;
+        fc->pbuf_t = nt;
+        fc->pbuf_p = np;
+        fc->pbuf_cap = nc;
+      }
+      fc->pstamp[p] = fc->pkey;
+      fc->pbuf_t[fc->pbuf_n] = tt;
+      fc->pbuf_p[fc->pbuf_n] = p;
+      fc->pbuf_n++;
+    }
+    return;
+  }
   for (u = 0; u < n; u++) {
     int32_t p = ps[u];
     double tt, bh0, bh1;
-    if (fc->pstamp[p] == fc->pkey) continue; /* штамп ДО ray-tri (А1564) */
-    /* §865: префильтр bbox×сегмент — консервативный, результата не меняет */
-    if (!front_box_seg(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri,
-                       fc->o->tribox + 6 * (int64_t)py->pcs[p].tri + 3, fc->org, fc->om, tin, tout,
-                       &bh0, &bh1))
-      continue;
-    tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[p].tri);
+    if (fc->pstamp[p] == fc->pkey) continue; /* уже в списке попаданий трубки */
+    if (fc->pc_t[p] != fc->pkey) {           /* §865/р.13: bbox-интервал — константа трубки */
+      if (!front_box_seg(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri,
+                         fc->o->tribox + 6 * (int64_t)py->pcs[p].tri + 3, fc->org, fc->om, fc->pth0,
+                         fc->pth1, &bh0, &bh1)) {
+        fc->pc_bh[2 * (int64_t)p] = 1.0; /* пустой интервал: [1,0] */
+        fc->pc_bh[2 * (int64_t)p + 1] = 0.0;
+        fc->pc_t[p] = fc->pkey;
+        continue;
+      }
+      fc->pc_bh[2 * (int64_t)p] = bh0;
+      fc->pc_bh[2 * (int64_t)p + 1] = bh1;
+      fc->pc_t[p] = fc->pkey;
+    } else {
+      bh0 = fc->pc_bh[2 * (int64_t)p];
+      bh1 = fc->pc_bh[2 * (int64_t)p + 1];
+    }
+    /* клип интервала к [tin,tout] пуст ⟺ box_seg по сегменту дал бы 0 —
+     * сегмент ⊂ трубки, ровно та же проверка без повторного box_seg
+     * (маркер пустого интервала [1,0] отсекается первым тестом) */
+    if (!(bh0 <= bh1) || bh1 < tin || bh0 > tout) continue;
+    if (fc->pc_rs[p] != fc->pkey) { /* ray-tri — ОДИН РАЗ на (кусок, трубку) */
+      fc->pc_tt[p] = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[p].tri);
+      fc->pc_rs[p] = fc->pkey;
+    }
+    tt = fc->pc_tt[p];
     if (!(tt >= tin) || !(tt <= tout)) continue;
     if (fc->pbuf_n == fc->pbuf_cap) {
       int64_t nc = fc->pbuf_cap ? fc->pbuf_cap * 2 : 256;
@@ -1483,7 +1539,6 @@ static void path_collect_list(front_ctx *fc, const int32_t *ps, int32_t n, doubl
 
 /* §865/А1580 (path=1): выбор списка кусков клетки/узла и сбор попаданий */
 static void path_collect(front_ctx *fc, int32_t l, int32_t pos, double tin, double tout) {
-  const hz_pyr *py = fc->py;
   const int32_t *ps;
   int32_t n = 0;
   double blo[3], bhi[3];
@@ -1566,9 +1621,6 @@ static void path_dda(front_ctx *fc, int32_t l, double tin, double tout, const do
     if (g[0] >= 0 && g[1] >= 0 && g[2] >= 0 && g[0] < dim[0] && g[1] < dim[1] && g[2] < dim[2]) {
       id = g[0] + pitch1 * (g[1] + pitch2 * g[2]);
       pos = l < 0 ? hz_pyr_leaf_pos(py, id) : hz_pyr_node_pos(py, l, id);
-      if (getenv("HZ_PATH") && fc->ntube == 1500 && (s < 4 || s > 60))
-        fprintf(stderr, "STEP s=%lld g=(%lld,%lld,%lld) te=%.5g tn=%.5g leaf=%d\n", (long long)s,
-                (long long)g[0], (long long)g[1], (long long)g[2], te, tn, pos);
       if (pos >= 0)
         path_collect(fc, l, pos, te, tn);
       else
@@ -1690,6 +1742,8 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
     double Lin = 0.0;
     fc->nmat++;
     fc->pbuf_n = 0;
+    fc->pth0 = h0; /* §865/раунд 13: границы трубки для кэша кусков */
+    fc->pth1 = h1;
     path_dda(fc, jt, h0, h1, py->lo, fc->hi);
     for (i = 1; i < fc->pbuf_n; i++) {
       double tv = fc->pbuf_t[i];
@@ -1903,6 +1957,9 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   hz_sw_dir *tab = NULL;
   int32_t *stampv = NULL; /* §851: штампы визитов линий [ncells] */
   int64_t *pstamp = NULL; /* §852/А1564: штамп (трубка × кусок) [nt] */
+  /* §865/раунд 13: кэш «кусок × трубка» (только path=1) */
+  int64_t *pc_t = NULL, *pc_rs = NULL;
+  double *pc_bh = NULL, *pc_tt = NULL;
   int32_t *bstart = NULL, *bpids = NULL, *fillb = NULL; /* §852/А1566: bbox-индекс */
   /* §863: кэш списков кусков узлов (владелец — прогон, переживает fc) */
   int64_t *nstart = NULL;
@@ -2021,6 +2078,14 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       rc = 2;
       goto done;
     }
+    if (o->path) { /* §865/раунд 13: кэш «кусок × трубка» — только path=1 */
+      pc_t = (int64_t *)calloc((size_t)nt, sizeof *pc_t);
+      pc_rs = (int64_t *)calloc((size_t)nt, sizeof *pc_rs);
+      pc_bh = (double *)malloc((size_t)2 * nt * sizeof *pc_bh);
+      pc_tt = (double *)malloc((size_t)nt * sizeof *pc_tt);
+      /* нет памяти → кэш остаётся NULL, path_collect_list идёт прежним путём
+       * (fail closed: без новых массивов корректность не хуже раунда 12) */
+    }
     /* bbox-индекс А1566: слот s пересекает клетку листа, если bbox его
      * ИСХОДНОГО треугольника задевает клетку (два прохода counting-sort) */
     {
@@ -2106,6 +2171,10 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.noprop = o->noprop;
         fc.tau0 = o->tau0;
         fc.pstamp = pstamp;
+        fc.pc_t = pc_t;
+        fc.pc_rs = pc_rs;
+        fc.pc_bh = pc_bh;
+        fc.pc_tt = pc_tt;
         fc.bstart = bstart;
         fc.bpids = bpids;
         fc.mark = mark;
@@ -2328,6 +2397,10 @@ done:
   free(bits);
   free(tab);
   free(pstamp); /* §852/А1564 */
+  free(pc_t);   /* §865/раунд 13 */
+  free(pc_rs);
+  free(pc_bh);
+  free(pc_tt);
   free(stampv);
   free(nstart); /* §863 */
   free(nlen);

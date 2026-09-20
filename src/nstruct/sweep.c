@@ -1449,31 +1449,17 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
   }
 }
 
-/* §865/А1580 (path=1): попадания клетки в список полного пути трубки */
-static void path_collect(front_ctx *fc, int32_t l, int32_t pos, double tin, double tout) {
+/* §865/А1580 (path=1): попадания списка кусков в список полного пути */
+static void path_collect_list(front_ctx *fc, const int32_t *ps, int32_t n, double tin,
+                              double tout) {
   const hz_pyr *py = fc->py;
-  const int32_t *ps;
-  int32_t n = 0, u;
-  double blo[3], bhi[3];
-  if (l < 0) {
-    ps = fc->bpids + fc->bstart[pos];
-    n = fc->bstart[pos + 1] - fc->bstart[pos];
-  } else {
-    int64_t cid;
-    front_node_box(fc, l, pos, blo, bhi);
-    if (front_gather(fc, l, pos, &n) != 0) return;
-    cid = (int64_t)fc->ncluster0 + fc->noff[l] + pos;
-    if (cid >= 0 && fc->nstart[cid] >= 0) {
-      ps = fc->nstore + fc->nstart[cid];
-      n = fc->nlen[cid];
-    } else
-      ps = fc->pbuf;
-  }
+  int32_t u;
   for (u = 0; u < n; u++) {
     int32_t p = ps[u];
-    double tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[p].tri);
+    double tt;
+    if (fc->pstamp[p] == fc->pkey) continue; /* штамп ДО ray-tri (А1564) */
+    tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[p].tri);
     if (!(tt >= tin) || !(tt <= tout)) continue;
-    if (fc->pstamp[p] == fc->pkey) continue;
     if (fc->pbuf_n == fc->pbuf_cap) {
       int64_t nc = fc->pbuf_cap ? fc->pbuf_cap * 2 : 256;
       double *nt = (double *)realloc(fc->pbuf_t, (size_t)nc * sizeof *nt);
@@ -1488,6 +1474,40 @@ static void path_collect(front_ctx *fc, int32_t l, int32_t pos, double tin, doub
     fc->pbuf_p[fc->pbuf_n] = p;
     fc->pbuf_n++;
   }
+}
+
+/* §865/А1580 (path=1): выбор списка кусков клетки/узла и сбор попаданий */
+static void path_collect(front_ctx *fc, int32_t l, int32_t pos, double tin, double tout) {
+  const hz_pyr *py = fc->py;
+  const int32_t *ps;
+  int32_t n = 0;
+  double blo[3], bhi[3];
+  if (l < 0) {
+    ps = fc->bpids + fc->bstart[pos];
+    n = fc->bstart[pos + 1] - fc->bstart[pos];
+  } else {
+    int64_t cid;
+    front_node_box(fc, l, pos, blo, bhi);
+    cid = (int64_t)fc->ncluster0 + fc->noff[l] + pos;
+    if (cid >= 0 && fc->nstart[cid] >= 0) { /* §863: кэш списков узлов */
+      ps = fc->nstore + fc->nstart[cid];
+      n = fc->nlen[cid];
+    } else {
+      if (front_gather(fc, l, pos, &n) != 0) return;
+      ps = fc->pbuf;
+      if (cid >= 0 && *fc->nstore_n + n <= fc->nstore_cap) {
+        /* кэшируем собранный список (как ветка material во front_visit) */
+        int64_t st = *fc->nstore_n, q;
+        for (q = 0; q < n; q++)
+          fc->nstore[st + q] = fc->pbuf[q];
+        *fc->nstore_n = st + n;
+        fc->nstart[cid] = st;
+        fc->nlen[cid] = n;
+        ps = fc->nstore + st;
+      }
+    }
+  }
+  path_collect_list(fc, ps, n, tin, tout);
 }
 
 /* §865/А1580 (path=1): DDA уровня jt (jt<0 — листья) внутри [tin,tout] */

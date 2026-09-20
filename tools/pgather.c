@@ -272,6 +272,9 @@ int main(int argc, char **argv) {
   int32_t *mtl = NULL;
   double cell, t0, t1, sw_time;
   double *lum = NULL;
+  /* §867: данные mode=3, заполняются до memset(&so) — см. блок trivert */
+  double *g_tv9 = NULL, *g_tb6 = NULL;
+  uint8_t *g_lparr = NULL;
   int gather = 0; /* §849: 0 — DDA (умолчание), 1 — brute (путь верификации) */
   pg_bbox_csr csr;
   int64_t dda_steps = 0, dda_tested = 0;
@@ -380,16 +383,38 @@ int main(int argc, char **argv) {
     }
     cell = maxdim / (double)(1 << lev);
   }
-  { /* §852: вершины треугольников для точного пересечения лучевого свипа */
+  { /* §867: trivert/tribox/lp для mode=3 (точное пересечение + walk) —
+     * в порядке ИСХОДНЫХ треугольников (pcs[].tri); так как so ниже
+     * memset-ится, указатели назначаются ПОСЛЕ memset (класс бага pref) */
     double *tv9 = (double *)malloc((size_t)m.nt * 9 * sizeof *tv9);
+    double *tb6 = (double *)malloc((size_t)m.nt * 6 * sizeof *tb6);
+    uint8_t *lparr = (uint8_t *)malloc((size_t)m.nt);
     int32_t ti;
-    if (!tv9) { fprintf(stderr, "нет памяти на trivert\n"); return 2; }
-    for (ti = 0; ti < m.nt; ti++) {
-      double pp[3][3], aa;
-      hz_obj_tri(&m, ti, pp);
-      for (aa = 0; aa < 9; aa++) tv9[9 * (int64_t)ti + (int32_t)aa] = pp[0][aa];
+    if (!tv9 || !tb6 || !lparr) {
+      fprintf(stderr, "нет памяти на trivert/tribox/lp\n");
+      return 2;
     }
-    so.trivert = tv9;
+    for (ti = 0; ti < m.nt; ti++) {
+      double pp[3][3];
+      int32_t a2, aa;
+      hz_obj_tri(&m, ti, pp);
+      for (aa = 0; aa < 9; aa++)
+        tv9[9 * (int64_t)ti + aa] = ((const double *)pp)[aa];
+      for (a2 = 0; a2 < 3; a2++) {
+        double lo = pp[0][a2], hi2 = pp[0][a2];
+        int v;
+        for (v = 1; v < 3; v++) {
+          if (pp[v][a2] < lo) lo = pp[v][a2];
+          if (pp[v][a2] > hi2) hi2 = pp[v][a2];
+        }
+        tb6[6 * (int64_t)ti + a2] = lo;
+        tb6[6 * (int64_t)ti + 3 + a2] = hi2;
+      }
+      lparr[ti] = 0; /* ℓ_p = 0: рабочий уровень листьев (как в pref) */
+    }
+    g_tv9 = tv9;
+    g_tb6 = tb6;
+    g_lparr = lparr;
   }
   if (hz_pyr_build(&py, m.nt, cmin, cmax, cent, mtl, m.lo, m.hi, cell) != 0) {
     fprintf(stderr, "pgather: пирамида не построилась\n");
@@ -402,7 +427,14 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  /* --- СВИП: поле E на кусках (только объёмный фронт §845/§846) --- */
+  { /* §867: per-node max ℓ_p обязателен для mode=3 (§852) */
+    int32_t nup = 0;
+    if (hz_pyr_set_lp(&py, g_lparr, &nup) != 0) {
+      fprintf(stderr, "pgather: per-node max lp не построился\n");
+      return 2;
+    }
+  }
+  /* --- СВИП: поле E на кусках (фронт mode=3 + walk, §867) --- */
   if (gather == 0 && pg_bbox_csr_build(&py, cmin, cmax, &csr) != 0) {
     fprintf(stderr, "pgather: bbox-CSR не построился\n");
     return 2;
@@ -414,9 +446,14 @@ int main(int argc, char **argv) {
   so.tau0 = tau0;
   so.noprop = noprop;
   so.ndirs = ndirs;
-  so.mode = 2;
+  so.mode = 3; /* §867: фронт с точным пересечением (был mode=2) */
   so.build = 1;
   so.vc = 1;
+  so.walk = 1; /* §867: продакшн-модель А1576/§861 — дефолт потребителя */
+  so.trivert = g_tv9;
+  so.tribox = g_tb6;
+  so.lp = g_lparr;
+  so.domhi = m.hi;
   for (i = 0; i < m.nt; i++)
     py.pcs[i].e = 0.0f;
   t0 = now_sec();

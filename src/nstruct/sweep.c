@@ -673,6 +673,7 @@ typedef struct {
   pc_rec *pc;        /* [nt] */
   double pth0, pth1; /* границы трубки [h0,h1] для кэша (§865/раунд 13) */
   double lost;       /* поток за границей домена, w·csec-единицы */
+  int negseen;       /* §871: события Lin<0 за прогон (сентинел, лимит печати 8) */
   int64_t ncellbase; /* базовых клеток полным DDA («до», прибор А1569) */
   int cbase, cfront; /* прибор считается на первой итерации (геометрия статична) */
   /* аккумуляторы */
@@ -987,6 +988,10 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
     fc->emitted += fc->w_d * front_le(fc, pbest) * csec;
     *a = 0.0;
     *b = front_le(fc, pbest) + front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI);
+    if (Lin < 0.0 && fc->negseen < 8) { /* §871: сентинел Lin<0 */
+      fc->negseen++;
+      fprintf(stderr, "NEG-A pbest=%d Lin=%.6g\n", pbest, Lin);
+    }
     sw_accum(fc, pbest, fc->w_d * Lin * csec * fc->axcos / fc->area[pbest]); /* §862 */
     goto done;
   }
@@ -1021,6 +1026,10 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
         if (fc->pstamp[p] == fc->pkey) continue;
         if (!front_contained(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri, blo, bhi)) continue;
         fc->Ed[p] += fc->w_d * Lin * f * csec * fc->axcos * wt[u] / swt / fc->area[p];
+        if (Lin * f < 0.0 && fc->negseen < 8) { /* §871: сентинел Lin<0 */
+          fc->negseen++;
+          fprintf(stderr, "NEG-T p=%d Lin=%.6g f=%.6g\n", p, Lin, f);
+        }
         sw_accum(fc, p,
                  fc->w_d * Lin * f * csec * fc->axcos * wt[u] / swt / fc->area[p]); /* §862 */
       }
@@ -1187,6 +1196,12 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
       if (first) { /* родительская доля трубки погашена первой поверхностью (G6) */
         fc->depA += ai;
         first = 0;
+      }
+      if (Lin < 0.0 && fc->negseen < 8) { /* §871: сентинел Lin<0 */
+        fc->negseen++;
+        fprintf(stderr, "NEGLIN tube=%lld p=%d Lin=%.6g le=%.6g rho=%.6g Eprev=%.6g area=%.6g\n",
+                (long long)fc->ntube, p, Lin, front_le(fc, p), front_rho(fc, p), fc->Eprev[p],
+                fc->area[p]);
       }
       fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos / fc->area[p];
       fc->absorbed += fc->w_d * Lin * csec;

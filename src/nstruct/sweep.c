@@ -1456,8 +1456,13 @@ static void path_collect_list(front_ctx *fc, const int32_t *ps, int32_t n, doubl
   int32_t u;
   for (u = 0; u < n; u++) {
     int32_t p = ps[u];
-    double tt;
+    double tt, bh0, bh1;
     if (fc->pstamp[p] == fc->pkey) continue; /* штамп ДО ray-tri (А1564) */
+    /* §865: префильтр bbox×сегмент — консервативный, результата не меняет */
+    if (!front_box_seg(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri,
+                       fc->o->tribox + 6 * (int64_t)py->pcs[p].tri + 3, fc->org, fc->om, tin, tout,
+                       &bh0, &bh1))
+      continue;
     tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[p].tri);
     if (!(tt >= tin) || !(tt <= tout)) continue;
     if (fc->pbuf_n == fc->pbuf_cap) {

@@ -599,6 +599,14 @@ static void sw_line_sweep_dir(const hz_pyr *py, const double om[3], double w_d, 
  * (материал × узел): представитель ray-tri, константы A/le/ρ предвычислены,
  * энергия депозита копится на группу (O(1) на попадание) и раздаётся членам
  * после итерации. Eprev-среднее пересчитывается раз в итерацию (SE). */
+/* §865/раунд 15: запись per-трубочного кэша «кусок проверен» (path=1) */
+typedef struct {
+  double bh0, bh1; /* bbox t-интервал куска на трубке (пустой: 1,0) */
+  double tt;       /* кэш sw_ray_tri_raw */
+  int64_t tstamp;  /* pkey: bh0/bh1 валидны */
+  int64_t ttstamp; /* pkey: tt посчитан (ray-tri — один раз на кусок×трубку) */
+  int64_t pstamp;  /* pkey: кусок уже в списке попаданий этой трубки */
+} pc_rec;
 typedef struct {
   int64_t ng, ngcap;
   int32_t *grep;            /* представитель группы */
@@ -658,12 +666,11 @@ typedef struct {
   double *pbuf_t;
   int32_t *pbuf_p;
   int64_t pbuf_n, pbuf_cap;
-  /* §865/раунд 13: per-трубочный кэш «кусок проверен» — bbox t-интервал по
-   * ВСЕЙ трубке и результат ray-tri; штамп pkey. Владелец hz_sw_run. */
-  int64_t *pc_t;     /* [nt]: штамп валидности pc_bh */
-  int64_t *pc_rs;    /* [nt]: штамп валидности pc_tt */
-  double *pc_bh;     /* [2*nt]: bbox t-интервал куска на трубке (пустой: 1,0) */
-  double *pc_tt;     /* [nt]: кэш sw_ray_tri_raw */
+  /* §865/раунды 13+15: per-трубочный кэш «кусок проверен» — ОДНА запись на
+   * кусок (40 Б, одна-две кэш-линии вместо 3–4 случайных по массивам):
+   * bbox t-интервал по ВСЕЙ трубке + кэш ray-tri + штампы pkey.
+   * Владелец hz_sw_run; NULL → прежний цикл (fail closed). */
+  pc_rec *pc;        /* [nt] */
   double pth0, pth1; /* границы трубки [h0,h1] для кэша (§865/раунд 13) */
   double lost;       /* поток за границей домена, w·csec-единицы */
   int64_t ncellbase; /* базовых клеток полным DDA («до», прибор А1569) */
@@ -1463,7 +1470,7 @@ static void path_collect_list(front_ctx *fc, const int32_t *ps, int32_t n, doubl
   int32_t u;
   /* §865/раунд 13: кэш «кусок × трубка» выключен (нет памяти при постройке —
    * fail closed) → прежний путь: bbox×сегмент + ray-tri на каждый визит */
-  if (!fc->pc_t || !fc->pc_rs || !fc->pc_bh || !fc->pc_tt) {
+  if (!fc->pc) {
     for (u = 0; u < n; u++) {
       int32_t p = ps[u];
       double tt, bh0, bh1;
@@ -1493,33 +1500,34 @@ static void path_collect_list(front_ctx *fc, const int32_t *ps, int32_t n, doubl
   }
   for (u = 0; u < n; u++) {
     int32_t p = ps[u];
+    pc_rec *r = fc->pc + p;
     double tt, bh0, bh1;
-    if (fc->pstamp[p] == fc->pkey) continue; /* уже в списке попаданий трубки */
-    if (fc->pc_t[p] != fc->pkey) {           /* §865/р.13: bbox-интервал — константа трубки */
+    if (r->pstamp == fc->pkey) continue; /* уже в списке попаданий трубки */
+    if (r->tstamp != fc->pkey) {         /* §865/р.13: bbox-интервал — константа трубки */
       if (!front_box_seg(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri,
                          fc->o->tribox + 6 * (int64_t)py->pcs[p].tri + 3, fc->org, fc->om, fc->pth0,
                          fc->pth1, &bh0, &bh1)) {
-        fc->pc_bh[2 * (int64_t)p] = 1.0; /* пустой интервал: [1,0] */
-        fc->pc_bh[2 * (int64_t)p + 1] = 0.0;
-        fc->pc_t[p] = fc->pkey;
+        r->bh0 = 1.0; /* пустой интервал: [1,0] */
+        r->bh1 = 0.0;
+        r->tstamp = fc->pkey;
         continue;
       }
-      fc->pc_bh[2 * (int64_t)p] = bh0;
-      fc->pc_bh[2 * (int64_t)p + 1] = bh1;
-      fc->pc_t[p] = fc->pkey;
+      r->bh0 = bh0;
+      r->bh1 = bh1;
+      r->tstamp = fc->pkey;
     } else {
-      bh0 = fc->pc_bh[2 * (int64_t)p];
-      bh1 = fc->pc_bh[2 * (int64_t)p + 1];
+      bh0 = r->bh0;
+      bh1 = r->bh1;
     }
     /* клип интервала к [tin,tout] пуст ⟺ box_seg по сегменту дал бы 0 —
      * сегмент ⊂ трубки, ровно та же проверка без повторного box_seg
      * (маркер пустого интервала [1,0] отсекается первым тестом) */
     if (!(bh0 <= bh1) || bh1 < tin || bh0 > tout) continue;
-    if (fc->pc_rs[p] != fc->pkey) { /* ray-tri — ОДИН РАЗ на (кусок, трубку) */
-      fc->pc_tt[p] = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[p].tri);
-      fc->pc_rs[p] = fc->pkey;
+    if (r->ttstamp != fc->pkey) { /* ray-tri — ОДИН РАЗ на (кусок, трубку) */
+      r->tt = sw_ray_tri_raw(fc->org, fc->om, fc->o->trivert + 9 * (int64_t)py->pcs[p].tri);
+      r->ttstamp = fc->pkey;
     }
-    tt = fc->pc_tt[p];
+    tt = r->tt;
     if (!(tt >= tin) || !(tt <= tout)) continue;
     if (fc->pbuf_n == fc->pbuf_cap) {
       int64_t nc = fc->pbuf_cap ? fc->pbuf_cap * 2 : 256;
@@ -1530,7 +1538,7 @@ static void path_collect_list(front_ctx *fc, const int32_t *ps, int32_t n, doubl
       fc->pbuf_p = np;
       fc->pbuf_cap = nc;
     }
-    fc->pstamp[p] = fc->pkey;
+    r->pstamp = fc->pkey;
     fc->pbuf_t[fc->pbuf_n] = tt;
     fc->pbuf_p[fc->pbuf_n] = p;
     fc->pbuf_n++;
@@ -1981,8 +1989,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   int32_t *stampv = NULL; /* §851: штампы визитов линий [ncells] */
   int64_t *pstamp = NULL; /* §852/А1564: штамп (трубка × кусок) [nt] */
   /* §865/раунд 13: кэш «кусок × трубка» (только path=1) */
-  int64_t *pc_t = NULL, *pc_rs = NULL;
-  double *pc_bh = NULL, *pc_tt = NULL;
+  pc_rec *pc = NULL; /* §865/раунды 13+15: кэш «кусок × трубка» (только path=1) */
   int32_t *bstart = NULL, *bpids = NULL, *fillb = NULL; /* §852/А1566: bbox-индекс */
   /* §863: кэш списков кусков узлов (владелец — прогон, переживает fc) */
   int64_t *nstart = NULL;
@@ -2101,14 +2108,10 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       rc = 2;
       goto done;
     }
-    if (o->path) { /* §865/раунд 13: кэш «кусок × трубка» — только path=1 */
-      pc_t = (int64_t *)calloc((size_t)nt, sizeof *pc_t);
-      pc_rs = (int64_t *)calloc((size_t)nt, sizeof *pc_rs);
-      pc_bh = (double *)malloc((size_t)nt * 2 * sizeof *pc_bh);
-      pc_tt = (double *)malloc((size_t)nt * sizeof *pc_tt);
-      /* нет памяти → кэш остаётся NULL, path_collect_list идёт прежним путём
-       * (fail closed: без новых массивов корректность не хуже раунда 12) */
-    }
+    if (o->path) /* §865/раунды 13+15: кэш «кусок × трубка» — только path=1 */
+      pc = (pc_rec *)calloc((size_t)nt, sizeof *pc);
+    /* нет памяти → кэш остаётся NULL, path_collect_list идёт прежним путём
+     * (fail closed: без новых массивов корректность не хуже раунда 12) */
     /* bbox-индекс А1566: слот s пересекает клетку листа, если bbox его
      * ИСХОДНОГО треугольника задевает клетку (два прохода counting-sort) */
     {
@@ -2194,10 +2197,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.noprop = o->noprop;
         fc.tau0 = o->tau0;
         fc.pstamp = pstamp;
-        fc.pc_t = pc_t;
-        fc.pc_rs = pc_rs;
-        fc.pc_bh = pc_bh;
-        fc.pc_tt = pc_tt;
+        fc.pc = pc;
         fc.bstart = bstart;
         fc.bpids = bpids;
         fc.mark = mark;
@@ -2420,10 +2420,7 @@ done:
   free(bits);
   free(tab);
   free(pstamp); /* §852/А1564 */
-  free(pc_t);   /* §865/раунд 13 */
-  free(pc_rs);
-  free(pc_bh);
-  free(pc_tt);
+  free(pc);     /* §865/раунды 13+15 */
   free(stampv);
   free(nstart); /* §863 */
   free(nlen);

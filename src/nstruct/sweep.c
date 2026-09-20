@@ -2392,15 +2392,31 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     if (o->mode == 3 && o->lpacc && o->lpapply) { /* §862: этаж = целая часть */
       int32_t nup = 0;
       if (!lpflo) {
-        lpflo = (uint8_t *)malloc((size_t)nt);
+        lpflo = (uint8_t *)calloc(
+            (size_t)nt,
+            sizeof *lpflo); /* 0: первая
+                             * конверсия честно посчитает смены относительно fine-этажа */
         if (!lpflo) {
           rc = 2;
           goto done;
         }
       }
-      for (p = 0; p < nt; p++) {
-        double fl = o->lpacc[p];
-        lpflo[p] = fl >= 255.0 ? 255 : (uint8_t)fl;
+      { /* §866: этаж = min(floor(lpacc), lpceil), отрицательный вклад — 0
+         * (раньше (uint8_t) от отрицательного double — UB); приборы смены */
+        int64_t nchg = 0;
+        int32_t h[16] = {0}, q;
+        for (p = 0; p < nt; p++) {
+          double fl = o->lpacc[p];
+          int32_t fi = fl >= 255.0 ? 255 : (fl < 0.0 ? 0 : (int32_t)fl);
+          if (o->lpceil > 0 && fi > o->lpceil) fi = o->lpceil;
+          if (lpflo[p] != (uint8_t)fi) nchg++;
+          lpflo[p] = (uint8_t)fi;
+          h[fi > 15 ? 15 : fi]++;
+        }
+        if (nchg > st->flochg_max) st->flochg_max = nchg;
+        st->flochg_sum += nchg;
+        for (q = 0; q < 16; q++)
+          st->flhist[q] = h[q];
       }
       if (hz_pyr_set_lp(py, lpflo, &nup) != 0) {
         rc = 2;

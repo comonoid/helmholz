@@ -33,6 +33,7 @@ int main(int argc, char **argv) {
   int vc = 1;            /* §851: компоненты пустоты по умолчанию включены */
   int lp = 0;            /* §852: LOD-уровень кусков ℓ_p (единый; лестница G1) */
   int adapt = 0;         /* §862: 1 — дробный аккумулятор детальности */
+  int lpceil = 0;        /* §866: потолок адаптивного этажа (0 — без) */
   double *lpacc = NULL;  /* §862: аккумулятор [nt], живёт до конца main */
   double *lphits = NULL; /* §862-диаг: счётчик событий [nt] */
   int dumpE = 0;         /* §862-диаг: дамп per-piece E последней итерации */
@@ -89,6 +90,8 @@ int main(int argc, char **argv) {
       lp = atoi(argv[i] + 3); /* §852: ℓ_p кусков */
     } else if (strncmp(argv[i], "adapt=", 6) == 0) {
       adapt = atoi(argv[i] + 6); /* §862 */
+    } else if (strncmp(argv[i], "lpceil=", 7) == 0) {
+      lpceil = atoi(argv[i] + 7); /* §866: потолок этажа */
     } else if (strncmp(argv[i], "cdelta=", 7) == 0) {
       cdelta = atof(argv[i] + 7); /* §862 */
     } else if (strncmp(argv[i], "agg=", 4) == 0) {
@@ -262,6 +265,7 @@ int main(int argc, char **argv) {
       so.agg = agg;
       so.lphits = lphits;
       so.lpapply = (adapt == 1); /* adapt=2 — пассивная диагностика */
+      so.lpceil = lpceil;        /* §866 */
     }
     so.xint = xint;
     so.walk = walk;
@@ -522,21 +526,16 @@ int main(int argc, char **argv) {
     for (i = 0; i < (int)m.nt; i++)
       printf("E1 p=%d tri=%d e=%.8g hits=%.0f sdelta=%.8g\n", i, py.pcs[i].tri, (double)py.pcs[i].e,
              lphits ? lphits[i] : 0.0, lpacc ? lpacc[i] : 0.0);
-  if (lpacc) { /* §862: гистограмма этажей на последней итерации */
-    int fl, cnt[16] = {0}, maxfl = 0;
-    for (i = 0; i < (int)m.nt; i++) {
-      fl = (int)lpacc[i];
-      if (fl < 0)
-        fl = 0; /* §862-диаг: вклад бывает < 0 (отрицательные
-                 * Lin-депозиты) — вне гистограммы, не в стёк */
-      if (fl > 15) fl = 15;
-      cnt[fl]++;
-      if (fl > maxfl) maxfl = fl;
-    }
-    printf("ЛОД-АДАПТ: cdelta=%.3g этажи", cdelta);
+  if (lpacc) { /* §866: применённые этажи (с потолком) — из st.flhist */
+    int fl, maxfl = 0;
+    (void)0;
+    for (fl = 0; fl < 16; fl++)
+      if (st.flhist[fl] > 0) maxfl = fl;
+    printf("ЛОД-АДАПТ: cdelta=%.3g lpceil=%d макс-смен=%lld Σсмен=%lld этажи", cdelta, lpceil,
+           (long long)st.flochg_max, (long long)st.flochg_sum);
     for (fl = 0; fl <= maxfl; fl++)
-      printf(" %d:%d", fl, cnt[fl]);
-    printf(")\n");
+      printf(" %d:%d", fl, (int)st.flhist[fl]);
+    printf("\n");
     free(lpacc);
     free(lphits);
   }

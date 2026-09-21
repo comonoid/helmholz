@@ -350,6 +350,8 @@ int main(int argc, char **argv) {
   int iters = 30, lev = 6, tau0 = 0, noprop = 0, ndirs = 26, mort = 1, i, ax;
   double *lep = NULL; /* §874: per-piece эмиссия (ср. Ke); NULL — прежний мир */
   int W = 320, H = 240, k27 = 0;
+  int frames = 1, have_eye2 = 0; /* §877: ходьба */
+  double eye2[3] = {0, 0, 0}, look2[3] = {0, 0, 0};
   hz_objmesh m;
   hz_pyr py;
   hz_sw_opts so;
@@ -402,6 +404,13 @@ int main(int argc, char **argv) {
       gather = atoi(argv[i] + 7);
     else if (strncmp(argv[i], "k27=", 4) == 0)
       k27 = atoi(argv[i] + 4);
+    else if (strncmp(argv[i], "frames=", 7) == 0)
+      frames = atoi(argv[i] + 7); /* §877 */
+    else if (strncmp(argv[i], "eye2=", 5) == 0) {
+      parse3(argv[i] + 5, eye2);
+      have_eye2 = 1;
+    } else if (strncmp(argv[i], "look2=", 6) == 0)
+      parse3(argv[i] + 6, look2);
     else if (strncmp(argv[i], "out=", 4) == 0)
       outfile = argv[i] + 4;
     else if (strcmp(argv[i], "tau0") == 0)
@@ -419,6 +428,14 @@ int main(int argc, char **argv) {
       fov > PG_FOV_MAX) {
     fprintf(stderr, "use: pgather <scene.obj> [lev=N dirs=.. it=N rho=F le=F] "
                     "[eye=X,Y,Z look=X,Y,Z fov=F W=N H=N] [k27=N] [out=ФАЙЛ]\n");
+    return 2;
+  }
+  t0 = now_sec();
+  if (!have_eye2)
+    for (ax = 0; ax < 3; ax++)
+      eye2[ax] = eye[ax]; /* §877: поворот на месте */
+  if (frames < 1 || (have_eye2 && frames < 2)) {
+    fprintf(stderr, "pgather: frames=N>=2 требует eye2=/look2= (ходьба §877)\n");
     return 2;
   }
   t0 = now_sec();
@@ -703,120 +720,139 @@ int main(int argc, char **argv) {
     fprintf(stderr, "pgather: нет памяти на кадр\n");
     return 2;
   }
-  {
-    /* базис камеры */
-    double fwd[3], right[3], up[3], tmp[3] = {0, 0, 1};
-    double tanf = tan(fov * M_PI / 360.0);
+  for (int fr = 0; fr < frames; fr++) {
+    /* §877: ходьба — линейная интерполяция (eye,look) вдоль траектории;
+     * поле E решено ОДИН раз выше — кадр стоит только сбор */
+    double ef[3], lf[3];
+    double tk = frames > 1 ? (double)fr / (double)(frames - 1) : 0.0;
     int64_t nhit = 0;
     double lsum = 0, lmax = 0;
-    for (ax = 0; ax < 3; ax++)
-      fwd[ax] = look[ax] - eye[ax];
-    {
-      double nn = sqrt(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
-      if (nn < 1e-12) {
-        fprintf(stderr, "pgather: глаз совпадает с точкой взгляда\n");
-        return 2;
-      }
-      for (ax = 0; ax < 3; ax++)
-        fwd[ax] /= nn;
+    for (ax = 0; ax < 3; ax++) {
+      ef[ax] = eye[ax] + tk * (eye2[ax] - eye[ax]);
+      lf[ax] = look[ax] + tk * (look2[ax] - look[ax]);
     }
-    right[0] = fwd[1] * tmp[2] - fwd[2] * tmp[1];
-    right[1] = fwd[2] * tmp[0] - fwd[0] * tmp[2];
-    right[2] = fwd[0] * tmp[1] - fwd[1] * tmp[0];
+    if (frames > 1)
+      printf("ХОДЬБА: кадр %d/%d eye=(%.2f %.2f %.2f)\n", fr, frames, ef[0], ef[1], ef[2]);
     {
-      double nn = sqrt(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
-      if (nn < 1e-9) { /* взгляд вдоль z — базис от x */
-        tmp[0] = 1;
-        tmp[1] = tmp[2] = 0;
-        right[0] = fwd[1] * tmp[2] - fwd[2] * tmp[1];
-        right[1] = fwd[2] * tmp[0] - fwd[0] * tmp[2];
-        right[2] = fwd[0] * tmp[1] - fwd[1] * tmp[0];
-        nn = sqrt(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
-      }
+      /* базис камеры */
+      double fwd[3], right[3], up[3], tmp[3] = {0, 0, 1};
+      double tanf = tan(fov * M_PI / 360.0);
       for (ax = 0; ax < 3; ax++)
-        right[ax] /= nn;
-    }
-    up[0] = fwd[1] * right[2] - fwd[2] * right[1];
-    up[1] = fwd[2] * right[0] - fwd[0] * right[2];
-    up[2] = fwd[0] * right[1] - fwd[1] * right[0];
-
-    t0 = now_sec();
-    pg_cam cam;
-    memset(&cam, 0, sizeof cam);
-    cam.py = &py;
-    cam.csr = &csr;
-    cam.m = &m;
-    cam.kd = kd;
-    cam.lep = lep;
-    cam.ks = ksf > 0.0 ? ks : NULL; /* §874: ksf=0 — рекурсии не рождаются (А1584) */
-    cam.nrm = nrm;
-    cam.le = le;
-    cam.rho = rho;
-    cam.gather = gather;
-    cam.hop_eps = PG_HOP_EPS_REL * maxdim; /* §874/А1582 */
-    cam.steps = &dda_steps;
-    cam.tested = &dda_tested;
-    cam.nsec = &sec_rays;
-    for (int iy = 0; iy < H; iy++)
-      for (int ix = 0; ix < W; ix++) {
-        double sx = (2.0 * (ix + 0.5) / W - 1.0) * tanf;
-        double sy = (1.0 - 2.0 * (iy + 0.5) / H) * tanf * (double)H / (double)W;
-        double rd[3], thit = -1.0, L = 0.0;
-        int32_t pbest;
+        fwd[ax] = lf[ax] - ef[ax];
+      {
+        double nn = sqrt(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
+        if (nn < 1e-12) {
+          fprintf(stderr, "pgather: глаз совпадает с точкой взгляда\n");
+          return 2;
+        }
         for (ax = 0; ax < 3; ax++)
-          rd[ax] = fwd[ax] + sx * right[ax] + sy * up[ax];
-        {
-          double nn = sqrt(rd[0] * rd[0] + rd[1] * rd[1] + rd[2] * rd[2]);
+          fwd[ax] /= nn;
+      }
+      right[0] = fwd[1] * tmp[2] - fwd[2] * tmp[1];
+      right[1] = fwd[2] * tmp[0] - fwd[0] * tmp[2];
+      right[2] = fwd[0] * tmp[1] - fwd[1] * tmp[0];
+      {
+        double nn = sqrt(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
+        if (nn < 1e-9) { /* взгляд вдоль z — базис от x */
+          tmp[0] = 1;
+          tmp[1] = tmp[2] = 0;
+          right[0] = fwd[1] * tmp[2] - fwd[2] * tmp[1];
+          right[1] = fwd[2] * tmp[0] - fwd[0] * tmp[2];
+          right[2] = fwd[0] * tmp[1] - fwd[1] * tmp[0];
+          nn = sqrt(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
+        }
+        for (ax = 0; ax < 3; ax++)
+          right[ax] /= nn;
+      }
+      up[0] = fwd[1] * right[2] - fwd[2] * right[1];
+      up[1] = fwd[2] * right[0] - fwd[0] * right[2];
+      up[2] = fwd[0] * right[1] - fwd[1] * right[0];
+
+      t0 = now_sec();
+      pg_cam cam;
+      memset(&cam, 0, sizeof cam);
+      cam.py = &py;
+      cam.csr = &csr;
+      cam.m = &m;
+      cam.kd = kd;
+      cam.lep = lep;
+      cam.ks = ksf > 0.0 ? ks : NULL; /* §874: ksf=0 — рекурсии не рождаются (А1584) */
+      cam.nrm = nrm;
+      cam.le = le;
+      cam.rho = rho;
+      cam.gather = gather;
+      cam.hop_eps = PG_HOP_EPS_REL * maxdim; /* §874/А1582 */
+      cam.steps = &dda_steps;
+      cam.tested = &dda_tested;
+      cam.nsec = &sec_rays;
+      for (int iy = 0; iy < H; iy++)
+        for (int ix = 0; ix < W; ix++) {
+          double sx = (2.0 * (ix + 0.5) / W - 1.0) * tanf;
+          double sy = (1.0 - 2.0 * (iy + 0.5) / H) * tanf * (double)H / (double)W;
+          double rd[3], thit = -1.0, L = 0.0;
+          int32_t pbest;
           for (ax = 0; ax < 3; ax++)
-            rd[ax] /= nn;
+            rd[ax] = fwd[ax] + sx * right[ax] + sy * up[ax];
+          {
+            double nn = sqrt(rd[0] * rd[0] + rd[1] * rd[1] + rd[2] * rd[2]);
+            for (ax = 0; ax < 3; ax++)
+              rd[ax] /= nn;
+          }
+          /* §874/А1585: базовый и вторичный лучи — одним сборщиком */
+          pbest = pg_nearest(&py, &csr, &m, ef, rd, gather, &thit, &dda_steps, &dda_tested);
+          if (pbest >= 0) {
+            L = pg_lcam_hit(&cam, ef, rd, pbest, thit, 0);
+            nhit++;
+            lsum += L;
+            if (L > lmax) lmax = L;
+          }
+          lum[(size_t)iy * (size_t)W + (size_t)ix] = L;
         }
-        /* §874/А1585: базовый и вторичный лучи — одним сборщиком */
-        pbest = pg_nearest(&py, &csr, &m, eye, rd, gather, &thit, &dda_steps, &dda_tested);
-        if (pbest >= 0) {
-          L = pg_lcam_hit(&cam, eye, rd, pbest, thit, 0);
-          nhit++;
-          lsum += L;
-          if (L > lmax) lmax = L;
+      t1 = now_sec();
+      if (gather == 0)
+        printf("DDA: клеток/луч %.1f, кусков/луч %.1f (%.2f %% от nt)\n",
+               (double)dda_steps / ((double)W * (double)H),
+               (double)dda_tested / ((double)W * (double)H),
+               100.0 * (double)dda_tested / ((double)W * (double)H) / (double)m.nt);
+      printf("СБОР: лучей %d, попало %" PRId64
+             " (%.2f %%), средняя яркость %.4f, max %.4f, %.2f с\n",
+             W * H, nhit, 100.0 * (double)nhit / ((double)W * (double)H),
+             lsum / (nhit ? (double)nhit : 1.0), lmax, t1 - t0);
+      printf("§874: вторичных зеркальных лучей %" PRId64 " (ksf=%.3g)\n", cam.nsec ? *cam.nsec : 0,
+             ksf);
+      {
+        double rr = rho < 0 ? 0.5 : rho;
+        double Lpred = le + rr * st.e_avg / (2.0 * M_PI);
+        double Lmeas = lsum / (nhit ? (double)nhit : 1.0);
+        printf("СЛИЧЕНИЕ: L_свипа = le + rho·E_avg/2π = %.4f; L_сбора = %.4f; отношение %.4f\n",
+               Lpred, Lmeas, Lmeas / Lpred);
+      }
+      {
+        char fname[4096];
+        FILE *f;
+        if (fr == 0)
+          snprintf(fname, sizeof fname, "%s", outfile);
+        else
+          snprintf(fname, sizeof fname, "%s_f%02d.ppm", outfile, fr);
+        f = fopen(fname, "wb");
+        if (!f) {
+          fprintf(stderr, "pgather: не открыть %s\n", fname);
+          return 2;
         }
-        lum[(size_t)iy * (size_t)W + (size_t)ix] = L;
+        fprintf(f, "P6\n%d %d\n255\n", W, H);
+        for (i = 0; i < W * H; i++) {
+          double v = lum[i] / (lmax > 0 ? lmax : 1.0) * 255.0;
+          unsigned char b[3];
+          if (v > 255.0) v = 255.0;
+          if (v < 0.0) v = 0.0;
+          b[0] = b[1] = b[2] = (unsigned char)v;
+          fwrite(b, 1, 3, f);
+        }
+        fclose(f);
+        printf("КАДР: %s записан (P6, нормировка на max кадра)\n", fname);
       }
-    t1 = now_sec();
-    if (gather == 0)
-      printf("DDA: клеток/луч %.1f, кусков/луч %.1f (%.2f %% от nt)\n",
-             (double)dda_steps / ((double)W * (double)H),
-             (double)dda_tested / ((double)W * (double)H),
-             100.0 * (double)dda_tested / ((double)W * (double)H) / (double)m.nt);
-    printf("СБОР: лучей %d, попало %" PRId64 " (%.2f %%), средняя яркость %.4f, max %.4f, %.2f с\n",
-           W * H, nhit, 100.0 * (double)nhit / ((double)W * (double)H),
-           lsum / (nhit ? (double)nhit : 1.0), lmax, t1 - t0);
-    printf("§874: вторичных зеркальных лучей %" PRId64 " (ksf=%.3g)\n", cam.nsec ? *cam.nsec : 0,
-           ksf);
-    {
-      double rr = rho < 0 ? 0.5 : rho;
-      double Lpred = le + rr * st.e_avg / (2.0 * M_PI);
-      double Lmeas = lsum / (nhit ? (double)nhit : 1.0);
-      printf("СЛИЧЕНИЕ: L_свипа = le + rho·E_avg/2π = %.4f; L_сбора = %.4f; отношение %.4f\n",
-             Lpred, Lmeas, Lmeas / Lpred);
-    }
-    {
-      FILE *f = fopen(outfile, "wb");
-      if (!f) {
-        fprintf(stderr, "pgather: не открыть %s\n", outfile);
-        return 2;
-      }
-      fprintf(f, "P6\n%d %d\n255\n", W, H);
-      for (i = 0; i < W * H; i++) {
-        double v = lum[i] / (lmax > 0 ? lmax : 1.0) * 255.0;
-        unsigned char b[3];
-        if (v > 255.0) v = 255.0;
-        if (v < 0.0) v = 0.0;
-        b[0] = b[1] = b[2] = (unsigned char)v;
-        fwrite(b, 1, 3, f);
-      }
-      fclose(f);
-      printf("КАДР: %s записан (P6, нормировка на max кадра)\n", outfile);
-    }
-  }
+    } /* базис камеры */
+  } /* §877: ходьба */
 
   free(lum);
   free(g_tv9); /* §874: утечка trivert/tribox/lp (предсуществующая с §867,

@@ -675,18 +675,23 @@ int main(int argc, char **argv) {
         up[ax] = fwd[(ax + 1) % 3] * right[(ax + 2) % 3] - fwd[(ax + 2) % 3] * right[(ax + 1) % 3];
       lum = (double *)malloc((size_t)W * (size_t)H * sizeof *lum);
       if (!lum) return 2;
+      /* §886: параллелизм §878/§884 ВКЛЮЧЁН (указание: делать все
+       * оптимизации) — строки кадра независимы, файл read-only */
+#pragma omp parallel for schedule(dynamic, 16) private(ax) reduction(+ : tested2, nhit2)
       for (int iy = 0; iy < H; iy++)
         for (int ix = 0; ix < W; ix++) {
           double sx = (2.0 * (ix + 0.5) / W - 1.0) * tanf;
           double sy = (1.0 - 2.0 * (iy + 0.5) / H) * tanf * (double)H / (double)W;
           double rd[3] = {0, 0, 0}, nn;
           int32_t hit;
+          int64_t tested_loc = 0;
           for (ax = 0; ax < 3; ax++)
             rd[ax] = fwd[ax] + sx * right[ax] + sy * up[ax];
           nn = sqrt(rd[0] * rd[0] + rd[1] * rd[1] + rd[2] * rd[2]);
           for (ax = 0; ax < 3; ax++)
             rd[ax] /= nn;
-          hit = pg_hblk_nearest(&hb, eye, rd, &tested2);
+          hit = pg_hblk_nearest(&hb, eye, rd, &tested_loc);
+          tested2 += tested_loc;
           if (hit >= 0) nhit2++;
           lum[(size_t)iy * (size_t)W + (size_t)ix] = hit >= 0 ? le : 0.0;
         }
@@ -696,7 +701,7 @@ int main(int argc, char **argv) {
              nhit2, 100.0 * (double)nhit2 / ((double)W * (double)H),
              (double)tested2 / ((double)W * (double)H), tB - tA);
       printf("HBLK RSS: max %.1f МБ; фолты минорные %lld, мажорные %lld (за сбор)\n",
-             rb.ru_maxrss / 1024.0, (long long)(rb.ru_minflt - ra.ru_minflt),
+             (double)rb.ru_maxrss / 1024.0, (long long)(rb.ru_minflt - ra.ru_minflt),
              (long long)(rb.ru_majflt - ra.ru_majflt));
       {
         char fname[4096];

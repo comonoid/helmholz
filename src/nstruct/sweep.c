@@ -688,6 +688,7 @@ typedef struct {
   int64_t hop_hops_sum; /* §881: Σ хопов по трубкам направления */
   double hop_lost_thr;  /* §881/П7: из hop_lost — порогом */
   double hop_lost_cap;  /* §881/П7: из hop_lost — ёмкостью */
+  double row_dep;       /* §887-b: счётчик исполнений row-ветки */
   /* §881: ёмкость 32 (была 4): на зеркально-плотных сценах цепи длиннее 4 —
    * основной поток (дефект §880); усечение — порогом от корня цепи (А1617) */
   double hop_pt[32][3];
@@ -1830,6 +1831,7 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
       sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos / fc->area[p]);
       Lin = Lh;
     }
+    fc->row_dep += 1.0; /* §887-b: маркер исполнения ветки (счётчик визитов) */
     a = 0.0;
     b = Lin;
   } else {
@@ -2229,6 +2231,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         st->hops += fc.hop_hops_sum;
         st->hop_thr += fc.hop_lost_thr;
         st->hop_cap += fc.hop_lost_cap;
+        st->row_dep += fc.row_dep;
         st->hop_cap += fc.hop_lost_cap;
         absorbed += fc.absorbed;
         emitted += fc.emitted;

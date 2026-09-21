@@ -143,6 +143,8 @@ typedef struct {
   int64_t hops;    /* выполнено хопов */
   double hop_thr;  /* §881/П7: из них порогом */
   double hop_cap;  /* §881/П7: из них ёмкостью */
+  double row_dep;  /* §887-b: Σ депозитов ветки row-intercept (1824) */
+  double fv_dep;   /* §887-b: Σ депозитов ветки front_visit (1237) */
   double emitted;  /* излучено за последнюю итерацию (внешний вход Le) */
   double absorbed; /* поглощено кусками за последнюю итерацию */
   double lost;     /* ушло с лучом за границу домена */

@@ -1259,6 +1259,7 @@ int main(int argc, char **argv) {
       if (ksf > 0.0) { /* §881: потери hop-политики видны числом (П3) */
         printf("§881: хопов %" PRId64 ", hop_lost=%.4g (absorbed=%.4g)\n", st.hops, st.hop_lost,
                st.absorbed);
+        printf("§887-b: row-ветка исполнена %.0f раз\n", st.row_dep);
       }
       {
         double rr = rho < 0 ? 0.5 : rho;

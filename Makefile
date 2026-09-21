@@ -214,6 +214,9 @@ build/swee3: tools/swee3.c src/nstruct/pyr.c src/nstruct/pyr.h src/nstruct/sweep
 
 # pgather — §847, СБОР ПО ПИКСЕЛЮ на новом носителе: свип mode=2 + камера;
 # картинка в img/ (правило проекта).
+build/pblock: tools/pblock.c src/scene_obj.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pblock.c src/scene_obj.c -lm'
+
 build/pgather: tools/pgather.c src/nstruct/pyr.c src/nstruct/pyr.h src/nstruct/sweep.c \
 	src/nstruct/sweep.h src/scene_obj.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pgather.c src/nstruct/pyr.c src/nstruct/sweep.c src/scene_obj.c -lm'

@@ -33,6 +33,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <fcntl.h>
 
 #include "nstruct/pyr.h"
 #include "nstruct/sweep.h"
@@ -339,6 +343,170 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
   return L;
 }
 
+/* --- §882: HBLK v1 — mmap-сбор (блок = листовая клетка, Morton) --- */
+#define PG_HBLK_MAGIC 0x314B4C4248ULL
+typedef struct {
+  uint8_t *base; /* начало mmap */
+  size_t len;
+  const uint64_t *hdr;
+  const uint8_t *tab; /* pb_cellrec {cell,start,cnt+pad} 24 Б */
+  const int32_t *ids;
+  const double *tris; /* 9 double на tri, исходный порядок */
+  int64_t nocc, nx, ny, nz, nt;
+  double cell;
+  double lo[3];
+  int nlev; /* занятых уровней бинпоиска */
+} pg_hblk;
+
+static int64_t pg_hblk_morton3(uint32_t x, uint32_t y, uint32_t z) {
+  int64_t r = 0;
+  int b;
+  for (b = 0; b < 21; b++)
+    r |= ((int64_t)(x >> b & 1) << (3 * b)) | ((int64_t)(y >> b & 1) << (3 * b + 1)) |
+         ((int64_t)(z >> b & 1) << (3 * b + 2));
+  return r;
+}
+
+static int pg_hblk_open(pg_hblk *h, const char *path) {
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return 2;
+  off_t len = lseek(fd, 0, SEEK_END);
+  if (len < 24 * 8) {
+    close(fd);
+    return 2;
+  }
+  h->len = (size_t)len;
+  h->base = (uint8_t *)mmap(NULL, h->len, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd);
+  if (h->base == MAP_FAILED) return 2;
+  madvise(h->base, h->len, MADV_RANDOM);
+  h->hdr = (const uint64_t *)h->base;
+  if (h->hdr[0] != PG_HBLK_MAGIC) return 2;
+  h->nt = (int64_t)h->hdr[1];
+  h->nx = (int64_t)h->hdr[2];
+  h->ny = (int64_t)h->hdr[3];
+  h->nz = (int64_t)h->hdr[4];
+  memcpy(h->lo, &h->hdr[5], 3 * sizeof(double));
+  memcpy(&h->cell, &h->hdr[8], sizeof(double));
+  h->nocc = (int64_t)h->hdr[9];
+  h->tab = h->base + h->hdr[10];
+  h->ids = (const int32_t *)(h->base + h->hdr[11]);
+  h->tris = (const double *)(h->base + h->hdr[12]);
+  h->nlev = 0;
+  while ((1LL << h->nlev) < h->nocc)
+    h->nlev++;
+  return 0;
+}
+
+static void pg_hblk_close(pg_hblk *h) {
+  munmap(h->base, h->len);
+}
+
+/* ближайшее пересечение луча с блочным файлом; куски/вершины — из mmap */
+static int32_t pg_hblk_nearest(const pg_hblk *h, const double org[3], const double rd[3],
+                               int64_t *tested) {
+  double tlo = 0.0, thi = 1e30, tcur, tbest = -1.0;
+  int64_t cellv[3], stepv[3];
+  double tnext[3], tdelta[3];
+  int32_t ax, best = -1;
+  for (ax = 0; ax < 3; ax++) {
+    double n = ax == 0 ? (double)h->nx : (ax == 1 ? (double)h->ny : (double)h->nz);
+    if (fabs(rd[ax]) < 1e-30) {
+      if (org[ax] < h->lo[ax] || org[ax] > h->lo[ax] + n * h->cell) return -1;
+      continue;
+    }
+    {
+      double ta = (h->lo[ax] - org[ax]) / rd[ax];
+      double tb = (h->lo[ax] + n * h->cell - org[ax]) / rd[ax];
+      if (ta > tb) {
+        double tt = ta;
+        ta = tb;
+        tb = tt;
+      }
+      if (ta > tlo) tlo = ta;
+      if (tb < thi) thi = tb;
+    }
+  }
+  if (tlo > thi) return -1;
+  tcur = tlo;
+  for (ax = 0; ax < 3; ax++) {
+    int64_t nax = ax == 0 ? h->nx : (ax == 1 ? h->ny : h->nz);
+    double pos = org[ax] + tcur * rd[ax];
+    int64_t idx = (int64_t)((pos - h->lo[ax]) / h->cell);
+    if (idx < 0) idx = 0;
+    if (idx >= nax) idx = nax - 1;
+    cellv[ax] = idx;
+    if (fabs(rd[ax]) < 1e-30) {
+      tnext[ax] = 1e30;
+      tdelta[ax] = 0.0;
+      stepv[ax] = 0;
+    } else {
+      double boundary = rd[ax] > 0.0 ? h->lo[ax] + ((double)idx + 1.0) * h->cell
+                                     : h->lo[ax] + (double)idx * h->cell;
+      stepv[ax] = rd[ax] > 0.0 ? 1 : -1;
+      tdelta[ax] = h->cell / fabs(rd[ax]);
+      tnext[ax] = tcur + (boundary - pos) / rd[ax];
+    }
+  }
+  for (;;) {
+    /* занятость клетки — бинпоиск Morton-ключа по таблице (А1623) */
+    int64_t key = pg_hblk_morton3((uint32_t)cellv[0], (uint32_t)cellv[1], (uint32_t)cellv[2]);
+    int64_t lo = 0, hi = h->nocc;
+    while (lo < hi) {
+      int64_t mid = (lo + hi) / 2;
+      int64_t c;
+      memcpy(&c, h->tab + (size_t)mid * 24, 8);
+      if (c < key)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    if (lo < h->nocc) {
+      int64_t c;
+      memcpy(&c, h->tab + (size_t)lo * 24, 8);
+      if (c == key) {
+        int64_t start, cnt;
+        memcpy(&start, h->tab + (size_t)lo * 24 + 8, 8);
+        memcpy(&cnt, h->tab + (size_t)lo * 24 + 16, 4);
+        for (int64_t s = 0; s < cnt; s++) {
+          int32_t t = h->ids[start + s];
+          const double *tv = h->tris + 9 * (int64_t)t;
+          double p3[3][3], tt;
+          (*tested)++;
+          for (int q = 0; q < 9; q++)
+            ((double *)p3)[q] = tv[q];
+          tt = pg_ray_tri(org, rd, p3);
+          if (tt >= 0.0 && (tbest < 0.0 || tt < tbest)) {
+            tbest = tt;
+            best = t; /* исходный tri — kd/ks/pg_ray_tri согласованы */
+          }
+        }
+      }
+    }
+    double tn = tnext[0];
+    if (tnext[1] < tn) tn = tnext[1];
+    if (tnext[2] < tn) tn = tnext[2];
+    if (tn > thi || (tbest >= 0.0 && tn > tbest)) break;
+    if (tnext[0] <= tnext[1] && tnext[0] <= tnext[2]) {
+      tcur = tnext[0];
+      tnext[0] += tdelta[0];
+      cellv[0] += stepv[0];
+    } else if (tnext[1] <= tnext[2]) {
+      tcur = tnext[1];
+      tnext[1] += tdelta[1];
+      cellv[1] += stepv[1];
+    } else {
+      tcur = tnext[2];
+      tnext[2] += tdelta[2];
+      cellv[2] += stepv[2];
+    }
+    if (cellv[0] < 0 || cellv[1] < 0 || cellv[2] < 0 || cellv[0] >= h->nx || cellv[1] >= h->ny ||
+        cellv[2] >= h->nz)
+      break;
+  }
+  return best;
+}
+
 int main(int argc, char **argv) {
   const char *path = NULL, *outfile = "img/pgather.ppm";
   /* §875: дефолты потребителя — ПРОДАКШН-МОДЕЛЬ (дихотомия ks §873/874,
@@ -352,7 +520,8 @@ int main(int argc, char **argv) {
   int W = 320, H = 240, k27 = 0;
   int frames = 1, have_eye2 = 0; /* §877: ходьба */
   double eye2[3] = {0, 0, 0}, look2[3] = {0, 0, 0};
-  int have_delbox = 0; /* §879: разрушаемость-прототип */
+  int have_delbox = 0;        /* §879: разрушаемость-прототип */
+  const char *blkfile = NULL; /* §882: HBLK v1, mmap-сбор */
   double delbox[6];
   hz_objmesh m;
   hz_pyr py;
@@ -406,6 +575,8 @@ int main(int argc, char **argv) {
       gather = atoi(argv[i] + 7);
     else if (strncmp(argv[i], "k27=", 4) == 0)
       k27 = atoi(argv[i] + 4);
+    else if (strncmp(argv[i], "blk=", 4) == 0)
+      blkfile = argv[i] + 4; /* §882 */
     else if (strncmp(argv[i], "delbox=", 7) == 0) {
       if (sscanf(argv[i] + 7, "%lf,%lf,%lf:%lf,%lf,%lf", &delbox[0], &delbox[1], &delbox[2],
                  &delbox[3], &delbox[4], &delbox[5]) == 6)
@@ -451,6 +622,98 @@ int main(int argc, char **argv) {
   }
   t1 = now_sec();
   printf("СТАТЬЯ obj-загрузка: %.2f с (nt=%d, mtl=%d)\n", t1 - t0, m.nt, m.nmtl);
+
+  if (blkfile) {
+    /* --- §882 v1: mmap-сбор, самодостаточный (без пирамиды/свипа).
+     * E≡0 (слот E в файле — v2): кадр = силуэт (le на попаданиях). */
+    pg_hblk hb;
+    struct rusage ra, rb;
+    if (pg_hblk_open(&hb, blkfile) != 0) {
+      fprintf(stderr, "pgather: HBLK не читается: %s\n", blkfile);
+      return 2;
+    }
+    printf("HBLK: nt=%lld, сетка %lldx%lldx%lld, cell=%.4g, занятых клеток %lld\n",
+           (long long)hb.nt, (long long)hb.nx, (long long)hb.ny, (long long)hb.nz, hb.cell,
+           (long long)hb.nocc);
+    getrusage(RUSAGE_SELF, &ra);
+    {
+      double fwd[3], right[3], up[3], tmpv[3] = {0, 0, 1};
+      double tanf = tan(fov * M_PI / 360.0);
+      int64_t nhit2 = 0, tested2 = 0;
+      double tA = now_sec(), tB;
+      for (ax = 0; ax < 3; ax++)
+        fwd[ax] = look[ax] - eye[ax];
+      {
+        double nn = sqrt(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
+        if (nn < 1e-12) {
+          fprintf(stderr, "pgather: глаз совпадает с точкой взгляда\n");
+          return 2;
+        }
+        for (ax = 0; ax < 3; ax++)
+          fwd[ax] /= nn;
+      }
+      for (ax = 0; ax < 3; ax++)
+        right[ax] = fwd[(ax + 1) % 3] * tmpv[(ax + 2) % 3] - fwd[(ax + 2) % 3] * tmpv[(ax + 1) % 3];
+      {
+        double nn = sqrt(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
+        if (nn < 1e-9) {
+          tmpv[0] = 1;
+          tmpv[1] = tmpv[2] = 0;
+          for (ax = 0; ax < 3; ax++)
+            right[ax] =
+                fwd[(ax + 1) % 3] * tmpv[(ax + 2) % 3] - fwd[(ax + 2) % 3] * tmpv[(ax + 1) % 3];
+          nn = sqrt(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
+        }
+        for (ax = 0; ax < 3; ax++)
+          right[ax] /= nn;
+      }
+      for (ax = 0; ax < 3; ax++)
+        up[ax] = fwd[(ax + 1) % 3] * right[(ax + 2) % 3] - fwd[(ax + 2) % 3] * right[(ax + 1) % 3];
+      lum = (double *)malloc((size_t)W * (size_t)H * sizeof *lum);
+      if (!lum) return 2;
+      for (int iy = 0; iy < H; iy++)
+        for (int ix = 0; ix < W; ix++) {
+          double sx = (2.0 * (ix + 0.5) / W - 1.0) * tanf;
+          double sy = (1.0 - 2.0 * (iy + 0.5) / H) * tanf * (double)H / (double)W;
+          double rd[3] = {0, 0, 0}, nn;
+          int32_t hit;
+          for (ax = 0; ax < 3; ax++)
+            rd[ax] = fwd[ax] + sx * right[ax] + sy * up[ax];
+          nn = sqrt(rd[0] * rd[0] + rd[1] * rd[1] + rd[2] * rd[2]);
+          for (ax = 0; ax < 3; ax++)
+            rd[ax] /= nn;
+          hit = pg_hblk_nearest(&hb, eye, rd, &tested2);
+          if (hit >= 0) nhit2++;
+          lum[(size_t)iy * (size_t)W + (size_t)ix] = hit >= 0 ? le : 0.0;
+        }
+      tB = now_sec();
+      getrusage(RUSAGE_SELF, &rb);
+      printf("HBLK СБОР: лучей %d, попало %" PRId64 " (%.2f %%), кусков/луч %.1f, %.2f с\n", W * H,
+             nhit2, 100.0 * (double)nhit2 / ((double)W * (double)H),
+             (double)tested2 / ((double)W * (double)H), tB - tA);
+      printf("HBLK RSS: max %.1f МБ; фолты минорные %ld, мажорные %ld (за сбор)\n",
+             rb.ru_maxrss / 1024.0, rb.ru_minflt - ra.ru_minflt, rb.ru_majflt - ra.ru_majflt);
+      {
+        char fname[4096];
+        FILE *f;
+        snprintf(fname, sizeof fname, "%s", outfile);
+        f = fopen(fname, "wb");
+        if (!f) return 2;
+        fprintf(f, "P6\n%d %d\n255\n", W, H);
+        for (i = 0; i < W * H; i++) {
+          unsigned char b[3];
+          b[0] = b[1] = b[2] = (unsigned char)(lum[i] > 0 ? 255 : 0);
+          fwrite(b, 1, 3, f);
+        }
+        fclose(f);
+        printf("КАДР: %s записан (HBLK v1, силуэт)\n", fname);
+      }
+      free(lum);
+    }
+    pg_hblk_close(&hb);
+    hz_obj_free(&m);
+    return 0;
+  }
 
   area = (double *)malloc((size_t)m.nt * sizeof *area);
   nrm = (double *)malloc((size_t)m.nt * 3 * sizeof *nrm);

@@ -21,6 +21,9 @@
  *   eye=X,Y,Z look=X,Y,Z fov=F W=N H=N — камера (fov в градусах, по
  *   горизонтали); out=ФАЙЛ — вывод (умолчание img/pgather.ppm, PPM P6);
  *   k27=N — К27-приёмка: N×N контрольных лучей через диск касания шаров.
+ *   useke — §874/А1576: эмиссия материалов Ke попадает в свип и кадр;
+ *   ksf=F — §874: дихотомия T4 (зеркало): F·ср.ks3 в свип (хоп walk) и
+ *           зеркальные вторичные лучи камеры (глубина ≤ 4); 0 — прежний мир.
  *
  * КАРТИНКИ ПИШУТСЯ В img/, А НЕ В build/ (правило проекта).
  */
@@ -39,6 +42,13 @@
 #define PG_FOV_MAX 170.0 /* выше — кадр шире полусферы, проекция вырождается */
 #define PG_WH_MAX 4096   /* потолок кадра: перебор nt на луч, больше не нужно */
 #define PG_K27_RAYS 64   /* контрольных лучей на сторону диска касания */
+/* §874: глубина зеркальной рекурсии камеры = HZ_MIRROR_BOUNCE_MAX из walk
+ * (sweep.c, §873 шаг 2): 0.95^4 < 0.82 — глубже камера не видит того,
+ * чего нет в поле. */
+#define PG_MIRROR_BOUNCE_MAX 4
+/* §874/А1582: сдвиг начала вторичного луча вдоль R против самопересечения,
+ * в долях габарита сцены (меньше толщины стен синтетики) */
+#define PG_HOP_EPS_REL 1e-6
 
 static double now_sec(void) {
   struct timespec ts;
@@ -171,7 +181,8 @@ static int pg_bbox_csr_build(const hz_pyr *py, const double *cmin, const double 
  * тай-брейк по порядку осей А1546). Приборы — steps/tested.
  * Возврат куска или -1. */
 static int32_t pg_dda(const hz_pyr *py, const pg_bbox_csr *csr, const hz_objmesh *m,
-                      const double eye[3], const double rd[3], int64_t *steps, int64_t *tested) {
+                      const double eye[3], const double rd[3], int64_t *steps, int64_t *tested,
+                      double *thit) {
   double tlo = 0.0, thi = 1e30, tcur, tbest = -1.0;
   int64_t cell[3], stepv[3];
   double tnext[3], tdelta[3];
@@ -255,20 +266,94 @@ static int32_t pg_dda(const hz_pyr *py, const pg_bbox_csr *csr, const hz_objmesh
         cell[2] >= py->nz)
       break; /* страховка выхода из сетки */
   }
+  if (thit) *thit = tbest; /* §874: параметр удара — вторичный луч (А1585) */
   return best;
+}
+
+/* §874/А1585: общий сборщик ближайшего попадания — базовый и вторичный лучи
+ * ходят ОДНИМ кодом (gather=0 — DDA по пирамиде, gather=1 — перебор).
+ * Возврат куска или -1; thit — параметр удара. */
+static int32_t pg_nearest(const hz_pyr *py, const pg_bbox_csr *csr, const hz_objmesh *m,
+                          const double org[3], const double rd[3], int gather_mode, double *thit,
+                          int64_t *steps, int64_t *tested) {
+  if (gather_mode == 0) return pg_dda(py, csr, m, org, rd, steps, tested, thit);
+  {
+    int32_t i, best = -1;
+    double tbest = -1.0;
+    for (i = 0; i < m->nt; i++) {
+      double p3[3][3], tt;
+      hz_obj_tri(m, py->pcs[i].tri, p3);
+      tt = pg_ray_tri(org, rd, p3);
+      if (tt >= 0.0 && (tbest < 0.0 || tt < tbest)) {
+        tbest = tt;
+        best = i;
+      }
+    }
+    *thit = tbest;
+    return best;
+  }
+}
+
+/* §874: яркость по лучу С отражениями (дихотомия T4).
+ * L_cam(p,d) = le + kdvis·E_p/2π + ks_eff·L_cam(отражённый, d+1),
+ * ks_eff = min(ks[p], 1−kdvis) — тот же клэмп, что в депозите walk
+ * (§873; А1580: kdvis по ovr-семантике, как front_rho). */
+typedef struct {
+  const hz_pyr *py;
+  const pg_bbox_csr *csr;
+  const hz_objmesh *m;
+  const double *kd;  /* переставлен, индекс по куску */
+  const double *lep; /* NULL — нет per-piece эмиссии */
+  const double *ks;  /* NULL — дихотомия выключена (ksf=0) */
+  const double *nrm;
+  double le, rho;
+  int gather;
+  double hop_eps;
+  int64_t *steps, *tested;
+  int64_t *nsec; /* зеркальных вторичных лучей (прибор) */
+} pg_cam;
+
+static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[3], int32_t p,
+                          double thit, int depth) {
+  double kdvis = c->rho < 0 ? c->kd[p] : c->rho;
+  double L = c->le + (c->lep ? c->lep[p] : 0.0) + kdvis * (double)c->py->pcs[p].e / (2.0 * M_PI);
+  if (c->ks && depth < PG_MIRROR_BOUNCE_MAX) {
+    double kse = c->ks[p];
+    if (kse > 1.0 - kdvis) kse = 1.0 - kdvis > 0.0 ? 1.0 - kdvis : 0.0;
+    if (kse > 0.0) {
+      const double *nv = c->nrm + 3 * (int64_t)p;
+      double dot = rd[0] * nv[0] + rd[1] * nv[1] + rd[2] * nv[2];
+      double rorg[3], rr[3], sth = -1.0;
+      int32_t q;
+      int ax;
+      /* отражение не зависит от ориентации нормали: R = rd − 2(rd·n̂)n̂ */
+      for (ax = 0; ax < 3; ax++)
+        rr[ax] = rd[ax] - 2.0 * dot * nv[ax];
+      for (ax = 0; ax < 3; ax++)
+        rorg[ax] = org[ax] + rd[ax] * thit + rr[ax] * c->hop_eps;
+      q = pg_nearest(c->py, c->csr, c->m, rorg, rr, c->gather, &sth, c->steps, c->tested);
+      (*c->nsec)++;
+      if (q >= 0) L += kse * pg_lcam_hit(c, rorg, rr, q, sth, depth + 1);
+    }
+  }
+  return L;
 }
 
 int main(int argc, char **argv) {
   const char *path = NULL, *outfile = "img/pgather.ppm";
-  double scale = 1.0, le = 1.0, rho = -1.0, fov = 60.0;
+  double scale = 1.0, le = 1.0, rho = -1.0, fov = 60.0, ksf = 0.0;
+  int useke = 0; /* А1576: эмиссия материалов Ke (нужна фальсификаторам §874) */
   double eye[3] = {0, 0, 0}, look[3] = {0, 0, 0};
   int iters = 30, lev = 6, tau0 = 0, noprop = 0, ndirs = 26, mort = 1, i, ax;
+  double *lep = NULL; /* §874: per-piece эмиссия (ср. Ke); NULL — прежний мир */
   int W = 320, H = 240, k27 = 0;
   hz_objmesh m;
   hz_pyr py;
   hz_sw_opts so;
   hz_sw_stat st;
   double *area = NULL, *nrm = NULL, *kd = NULL, *cent = NULL, *cmin = NULL, *cmax = NULL;
+  double *ks = NULL; /* §874: per-piece зеркальная доля (ksf · ср. ks3); NULL-семантика в so */
+  double maxdim = 0.0;
   int32_t *mtl = NULL;
   double cell, t0, t1, sw_time;
   double *lum = NULL;
@@ -277,7 +362,7 @@ int main(int argc, char **argv) {
   uint8_t *g_lparr = NULL;
   int gather = 0; /* §849: 0 — DDA (умолчание), 1 — brute (путь верификации) */
   pg_bbox_csr csr;
-  int64_t dda_steps = 0, dda_tested = 0;
+  int64_t dda_steps = 0, dda_tested = 0, sec_rays = 0;
 
   for (i = 1; i < argc; i++) {
     if (strncmp(argv[i], "lev=", 4) == 0)
@@ -304,6 +389,10 @@ int main(int argc, char **argv) {
       W = atoi(argv[i] + 2);
     else if (strncmp(argv[i], "H=", 2) == 0)
       H = atoi(argv[i] + 2);
+    else if (strcmp(argv[i], "useke") == 0)
+      useke = 1; /* А1576/§874 */
+    else if (strncmp(argv[i], "ksf=", 4) == 0)
+      ksf = atof(argv[i] + 4); /* §874: дихотомия T4 в pgather */
     else if (strncmp(argv[i], "gather=", 7) == 0)
       gather = atoi(argv[i] + 7);
     else if (strncmp(argv[i], "k27=", 4) == 0)
@@ -335,11 +424,13 @@ int main(int argc, char **argv) {
   area = (double *)malloc((size_t)m.nt * sizeof *area);
   nrm = (double *)malloc((size_t)m.nt * 3 * sizeof *nrm);
   kd = (double *)malloc((size_t)m.nt * sizeof *kd);
+  ks = (double *)malloc((size_t)m.nt * sizeof *ks); /* §874 */
+  if (useke) lep = (double *)malloc((size_t)m.nt * sizeof *lep);
   cent = (double *)malloc((size_t)m.nt * 3 * sizeof *cent);
   cmin = (double *)malloc((size_t)m.nt * 3 * sizeof *cmin);
   cmax = (double *)malloc((size_t)m.nt * 3 * sizeof *cmax);
   mtl = (int32_t *)malloc((size_t)m.nt * sizeof *mtl);
-  if (!area || !nrm || !kd || !cent || !cmin || !cmax || !mtl) {
+  if (!area || !nrm || !kd || !ks || (useke && !lep) || !cent || !cmin || !cmax || !mtl) {
     fprintf(stderr, "pgather: нет памяти\n");
     return 2;
   }
@@ -372,11 +463,16 @@ int main(int argc, char **argv) {
       for (ax = 0; ax < 3; ax++)
         nrm[3 * (int64_t)i + ax] /= nn;
     kd[i] = m.mtl[m.fm[i]].kd;
+    /* §874: ks — ksf · среднее ks3 (прецедент усреднения kd, §873 шаг 1);
+     * заполнение в порядке ИСХОДНЫХ треугольников ДО hz_pyr_build —
+     * перестановка выровняет ks со слотами кусков (урок §873-Ф-а) */
+    ks[i] = ksf * ((m.mtl[m.fm[i]].ks3[0] + m.mtl[m.fm[i]].ks3[1] + m.mtl[m.fm[i]].ks3[2]) / 3.0);
+    if (lep) /* §874: front_le = le + lep[p] — в lep только ср. Ke (без le) */
+      lep[i] = (m.mtl[m.fm[i]].ke3[0] + m.mtl[m.fm[i]].ke3[1] + m.mtl[m.fm[i]].ke3[2]) / 3.0;
     mtl[i] = m.fm[i];
   }
 
   {
-    double maxdim = 0.0;
     for (ax = 0; ax < 3; ax++) {
       double s = m.hi[ax] - m.lo[ax];
       if (s > maxdim) maxdim = s;
@@ -420,9 +516,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "pgather: пирамида не построилась\n");
     return 2;
   }
-  if (mort && (hz_pyr_morton(&py) != 0 || hz_pyr_permute(&py, area, sizeof *area) != 0 ||
-               hz_pyr_permute(&py, nrm, 3 * sizeof *nrm) != 0 ||
-               hz_pyr_permute(&py, kd, sizeof *kd) != 0)) {
+  if (mort &&
+      (hz_pyr_morton(&py) != 0 || hz_pyr_permute(&py, area, sizeof *area) != 0 ||
+       hz_pyr_permute(&py, nrm, 3 * sizeof *nrm) != 0 || hz_pyr_permute(&py, kd, sizeof *kd) != 0 ||
+       hz_pyr_permute(&py, ks, sizeof *ks) != 0 ||
+       (lep && hz_pyr_permute(&py, lep, sizeof *lep) != 0))) { /* §874/А1581 */
     fprintf(stderr, "pgather: Morton не прошёл\n");
     return 2;
   }
@@ -449,7 +547,9 @@ int main(int argc, char **argv) {
   so.mode = 3; /* §867: фронт с точным пересечением (был mode=2) */
   so.build = 1;
   so.vc = 1;
-  so.walk = 1; /* §867: продакшн-модель А1576/§861 — дефолт потребителя */
+  so.walk = 1;                   /* §867: продакшн-модель А1576/§861 — дефолт потребителя */
+  so.ks = ksf > 0.0 ? ks : NULL; /* §874: ksf=0 — прежний мир (битово, П1) */
+  so.lep = lep;                  /* §874: NULL при useke=0 — побитово прежний мир */
   so.trivert = g_tv9;
   so.tribox = g_tb6;
   so.lp = g_lparr;
@@ -621,12 +721,28 @@ int main(int argc, char **argv) {
     up[2] = fwd[0] * right[1] - fwd[1] * right[0];
 
     t0 = now_sec();
+    pg_cam cam;
+    memset(&cam, 0, sizeof cam);
+    cam.py = &py;
+    cam.csr = &csr;
+    cam.m = &m;
+    cam.kd = kd;
+    cam.lep = lep;
+    cam.ks = ksf > 0.0 ? ks : NULL; /* §874: ksf=0 — рекурсии не рождаются (А1584) */
+    cam.nrm = nrm;
+    cam.le = le;
+    cam.rho = rho;
+    cam.gather = gather;
+    cam.hop_eps = PG_HOP_EPS_REL * maxdim; /* §874/А1582 */
+    cam.steps = &dda_steps;
+    cam.tested = &dda_tested;
+    cam.nsec = &sec_rays;
     for (int iy = 0; iy < H; iy++)
       for (int ix = 0; ix < W; ix++) {
         double sx = (2.0 * (ix + 0.5) / W - 1.0) * tanf;
         double sy = (1.0 - 2.0 * (iy + 0.5) / H) * tanf * (double)H / (double)W;
-        double rd[3], tbest = -1.0;
-        int pbest = -1;
+        double rd[3], thit = -1.0, L = 0.0;
+        int32_t pbest;
         for (ax = 0; ax < 3; ax++)
           rd[ax] = fwd[ax] + sx * right[ax] + sy * up[ax];
         {
@@ -634,35 +750,15 @@ int main(int argc, char **argv) {
           for (ax = 0; ax < 3; ax++)
             rd[ax] /= nn;
         }
-        if (gather == 0) { /* §849: марш по пирамиде */
-          int64_t st1 = 0, te1 = 0;
-          pbest = pg_dda(&py, &csr, &m, eye, rd, &st1, &te1);
-          dda_steps += st1;
-          dda_tested += te1;
-        } else {
-          for (i = 0; i < m.nt; i++) {
-            double p3[3][3], tt;
-            hz_obj_tri(&m, py.pcs[i].tri, p3);
-            tt = pg_ray_tri(eye, rd, p3);
-            if (tt >= 0.0 && (tbest < 0.0 || tt < tbest)) {
-              tbest = tt;
-              pbest = i;
-            }
-          }
+        /* §874/А1585: базовый и вторичный лучи — одним сборщиком */
+        pbest = pg_nearest(&py, &csr, &m, eye, rd, gather, &thit, &dda_steps, &dda_tested);
+        if (pbest >= 0) {
+          L = pg_lcam_hit(&cam, eye, rd, pbest, thit, 0);
+          nhit++;
+          lsum += L;
+          if (L > lmax) lmax = L;
         }
-        {
-          double L = 0.0;
-          if (pbest >= 0) {
-            int q = py.pcs[pbest].tri; /* яркость — по ИСХОДНОМУ индексу для отчёта,
-                                          поле — у куска pbest */
-            (void)q;
-            L = le + (rho < 0 ? kd[pbest] : rho) * (double)py.pcs[pbest].e / (2.0 * M_PI);
-            nhit++;
-            lsum += L;
-            if (L > lmax) lmax = L;
-          }
-          lum[(size_t)iy * (size_t)W + (size_t)ix] = L;
-        }
+        lum[(size_t)iy * (size_t)W + (size_t)ix] = L;
       }
     t1 = now_sec();
     if (gather == 0)
@@ -673,6 +769,8 @@ int main(int argc, char **argv) {
     printf("СБОР: лучей %d, попало %" PRId64 " (%.2f %%), средняя яркость %.4f, max %.4f, %.2f с\n",
            W * H, nhit, 100.0 * (double)nhit / ((double)W * (double)H),
            lsum / (nhit ? (double)nhit : 1.0), lmax, t1 - t0);
+    printf("§874: вторичных зеркальных лучей %" PRId64 " (ksf=%.3g)\n", cam.nsec ? *cam.nsec : 0,
+           ksf);
     {
       double rr = rho < 0 ? 0.5 : rho;
       double Lpred = le + rr * st.e_avg / (2.0 * M_PI);
@@ -701,10 +799,16 @@ int main(int argc, char **argv) {
   }
 
   free(lum);
+  free(g_tv9); /* §874: утечка trivert/tribox/lp (предсуществующая с §867,
+                * поймана ASAN при прогоне §874) */
+  free(g_tb6);
+  free(g_lparr);
   if (gather == 0) pg_bbox_csr_free(&csr);
   free(area);
   free(nrm);
   free(kd);
+  free(ks);
+  free(lep);
   free(cent);
   free(cmin);
   free(cmax);

@@ -11,7 +11,7 @@ mtl="${out%.obj}.mtl"
 cat > "$mtl" <<EOF
 newmtl emit
 Kd 0.000000
-Ke 1.000000
+Ke 1.000000 1.000000 1.000000
 Ks 0.000000 0.000000 0.000000
 newmtl mir
 Kd 0.000000

@@ -154,7 +154,7 @@ static int ref_bbox_csr_build(const hz_pyr *py, const double *cmin, const double
 
 /* ближайший кусок вдоль луча; возврат куска или -1 */
 static int32_t ref_trace(const hz_pyr *py, const ref_bbox_csr *csr, const hz_objmesh *m,
-                         const double o[3], const double d[3]) {
+                         const double o[3], const double d[3], double *thit) {
   double tlo = 0.0, thi = 1e30, tcur, tbest = -1.0;
   int64_t cell[3], stepv[3];
   double tnext[3], tdelta[3];
@@ -232,6 +232,7 @@ static int32_t ref_trace(const hz_pyr *py, const ref_bbox_csr *csr, const hz_obj
         cell[2] >= py->nz)
       break;
   }
+  if (thit) *thit = tbest; /* §880/А1610 */
   return best;
 }
 
@@ -244,9 +245,49 @@ static double ref_urand(void) {
   return (double)(ref_rng >> 11) * (1.0 / 9007199254740992.0);
 }
 
+/* --- §880: зеркальная рекурсия яркости эталона (та же, что камера §874):
+ * L_hit = Lout[q] + ks_eff·L_hit(R(ω), depth+1). Lout[q] = le + rr·E_q/2π —
+ * Жакоби предыдущей итерации (А1611). Клэмп ks_eff ≤ 1−rr (А1612: pref-rr —
+ * глобальная диффузная доля; при rho<0 эталон и свип расходятся в kd/0.5 —
+ * ПРЕДСУЩЕСТВУЮЩЕЕ расхождение эталона, не этого шага). Промах = фон 0. */
+#define REF_MIRROR_BOUNCE_MAX 4 /* = HZ-глубине свипа */
+#define REF_HOP_EPS 1e-5        /* тот же абсолютный сдвиг, что старт луча */
+typedef struct {
+  const hz_pyr *py;
+  const ref_bbox_csr *csr;
+  const hz_objmesh *m;
+  const double *ks, *nrm, *Lout, *kd;
+  double rr;   /* ovr-доля; при rho<0 кусочный kd берётся из c->kd */
+  int kd_mode; /* 1 — kdvis по куску (А1616), 0 — глобальный rr */
+} ref_ctx;
+
+static double ref_lhit(const ref_ctx *c, const double org[3], const double om[3], int depth) {
+  double thit = -1.0;
+  int32_t q = ref_trace(c->py, c->csr, c->m, org, om, &thit);
+  if (q < 0) return 0.0; /* фон (§842) */
+  {
+    double L = c->Lout[q];
+    double kdvis = c->kd_mode ? c->kd[q] : c->rr; /* А1616 */
+    double kse = c->ks[q];
+    if (kse > 1.0 - kdvis) kse = 1.0 - kdvis > 0.0 ? 1.0 - kdvis : 0.0;
+    if (kse > 0.0 && depth < REF_MIRROR_BOUNCE_MAX) {
+      const double *nv = c->nrm + 3 * (int64_t)q;
+      double dot = om[0] * nv[0] + om[1] * nv[1] + om[2] * nv[2];
+      double rorg[3], rr2[3];
+      int ax;
+      for (ax = 0; ax < 3; ax++)
+        rr2[ax] = om[ax] - 2.0 * dot * nv[ax];
+      for (ax = 0; ax < 3; ax++)
+        rorg[ax] = org[ax] + om[ax] * thit + rr2[ax] * REF_HOP_EPS;
+      L += kse * ref_lhit(c, rorg, rr2, depth + 1);
+    }
+    return L;
+  }
+}
+
 int main(int argc, char **argv) {
   const char *path = NULL;
-  double scale = 1.0, le = 1.0, rho = -1.0;
+  double scale = 1.0, le = 1.0, rho = -1.0, ksf = 0.0;
   int iters = 30, lev = 6, mort = 1, i, ax;
   int K = PREF_K_DEFAULT;
   hz_objmesh m;
@@ -255,7 +296,7 @@ int main(int argc, char **argv) {
   hz_sw_stat st;
   double *area = NULL, *nrm = NULL, *kd = NULL, *cent = NULL, *cmin = NULL, *cmax = NULL;
   int32_t *mtl = NULL;
-  double cell, *Eref = NULL, *Lout = NULL;
+  double cell, *Eref = NULL, *Lout = NULL, *ks = NULL; /* §880 */
   ref_bbox_csr csr;
 
   for (i = 1; i < argc; i++) {
@@ -267,6 +308,8 @@ int main(int argc, char **argv) {
       le = atof(argv[i] + 3);
     else if (strncmp(argv[i], "it=", 3) == 0)
       iters = atoi(argv[i] + 3);
+    else if (strncmp(argv[i], "ksf=", 4) == 0)
+      ksf = atof(argv[i] + 4); /* §880: зеркальный MC-эталон */
     else if (strncmp(argv[i], "K=", 2) == 0)
       K = atoi(argv[i] + 2);
     else if (strncmp(argv[i], "mort=", 5) == 0)
@@ -293,7 +336,8 @@ int main(int argc, char **argv) {
   mtl = (int32_t *)malloc((size_t)m.nt * sizeof *mtl);
   Eref = (double *)malloc((size_t)m.nt * sizeof *Eref);
   Lout = (double *)malloc((size_t)m.nt * sizeof *Lout);
-  if (!area || !nrm || !kd || !cent || !cmin || !cmax || !mtl || !Eref || !Lout) {
+  ks = (double *)malloc((size_t)m.nt * sizeof *ks);
+  if (!area || !nrm || !kd || !ks || !cent || !cmin || !cmax || !mtl || !Eref || !Lout) {
     fprintf(stderr, "pref: нет памяти\n");
     return 2;
   }
@@ -326,6 +370,7 @@ int main(int argc, char **argv) {
       for (ax = 0; ax < 3; ax++)
         nrm[3 * (int64_t)i + ax] /= nn;
     kd[i] = m.mtl[m.fm[i]].kd;
+    ks[i] = ksf * ((m.mtl[m.fm[i]].ks3[0] + m.mtl[m.fm[i]].ks3[1] + m.mtl[m.fm[i]].ks3[2]) / 3.0);
     mtl[i] = m.fm[i];
   }
   {
@@ -341,9 +386,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "pref: пирамида не построилась\n");
     return 2;
   }
-  if (mort && (hz_pyr_morton(&py) != 0 || hz_pyr_permute(&py, area, sizeof *area) != 0 ||
-               hz_pyr_permute(&py, nrm, 3 * sizeof *nrm) != 0 ||
-               hz_pyr_permute(&py, kd, sizeof *kd) != 0)) {
+  if (mort &&
+      (hz_pyr_morton(&py) != 0 || hz_pyr_permute(&py, area, sizeof *area) != 0 ||
+       hz_pyr_permute(&py, nrm, 3 * sizeof *nrm) != 0 || hz_pyr_permute(&py, kd, sizeof *kd) != 0 ||
+       hz_pyr_permute(&py, ks, sizeof *ks) != 0)) { /* §880/А1613 */
     fprintf(stderr, "pref: Morton не прошёл\n");
     return 2;
   }
@@ -355,7 +401,7 @@ int main(int argc, char **argv) {
   double eavg_ref = 0.0; /* §850: живёт до СВЕРКИ */
   /* --- ЭТАЛОН: итерации Жакоби со случайными направлениями --- */
   {
-    double rr = rho < 0 ? 0.5 : rho;
+    double rr = rho < 0 ? 0.5 : rho; /* ovr-доля (используется при rho>=0) */
     double t0 = now_sec(), t1;
     double factor = 1.0, eprev = 0.0;
     int64_t miss_in = 0, miss_out = 0;
@@ -387,6 +433,13 @@ int main(int argc, char **argv) {
         org[0] = cent[3 * (int64_t)i];
         org[1] = cent[3 * (int64_t)i + 1];
         org[2] = cent[3 * (int64_t)i + 2];
+        /* §880: диффузная доля приёмника — депозит свипа = (1−ks_eff)·L·cos;
+         * при ksf=0 множитель 1 — прежний мир (П1) */
+        double kse_i = 0.0, kdvis_i = rho < 0 ? kd[i] : rr; /* А1616 */
+        if (ksf > 0.0) {
+          kse_i = ks[i];
+          if (kse_i > 1.0 - kdvis_i) kse_i = 1.0 - kdvis_i > 0.0 ? 1.0 - kdvis_i : 0.0;
+        }
         for (k = 0; k < K; k++) {
           double phi = 2.0 * M_PI * ref_urand();
           double mu = ref_urand(), sq = sqrt(1.0 - mu * mu);
@@ -397,13 +450,26 @@ int main(int argc, char **argv) {
           om[0] = side * (mu * nrm[3 * (int64_t)i] + s1 * u2[0] + c1 * w2[0]);
           om[1] = side * (mu * nrm[3 * (int64_t)i + 1] + s1 * u2[1] + c1 * w2[1]);
           om[2] = side * (mu * nrm[3 * (int64_t)i + 2] + s1 * u2[2] + c1 * w2[2]);
-          {
-            double o2[3] = {org[0] + 1e-5 * om[0], org[1] + 1e-5 * om[1], org[2] + 1e-5 * om[2]};
-            hit = ref_trace(&py, &csr, &m, o2, om);
-          }
-          if (hit >= 0)
-            acc += mu * Lout[hit]; /* |cos|·L; вес 4π/K — K на ОБЕ полусферы */
-          else if (side > 0)
+          double o2[3] = {org[0] + 1e-5 * om[0], org[1] + 1e-5 * om[1], org[2] + 1e-5 * om[2]};
+          hit = ref_trace(&py, &csr, &m, o2, om, NULL);
+          if (hit >= 0) {
+            if (ksf > 0.0) { /* §880: зеркальная рекурсия; старт от офсетной
+                              * точки o2 — из центроида луч попал бы в свой же
+                              * треугольник и был бы срезан t<1e-9 */
+              ref_ctx c;
+              c.py = &py;
+              c.csr = &csr;
+              c.m = &m;
+              c.ks = ks;
+              c.nrm = nrm;
+              c.Lout = Lout;
+              c.kd = kd;
+              c.rr = rr;
+              c.kd_mode = rho < 0;
+              acc += (1.0 - kse_i) * mu * ref_lhit(&c, o2, om, 0);
+            } else
+              acc += mu * Lout[hit]; /* |cos|·L; вес 4π/K — K на ОБЕ полусферы */
+          } else if (side > 0)
             miss_in++;
           else
             miss_out++;
@@ -421,7 +487,7 @@ int main(int argc, char **argv) {
         eprev = emean;
         eavg_ref = emean;
         for (i = 0; i < m.nt; i++)
-          Lout[i] = le + rr * Eref[i] / (2.0 * M_PI);
+          Lout[i] = le + (rho < 0 ? kd[i] : rr) * Eref[i] / (2.0 * M_PI); /* А1616 */
       }
       t1 = now_sec();
       printf("ЭТАЛОН it=%d: E_avg=%.4f (фактор %.2e, %.1f с)\n", it, eavg_ref, factor, t1 - t0);
@@ -445,9 +511,10 @@ int main(int argc, char **argv) {
   so.mode = 3;
   so.build = 1;
   so.vc = 1;
-  so.walk = 1; /* §867: продакшн-модель А1576/§861 (точные многопопадные
-                * пересечения) — дефолт потребителя; фантомная самозасветка
-                * старой схемы снята (§865) */
+  so.walk = 1;                   /* §867: продакшн-модель А1576/§861 (точные многопопадные
+                                  * пересечения) — дефолт потребителя; фантомная самозасветка
+                                  * старой схемы снята (§865) */
+  so.ks = ksf > 0.0 ? ks : NULL; /* §880: дихотомия в свипе — та же, что у эталона */
   {
     /* §852: trivert/tribox в порядке ИСХОДНЫХ треугольников (pcs[].tri) */
     double *tv9 = (double *)malloc((size_t)m.nt * 9 * sizeof *tv9);

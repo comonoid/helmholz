@@ -421,10 +421,13 @@ int main(int argc, char **argv) {
                     "[eye=X,Y,Z look=X,Y,Z fov=F W=N H=N] [k27=N] [out=ФАЙЛ]\n");
     return 2;
   }
+  t0 = now_sec();
   if (hz_obj_load(&m, path, scale) != 0) {
     fprintf(stderr, "pgather: не читается %s\n", path);
     return 2;
   }
+  t1 = now_sec();
+  printf("СТАТЬЯ obj-загрузка: %.2f с (nt=%d, mtl=%d)\n", t1 - t0, m.nt, m.nmtl);
 
   area = (double *)malloc((size_t)m.nt * sizeof *area);
   nrm = (double *)malloc((size_t)m.nt * 3 * sizeof *nrm);
@@ -481,6 +484,9 @@ int main(int argc, char **argv) {
     mtl[i] = m.fm[i];
   }
 
+  t1 = now_sec();
+  printf("СТАТЬЯ подготовка (area/nrm/kd/ks/lep/trivert): %.2f с\n", t1 - t0);
+  t0 = now_sec();
   {
     for (ax = 0; ax < 3; ax++) {
       double s = m.hi[ax] - m.lo[ax];
@@ -541,11 +547,16 @@ int main(int argc, char **argv) {
       return 2;
     }
   }
+  t1 = now_sec();
+  printf("СТАТЬЯ пирамида+Morton+lp: %.2f с (листьев %d)\n", t1 - t0, py.nleaf);
+  t0 = now_sec();
   /* --- СВИП: поле E на кусках (фронт mode=3 + walk, §867) --- */
   if (gather == 0 && pg_bbox_csr_build(&py, cmin, cmax, &csr) != 0) {
     fprintf(stderr, "pgather: bbox-CSR не построился\n");
     return 2;
   }
+  t1 = now_sec();
+  if (gather == 0) printf("СТАТЬЯ bbox-CSR: %.2f с\n", t1 - t0);
   memset(&so, 0, sizeof so);
   so.le = le;
   so.rho = rho;

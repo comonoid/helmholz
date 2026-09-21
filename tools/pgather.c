@@ -465,9 +465,13 @@ static int32_t pg_hblk_nearest(const pg_hblk *h, const double org[3], const doub
       int64_t c;
       memcpy(&c, h->tab + (size_t)lo * 24, 8);
       if (c == key) {
-        int64_t start, cnt;
+        int64_t start = 0;
+        int32_t cnt32 = 0; /* §882: частичное memcpy в int64 оставляет старшие
+                            * байты отравленными (ASAN 0xBE) — SEGV; читать
+                            * ровно int32 и расширять */
         memcpy(&start, h->tab + (size_t)lo * 24 + 8, 8);
-        memcpy(&cnt, h->tab + (size_t)lo * 24 + 16, 4);
+        memcpy(&cnt32, h->tab + (size_t)lo * 24 + 16, 4);
+        int64_t cnt = cnt32;
         for (int64_t s = 0; s < cnt; s++) {
           int32_t t = h->ids[start + s];
           const double *tv = h->tris + 9 * (int64_t)t;
@@ -691,8 +695,9 @@ int main(int argc, char **argv) {
       printf("HBLK СБОР: лучей %d, попало %" PRId64 " (%.2f %%), кусков/луч %.1f, %.2f с\n", W * H,
              nhit2, 100.0 * (double)nhit2 / ((double)W * (double)H),
              (double)tested2 / ((double)W * (double)H), tB - tA);
-      printf("HBLK RSS: max %.1f МБ; фолты минорные %ld, мажорные %ld (за сбор)\n",
-             rb.ru_maxrss / 1024.0, rb.ru_minflt - ra.ru_minflt, rb.ru_majflt - ra.ru_majflt);
+      printf("HBLK RSS: max %.1f МБ; фолты минорные %lld, мажорные %lld (за сбор)\n",
+             rb.ru_maxrss / 1024.0, (long long)(rb.ru_minflt - ra.ru_minflt),
+             (long long)(rb.ru_majflt - ra.ru_majflt));
       {
         char fname[4096];
         FILE *f;

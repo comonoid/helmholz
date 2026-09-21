@@ -623,7 +623,10 @@ typedef struct {
   const double *area, *nrm, *kd, *Eprev;
   double *Ed;
   const double *om;
-  double org[3]; /* центр входной клетки трубки */
+  double omcur[3]; /* §873/T4: мутируемое направление ТЕКУЩЕЙ ноги (хоп
+                    * переписывает); om указывает сюда после setup — общая
+                    * таблица направлений только для чтения */
+  double org[3];   /* центр входной клетки трубки */
   double w_d, le, axcos;
   const double *lep; /* А1576: per-piece эмиссия (Ke); NULL — глобальный le */
   int noprop, tau0, ax;
@@ -674,6 +677,16 @@ typedef struct {
   double pth0, pth1; /* границы трубки [h0,h1] для кэша (§865/раунд 13) */
   double lost;       /* поток за границей домена, w·csec-единицы */
   int negseen;       /* §871: события Lin<0 за прогон (сентинел, лимит печати 8) */
+  /* §873/T4 шаг 2: очередь зеркальных хопов текущей трубки. Глубина
+   * ограничена HZ_MIRROR_BOUNCE_MAX: при ks ≤ 0.95 вклад (n+1)-го
+   * отражения < 0.95ⁿ < 0.82 уже при n=4; невлезающие доли идут в lost
+   * (баланс не нарушается). */
+  int hop_n;       /* элементов в очереди */
+  int hop_depth;   /* выполнено хопов */
+  double hop_lost; /* доля, вытесненная из очереди (в lost) */
+  double hop_pt[4][3];
+  double hop_dir[4][3];
+  double hop_lin[4];
   int64_t ncellbase; /* базовых клеток полным DDA («до», прибор А1569) */
   int cbase, cfront; /* прибор считается на первой итерации (геометрия статична) */
   /* аккумуляторы */
@@ -1178,13 +1191,43 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
                 (long long)fc->ntube, p, Lin, front_le(fc, p), front_rho(fc, p), fc->Eprev[p],
                 fc->area[p]);
       }
-      fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos / fc->area[p];
-      fc->absorbed += fc->w_d * Lin * csec;
+      /* §873/T4 шаг 2: дихотомия диффуз/зеркало. ks — доля ЗЕРКАЛЬНОГО
+       * отражения; нормировка против создания энергии: ks ≤ 1 − kd
+       * (kd+ks ≤ 1; клэмп назван в §873). Зеркальная доля уходит в хоп
+       * (продолжение из точки удара по R), в депозит и в диффузную
+       * ре-эмиссию идёт только диффузная доля. */
+      double ks = fc->o->ks ? fc->o->ks[p] : 0.0;
+      double kdf = front_rho(fc, p);
+      if (ks > 1.0 - kdf) ks = 1.0 - kdf > 0.0 ? 1.0 - kdf : 0.0;
+      if (ks > 0.0) {
+        double dot = fc->om[0] * fc->nrm[3 * (int64_t)p] + fc->om[1] * fc->nrm[3 * (int64_t)p + 1] +
+                     fc->om[2] * fc->nrm[3 * (int64_t)p + 2];
+        double lin_s = ks * Lin;
+        if (fc->hop_n < 4) {  /* очередь хопов — см. поля fc */
+          double tth = ht[i]; /* точка удара на текущем событии */
+          int q2;
+          for (q2 = 0; q2 < 3; q2++) {
+            fc->hop_pt[fc->hop_n][q2] = fc->org[q2] + fc->om[q2] * tth;
+            /* отражение не зависит от ориентации нормали: R = om - 2(om*n)n */
+            fc->hop_dir[fc->hop_n][q2] = fc->om[q2] - 2.0 * dot * fc->nrm[3 * (int64_t)p + q2];
+          }
+          fc->hop_lin[fc->hop_n] = lin_s;
+          fc->hop_n++;
+        } else {
+          fc->hop_lost += lin_s; /* очередь полна — доля в lost (баланс цел) */
+        }
+        fc->Ed[p] += fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / fc->area[p];
+        fc->absorbed += fc->w_d * Lin * (1.0 - ks) * csec;
+        sw_accum(fc, p, fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / fc->area[p]); /* §862 */
+      } else {
+        fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos / fc->area[p];
+        fc->absorbed += fc->w_d * Lin * csec;
+        sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos / fc->area[p]); /* §862 */
+      }
       fc->emitted += fc->w_d * front_le(fc, p) * csec;
       Lh = front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI);
       fc->recycled += fc->w_d * (Lh - fc->le) * csec;
       fc->ndep++;
-      sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos / fc->area[p]); /* §862 */
       Lin = Lh;
     }
     if (nh > 0) {
@@ -1647,6 +1690,9 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
   const hz_pyr *py = fc->py;
   double h0, h1, a = 0.0, b = 0.0;
   int q;
+  fc->hop_n = 0; /* §873/T4: состояние хопов — на трубку */
+  fc->hop_depth = 0;
+  fc->hop_lost = 0.0;
   for (q = 0; q < 3; q++)
     fc->org[q] = py->lo[q] + ((double)cc[q] + 0.5) * py->cell;
   if (!front_box_seg(py->lo, fc->hi, fc->org, fc->om, -1e30, 1e30, &h0, &h1)) return;
@@ -1774,8 +1820,43 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
     b = Lin;
   } else {
     front_visit(fc, py->nlev - 1, 0, h0, h1, &a, &b);
-    /* G6 на корне: вошедшая (нулевая — тёмный вход) доля = Σdep + вышедшая */
-    if (!fc->noprop && fabs(0.0 - fc->depA - a) > 1e-9 * (1.0 + fabs(a))) fc->g6viol++;
+    /* G6 на корне: вошедшая (нулевая — тёмный вход) доля = Σdep + вышедшая.
+     * §873/T4: при зеркальных хопах вход лег NOT нулевой (hop_lin), проверка
+     * корня не применима — честный баланс хопов считает lost/absorbed. */
+    if (!fc->noprop && fc->hop_n == 0 && fc->hop_depth == 0 &&
+        fabs(0.0 - fc->depA - a) > 1e-9 * (1.0 + fabs(a)))
+      fc->g6viol++;
+    /* §873/T4 шаг 2: зеркальные хопы — LIFO-обработка очереди */
+    while (fc->hop_n > 0) {
+      double ai = fc->hop_lin[fc->hop_n - 1];
+      const double *pt = fc->hop_pt[fc->hop_n - 1];
+      const double *dir = fc->hop_dir[fc->hop_n - 1];
+      fc->hop_n--;
+      fc->hop_depth++;
+      if (fc->hop_depth > 4) { /* HZ_MIRROR_BOUNCE_MAX — см. поля fc */
+        fc->hop_lost += ai;
+        continue;
+      }
+      for (q = 0; q < 3; q++) {
+        fc->org[q] = pt[q];
+        fc->omcur[q] = dir[q]; /* om указывает на omcur — направление ноги */
+      }
+      if (!front_box_seg(py->lo, fc->hi, fc->org, fc->om, 0.0, 1e30, &h0, &h1)) continue;
+      a = ai;
+      b = 0.0;
+      fc->depA = 0.0; /* G6 хоп-ноги: вошедшая доля = ai */
+      front_visit(fc, py->nlev - 1, 0, h0, h1, &a, &b);
+      if (!fc->noprop && fc->hop_n == 0 && fabs(ai - fc->depA - a - b) > 1e-9 * (1.0 + fabs(ai)))
+        fc->g6viol++;
+      if (b > 0.0) {
+        *lostB += b; /* непогашенный хвост хоп-ноги вышел за домен */
+        fc->nlostseg++;
+      }
+    }
+    if (fc->hop_lost > 0.0) {
+      *lostB += fc->hop_lost; /* вытесненные из очереди доли — в lost */
+      fc->nlostseg++;
+    }
   }
   if (a > 0.0 || b > 0.0)
     fc->nlostseg++; /* остаток ушёл за границу домена — в lost, не исчез (А1567) */
@@ -1785,17 +1866,20 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
 
 /* направление целиком: трубки = линии базовой сетки (дедупликация штампом
  * клетки, как §851) */
-static void front_dir(front_ctx *fc, int32_t *stampv) {
+static void front_dir(front_ctx *fc, int32_t *stampv, const double *odir) {
   const hz_pyr *py = fc->py;
   int32_t ax;
   int32_t f[3];
   for (ax = 0; ax < 3; ax++) {
     int64_t n = ax == 0 ? py->nx : (ax == 1 ? py->ny : py->nz);
-    if (fabs(fc->om[ax]) < 1e-30) {
+    /* §873/T4: omcur — направление ТЕКУЩЕЙ ноги; на старте направления
+     * восстанавливается из таблицы (хопы прошлой трубки его портили) */
+    fc->omcur[ax] = odir[ax];
+    if (fabs(odir[ax]) < 1e-30) {
       f[ax] = -1;
       continue;
     }
-    f[ax] = fc->om[ax] > 0.0 ? 0 : (int32_t)(n - 1);
+    f[ax] = odir[ax] > 0.0 ? 0 : (int32_t)(n - 1);
   }
   for (ax = 0; ax < 3; ax++) {
     int64_t b1, b2;
@@ -2094,7 +2178,10 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.kd = kd;
         fc.Eprev = Eprev;
         fc.Ed = Ed;
-        fc.om = om;
+        fc.omcur[0] = om[0]; /* §873: хопы пишут сюда, таблица — read-only */
+        fc.omcur[1] = om[1];
+        fc.omcur[2] = om[2];
+        fc.om = fc.omcur;
         fc.w_d = w_d;
         fc.le = o->le;
         fc.lep = o->lep; /* А1576: per-piece эмиссия (NULL — прежний мир) */
@@ -2123,7 +2210,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.hi[0] = o->domhi[0]; /* меш-граница, не сеточная (§852) */
         fc.hi[1] = o->domhi[1];
         fc.hi[2] = o->domhi[2];
-        front_dir(&fc, stampv);
+        front_dir(&fc, stampv, om);
         absorbed += fc.absorbed;
         emitted += fc.emitted;
         recycled += fc.recycled;

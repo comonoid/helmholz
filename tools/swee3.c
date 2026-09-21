@@ -308,13 +308,13 @@ int main(int argc, char **argv) {
       }
       so.lep = lep9;
     }
-    { /* §873 шаг 1: per-piece зеркальная доля = среднее ks3 материала (тот же
-       * прецедент усреднения, что kd). Пока шаг 2 (зеркальный хоп) не
-       * реализован, ksf > 0 — отказ запуска (fail closed: отделять долю
-       * без продолжения значило бы терять энергию); печать ниже —
-       * потребитель поля ks уже на шаге 1. */
-      if (ksf > 0.0) {
-        fprintf(stderr, "swee3: ksf>0 требует зеркального хопа (T4 шаг 2) - отказ\n");
+    { /* §873/T4: per-piece зеркальная доля = ksf · среднее ks3 материала
+       * (прецедент усреднения, что kd). ksf=0 (умолчание) — прежний мир
+       * (so.ks=NULL, битово). Зеркальный хоп реализован только для walk:
+       * ksf>0 без walk=1 — отказ (в path депозиты полные, доля пропала бы
+       * — fail closed). */
+      if (ksf > 0.0 && !walk) {
+        fprintf(stderr, "swee3: ksf>0 требует walk=1 (хоп есть только в walk) - отказ\n");
         return 2;
       }
       ks = (double *)calloc((size_t)m.nt, sizeof *ks);
@@ -322,7 +322,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "нет памяти на ks\n");
         return 2;
       }
-      so.ks = ks;
+      so.ks = ksf > 0.0 ? ks : NULL; /* ksf=0 — прежний мир (битово) */
     }
   }
   if (hz_pyr_build(&py, m.nt, cmin, cmax, cent, mtl, m.lo, m.hi, cell) != 0) {
@@ -339,7 +339,11 @@ int main(int argc, char **argv) {
     if (hz_pyr_permute(&py, area, sizeof *area) != 0 ||
         hz_pyr_permute(&py, nrm, 3 * sizeof *nrm) != 0 ||
         hz_pyr_permute(&py, kd, sizeof *kd) != 0 ||
-        (lep9 && hz_pyr_permute(&py, lep9, sizeof(double)) != 0)) {
+        (lep9 && hz_pyr_permute(&py, lep9, sizeof(double)) != 0) ||
+        (ks && hz_pyr_permute(&py, ks, sizeof(double)) !=
+                   0)) { /* §873: ks
+                          * живёт в ПОРЯДКЕ КУСКОВ, как area/nrm/kd — без перестановки зеркала
+                          * получали чужой ks (ловится фальсификатором mirror_box) */
       fprintf(stderr, "swee3: перестановка не прошла\n");
       return 2;
     }
@@ -384,9 +388,10 @@ int main(int argc, char **argv) {
     double mx = 0.0;
     for (int32_t tq = 0; tq < m.nt; tq++) {
       const double *kq = m.mtl[m.fm[tq]].ks3;
-      double k = (kq[0] + kq[1] + kq[2]) / 3.0;
+      double k = ksf * ((kq[0] + kq[1] + kq[2]) / 3.0);
       if (k > 0.0) nm++;
       if (k > mx) mx = k;
+      ks[tq] = k;
     }
     printf("   зеркальных кусков (ks>0): %d из %d, max ks=%.3g\n", nm, m.nt, mx);
   }
@@ -573,8 +578,9 @@ int main(int argc, char **argv) {
   free((void *)(uintptr_t)so.lp);
   if (dumpE) /* §862-диаг: нагрузка куска, последняя итерация */
     for (i = 0; i < (int)m.nt; i++)
-      printf("E1 p=%d tri=%d e=%.8g hits=%.0f sdelta=%.8g\n", i, py.pcs[i].tri, (double)py.pcs[i].e,
-             lphits ? lphits[i] : 0.0, lpacc ? lpacc[i] : 0.0);
+      printf("E1 p=%d tri=%d e=%.8g hits=%.0f sdelta=%.8g ks=%.3g\n", i, py.pcs[i].tri,
+             (double)py.pcs[i].e, lphits ? lphits[i] : 0.0, lpacc ? lpacc[i] : 0.0,
+             ks ? ks[i] : -1.0);
   if (lpacc) { /* §866: применённые этажи (с потолком) — из st.flhist */
     int fl, maxfl = 0;
     (void)0;
@@ -589,6 +595,7 @@ int main(int argc, char **argv) {
     free(lphits);
   }
   free(lep9); /* А1576: per-piece эмиссия */
+  free(ks); /* §873/T4: per-piece зеркальная доля */
   hz_pyr_free(&py);
   hz_obj_free(&m);
   return 0;

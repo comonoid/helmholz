@@ -352,6 +352,8 @@ int main(int argc, char **argv) {
   int W = 320, H = 240, k27 = 0;
   int frames = 1, have_eye2 = 0; /* §877: ходьба */
   double eye2[3] = {0, 0, 0}, look2[3] = {0, 0, 0};
+  int have_delbox = 0; /* §879: разрушаемость-прототип */
+  double delbox[6];
   hz_objmesh m;
   hz_pyr py;
   hz_sw_opts so;
@@ -404,7 +406,11 @@ int main(int argc, char **argv) {
       gather = atoi(argv[i] + 7);
     else if (strncmp(argv[i], "k27=", 4) == 0)
       k27 = atoi(argv[i] + 4);
-    else if (strncmp(argv[i], "frames=", 7) == 0)
+    else if (strncmp(argv[i], "delbox=", 7) == 0) {
+      if (sscanf(argv[i] + 7, "%lf,%lf,%lf:%lf,%lf,%lf", &delbox[0], &delbox[1], &delbox[2],
+                 &delbox[3], &delbox[4], &delbox[5]) == 6)
+        have_delbox = 1; /* §879 */
+    } else if (strncmp(argv[i], "frames=", 7) == 0)
       frames = atoi(argv[i] + 7); /* §877 */
     else if (strncmp(argv[i], "eye2=", 5) == 0) {
       parse3(argv[i] + 5, eye2);
@@ -601,6 +607,151 @@ int main(int argc, char **argv) {
   t1 = now_sec();
   sw_time = t1 - t0;
   printf("СВИП: E_avg=%.4f (%.3f с)\n", st.e_avg, sw_time);
+
+  if (have_delbox) {
+    /* --- §879: РАЗРУШАЕМОСТЬ-1. A: решение полной сцены (выше), E по tri;
+     * B: пересборка без delbox-кусков + тёплый пересвип; C: холодный (E=0),
+     * те же итерации. pcs.tri остаётся исходным tri (А1604). */
+    double *oldE = (double *)calloc((size_t)m.nt, sizeof *oldE);
+    int *keep = (int *)calloc((size_t)m.nt, sizeof *keep);
+    int32_t nt2 = 0, p2;
+    double *cmin2, *cmax2, *cent2, *area2, *nrm2, *kd2, *ks2, *lep2 = NULL, *warmE;
+    int32_t *mtl2, *Ltri;
+    hz_sw_opts soB;
+    hz_sw_stat stB, stC;
+    double tB, tC, dsum = 0, dmax = 0, esum = 0;
+    if (!oldE || !keep) {
+      fprintf(stderr, "pgather: нет памяти на разрушение\n");
+      return 2;
+    }
+    for (i = 0; i < m.nt; i++)
+      oldE[py.pcs[i].tri] = py.pcs[i].e; /* А1608 */
+    for (i = 0; i < m.nt; i++) {
+      int out = cent[3 * (int64_t)i] >= delbox[0] && cent[3 * (int64_t)i] <= delbox[3] &&
+                cent[3 * (int64_t)i + 1] >= delbox[1] && cent[3 * (int64_t)i + 1] <= delbox[4] &&
+                cent[3 * (int64_t)i + 2] >= delbox[2] && cent[3 * (int64_t)i + 2] <= delbox[5];
+      keep[i] = !out;
+      if (!out) nt2++;
+    }
+    printf("РАЗРУШЕНИЕ: удалено %d из %d кусков\n", m.nt - nt2, m.nt);
+    if (nt2 == 0) { /* А1607: keep-all допустим (НК); недопустимо удаление
+                     * ВСЕЙ сцены — решать нечего */
+      fprintf(stderr, "pgather: delbox удаляет всю сцену\n");
+      return 2;
+    }
+    cmin2 = (double *)malloc((size_t)nt2 * 3 * sizeof *cmin2);
+    cmax2 = (double *)malloc((size_t)nt2 * 3 * sizeof *cmax2);
+    cent2 = (double *)malloc((size_t)nt2 * 3 * sizeof *cent2);
+    area2 = (double *)malloc((size_t)nt2 * sizeof *area2);
+    nrm2 = (double *)malloc((size_t)nt2 * 3 * sizeof *nrm2);
+    kd2 = (double *)malloc((size_t)nt2 * sizeof *kd2);
+    ks2 = (double *)malloc((size_t)nt2 * sizeof *ks2);
+    mtl2 = (int32_t *)malloc((size_t)nt2 * sizeof *mtl2);
+    Ltri = (int32_t *)malloc((size_t)nt2 * sizeof *Ltri);
+    if (useke) lep2 = (double *)malloc((size_t)nt2 * sizeof *lep2);
+    warmE = (double *)malloc((size_t)nt2 * sizeof *warmE);
+    if (!cmin2 || !cmax2 || !cent2 || !area2 || !nrm2 || !kd2 || !ks2 || !mtl2 || !Ltri ||
+        (useke && !lep2) || !warmE) {
+      fprintf(stderr, "pgather: нет памяти на фазы B/C\n");
+      return 2;
+    }
+    p2 = 0;
+    for (i = 0; i < m.nt; i++) { /* компактация в порядке кусков фазы A */
+      int32_t tri = py.pcs[i].tri;
+      if (!keep[tri]) continue;
+      cmin2[3 * p2] = cmin[3 * (int64_t)tri];
+      cmin2[3 * p2 + 1] = cmin[3 * (int64_t)tri + 1];
+      cmin2[3 * p2 + 2] = cmin[3 * (int64_t)tri + 2];
+      cmax2[3 * p2] = cmax[3 * (int64_t)tri];
+      cmax2[3 * p2 + 1] = cmax[3 * (int64_t)tri + 1];
+      cmax2[3 * p2 + 2] = cmax[3 * (int64_t)tri + 2];
+      cent2[3 * p2] = cent[3 * (int64_t)tri];
+      cent2[3 * p2 + 1] = cent[3 * (int64_t)tri + 1];
+      cent2[3 * p2 + 2] = cent[3 * (int64_t)tri + 2];
+      area2[p2] = area[i];
+      nrm2[3 * p2] = nrm[3 * (int64_t)i];
+      nrm2[3 * p2 + 1] = nrm[3 * (int64_t)i + 1];
+      nrm2[3 * p2 + 2] = nrm[3 * (int64_t)i + 2];
+      kd2[p2] = kd[i];
+      ks2[p2] = ks[i];
+      if (lep2) lep2[p2] = lep[i];
+      mtl2[p2] = mtl[i];
+      Ltri[p2] = tri; /* А1604: исходный tri для pcs.tri */
+      p2++;
+    }
+    hz_pyr_free(&py);
+    if (hz_pyr_build(&py, nt2, cmin2, cmax2, cent2, mtl2, m.lo, m.hi, cell) != 0) {
+      fprintf(stderr, "pgather: пирамида фазы B не построилась\n");
+      return 2;
+    }
+    for (p2 = 0; p2 < nt2; p2++)
+      py.pcs[p2].tri = Ltri[p2];
+    free(Ltri);
+    if (hz_pyr_morton(&py) != 0 || hz_pyr_permute(&py, area2, sizeof *area2) != 0 ||
+        hz_pyr_permute(&py, nrm2, 3 * sizeof *nrm2) != 0 ||
+        hz_pyr_permute(&py, kd2, sizeof *kd2) != 0 || hz_pyr_permute(&py, ks2, sizeof *ks2) != 0 ||
+        (lep2 && hz_pyr_permute(&py, lep2, sizeof *lep2) != 0)) {
+      fprintf(stderr, "pgather: Morton фазы B не прошёл\n");
+      return 2;
+    }
+    {
+      int32_t nup = 0;
+      if (hz_pyr_set_lp(&py, g_lparr, &nup) != 0) {
+        fprintf(stderr, "pgather: lp фазы B не построился\n");
+        return 2;
+      }
+    }
+    for (p2 = 0; p2 < nt2; p2++)
+      py.pcs[p2].e = (float)oldE[py.pcs[p2].tri]; /* тёплый старт */
+    soB = so;
+    soB.ks = ksf > 0.0 ? ks2 : NULL;
+    soB.lep = lep2;
+    t0 = now_sec();
+    if (hz_sw_run(&py, nt2, area2, nrm2, kd2, &soB, &stB, NULL) != 0) return 2;
+    t1 = now_sec();
+    tB = t1 - t0;
+    for (p2 = 0; p2 < nt2; p2++)
+      warmE[p2] = py.pcs[p2].e; /* А1606 */
+    for (p2 = 0; p2 < nt2; p2++)
+      py.pcs[p2].e = 0.0f;
+    if (hz_sw_run(&py, nt2, area2, nrm2, kd2, &soB, &stC, NULL) != 0) return 2;
+    tC = now_sec() - t1;
+    for (p2 = 0; p2 < nt2; p2++) {
+      double d = fabs(warmE[p2] - (double)py.pcs[p2].e);
+      dsum += d;
+      if (d > dmax) dmax = d;
+      esum += (double)py.pcs[p2].e;
+    }
+    printf("РАЗРУШЕНИЕ: свип тёплый %.3f с, холодный %.3f с; |ΔE| среднее %.4g, max %.4g "
+           "(E_cold среднее %.4f); E_avg warm %.4f / cold %.4f\n",
+           tB, tC, dsum / nt2, dmax, esum / nt2, stB.e_avg, stC.e_avg);
+    for (p2 = 0; p2 < nt2; p2++)
+      py.pcs[p2].e = (float)warmE[p2]; /* кадр = тёплый */
+    /* камера/сбор живут на фазе B: swap piece-indexed массивов (А1604) */
+    free(kd);
+    kd = kd2;
+    free(nrm);
+    nrm = nrm2;
+    free(ks);
+    ks = ks2;
+    if (lep) free(lep);
+    lep = lep2;
+    free(oldE);
+    free(keep);
+    free(warmE);
+    free(mtl2);
+    free(cent2);
+    free(cmin2);
+    free(cmax2);
+    free(area2);
+    if (gather == 0) { /* А1605: CSR по новой пирамиде */
+      pg_bbox_csr_free(&csr);
+      if (pg_bbox_csr_build(&py, cmin, cmax, &csr) != 0) {
+        fprintf(stderr, "pgather: CSR фазы B не построился\n");
+        return 2;
+      }
+    }
+  }
 
   /* --- К27: два касающихся шара — лучи через диск касания идут в БЛИЖНИЙ.
    * Шары сцены spheres.obj: центры и радиус восстанавливаются из bbox

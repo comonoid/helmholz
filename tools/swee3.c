@@ -322,6 +322,14 @@ int main(int argc, char **argv) {
         fprintf(stderr, "нет памяти на ks\n");
         return 2;
       }
+      /* §873: заполнение в порядке ИСХОДНЫХ треугольников — ДО
+       * hz_pyr_build/hz_pyr_permute: перестановка выровняет ks со слотами
+       * кусков (как area/nrm/kd). Заполнение ПОСЛЕ перестановки давало
+       * зеркалам чужой ks (фальсификатор перисктор это поймал). */
+      for (int32_t tq = 0; tq < m.nt; tq++) {
+        const double *kq = m.mtl[m.fm[tq]].ks3;
+        ks[tq] = ksf * ((kq[0] + kq[1] + kq[2]) / 3.0);
+      }
       so.ks = ksf > 0.0 ? ks : NULL; /* ksf=0 — прежний мир (битово) */
     }
   }
@@ -388,10 +396,9 @@ int main(int argc, char **argv) {
     double mx = 0.0;
     for (int32_t tq = 0; tq < m.nt; tq++) {
       const double *kq = m.mtl[m.fm[tq]].ks3;
-      double k = ksf * ((kq[0] + kq[1] + kq[2]) / 3.0);
+      double k = (kq[0] + kq[1] + kq[2]) / 3.0;
       if (k > 0.0) nm++;
       if (k > mx) mx = k;
-      ks[tq] = k;
     }
     printf("   зеркальных кусков (ks>0): %d из %d, max ks=%.3g\n", nm, m.nt, mx);
   }

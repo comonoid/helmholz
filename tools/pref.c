@@ -288,6 +288,7 @@ static double ref_lhit(const ref_ctx *c, const double org[3], const double om[3]
 int main(int argc, char **argv) {
   const char *path = NULL;
   double scale = 1.0, le = 1.0, rho = -1.0, ksf = 0.0;
+  const char *eout = NULL; /* §887: пер-кусковой дамп E */
   int iters = 30, lev = 6, mort = 1, i, ax;
   int K = PREF_K_DEFAULT;
   hz_objmesh m;
@@ -308,6 +309,8 @@ int main(int argc, char **argv) {
       le = atof(argv[i] + 3);
     else if (strncmp(argv[i], "it=", 3) == 0)
       iters = atoi(argv[i] + 3);
+    else if (strncmp(argv[i], "eout=", 5) == 0)
+      eout = argv[i] + 5; /* §887 */
     else if (strncmp(argv[i], "ksf=", 4) == 0)
       ksf = atof(argv[i] + 4); /* §880: зеркальный MC-эталон */
     else if (strncmp(argv[i], "K=", 2) == 0)
@@ -589,6 +592,25 @@ int main(int argc, char **argv) {
            eavg_swp / eavg_ref);
     printf("СВЕРКА: |Δ| средняя=%.4f, max=%.4f (по кускам); медиана отношения куска=%.4f\n",
            dsum / asum, dmax, rmed);
+    if (eout) { /* §887: пер-кусковой дамп — tri, центр, kd, ks, Eref, Eswp, ratio */
+      FILE *fe = fopen(eout, "w");
+      if (!fe) return 2;
+      fprintf(fe, "# tri x y z kd ks Eref Eswp ratio\n");
+      for (i2 = 0; i2 < m.nt; i2++) {
+        double p[3][3];
+        int32_t tri = py.pcs[i2].tri;
+        hz_obj_tri(&m, tri, p);
+        double cx = (p[0][0] + p[1][0] + p[2][0]) / 3.0;
+        double cy = (p[0][1] + p[1][1] + p[2][1]) / 3.0;
+        double cz = (p[0][2] + p[1][2] + p[2][2]) / 3.0;
+        double ef = Eref[i2];
+        double es = (double)py.pcs[i2].e;
+        fprintf(fe, "%d %.6f %.6f %.6f %.4f %.4f %.6g %.6g %.6f\n", tri, cx, cy, cz, kd[i2],
+                ksf > 0.0 ? ks[i2] : 0.0, ef, es, ef > 1e-9 ? es / ef : 1.0);
+      }
+      fclose(fe);
+      printf("§887: дамп %s записан (%d кусков)\n", eout, m.nt);
+    }
     free(rat);
   }
   free(Eref);

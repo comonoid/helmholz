@@ -769,27 +769,36 @@ int main(int argc, char **argv) {
       up[2] = fwd[0] * right[1] - fwd[1] * right[0];
 
       t0 = now_sec();
-      pg_cam cam;
-      memset(&cam, 0, sizeof cam);
-      cam.py = &py;
-      cam.csr = &csr;
-      cam.m = &m;
-      cam.kd = kd;
-      cam.lep = lep;
-      cam.ks = ksf > 0.0 ? ks : NULL; /* §874: ksf=0 — рекурсии не рождаются (А1584) */
-      cam.nrm = nrm;
-      cam.le = le;
-      cam.rho = rho;
-      cam.gather = gather;
-      cam.hop_eps = PG_HOP_EPS_REL * maxdim; /* §874/А1582 */
-      cam.steps = &dda_steps;
-      cam.tested = &dda_tested;
-      cam.nsec = &sec_rays;
-      for (int iy = 0; iy < H; iy++)
+      pg_cam cam, cam0;
+      memset(&cam0, 0, sizeof cam0);
+      cam0.py = &py;
+      cam0.csr = &csr;
+      cam0.m = &m;
+      cam0.kd = kd;
+      cam0.lep = lep;
+      cam0.ks = ksf > 0.0 ? ks : NULL; /* §874: ksf=0 — рекурсии не рождаются (А1584) */
+      cam0.nrm = nrm;
+      cam0.le = le;
+      cam0.rho = rho;
+      cam0.gather = gather;
+      cam0.hop_eps = PG_HOP_EPS_REL * maxdim; /* §874/А1582 */
+/* §878: лучи кадра независимы, поле read-only — строка кадра = единица
+ * работы; счётчики thread-local с редукцией (А1599/А1600). */
+#pragma omp parallel for schedule(dynamic, 16) private(ax, cam)                                    \
+    reduction(+ : dda_steps, dda_tested, sec_rays, nhit, lsum) reduction(max : lmax)
+      for (int iy = 0; iy < H; iy++) {
+        int64_t st_loc = 0, te_loc = 0, sec_loc = 0; /* А1599: thread-local */
+        cam = cam0;
+        cam.steps = &st_loc;
+        cam.tested = &te_loc;
+        cam.nsec = &sec_loc;
         for (int ix = 0; ix < W; ix++) {
           double sx = (2.0 * (ix + 0.5) / W - 1.0) * tanf;
           double sy = (1.0 - 2.0 * (iy + 0.5) / H) * tanf * (double)H / (double)W;
-          double rd[3], thit = -1.0, L = 0.0;
+          /* явная инициализация rd — анализатор теряет индукцию цикла по ax
+           * в OMP-регионе (FP-класс diam, прецедент pg_bbox_span/e1);
+           * все элементы перезаписываются — арифметика не меняется */
+          double rd[3] = {0, 0, 0}, thit = -1.0, L = 0.0;
           int32_t pbest;
           for (ax = 0; ax < 3; ax++)
             rd[ax] = fwd[ax] + sx * right[ax] + sy * up[ax];
@@ -799,7 +808,7 @@ int main(int argc, char **argv) {
               rd[ax] /= nn;
           }
           /* §874/А1585: базовый и вторичный лучи — одним сборщиком */
-          pbest = pg_nearest(&py, &csr, &m, ef, rd, gather, &thit, &dda_steps, &dda_tested);
+          pbest = pg_nearest(&py, &csr, &m, ef, rd, gather, &thit, &st_loc, &te_loc);
           if (pbest >= 0) {
             L = pg_lcam_hit(&cam, ef, rd, pbest, thit, 0);
             nhit++;
@@ -808,6 +817,10 @@ int main(int argc, char **argv) {
           }
           lum[(size_t)iy * (size_t)W + (size_t)ix] = L;
         }
+        dda_steps += st_loc;
+        dda_tested += te_loc;
+        sec_rays += sec_loc;
+      }
       t1 = now_sec();
       if (gather == 0)
         printf("DDA: клеток/луч %.1f, кусков/луч %.1f (%.2f %% от nt)\n",
@@ -818,8 +831,7 @@ int main(int argc, char **argv) {
              " (%.2f %%), средняя яркость %.4f, max %.4f, %.2f с\n",
              W * H, nhit, 100.0 * (double)nhit / ((double)W * (double)H),
              lsum / (nhit ? (double)nhit : 1.0), lmax, t1 - t0);
-      printf("§874: вторичных зеркальных лучей %" PRId64 " (ksf=%.3g)\n", cam.nsec ? *cam.nsec : 0,
-             ksf);
+      printf("§874: вторичных зеркальных лучей %" PRId64 " (ksf=%.3g)\n", sec_rays, ksf);
       {
         double rr = rho < 0 ? 0.5 : rho;
         double Lpred = le + rr * st.e_avg / (2.0 * M_PI);

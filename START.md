@@ -73,6 +73,8 @@
     walk / path=         режимы сбора (walk — продакшн, path — за ключом)
     adapt= lpceil= lppol= amode= cdelta=   адаптивные этажи детальности
     ksf=                 доля зеркального хопа (T4; fail-closed)
+    pgather              дефолт — продакшн-модель (useke=1 ksf=1, §875);
+                         useke=0/ksf=0 — прежний мир
     xgloss               аналитический Фонг-блик в растре
 
 Частые НЕГАТИВНЫЕ КОНТРОЛИ: xnolim, xnomaxp, xmatfar, xnopiece, xscramble,

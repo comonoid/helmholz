@@ -341,8 +341,11 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
 
 int main(int argc, char **argv) {
   const char *path = NULL, *outfile = "img/pgather.ppm";
-  double scale = 1.0, le = 1.0, rho = -1.0, fov = 60.0, ksf = 0.0;
-  int useke = 0; /* А1576: эмиссия материалов Ke (нужна фальсификаторам §874) */
+  /* §875: дефолты потребителя — ПРОДАКШН-МОДЕЛЬ (дихотомия ks §873/874,
+   * per-piece эмиссия Ke А1576); useke=0 / ksf=0 — документированный выход
+   * к прежнему миру. */
+  double scale = 1.0, le = 1.0, rho = -1.0, fov = 60.0, ksf = 1.0;
+  int useke = 1;
   double eye[3] = {0, 0, 0}, look[3] = {0, 0, 0};
   int iters = 30, lev = 6, tau0 = 0, noprop = 0, ndirs = 26, mort = 1, i, ax;
   double *lep = NULL; /* §874: per-piece эмиссия (ср. Ke); NULL — прежний мир */
@@ -390,7 +393,9 @@ int main(int argc, char **argv) {
     else if (strncmp(argv[i], "H=", 2) == 0)
       H = atoi(argv[i] + 2);
     else if (strcmp(argv[i], "useke") == 0)
-      useke = 1; /* А1576/§874 */
+      useke = 1; /* А1576; голый флаг — обратная совместимость §874 (А1587) */
+    else if (strncmp(argv[i], "useke=", 6) == 0)
+      useke = atoi(argv[i] + 6); /* §875: useke=0 — прежний мир */
     else if (strncmp(argv[i], "ksf=", 4) == 0)
       ksf = atof(argv[i] + 4); /* §874: дихотомия T4 в pgather */
     else if (strncmp(argv[i], "gather=", 7) == 0)
@@ -435,7 +440,11 @@ int main(int argc, char **argv) {
     return 2;
   }
   for (i = 0; i < m.nt; i++) {
-    double p[3][3], e1[3], e2[3], nn;
+    double p[3][3], nn;
+    /* явная инициализация — анализатор теряет индукцию цикла по ax
+     * (FP-класс diam, прецедент pg_bbox_span); все элементы далее
+     * перезаписываются — арифметика не меняется */
+    double e1[3] = {0, 0, 0}, e2[3] = {0, 0, 0};
     int v;
     hz_obj_tri(&m, (int32_t)i, p);
     for (ax = 0; ax < 3; ax++) {

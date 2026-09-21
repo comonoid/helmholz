@@ -250,8 +250,8 @@ static double ref_urand(void) {
  * Жакоби предыдущей итерации (А1611). Клэмп ks_eff ≤ 1−rr (А1612: pref-rr —
  * глобальная диффузная доля; при rho<0 эталон и свип расходятся в kd/0.5 —
  * ПРЕДСУЩЕСТВУЮЩЕЕ расхождение эталона, не этого шага). Промах = фон 0. */
-#define REF_MIRROR_BOUNCE_MAX 4 /* = HZ-глубине свипа */
-#define REF_HOP_EPS 1e-5        /* тот же абсолютный сдвиг, что старт луча */
+#define REF_MIRROR_BOUNCE_MAX 12 /* §881/А1620: та же политика усечения ~1e-4, что HZ */
+#define REF_HOP_EPS 1e-5         /* тот же абсолютный сдвиг, что старт луча */
 typedef struct {
   const hz_pyr *py;
   const ref_bbox_csr *csr;

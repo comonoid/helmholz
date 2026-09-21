@@ -681,12 +681,19 @@ typedef struct {
    * ограничена HZ_MIRROR_BOUNCE_MAX: при ks ≤ 0.95 вклад (n+1)-го
    * отражения < 0.95ⁿ < 0.82 уже при n=4; невлезающие доли идут в lost
    * (баланс не нарушается). */
-  int hop_n;       /* элементов в очереди */
-  int hop_depth;   /* выполнено хопов */
-  double hop_lost; /* доля, вытесненная из очереди (в lost) */
-  double hop_pt[4][3];
-  double hop_dir[4][3];
-  double hop_lin[4];
+  int hop_n;            /* элементов в очереди */
+  int hop_depth;        /* выполнено хопов (диагностика; усечения больше нет) */
+  double hop_lost;      /* доля, вытесненная порогом/ёмкостью (в lost) */
+  double hop_lost_sum;  /* §881: Σ по трубкам направления */
+  int64_t hop_hops_sum; /* §881: Σ хопов по трубкам направления */
+  double hop_lost_thr;  /* §881/П7: из hop_lost — порогом */
+  double hop_lost_cap;  /* §881/П7: из hop_lost — ёмкостью */
+  /* §881: ёмкость 32 (была 4): на зеркально-плотных сценах цепи длиннее 4 —
+   * основной поток (дефект §880); усечение — порогом от корня цепи (А1617) */
+  double hop_pt[32][3];
+  double hop_dir[32][3];
+  double hop_lin[32];
+  double hop_root[32]; /* Lin цепи в точке первого зеркального удара */
   int64_t ncellbase; /* базовых клеток полным DDA («до», прибор А1569) */
   int cbase, cfront; /* прибор считается на первой итерации (геометрия статична) */
   /* аккумуляторы */
@@ -1203,7 +1210,9 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
         double dot = fc->om[0] * fc->nrm[3 * (int64_t)p] + fc->om[1] * fc->nrm[3 * (int64_t)p + 1] +
                      fc->om[2] * fc->nrm[3 * (int64_t)p + 2];
         double lin_s = ks * Lin;
-        if (fc->hop_n < 4) {  /* очередь хопов — см. поля fc */
+        /* §881: порог от корня цепи (А1617): lin_s >= 1e-3·root; 1e-3 =
+         * HZ_MIRROR_HOP_REL — <=0.1% энергии цепи теряется на усечении */
+        if (fc->hop_n < 32 && lin_s >= 1e-3 * Lin) {
           double tth = ht[i]; /* точка удара на текущем событии */
           int q2;
           for (q2 = 0; q2 < 3; q2++) {
@@ -1212,9 +1221,14 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
             fc->hop_dir[fc->hop_n][q2] = fc->om[q2] - 2.0 * dot * fc->nrm[3 * (int64_t)p + q2];
           }
           fc->hop_lin[fc->hop_n] = lin_s;
+          fc->hop_root[fc->hop_n] = Lin; /* корень = вход цепи в этой точке */
           fc->hop_n++;
         } else {
-          fc->hop_lost += lin_s; /* очередь полна — доля в lost (баланс цел) */
+          fc->hop_lost += lin_s; /* порог/ёмкость — в lost (баланс цел) */
+          if (fc->hop_n < 32)
+            fc->hop_lost_thr += lin_s;
+          else
+            fc->hop_lost_cap += lin_s;
         }
         fc->Ed[p] += fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / fc->area[p];
         fc->absorbed += fc->w_d * Lin * (1.0 - ks) * csec;
@@ -1833,10 +1847,8 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
       const double *dir = fc->hop_dir[fc->hop_n - 1];
       fc->hop_n--;
       fc->hop_depth++;
-      if (fc->hop_depth > 4) { /* HZ_MIRROR_BOUNCE_MAX — см. поля fc */
-        fc->hop_lost += ai;
-        continue;
-      }
+      /* §881/А1618: усечение по глубине снято — нога ниже порога от корня не
+       * рождается при спавне; цикл зеркального коридора обрывается порогом */
       for (q = 0; q < 3; q++) {
         fc->org[q] = pt[q];
         fc->omcur[q] = dir[q]; /* om указывает на omcur — направление ноги */
@@ -1862,6 +1874,8 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
     fc->nlostseg++; /* остаток ушёл за границу домена — в lost, не исчез (А1567) */
   *lostA += a;
   *lostB += b;
+  fc->hop_lost_sum += fc->hop_lost;
+  fc->hop_hops_sum += fc->hop_depth;
 }
 
 /* направление целиком: трубки = линии базовой сетки (дедупликация штампом
@@ -2211,6 +2225,11 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.hi[1] = o->domhi[1];
         fc.hi[2] = o->domhi[2];
         front_dir(&fc, stampv, om);
+        st->hop_lost += fc.hop_lost_sum;
+        st->hops += fc.hop_hops_sum;
+        st->hop_thr += fc.hop_lost_thr;
+        st->hop_cap += fc.hop_lost_cap;
+        st->hop_cap += fc.hop_lost_cap;
         absorbed += fc.absorbed;
         emitted += fc.emitted;
         recycled += fc.recycled;

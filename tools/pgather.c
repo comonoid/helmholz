@@ -983,6 +983,10 @@ int main(int argc, char **argv) {
              W * H, nhit, 100.0 * (double)nhit / ((double)W * (double)H),
              lsum / (nhit ? (double)nhit : 1.0), lmax, t1 - t0);
       printf("§874: вторичных зеркальных лучей %" PRId64 " (ksf=%.3g)\n", sec_rays, ksf);
+      if (ksf > 0.0) { /* §881: потери hop-политики видны числом (П3) */
+        printf("§881: хопов %" PRId64 ", hop_lost=%.4g (absorbed=%.4g)\n", st.hops, st.hop_lost,
+               st.absorbed);
+      }
       {
         double rr = rho < 0 ? 0.5 : rho;
         double Lpred = le + rr * st.e_avg / (2.0 * M_PI);

@@ -681,14 +681,15 @@ typedef struct {
    * ограничена HZ_MIRROR_BOUNCE_MAX: при ks ≤ 0.95 вклад (n+1)-го
    * отражения < 0.95ⁿ < 0.82 уже при n=4; невлезающие доли идут в lost
    * (баланс не нарушается). */
-  int hop_n;            /* элементов в очереди */
-  int hop_depth;        /* выполнено хопов (диагностика; усечения больше нет) */
-  double hop_lost;      /* доля, вытесненная порогом/ёмкостью (в lost) */
-  double hop_lost_sum;  /* §881: Σ по трубкам направления */
-  int64_t hop_hops_sum; /* §881: Σ хопов по трубкам направления */
-  double hop_lost_thr;  /* §881/П7: из hop_lost — порогом */
-  double hop_lost_cap;  /* §881/П7: из hop_lost — ёмкостью */
-  double row_dep;       /* §887-b: счётчик исполнений row-ветки */
+  int hop_n;                 /* элементов в очереди */
+  int hop_depth;             /* выполнено хопов (диагностика; усечения больше нет) */
+  double hop_lost;           /* доля, вытесненная порогом/ёмкостью (в lost) */
+  double hop_lost_sum;       /* §881: Σ по трубкам направления */
+  int64_t hop_hops_sum;      /* §881: Σ хопов по трубкам направления */
+  double Lh_last;            /* §892: диффузное продолжение клетки */
+  double hop_lost_thr;       /* §881/П7: из hop_lost — порогом */
+  double hop_lost_cap;       /* §881/П7: из hop_lost — ёмкостью */
+  double row_dep;            /* §887-b: счётчик исполнений row-ветки */
   int64_t lin_pos, lin_zero; /* §887-d: депозиты с Lin>0.5 / <=0.5 */
   /* §881: ёмкость 32 (была 4): на зеркально-плотных сценах цепи длиннее 4 —
    * основной поток (дефект §880); усечение — порогом от корня цепи (А1617) */
@@ -1210,85 +1211,71 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
     hp[v] = p;
   }
   {
-    int first = 1;
-    for (i = 0; i < nh; i++) {
-      int32_t p = hp[i];
-      double Lh;
-      if (fc->pstamp[p] == fc->pkey) continue; /* дубль куска (список/стык) */
-      /* ШТАМП при любом событии: пересечение обрабатывается один раз */
-      fc->pstamp[p] = fc->pkey;
-      if (first) { /* родительская доля трубки погашена первой поверхностью (G6) */
-        fc->depA += ai;
-        first = 0;
+    /* §892: ЛИНЕЙНАЯ НАГРУЗКА КЛЕТКИ (T4) — поток трубки делится между
+     * ВСЕМИ кусками клетки пропорционально площади: Ed_p +=
+     * w_d·Lin·csec·axcos·(1−ks_p)/Σarea. Нет лотереи треугольников
+     * (ray effect на уровне кусков) и 1/area-сингулярности (знаменатель
+     * Σarea ограничен). Зеркальный релей — хоп от ближайшего точного
+     * удара (pbest по списку ray-tri: точка, R, ks·Lin). */
+    double sarea = 0.0;
+    for (u = 0; u < n; u++) {
+      int32_t p = ps[u];
+      if (fc->pstamp[p] == fc->pkey) continue;
+      sarea += fc->area[p];
+    }
+    int32_t pbest = -1;
+    double tb = 1e30;
+    for (i = 0; i < nh; i++)
+      if (ht[i] < tb) {
+        tb = ht[i];
+        pbest = hp[i];
       }
-      if (Lin < 0.0 && fc->negseen < 8) { /* §871: сентинел Lin<0 */
-        fc->negseen++;
-        fprintf(stderr, "NEGLIN tube=%lld p=%d Lin=%.6g le=%.6g rho=%.6g Eprev=%.6g area=%.6g\n",
-                (long long)fc->ntube, p, Lin, front_le(fc, p), front_rho(fc, p), fc->Eprev[p],
-                fc->area[p]);
+    if (Lin > 0.0 && sarea > 0.0) {
+      for (u = 0; u < n; u++) {
+        int32_t p = ps[u];
+        if (fc->pstamp[p] == fc->pkey) continue;
+        fc->pstamp[p] = fc->pkey; /* один депозит на (кусок, направление) */
+        double ks = fc->o->ks ? fc->o->ks[p] : 0.0;
+        double kdf = front_rho(fc, p);
+        if (ks > 1.0 - kdf) ks = 1.0 - kdf > 0.0 ? 1.0 - kdf : 0.0;
+        fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos * (1.0 - ks) / sarea;
+        fc->absorbed += fc->w_d * Lin * csec * (1.0 - ks) * fc->area[p] / sarea;
+        sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos * (1.0 - ks) / sarea);
+        if (tri_trace_on(p))
+          fprintf(stderr, "TRI %d LL: Lin=%.6g ks=%.3g Ed=%.6g\n", p, Lin, ks, fc->Ed[p]);
       }
-      /* §873/T4 шаг 2: дихотомия диффуз/зеркало. ks — доля ЗЕРКАЛЬНОГО
-       * отражения; нормировка против создания энергии: ks ≤ 1 − kd
-       * (kd+ks ≤ 1; клэмп назван в §873). Зеркальная доля уходит в хоп
-       * (продолжение из точки удара по R), в депозит и в диффузную
-       * ре-эмиссию идёт только диффузная доля. */
-      double ks = fc->o->ks ? fc->o->ks[p] : 0.0;
-      double kdf = front_rho(fc, p);
+      fc->emitted += fc->w_d * front_le(fc, ps[0]) * csec;
+    }
+    /* зеркальный релей + диффузное продолжение — от ближайшего удара */
+    if (pbest >= 0) {
+      double ks = fc->o->ks ? fc->o->ks[pbest] : 0.0;
+      double kdf = front_rho(fc, pbest);
       if (ks > 1.0 - kdf) ks = 1.0 - kdf > 0.0 ? 1.0 - kdf : 0.0;
-      if (ks > 0.0) {
-        double dot = fc->om[0] * fc->nrm[3 * (int64_t)p] + fc->om[1] * fc->nrm[3 * (int64_t)p + 1] +
-                     fc->om[2] * fc->nrm[3 * (int64_t)p + 2];
-        double lin_s = ks * Lin;
-        /* §881: порог от корня цепи (А1617): lin_s >= 1e-3·root; 1e-3 =
-         * HZ_MIRROR_HOP_REL — <=0.1% энергии цепи теряется на усечении */
-        if (fc->hop_n < 32 && lin_s >= 1e-3 * Lin) {
-          double tth = ht[i]; /* точка удара на текущем событии */
-          int q2;
-          for (q2 = 0; q2 < 3; q2++) {
-            fc->hop_pt[fc->hop_n][q2] = fc->org[q2] + fc->om[q2] * tth;
-            /* отражение не зависит от ориентации нормали: R = om - 2(om*n)n */
-            fc->hop_dir[fc->hop_n][q2] = fc->om[q2] - 2.0 * dot * fc->nrm[3 * (int64_t)p + q2];
-          }
-          fc->hop_lin[fc->hop_n] = lin_s;
-          fc->hop_root[fc->hop_n] = Lin; /* корень = вход цепи в этой точке */
-          fc->hop_n++;
-        } else {
-          fc->hop_lost += lin_s; /* порог/ёмкость — в lost (баланс цел) */
-          if (fc->hop_n < 32)
-            fc->hop_lost_thr += lin_s;
-          else
-            fc->hop_lost_cap += lin_s;
+      if (ks > 0.0 && Lin > 0.0 && fc->hop_n < 32) {
+        const double *nv = fc->nrm + 3 * (int64_t)pbest;
+        double dot = fc->om[0] * nv[0] + fc->om[1] * nv[1] + fc->om[2] * nv[2];
+        double tth = tb;
+        int q2;
+        for (q2 = 0; q2 < 3; q2++) {
+          fc->hop_pt[fc->hop_n][q2] = fc->org[q2] + fc->om[q2] * tth;
+          fc->hop_dir[fc->hop_n][q2] = fc->om[q2] - 2.0 * dot * nv[q2];
         }
-        fc->Ed[p] += fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / front_depden(fc, p);
-        fc->absorbed += fc->w_d * Lin * (1.0 - ks) * csec;
-        sw_accum(fc, p,
-                 fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / front_depden(fc, p)); /* §862 */
-        if (Lin > 0.5)
-          fc->lin_pos++;
-        else
-          fc->lin_zero++;
-        if (tri_trace_on(p))
-          fprintf(stderr, "TRI %d FV ks>0: Lin=%.6g ks=%.3g Ed=%.6g\n", p, Lin, ks, fc->Ed[p]);
-      } else {
-        fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos / front_depden(fc, p);
-        fc->absorbed += fc->w_d * Lin * csec;
-        sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos / front_depden(fc, p)); /* §862 */
-        if (Lin > 0.5)
-          fc->lin_pos++;
-        else
-          fc->lin_zero++;
-        if (tri_trace_on(p))
-          fprintf(stderr, "TRI %d FV ks=0: Lin=%.6g Ed=%.6g\n", p, Lin, fc->Ed[p]);
+        fc->hop_lin[fc->hop_n] = ks * Lin;
+        fc->hop_root[fc->hop_n] = Lin;
+        fc->hop_n++;
+      } else if (ks > 0.0 && Lin > 0.0) {
+        fc->hop_lost += ks * Lin;
       }
-      fc->emitted += fc->w_d * front_le(fc, p) * csec;
-      Lh = front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI);
-      fc->recycled += fc->w_d * (Lh - fc->le) * csec;
+      fc->Lh_last = front_le(fc, pbest) + kdf * fc->Eprev[pbest] / (2.0 * M_PI);
+      fc->recycled += fc->w_d * (fc->Lh_last - fc->le) * csec;
       fc->ndep++;
-      Lin = Lh;
     }
     if (nh > 0) {
+      /* §892-b: зажигание БЕЗ условия Lin>0 — тёмная трубка подхватывает
+       * эмиссию поверхности (Lh = le+lep > 0); иначе она тёмная навсегда
+       * (баг нулевых депозитов §892) */
       *a = 0.0;
-      *b = Lin;
+      *b = pbest >= 0 ? fc->Lh_last : Lin;
     }
   }
 }

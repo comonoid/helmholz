@@ -1316,9 +1316,9 @@ int main(int argc, char **argv) {
         printf("§887-b: row-ветка исполнена %.0f раз\n", st.row_dep);
         printf("§887-d: депозитов Lin>0.5: %lld, Lin<=0.5: %lld\n", (long long)st.lin_pos,
                (long long)st.lin_zero);
-        printf("§894: деп_main=%.1f деп_ног=%.1f (absorbed=%.1f)\n", st.dep_main, st.dep_leg,
-               st.absorbed);
       }
+      printf("§894: деп_main=%.1f деп_ног=%.1f депозитов=%lld (absorbed=%.1f)\n", st.dep_main,
+             st.dep_leg, (long long)st.dep_cnt, st.absorbed);
       {
         double rr = rho < 0 ? 0.5 : rho;
         double Lpred = le + rr * st.e_avg / (2.0 * M_PI);

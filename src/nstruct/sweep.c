@@ -689,6 +689,8 @@ typedef struct {
   double Lh_last;            /* §892: диффузное продолжение клетки */
   double lh_cap;             /* §893: кап радианса итерации */
   double lh_seen;            /* §893: максимум радианса за направление */
+  double *Linmax_prev;       /* §893-b: пер-кусковый max пришедшего радианса */
+  double *Linmax_cur;        /* §893-b: текущей итерации */
   double hop_lost_thr;       /* §881/П7: из hop_lost — порогом */
   double hop_lost_cap;       /* §881/П7: из hop_lost — ёмкостью */
   double row_dep;            /* §887-b: счётчик исполнений row-ветки */
@@ -1045,8 +1047,8 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
     }
     fc->emitted += fc->w_d * front_le(fc, pbest) * csec;
     *a = 0.0;
-    *b = front_lh_cap(fc, front_le(fc, pbest) +
-                                front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI));
+    *b = front_lh_cap(fc,
+                      front_le(fc, pbest) + front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI));
     if (Lin < 0.0 && fc->negseen < 8) { /* §871: сентинел Lin<0 */
       fc->negseen++;
       fprintf(stderr, "NEG-A pbest=%d Lin=%.6g\n", pbest, Lin);
@@ -1229,12 +1231,18 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
      * (ray effect на уровне кусков) и 1/area-сингулярности (знаменатель
      * Σarea ограничен). Зеркальный релей — хоп от ближайшего точного
      * удара (pbest по списку ray-tri: точка, R, ks·Lin). */
-    double sarea = 0.0;
+    /* §893-b: вес нормали — соседние фасетки имеют близкие |cos n,om|:
+     * гладкие веса вместо лотереи «попал/не попал ray-tri» */
+    double sw = 0.0, sw_den = 0.0;
     for (u = 0; u < n; u++) {
       int32_t p = ps[u];
       if (fc->pstamp[p] == fc->pkey) continue;
-      sarea += fc->area[p];
+      const double *nv = fc->nrm + 3 * (int64_t)p;
+      double an = fabs(fc->om[0] * nv[0] + fc->om[1] * nv[1] + fc->om[2] * nv[2]);
+      sw += fc->area[p] * an;
     }
+    /* 1/area однокусковых клеток (sw = area·an) давала пестроту и взрыв */
+    sw_den = sw > FRONT_DEP_MIN_SHARE * csec ? sw : FRONT_DEP_MIN_SHARE * csec;
     int32_t pbest = -1;
     double tb = 1e30;
     for (i = 0; i < nh; i++)
@@ -1242,7 +1250,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
         tb = ht[i];
         pbest = hp[i];
       }
-    if (Lin > 0.0 && sarea > 0.0) {
+    if (Lin > 0.0 && sw_den > 0.0) {
       for (u = 0; u < n; u++) {
         int32_t p = ps[u];
         if (fc->pstamp[p] == fc->pkey) continue;
@@ -1250,9 +1258,12 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
         double ks = fc->o->ks ? fc->o->ks[p] : 0.0;
         double kdf = front_rho(fc, p);
         if (ks > 1.0 - kdf) ks = 1.0 - kdf > 0.0 ? 1.0 - kdf : 0.0;
-        fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos * (1.0 - ks) / sarea;
-        fc->absorbed += fc->w_d * Lin * csec * (1.0 - ks) * fc->area[p] / sarea;
-        sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos * (1.0 - ks) / sarea);
+        const double *nv = fc->nrm + 3 * (int64_t)p;
+        double an = fabs(fc->om[0] * nv[0] + fc->om[1] * nv[1] + fc->om[2] * nv[2]);
+        fc->Linmax_cur[p] = fc->Linmax_cur[p] < Lin ? Lin : fc->Linmax_cur[p];
+        fc->Ed[p] += fc->w_d * Lin * csec * an * (1.0 - ks) / sw_den;
+        fc->absorbed += fc->w_d * Lin * csec * an * (1.0 - ks) * fc->area[p] / sw_den;
+        sw_accum(fc, p, fc->w_d * Lin * csec * an * (1.0 - ks) / sw_den);
         if (tri_trace_on(p))
           fprintf(stderr, "TRI %d LL: Lin=%.6g ks=%.3g Ed=%.6g\n", p, Lin, ks, fc->Ed[p]);
       }
@@ -1278,7 +1289,12 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
       } else if (ks > 0.0 && Lin > 0.0) {
         fc->hop_lost += ks * Lin;
       }
-      fc->Lh_last = front_lh_cap(fc, front_le(fc, pbest) + kdf * fc->Eprev[pbest] / (2.0 * M_PI));
+      {
+        double lhcap_p = front_le(fc, pbest);
+        if (fc->Linmax_prev[pbest] > lhcap_p) lhcap_p = fc->Linmax_prev[pbest];
+        double lhraw = front_le(fc, pbest) + kdf * fc->Eprev[pbest] / (2.0 * M_PI);
+        fc->Lh_last = front_lh_cap(fc, lhraw > lhcap_p ? lhcap_p : lhraw);
+      }
       fc->recycled += fc->w_d * (fc->Lh_last - fc->le) * csec;
       fc->ndep++;
     }
@@ -1865,7 +1881,13 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
       fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos / front_depden(fc, p);
       fc->absorbed += fc->w_d * Lin * csec;
       fc->emitted += fc->w_d * front_le(fc, p) * csec;
-      Lh = front_lh_cap(fc, front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI));
+      {
+        double lhcap_p = front_le(fc, p);
+        Lh = front_lh_cap(fc,
+                          front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI) > lhcap_p
+                              ? lhcap_p
+                              : front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI));
+      }
       fc->recycled += fc->w_d * (Lh - fc->le) * csec;
       fc->ndep++;
       sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos / front_depden(fc, p));
@@ -2064,6 +2086,10 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
 
   Ed = (double *)calloc((size_t)nt, sizeof *Ed);
   Eprev = (double *)calloc((size_t)nt, sizeof *Eprev);
+  /* §893-b: пер-кусковый максимум пришедшего радианса (принцип максимума);
+   * NULL вне mode 3 — free(NULL) легален, использования вне mode 3 нет */
+  double *Linmax_prev = NULL;
+  double *Linmax_cur = NULL;
   order = (int32_t *)calloc(
       (size_t)py->nleaf,
       sizeof *order); /* calloc: анализатор видит инициализацию (FP-класс diam 07-24) */
@@ -2074,7 +2100,12 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     fld = (int64_t (*)[3])calloc(257, sizeof *fld);
     fldok = (uint8_t *)calloc(257, sizeof *fldok);
   }
-  if (!Ed || !Eprev || !order || !vindex || !bits || !walks || (o->mode == 3 && (!fld || !fldok))) {
+  if (o->mode == 3) { /* §893-b: пер-кусковый max пришедшего радианса */
+    Linmax_prev = (double *)calloc((size_t)nt, sizeof *Linmax_prev);
+    Linmax_cur = (double *)calloc((size_t)nt, sizeof *Linmax_cur);
+  }
+  if (!Ed || !Eprev || !order || !vindex || !bits || !walks || (o->mode == 3 && (!fld || !fldok)) ||
+      (o->mode == 3 && (!Linmax_prev || !Linmax_cur))) {
     rc = 2;
     goto done;
   }
@@ -2190,6 +2221,12 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     memset(Ed, 0, (size_t)nt * sizeof *Ed);
     for (p = 0; p < nt; p++)
       Eprev[p] = py->pcs[p].e;
+    { /* §893-b: swap пер-кускового максимума пришедшего радианса */
+      double *swp = Linmax_prev;
+      Linmax_prev = Linmax_cur;
+      Linmax_cur = swp;
+      memset(Linmax_cur, 0, (size_t)nt * sizeof *Linmax_cur);
+    }
     /* §893: Lh-ограничитель (принцип максимума радианса, §735): кап итерации
      * = LH_GROWTH·(макс радианс прошлой итерации). Рост ≤ +25 %/итерацию;
      * при альбедо<1 физическая сходимость даёт запас, расходимость — нет */
@@ -2243,6 +2280,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         int32_t mark = (int32_t)(it * (nd + 1) + d + 1);
         memset(&fc, 0, sizeof fc);
         fc.lh_cap = lh_cap;
+        fc.Linmax_prev = Linmax_prev;
+        fc.Linmax_cur = Linmax_cur;
         fc.py = py;
         fc.o = o;
         fc.area = area;
@@ -2515,6 +2554,8 @@ done:
   free(fld);   /* §864/Б1 */
   free(fldok);
   free(Ed);
+  free(Linmax_prev);
+  free(Linmax_cur);
   free(Eprev);
   free(order);
   free(vindex);

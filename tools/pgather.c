@@ -526,6 +526,7 @@ int main(int argc, char **argv) {
   double eye2[3] = {0, 0, 0}, look2[3] = {0, 0, 0};
   int have_delbox = 0;        /* §879: разрушаемость-прототип */
   int rgb = 0;                /* §889: RGB-рендер */
+  double expmul = 1.0;        /* §890: множитель экспозиции */
   const char *blkfile = NULL; /* §882: HBLK v1, mmap-сбор */
   double delbox[6];
   hz_objmesh m;
@@ -580,6 +581,8 @@ int main(int argc, char **argv) {
       gather = atoi(argv[i] + 7);
     else if (strncmp(argv[i], "k27=", 4) == 0)
       k27 = atoi(argv[i] + 4);
+    else if (strncmp(argv[i], "expm=", 5) == 0)
+      expmul = atof(argv[i] + 5); /* §890 */
     else if (strncmp(argv[i], "rgb=", 4) == 0)
       rgb = atoi(argv[i] + 4); /* §889 */
     else if (strncmp(argv[i], "blk=", 4) == 0)
@@ -1313,6 +1316,8 @@ int main(int argc, char **argv) {
         printf("§887-b: row-ветка исполнена %.0f раз\n", st.row_dep);
         printf("§887-d: депозитов Lin>0.5: %lld, Lin<=0.5: %lld\n", (long long)st.lin_pos,
                (long long)st.lin_zero);
+        printf("§894: деп_main=%.1f деп_ног=%.1f (absorbed=%.1f)\n", st.dep_main, st.dep_leg,
+               st.absorbed);
       }
       {
         double rr = rho < 0 ? 0.5 : rho;
@@ -1347,7 +1352,7 @@ int main(int argc, char **argv) {
               expk += lutmp[i];
               npos++;
             }
-          expk = expk / (npos > 0 ? (double)npos : 1.0) + 1e-9;
+          expk = expk * expmul / (npos > 0 ? (double)npos : 1.0) + 1e-9;
           free(lutmp);
           for (i = 0; i < W * H; i++)
             for (int ch = 0; ch < 3; ch++) {

@@ -692,6 +692,7 @@ typedef struct {
   double *Linmax_prev;       /* §893-b: пер-кусковый max пришедшего радианса */
   double *Linmax_cur;        /* §893-b: текущей итерации */
   int in_leg;                /* §894-c: трубка — нога (пер-хит депозит) */
+  double dep_leg, dep_main;  /* §894: Σ депозитов ног / основной трубки */
   double hop_lost_thr;       /* §881/П7: из hop_lost — порогом */
   double hop_lost_cap;       /* §881/П7: из hop_lost — ёмкостью */
   double row_dep;            /* §887-b: счётчик исполнений row-ветки */
@@ -1257,7 +1258,12 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
         } else if (ks > 0.0 && Lin > 0.0) {
           fc->hop_lost += ks * Lin;
         }
-        fc->Ed[p] += fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / front_depden(fc, p);
+        double dep = fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / front_depden(fc, p);
+        if (fc->in_leg)
+          fc->dep_leg += dep;
+        else
+          fc->dep_main += dep;
+        fc->Ed[p] += dep;
         fc->absorbed += fc->w_d * Lin * (1.0 - ks) * csec;
         fc->emitted += fc->w_d * front_le(fc, p) * csec;
         Lh = front_lh_cap(fc, front_le(fc, p) + kdf * fc->Eprev[p] / (2.0 * M_PI));
@@ -2350,6 +2356,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         st->hop_cap += fc.hop_lost_cap;
         st->row_dep += fc.row_dep;
         if (fc.lh_seen > lh_seen) lh_seen = fc.lh_seen;
+        st->dep_leg += fc.dep_leg;
+        st->dep_main += fc.dep_main;
         st->lin_pos += fc.lin_pos;
         st->lin_zero += fc.lin_zero;
         st->hop_cap += fc.hop_lost_cap;

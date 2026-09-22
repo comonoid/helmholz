@@ -689,14 +689,15 @@ typedef struct {
   double hop_lost_thr;  /* §881/П7: из hop_lost — порогом */
   double hop_lost_cap;  /* §881/П7: из hop_lost — ёмкостью */
   double row_dep;       /* §887-b: счётчик исполнений row-ветки */
+  int64_t lin_pos, lin_zero; /* §887-d: депозиты с Lin>0.5 / <=0.5 */
   /* §881: ёмкость 32 (была 4): на зеркально-плотных сценах цепи длиннее 4 —
    * основной поток (дефект §880); усечение — порогом от корня цепи (А1617) */
   double hop_pt[32][3];
   double hop_dir[32][3];
   double hop_lin[32];
   double hop_root[32]; /* Lin цепи в точке первого зеркального удара */
-  int64_t ncellbase; /* базовых клеток полным DDA («до», прибор А1569) */
-  int cbase, cfront; /* прибор считается на первой итерации (геометрия статична) */
+  int64_t ncellbase;   /* базовых клеток полным DDA («до», прибор А1569) */
+  int cbase, cfront;   /* прибор считается на первой итерации (геометрия статична) */
   /* аккумуляторы */
   double depA; /* Σ родительской доли, депонированной кускам (L-единицы) */
   double absorbed, emitted, recycled;
@@ -742,6 +743,32 @@ static double front_rho(const front_ctx *fc, int32_t p) {
  * (умолчание) поведение побитово прежнее */
 static double front_le(const front_ctx *fc, int32_t p) {
   return fc->le + (fc->lep ? (double)fc->lep[p] : 0.0);
+}
+
+/* §887-c: знаменатель депозита — «минимальная доля ряда» (форма §735):
+ * вырожденный кусок (area -> 0) получал E ~ 1/area и взрывался
+ * самоподкачкой Lh (room: E_avg 74.9, max куска 1e7 при it=20 против
+ * сошедшегося MC 11.07). DEP_MIN_SHARE = 1/16: кусок не может принять более
+ * 16 долей среднего по клетке; для обычных кусков D == area — арифметика
+ * битово неизменна. */
+#define FRONT_DEP_MIN_SHARE (1.0 / 16.0)
+static double front_depden(const front_ctx *fc, int32_t p) {
+  double cell2 = fc->py->cell * fc->py->cell;
+  double d = fc->area[p];
+  return d > FRONT_DEP_MIN_SHARE * cell2 ? d : FRONT_DEP_MIN_SHARE * cell2;
+}
+
+/* §887-d: трассировка одного куска (HZ_TRACE_TRI=<tri>) — читается
+ * однократно, печати только для указанного куска, здоровый прогон бесплатен */
+static int tri_trace_id = -1;
+static int tri_trace_init = 0;
+static int tri_trace_on(int32_t p) {
+  if (!tri_trace_init) {
+    const char *e = getenv("HZ_TRACE_TRI");
+    tri_trace_id = e ? atoi(e) : -1;
+    tri_trace_init = 1;
+  }
+  return (int)p == tri_trace_id;
 }
 
 static double front_cos(const front_ctx *fc, int32_t p) {
@@ -1044,13 +1071,14 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
         if (xi) break;
         if (fc->pstamp[p] == fc->pkey) continue;
         if (!front_contained(fc->o->tribox + 6 * (int64_t)py->pcs[p].tri, blo, bhi)) continue;
-        fc->Ed[p] += fc->w_d * Lin * f * csec * fc->axcos * wt[u] / swt / fc->area[p];
+        fc->Ed[p] += fc->w_d * Lin * f * csec * fc->axcos * wt[u] / swt / front_depden(fc, p);
         if (Lin * f < 0.0 && fc->negseen < 8) { /* §871: сентинел Lin<0 */
           fc->negseen++;
           fprintf(stderr, "NEG-T p=%d Lin=%.6g f=%.6g\n", p, Lin, f);
         }
         sw_accum(fc, p,
-                 fc->w_d * Lin * f * csec * fc->axcos * wt[u] / swt / fc->area[p]); /* §862 */
+                 fc->w_d * Lin * f * csec * fc->axcos * wt[u] / swt /
+                     front_depden(fc, p)); /* §862 */
       }
       fc->depA += f * ai;
       fc->absorbed += fc->w_d * Lin * f * csec;
@@ -1231,13 +1259,26 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
           else
             fc->hop_lost_cap += lin_s;
         }
-        fc->Ed[p] += fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / fc->area[p];
+        fc->Ed[p] += fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / front_depden(fc, p);
         fc->absorbed += fc->w_d * Lin * (1.0 - ks) * csec;
-        sw_accum(fc, p, fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / fc->area[p]); /* §862 */
+        sw_accum(fc, p,
+                 fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / front_depden(fc, p)); /* §862 */
+        if (Lin > 0.5)
+          fc->lin_pos++;
+        else
+          fc->lin_zero++;
+        if (tri_trace_on(p))
+          fprintf(stderr, "TRI %d FV ks>0: Lin=%.6g ks=%.3g Ed=%.6g\n", p, Lin, ks, fc->Ed[p]);
       } else {
-        fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos / fc->area[p];
+        fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos / front_depden(fc, p);
         fc->absorbed += fc->w_d * Lin * csec;
-        sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos / fc->area[p]); /* §862 */
+        sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos / front_depden(fc, p)); /* §862 */
+        if (Lin > 0.5)
+          fc->lin_pos++;
+        else
+          fc->lin_zero++;
+        if (tri_trace_on(p))
+          fprintf(stderr, "TRI %d FV ks=0: Lin=%.6g Ed=%.6g\n", p, Lin, fc->Ed[p]);
       }
       fc->emitted += fc->w_d * front_le(fc, p) * csec;
       Lh = front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI);
@@ -1822,13 +1863,13 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
     for (i = 0; i < fc->pbuf_n; i++) {
       int32_t p = fc->pbuf_p[i];
       double Lh;
-      fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos / fc->area[p];
+      fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos / front_depden(fc, p);
       fc->absorbed += fc->w_d * Lin * csec;
       fc->emitted += fc->w_d * front_le(fc, p) * csec;
       Lh = front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI);
       fc->recycled += fc->w_d * (Lh - fc->le) * csec;
       fc->ndep++;
-      sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos / fc->area[p]);
+      sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos / front_depden(fc, p));
       Lin = Lh;
     }
     fc->row_dep += 1.0; /* §887-b: маркер исполнения ветки (счётчик визитов) */
@@ -2232,6 +2273,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         st->hop_thr += fc.hop_lost_thr;
         st->hop_cap += fc.hop_lost_cap;
         st->row_dep += fc.row_dep;
+        st->lin_pos += fc.lin_pos;
+        st->lin_zero += fc.lin_zero;
         st->hop_cap += fc.hop_lost_cap;
         absorbed += fc.absorbed;
         emitted += fc.emitted;

@@ -511,6 +511,71 @@ static int32_t pg_hblk_nearest(const pg_hblk *h, const double org[3], const doub
   return best;
 }
 
+/* --- §896: клип треугольника клеткой (Sutherland–Hodgman по 6 плоскостям).
+ * Возврат: площадь клипа; poly/np — вершины. */
+static double sh_clip_tri(const double tri[3][3], const double blo[3], const double bhi[3],
+                          double out[3][3]) {
+  double poly[16][3], tmp[16][3];
+  int np = 3, nt2 = 0, pl;
+  for (int i = 0; i < 3; i++)
+    for (int a = 0; a < 3; a++)
+      poly[i][a] = tri[i][a];
+  const int axv[6] = {0, 0, 1, 1, 2, 2};
+  const int sgv[6] = {-1, 1, -1, 1, -1, 1};
+  const double *bnd[6] = {blo, bhi, blo, bhi, blo, bhi};
+  for (pl = 0; pl < 6 && np > 0; pl++) {
+    int a = axv[pl], sg = sgv[pl];
+    double bndv = bnd[pl][a];
+    nt2 = 0;
+    for (int i = 0; i < np; i++) {
+      const double *cur = poly[i], *nxt = poly[(i + 1) % np];
+      double c = cur[a], n = nxt[a];
+      int cin = (sg < 0) ? (c >= bndv - 1e-15) : (c <= bndv + 1e-15);
+      int nin = (sg < 0) ? (n >= bndv - 1e-15) : (n <= bndv + 1e-15);
+      if (cin) {
+        for (int q = 0; q < 3; q++)
+          tmp[nt2][q] = cur[q];
+        nt2++;
+      }
+      if ((cin && !nin) || (!cin && nin)) {
+        double t = (bndv - c) / (n - c);
+        for (int q = 0; q < 3; q++)
+          tmp[nt2][q] = cur[q] + t * (nxt[q] - cur[q]);
+        nt2++;
+      }
+    }
+    for (int i = 0; i < nt2; i++)
+      for (int q = 0; q < 3; q++)
+        poly[i][q] = tmp[i][q];
+    np = nt2;
+  }
+  if (np < 3) return 0.0;
+  { /* площадь + центроид (через триангуляцию веером) */
+    double area = 0.0, cx = 0, cy = 0, cz = 0;
+    for (int i = 1; i < np - 1; i++) {
+      double e1[3], e2[3], cr[3];
+      for (int a = 0; a < 3; a++) {
+        e1[a] = poly[i][a] - poly[0][a];
+        e2[a] = poly[i + 1][a] - poly[0][a];
+      }
+      cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
+      cr[1] = e1[2] * e2[0] - e1[0] * e2[2];
+      cr[2] = e1[0] * e2[1] - e1[1] * e2[0];
+      double aa = 0.5 * sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+      area += aa;
+      cx += aa * (poly[0][0] + poly[i][0] + poly[i + 1][0]) / 3.0;
+      cy += aa * (poly[0][1] + poly[i][1] + poly[i + 1][1]) / 3.0;
+      cz += aa * (poly[0][2] + poly[i][2] + poly[i + 1][2]) / 3.0;
+    }
+    if (area > 1e-14) {
+      out[0][0] = cx / area;
+      out[0][1] = cy / area;
+      out[0][2] = cz / area;
+    }
+    return area;
+  }
+}
+
 int main(int argc, char **argv) {
   const char *path = NULL, *outfile = "img/pgather.ppm";
   /* §875: дефолты потребителя — ПРОДАКШН-МОДЕЛЬ (дихотомия ks §873/874,
@@ -526,6 +591,7 @@ int main(int argc, char **argv) {
   double eye2[3] = {0, 0, 0}, look2[3] = {0, 0, 0};
   int have_delbox = 0;        /* §879: разрушаемость-прототип */
   int rgb = 0;                /* §889: RGB-рендер */
+  int clip = 0;               /* §896: кусок = (tri ∩ клетка) */
   double expmul = 1.0;        /* §890: множитель экспозиции */
   const char *blkfile = NULL; /* §882: HBLK v1, mmap-сбор */
   double delbox[6];
@@ -539,6 +605,11 @@ int main(int argc, char **argv) {
   int32_t *mtl = NULL;
   double cell, t0, t1, sw_time;
   double *lum = NULL;
+  /* §896: куски (tri ∩ клетка) — объявления в scope функции */
+  int32_t NP = 0;
+  int32_t *ktri = NULL, *qmtl = NULL, *qtri = NULL;
+  double *qcmin = NULL, *qcmax = NULL, *qcent = NULL;
+  double *qarea = NULL, *qnrm = NULL, *qkd = NULL, *qks = NULL, *qlep = NULL;
   /* §867: данные mode=3, заполняются до memset(&so) — см. блок trivert */
   double *g_tv9 = NULL, *g_tb6 = NULL;
   uint8_t *g_lparr = NULL;
@@ -583,6 +654,8 @@ int main(int argc, char **argv) {
       k27 = atoi(argv[i] + 4);
     else if (strncmp(argv[i], "expm=", 5) == 0)
       expmul = atof(argv[i] + 5); /* §890 */
+    else if (strncmp(argv[i], "clip=", 5) == 0)
+      clip = atoi(argv[i] + 5); /* §896 */
     else if (strncmp(argv[i], "rgb=", 4) == 0)
       rgb = atoi(argv[i] + 4); /* §889 */
     else if (strncmp(argv[i], "blk=", 4) == 0)
@@ -796,6 +869,95 @@ int main(int argc, char **argv) {
     }
     cell = maxdim / (double)(1 << lev);
   }
+  if (clip) {
+    /* §896: клип куска — кусок = (tri ∩ клетка). S-H клип по 6 плоскостям */
+    int64_t cap2 = 4096, n2 = 0;
+    qcmin = (double *)malloc((size_t)4096 * 6 * sizeof *qcmin);
+    qcmax = (double *)malloc((size_t)4096 * 6 * sizeof *qcmax);
+    qcent = (double *)malloc((size_t)4096 * 3 * sizeof *qcent);
+    qmtl = (int32_t *)malloc((size_t)4096 * sizeof *qmtl);
+    ktri = (int32_t *)malloc((size_t)4096 * sizeof *ktri);
+    qtri = (int32_t *)malloc((size_t)4096 * sizeof *qtri);
+    qarea = (double *)malloc((size_t)4096 * sizeof *qarea);
+    qnrm = (double *)malloc((size_t)4096 * 3 * sizeof *qnrm);
+    qkd = (double *)malloc((size_t)4096 * sizeof *qkd);
+    qks = (double *)malloc((size_t)4096 * sizeof *qks);
+    if (useke) qlep = (double *)malloc((size_t)4096 * sizeof *qlep);
+    if (!qcmin || !qcmax || !qcent || !qmtl || !qtri || !qarea || !qnrm || !qkd || !qks ||
+        (useke && !qlep))
+      return 2;
+    for (i = 0; i < m.nt; i++) {
+      double tri[3][3];
+      hz_obj_tri(&m, (int32_t)i, tri);
+      int64_t i0[3], i1[3];
+      for (ax = 0; ax < 3; ax++) {
+        double a = 1e30, b = -1e30;
+        for (int v = 0; v < 3; v++) {
+          if (tri[v][ax] < a) a = tri[v][ax];
+          if (tri[v][ax] > b) b = tri[v][ax];
+        }
+        i0[ax] = (int64_t)((a - m.lo[ax]) / cell);
+        i1[ax] = (int64_t)((b - m.lo[ax]) / cell);
+        if (i0[ax] < 0) i0[ax] = 0;
+        if (i1[ax] > (1 << lev) - 1) i1[ax] = (1 << lev) - 1;
+      }
+      for (int64_t cz = i0[2]; cz <= i1[2]; cz++)
+        for (int64_t cy = i0[1]; cy <= i1[1]; cy++)
+          for (int64_t cx = i0[0]; cx <= i1[0]; cx++) {
+            double blo[3] = {m.lo[0] + cx * cell, m.lo[1] + cy * cell, m.lo[2] + cz * cell};
+            double bhi[3] = {blo[0] + cell, blo[1] + cell, blo[2] + cell};
+            double outp[3][3];
+            double aa = sh_clip_tri(tri, blo, bhi, outp);
+            if (aa <= 1e-14) continue;
+            if (n2 >= cap2) {
+              cap2 *= 2;
+              qcmin = (double *)realloc(qcmin, (size_t)cap2 * 6 * sizeof *qcmin);
+              qcmax = (double *)realloc(qcmax, (size_t)cap2 * 6 * sizeof *qcmax);
+              qcent = (double *)realloc(qcent, (size_t)cap2 * 3 * sizeof *qcent);
+              qmtl = (int32_t *)realloc(qmtl, (size_t)cap2 * sizeof *qmtl);
+              qtri = (int32_t *)realloc(qtri, (size_t)cap2 * sizeof *qtri);
+              qarea = (double *)realloc(qarea, (size_t)cap2 * sizeof *qarea);
+              qnrm = (double *)realloc(qnrm, (size_t)cap2 * 3 * sizeof *qnrm);
+              qkd = (double *)realloc(qkd, (size_t)cap2 * sizeof *qkd);
+              qks = (double *)realloc(qks, (size_t)cap2 * sizeof *qks);
+              if (useke) qlep = (double *)realloc(qlep, (size_t)cap2 * sizeof *qlep);
+              if (!qcmin || !qcmax || !qcent || !qmtl || !qtri || !qarea || !qnrm || !qkd || !qks ||
+                  (useke && !qlep))
+                return 2;
+            }
+            for (int q = 0; q < 3; q++) {
+              qcmin[3 * n2 + q] = blo[q];
+              qcmax[3 * n2 + q] = bhi[q];
+              qcent[3 * n2 + q] = outp[0][q];
+            }
+            qmtl[n2] = m.fm[i];
+            qtri[n2] = (int32_t)i;
+            qarea[n2] = aa;
+            for (int q = 0; q < 3; q++)
+              qnrm[3 * n2 + q] = nrm[3 * (int64_t)i + q];
+            qkd[n2] = kd[i];
+            qks[n2] = ks[i];
+            if (lep) qlep[n2] = lep[i];
+            n2++;
+          }
+    }
+    /* куски: cmin/cmax/cent/mtl → кусочные (для build/CSR), остальные
+     * piece-массивы соберутся ниже (kd/ks/lep/nrm/area через ktri) */
+    NP = (int32_t)n2;
+    /* свап: дальше вся программа работает в терминах КУСКОВ */
+    free(area);
+    area = qarea;
+    free(nrm);
+    nrm = qnrm;
+    free(kd);
+    kd = qkd;
+    free(ks);
+    ks = qks;
+    free(lep);
+    lep = qlep;
+    ktri = qtri;
+    printf("§896: клип — кусков %d из %d треугольников\n", NP, m.nt);
+  }
   { /* §867: trivert/tribox/lp для mode=3 (точное пересечение + walk) —
      * в порядке ИСХОДНЫХ треугольников (pcs[].tri); так как so ниже
      * memset-ится, указатели назначаются ПОСЛЕ memset (класс бага pref) */
@@ -829,9 +991,18 @@ int main(int argc, char **argv) {
     g_tb6 = tb6;
     g_lparr = lparr;
   }
-  if (hz_pyr_build(&py, m.nt, cmin, cmax, cent, mtl, m.lo, m.hi, cell) != 0) {
+  int32_t nb = clip ? NP : m.nt;
+  const double *bcmin = clip ? qcmin : cmin;
+  const double *bcmax = clip ? qcmax : cmax;
+  const double *bcent = clip ? qcent : cent;
+  const int32_t *bmtl = clip ? qmtl : mtl;
+  if (hz_pyr_build(&py, nb, bcmin, bcmax, bcent, bmtl, m.lo, m.hi, cell) != 0) {
     fprintf(stderr, "pgather: пирамида не построилась\n");
     return 2;
+  }
+  if (clip) { /* §896: pcs.tri = исходный tri (ray-tri/tribox по исходнику) */
+    for (int32_t pi = 0; pi < nb; pi++)
+      py.pcs[pi].tri = ktri[pi];
   }
   if (mort &&
       (hz_pyr_morton(&py) != 0 || hz_pyr_permute(&py, area, sizeof *area) != 0 ||
@@ -900,7 +1071,7 @@ int main(int argc, char **argv) {
       so.lep = lepc[ch]; /* kd канала идёт 3-м аргументом hz_sw_run */
       for (i = 0; i < m.nt; i++)
         py.pcs[i].e = 0.0f;
-      if (hz_sw_run(&py, m.nt, area, nrm, kdc[ch], &so, &st, NULL) != 0) return 2;
+      if (hz_sw_run(&py, NP, area, nrm, kdc[ch], &so, &st, NULL) != 0) return 2;
       for (i = 0; i < m.nt; i++)
         Ec[ch][i] = py.pcs[i].e;
     }
@@ -911,7 +1082,7 @@ int main(int argc, char **argv) {
     for (i = 0; i < m.nt; i++)
       py.pcs[i].e = 0.0f;
     t0 = now_sec();
-    if (hz_sw_run(&py, m.nt, area, nrm, kd, &so, &st, NULL) != 0) {
+    if (hz_sw_run(&py, NP, area, nrm, kd, &so, &st, NULL) != 0) {
       fprintf(stderr, "pgather: свип не прошёл\n");
       return 2;
     }

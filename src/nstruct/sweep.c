@@ -1226,10 +1226,9 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
     hp[v] = p;
   }
   {
-    if (fc->in_leg) {
-      /* §894-c: НОГА — пер-хит депозит с декрементом потока: каждый кусок
-       * погашает депозитом свою долю, релей ks·Lin уходит хопом, Lin = Lh.
-       * (Линейная нагрузка на ногах множила энергию: N клеток = N×.) */
+    { /* §894-e: пер-хит депозит для ЛЮБОЙ трубки — схема согласована с
+       * MC-эталоном (коридор 1.0023, одно зеркало 1.0365); линейная
+       * нагрузка §892 снята: релей на ногах множил энергию (1.46) */
       int first = 1;
       for (i = 0; i < nh; i++) {
         int32_t p = hp[i];
@@ -1279,18 +1278,6 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
      * (ray effect на уровне кусков) и 1/area-сингулярности (знаменатель
      * Σarea ограничен). Зеркальный релей — хоп от ближайшего точного
      * удара (pbest по списку ray-tri: точка, R, ks·Lin). */
-    /* §893-b: вес нормали — соседние фасетки имеют близкие |cos n,om|:
-     * гладкие веса вместо лотереи «попал/не попал ray-tri» */
-    double sw = 0.0, sw_den = 0.0;
-    for (u = 0; u < n; u++) {
-      int32_t p = ps[u];
-      if (fc->pstamp[p] == fc->pkey) continue;
-      const double *nv = fc->nrm + 3 * (int64_t)p;
-      double an = fabs(fc->om[0] * nv[0] + fc->om[1] * nv[1] + fc->om[2] * nv[2]);
-      sw += fc->area[p] * an;
-    }
-    /* 1/area однокусковых клеток (sw = area·an) давала пестроту и взрыв */
-    sw_den = sw > FRONT_DEP_MIN_SHARE * csec ? sw : FRONT_DEP_MIN_SHARE * csec;
     int32_t pbest = -1;
     double tb = 1e30;
     for (i = 0; i < nh; i++)
@@ -1298,25 +1285,6 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
         tb = ht[i];
         pbest = hp[i];
       }
-    if (Lin > 0.0 && sw_den > 0.0) {
-      for (u = 0; u < n; u++) {
-        int32_t p = ps[u];
-        if (fc->pstamp[p] == fc->pkey) continue;
-        fc->pstamp[p] = fc->pkey; /* один депозит на (кусок, направление) */
-        double ks = fc->o->ks ? fc->o->ks[p] : 0.0;
-        double kdf = front_rho(fc, p);
-        if (ks > 1.0 - kdf) ks = 1.0 - kdf > 0.0 ? 1.0 - kdf : 0.0;
-        const double *nv = fc->nrm + 3 * (int64_t)p;
-        double an = fabs(fc->om[0] * nv[0] + fc->om[1] * nv[1] + fc->om[2] * nv[2]);
-        fc->Linmax_cur[p] = fc->Linmax_cur[p] < Lin ? Lin : fc->Linmax_cur[p];
-        fc->Ed[p] += fc->w_d * Lin * csec * an * (1.0 - ks) / sw_den;
-        fc->absorbed += fc->w_d * Lin * csec * an * (1.0 - ks) * fc->area[p] / sw_den;
-        sw_accum(fc, p, fc->w_d * Lin * csec * an * (1.0 - ks) / sw_den);
-        if (tri_trace_on(p))
-          fprintf(stderr, "TRI %d LL: Lin=%.6g ks=%.3g Ed=%.6g\n", p, Lin, ks, fc->Ed[p]);
-      }
-      fc->emitted += fc->w_d * front_le(fc, ps[0]) * csec;
-    }
     /* §894-b ОТКАТ: хоп на каждый зеркальный кусок клетки ДАВАЛ пере-
      * светление ×1.5-2 (коридор 1.47, одно зеркало 1.97): хоп-нога при
      * линейной нагрузке депонирует свой поток в КАЖДОЙ клетке пути без

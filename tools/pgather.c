@@ -525,6 +525,7 @@ int main(int argc, char **argv) {
   int frames = 1, have_eye2 = 0; /* §877: ходьба */
   double eye2[3] = {0, 0, 0}, look2[3] = {0, 0, 0};
   int have_delbox = 0;        /* §879: разрушаемость-прототип */
+  int rgb = 0;                /* §889: RGB-рендер */
   const char *blkfile = NULL; /* §882: HBLK v1, mmap-сбор */
   double delbox[6];
   hz_objmesh m;
@@ -579,6 +580,8 @@ int main(int argc, char **argv) {
       gather = atoi(argv[i] + 7);
     else if (strncmp(argv[i], "k27=", 4) == 0)
       k27 = atoi(argv[i] + 4);
+    else if (strncmp(argv[i], "rgb=", 4) == 0)
+      rgb = atoi(argv[i] + 4); /* §889 */
     else if (strncmp(argv[i], "blk=", 4) == 0)
       blkfile = argv[i] + 4; /* §882 */
     else if (strncmp(argv[i], "delbox=", 7) == 0) {
@@ -870,16 +873,49 @@ int main(int argc, char **argv) {
   so.tribox = g_tb6;
   so.lp = g_lparr;
   so.domhi = m.hi;
-  for (i = 0; i < m.nt; i++)
-    py.pcs[i].e = 0.0f;
-  t0 = now_sec();
-  if (hz_sw_run(&py, m.nt, area, nrm, kd, &so, &st, NULL) != 0) {
-    fprintf(stderr, "pgather: свип не прошёл\n");
-    return 2;
+  double *Ec[3] = {NULL, NULL, NULL}; /* §889: E по каналам */
+  double *kdc[3] = {NULL, NULL, NULL}, *lepc[3] = {NULL, NULL, NULL};
+  if (rgb) {
+    /* §889: три скалярных решения с альбедо/эмиссией канала (классика
+     * радиосити). kd_c = kd3[c], lep_c = ke3[c]; le остаётся общим. */
+    if (ksf > 0.0) {
+      fprintf(stderr, "pgather: rgb=1 с ksf>0 не совмещается в v1 - отказ\n");
+      return 2;
+    }
+    for (int ch = 0; ch < 3; ch++) {
+      kdc[ch] = (double *)malloc((size_t)m.nt * sizeof *kdc[ch]);
+      lepc[ch] = (double *)malloc((size_t)m.nt * sizeof *lepc[ch]);
+      Ec[ch] = (double *)malloc((size_t)m.nt * sizeof *Ec[ch]);
+      if (!kdc[ch] || !lepc[ch] || !Ec[ch]) return 2;
+      for (i = 0; i < m.nt; i++) {
+        kdc[ch][i] = m.mtl[m.fm[i]].kd3[ch];
+        lepc[ch][i] = m.mtl[m.fm[i]].ke3[ch];
+      }
+    }
+    t0 = now_sec();
+    for (int ch = 0; ch < 3; ch++) {
+      so.lep = lepc[ch]; /* kd канала идёт 3-м аргументом hz_sw_run */
+      for (i = 0; i < m.nt; i++)
+        py.pcs[i].e = 0.0f;
+      if (hz_sw_run(&py, m.nt, area, nrm, kdc[ch], &so, &st, NULL) != 0) return 2;
+      for (i = 0; i < m.nt; i++)
+        Ec[ch][i] = py.pcs[i].e;
+    }
+    t1 = now_sec();
+    sw_time = t1 - t0;
+    printf("СВИП RGB: 3 канала (%.3f с), E_avg=%.4f\n", sw_time, st.e_avg);
+  } else {
+    for (i = 0; i < m.nt; i++)
+      py.pcs[i].e = 0.0f;
+    t0 = now_sec();
+    if (hz_sw_run(&py, m.nt, area, nrm, kd, &so, &st, NULL) != 0) {
+      fprintf(stderr, "pgather: свип не прошёл\n");
+      return 2;
+    }
+    t1 = now_sec();
+    sw_time = t1 - t0;
+    printf("СВИП: E_avg=%.4f (%.3f с)\n", st.e_avg, sw_time);
   }
-  t1 = now_sec();
-  sw_time = t1 - t0;
-  printf("СВИП: E_avg=%.4f (%.3f с)\n", st.e_avg, sw_time);
 
   if (have_delbox) {
     /* --- §879: РАЗРУШАЕМОСТЬ-1. A: решение полной сцены (выше), E по tri;
@@ -1194,6 +1230,12 @@ int main(int argc, char **argv) {
 
       t0 = now_sec();
       pg_cam cam, cam0;
+      double *Lumc[3] = {NULL, NULL, NULL};
+      if (rgb)
+        for (int ch = 0; ch < 3; ch++) {
+          Lumc[ch] = (double *)malloc((size_t)W * (size_t)H * sizeof *Lumc[ch]);
+          if (!Lumc[ch]) return 2;
+        }
       memset(&cam0, 0, sizeof cam0);
       cam0.py = &py;
       cam0.csr = &csr;
@@ -1234,7 +1276,16 @@ int main(int argc, char **argv) {
           /* §874/А1585: базовый и вторичный лучи — одним сборщиком */
           pbest = pg_nearest(&py, &csr, &m, ef, rd, gather, &thit, &st_loc, &te_loc);
           if (pbest >= 0) {
-            L = pg_lcam_hit(&cam, ef, rd, pbest, thit, 0);
+            if (rgb) { /* §889: поканальная яркость (зеркальный член — v2) */
+              for (int ch = 0; ch < 3; ch++) {
+                double kdvis_c = rho < 0 ? kdc[ch][pbest] : rho;
+                double Lc = le + lepc[ch][pbest] + kdvis_c * Ec[ch][pbest] / (2.0 * M_PI);
+                Lumc[ch][(size_t)iy * (size_t)W + (size_t)ix] = Lc;
+                if (ch == 1) L = Lc; /* зелёный — яркостная метрика */
+              }
+            } else {
+              L = pg_lcam_hit(&cam, ef, rd, pbest, thit, 0);
+            }
             nhit++;
             lsum += L;
             if (L > lmax) lmax = L;
@@ -1283,14 +1334,37 @@ int main(int argc, char **argv) {
           return 2;
         }
         fprintf(f, "P6\n%d %d\n255\n", W, H);
-        for (i = 0; i < W * H; i++) {
-          double v = lum[i] / (lmax > 0 ? lmax : 1.0) * 255.0;
-          unsigned char b[3];
-          if (v > 255.0) v = 255.0;
-          if (v < 0.0) v = 0.0;
-          b[0] = b[1] = b[2] = (unsigned char)v;
-          fwrite(b, 1, 3, f);
-        }
+        if (rgb) { /* §889: экспозиция по средней ключевой яркости + гамма;
+                    * перцентиль душил тени (динамический диапазон лампы) */
+          double *lutmp = (double *)malloc((size_t)W * (size_t)H * sizeof *lutmp);
+          double expk = 0.0;
+          int64_t npos = 0;
+          if (!lutmp) return 2;
+          for (i = 0; i < W * H; i++)
+            lutmp[i] = Lumc[1][i];
+          for (i = 0; i < W * H; i++)
+            if (lutmp[i] > 0) {
+              expk += lutmp[i];
+              npos++;
+            }
+          expk = expk / (npos > 0 ? (double)npos : 1.0) + 1e-9;
+          free(lutmp);
+          for (i = 0; i < W * H; i++)
+            for (int ch = 0; ch < 3; ch++) {
+              double v = 255.0 * pow(Lumc[ch][i] / expk < 0 ? 0 : Lumc[ch][i] / expk, 1.0 / 2.2);
+              if (v > 255.0) v = 255.0;
+              unsigned char bb = (unsigned char)v;
+              if (fwrite(&bb, 1, 1, f) != 1) return 2;
+            }
+        } else
+          for (i = 0; i < W * H; i++) {
+            double v = lum[i] / (lmax > 0 ? lmax : 1.0) * 255.0;
+            unsigned char b[3];
+            if (v > 255.0) v = 255.0;
+            if (v < 0.0) v = 0.0;
+            b[0] = b[1] = b[2] = (unsigned char)v;
+            fwrite(b, 1, 3, f);
+          }
         fclose(f);
         printf("КАДР: %s записан (P6, нормировка на max кадра)\n", fname);
       }

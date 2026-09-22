@@ -687,6 +687,8 @@ typedef struct {
   double hop_lost_sum;       /* §881: Σ по трубкам направления */
   int64_t hop_hops_sum;      /* §881: Σ хопов по трубкам направления */
   double Lh_last;            /* §892: диффузное продолжение клетки */
+  double lh_cap;             /* §893: кап радианса итерации */
+  double lh_seen;            /* §893: максимум радианса за направление */
   double hop_lost_thr;       /* §881/П7: из hop_lost — порогом */
   double hop_lost_cap;       /* §881/П7: из hop_lost — ёмкостью */
   double row_dep;            /* §887-b: счётчик исполнений row-ветки */
@@ -770,6 +772,14 @@ static int tri_trace_on(int32_t p) {
     tri_trace_init = 1;
   }
   return (int)p == tri_trace_id;
+}
+
+/* §893: ограничитель радианса — Lh не превышает кап итерации */
+#define LH_GROWTH (1.0 + 0.25) /* §893: рост радианса не быстрее +25 %/итерацию */
+static double front_lh_cap(front_ctx *fc, double lh) {
+  if (lh > fc->lh_cap) lh = fc->lh_cap;
+  if (lh > fc->lh_seen) fc->lh_seen = lh;
+  return lh;
 }
 
 static double front_cos(const front_ctx *fc, int32_t p) {
@@ -1029,12 +1039,14 @@ static void front_interact(front_ctx *fc, const int32_t *ps, int32_t n, const do
       fc->depA += ai; /* родительская доля трубки погашена целиком (G6) */
       fc->absorbed += fc->w_d * Lin * csec;
       fc->ndep++;
-      Lh = front_le(fc, pbest) + front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI);
+      Lh = front_lh_cap(fc, front_le(fc, pbest) +
+                                front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI));
       fc->recycled += fc->w_d * (Lh - fc->le) * csec;
     }
     fc->emitted += fc->w_d * front_le(fc, pbest) * csec;
     *a = 0.0;
-    *b = front_le(fc, pbest) + front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI);
+    *b = front_lh_cap(fc, front_le(fc, pbest) +
+                                front_rho(fc, pbest) * fc->Eprev[pbest] / (2.0 * M_PI));
     if (Lin < 0.0 && fc->negseen < 8) { /* §871: сентинел Lin<0 */
       fc->negseen++;
       fprintf(stderr, "NEG-A pbest=%d Lin=%.6g\n", pbest, Lin);
@@ -1266,7 +1278,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
       } else if (ks > 0.0 && Lin > 0.0) {
         fc->hop_lost += ks * Lin;
       }
-      fc->Lh_last = front_le(fc, pbest) + kdf * fc->Eprev[pbest] / (2.0 * M_PI);
+      fc->Lh_last = front_lh_cap(fc, front_le(fc, pbest) + kdf * fc->Eprev[pbest] / (2.0 * M_PI));
       fc->recycled += fc->w_d * (fc->Lh_last - fc->le) * csec;
       fc->ndep++;
     }
@@ -1853,7 +1865,7 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
       fc->Ed[p] += fc->w_d * Lin * csec * fc->axcos / front_depden(fc, p);
       fc->absorbed += fc->w_d * Lin * csec;
       fc->emitted += fc->w_d * front_le(fc, p) * csec;
-      Lh = front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI);
+      Lh = front_lh_cap(fc, front_le(fc, p) + front_rho(fc, p) * fc->Eprev[p] / (2.0 * M_PI));
       fc->recycled += fc->w_d * (Lh - fc->le) * csec;
       fc->ndep++;
       sw_accum(fc, p, fc->w_d * Lin * csec * fc->axcos / front_depden(fc, p));
@@ -2173,10 +2185,25 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
 
   for (it = 0; it < o->iters; it++) {
     double emitted = 0, absorbed = 0, lost = 0, recycled = 0, e_sum = 0, area_sum = 0;
+    double lh_cap = 1e300, lh_seen = 0.0; /* §893 */
     int32_t p;
     memset(Ed, 0, (size_t)nt * sizeof *Ed);
     for (p = 0; p < nt; p++)
       Eprev[p] = py->pcs[p].e;
+    /* §893: Lh-ограничитель (принцип максимума радианса, §735): кап итерации
+     * = LH_GROWTH·(макс радианс прошлой итерации). Рост ≤ +25 %/итерацию;
+     * при альбедо<1 физическая сходимость даёт запас, расходимость — нет */
+    {
+      double lmax = 0.0;
+      for (p = 0; p < nt; p++) {
+        double rho_p = o->rho < 0 ? kd[p] : o->rho;
+        double le_p = o->le + (o->lep ? o->lep[p] : 0.0);
+        double lh = le_p + rho_p * Eprev[p] / (2.0 * M_PI);
+        if (lh > lmax) lmax = lh;
+      }
+      lh_cap = LH_GROWTH * lmax;
+      lh_seen = 0.0;
+    }
     if (o->mode == 3 && o->agg && ag.ng > 0) { /* §863: ΣEprev·a групп */
       for (int64_t g = 0; g < ag.ng; g++) {
         double s = 0;
@@ -2215,6 +2242,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         front_ctx fc;
         int32_t mark = (int32_t)(it * (nd + 1) + d + 1);
         memset(&fc, 0, sizeof fc);
+        fc.lh_cap = lh_cap;
         fc.py = py;
         fc.o = o;
         fc.area = area;
@@ -2260,6 +2288,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         st->hop_thr += fc.hop_lost_thr;
         st->hop_cap += fc.hop_lost_cap;
         st->row_dep += fc.row_dep;
+        if (fc.lh_seen > lh_seen) lh_seen = fc.lh_seen;
         st->lin_pos += fc.lin_pos;
         st->lin_zero += fc.lin_zero;
         st->hop_cap += fc.hop_lost_cap;

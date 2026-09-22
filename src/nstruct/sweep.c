@@ -691,6 +691,7 @@ typedef struct {
   double lh_seen;            /* §893: максимум радианса за направление */
   double *Linmax_prev;       /* §893-b: пер-кусковый max пришедшего радианса */
   double *Linmax_cur;        /* §893-b: текущей итерации */
+  int in_leg;                /* §894-c: трубка — нога (пер-хит депозит) */
   double hop_lost_thr;       /* §881/П7: из hop_lost — порогом */
   double hop_lost_cap;       /* §881/П7: из hop_lost — ёмкостью */
   double row_dep;            /* §887-b: счётчик исполнений row-ветки */
@@ -1225,6 +1226,53 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
     hp[v] = p;
   }
   {
+    if (fc->in_leg) {
+      /* §894-c: НОГА — пер-хит депозит с декрементом потока: каждый кусок
+       * погашает депозитом свою долю, релей ks·Lin уходит хопом, Lin = Lh.
+       * (Линейная нагрузка на ногах множила энергию: N клеток = N×.) */
+      int first = 1;
+      for (i = 0; i < nh; i++) {
+        int32_t p = hp[i];
+        double Lh;
+        if (fc->pstamp[p] == fc->pkey) continue;
+        fc->pstamp[p] = fc->pkey;
+        if (first) {
+          fc->depA += ai;
+          first = 0;
+        }
+        double ks = fc->o->ks ? fc->o->ks[p] : 0.0;
+        double kdf = front_rho(fc, p);
+        if (ks > 1.0 - kdf) ks = 1.0 - kdf > 0.0 ? 1.0 - kdf : 0.0;
+        if (ks > 0.0 && Lin > 0.0 && fc->hop_n < 32) {
+          const double *nv2 = fc->nrm + 3 * (int64_t)p;
+          double dot2 = fc->om[0] * nv2[0] + fc->om[1] * nv2[1] + fc->om[2] * nv2[2];
+          double tth = ht[i];
+          int q2;
+          for (q2 = 0; q2 < 3; q2++) {
+            fc->hop_pt[fc->hop_n][q2] = fc->org[q2] + fc->om[q2] * tth;
+            fc->hop_dir[fc->hop_n][q2] = fc->om[q2] - 2.0 * dot2 * nv2[q2];
+          }
+          fc->hop_lin[fc->hop_n] = ks * Lin;
+          fc->hop_root[fc->hop_n] = Lin;
+          fc->hop_n++;
+        } else if (ks > 0.0 && Lin > 0.0) {
+          fc->hop_lost += ks * Lin;
+        }
+        fc->Ed[p] += fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / front_depden(fc, p);
+        fc->absorbed += fc->w_d * Lin * (1.0 - ks) * csec;
+        fc->emitted += fc->w_d * front_le(fc, p) * csec;
+        Lh = front_lh_cap(fc, front_le(fc, p) + kdf * fc->Eprev[p] / (2.0 * M_PI));
+        fc->recycled += fc->w_d * (Lh - fc->le) * csec;
+        fc->ndep++;
+        sw_accum(fc, p, fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / front_depden(fc, p));
+        Lin = Lh;
+      }
+      if (nh > 0) {
+        *a = 0.0;
+        *b = Lin;
+      }
+      return;
+    }
     /* §892: ЛИНЕЙНАЯ НАГРУЗКА КЛЕТКИ (T4) — поток трубки делится между
      * ВСЕМИ кусками клетки пропорционально площади: Ed_p +=
      * w_d·Lin·csec·axcos·(1−ks_p)/Σarea. Нет лотереи треугольников
@@ -1909,6 +1957,7 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
         fabs(0.0 - fc->depA - a) > 1e-9 * (1.0 + fabs(a)))
       fc->g6viol++;
     /* §873/T4 шаг 2: зеркальные хопы — LIFO-обработка очереди */
+    fc->in_leg = 1; /* §894-c: дальше обрабатываются НОГИ */
     while (fc->hop_n > 0) {
       double ai = fc->hop_lin[fc->hop_n - 1];
       const double *pt = fc->hop_pt[fc->hop_n - 1];
@@ -1937,6 +1986,7 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
       *lostB += fc->hop_lost; /* вытесненные из очереди доли — в lost */
       fc->nlostseg++;
     }
+    fc->in_leg = 0;
   }
   if (a > 0.0 || b > 0.0)
     fc->nlostseg++; /* остаток ушёл за границу домена — в lost, не исчез (А1567) */

@@ -1198,7 +1198,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
       }
     }
 
-    if (fc->pstamp[p] == fc->pkey) {
+    if (fc->pstamp[py->pcs[p].tri] == fc->pkey) {
       fc->nstamp++; /* кратность 1 на (кусок, направление) — А1564 */
       continue;
     }
@@ -1242,8 +1242,8 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
       for (i = 0; i < nh; i++) {
         int32_t p = hp[i];
         double Lh;
-        if (fc->pstamp[p] == fc->pkey) continue;
-        fc->pstamp[p] = fc->pkey;
+        if (fc->pstamp[py->pcs[p].tri] == fc->pkey) continue;
+        fc->pstamp[py->pcs[p].tri] = fc->pkey;
         if (first) {
           fc->depA += ai;
           first = 0;

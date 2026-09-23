@@ -698,6 +698,7 @@ typedef struct {
   uint64_t leg_pkey;         /* §894-c-5: ключ штампа ноги (уникален на ногу) */
   double leg_root;           /* §894-c-5: корень цепи ноги (для порога) */
   int hop_dep[32];           /* §896-4: глубина цепи каждого хопа */
+  int64_t leg_budget;        /* §896-5: бюджет ног на направление */
   int cur_leg_depth;         /* §896-4: глубина обрабатываемой ноги */
   int64_t dep_cnt;           /* §894: число депозитов */
   double hop_lost_thr;       /* §881/П7: из hop_lost — порогом */
@@ -1251,7 +1252,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
         double kdf = front_rho(fc, p);
         if (ks > 1.0 - kdf) ks = 1.0 - kdf > 0.0 ? 1.0 - kdf : 0.0;
         double lin_hop = ks * Lin;
-        int relay_ok = lin_hop >= 1e-3 * fc->leg_root; /* §894-c-5: порог от КОРНЯ цепи */
+        int relay_ok = lin_hop > 0.0 && lin_hop >= 1e-3 * fc->leg_root; /* §894-c-5 */
         if (relay_ok && fc->hop_n < 32) {
           const double *nv2 = fc->nrm + 3 * (int64_t)p;
           double dot2 = fc->om[0] * nv2[0] + fc->om[1] * nv2[1] + fc->om[2] * nv2[2];
@@ -1944,11 +1945,17 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
     /* §873/T4 шаг 2: зеркальные хопы — LIFO-обработка очереди */
     int64_t *main_pstamp = fc->pstamp;
     uint64_t main_pkey = fc->pkey;
-    fc->in_leg = 1; /* §894-c: дальше обрабатываются НОГИ */
+    fc->in_leg = 1;                                /* §894-c: дальше обрабатываются НОГИ */
     fc->leg_pkey = ((uint64_t)fc->mark << 48) | 1; /* уникальный ключ на ногу */
     while (fc->hop_n > 0) {
       /* §894-c-5: нога живёт в СВОЁМ штамп-пространстве — штампы ног не
        * блокируют депозиты основной трубки (гипотеза аудита §896-3) */
+      if (fc->leg_budget <= 0) { /* §896-5: бюджет исчерпан — остаток в lost */
+        fc->hop_lost += fc->hop_lin[fc->hop_n - 1];
+        fc->hop_n--;
+        continue;
+      }
+      fc->leg_budget--;
       fc->pstamp = fc->leg_pstamp;
       fc->pkey = fc->leg_pkey;
       double ai = fc->hop_lin[fc->hop_n - 1];
@@ -1956,9 +1963,9 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
       const double *dir = fc->hop_dir[fc->hop_n - 1];
       fc->hop_n--;
       fc->hop_depth++;
-      fc->leg_pkey++; /* уникальный ключ каждой ноге */
+      fc->leg_pkey++;                         /* уникальный ключ каждой ноге */
       fc->leg_root = fc->hop_root[fc->hop_n]; /* корень цепи — порог от него */
-      if (fc->hop_dep[fc->hop_n] >= 32) { /* §896-4: цепь длиннее 32 — в lost */
+      if (fc->hop_dep[fc->hop_n] >= 32) {     /* §896-4: цепь длиннее 32 — в lost */
         fc->hop_lost += ai;
         fc->hop_n--;
         continue;
@@ -2106,9 +2113,10 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   uint64_t *bits = NULL;
   hz_sw_walk *walks = NULL;
   hz_sw_dir *tab = NULL;
-  int32_t *stampv = NULL; /* §851: штампы визитов линий [ncells] */
-  int64_t *pstamp = NULL; /* §852/А1564: штамп (трубка × кусок) [nt] */
+  int32_t *stampv = NULL;     /* §851: штампы визитов линий [ncells] */
+  int64_t *pstamp = NULL;     /* §852/А1564: штамп (трубка × кусок) [nt] */
   int64_t *leg_pstamp = NULL; /* §894-c-5: штампы ног (отдельное пространство) */
+  int64_t leg_budget = 0;     /* §896-5: бюджет ног на направление */
   /* §865/раунд 13: кэш «кусок × трубка» (только path=1) */
   pc_rec *pc = NULL; /* §865/раунды 13+15: кэш «кусок × трубка» (только path=1) */
   int32_t *bstart = NULL, *bpids = NULL, *fillb = NULL; /* §852/А1566: bbox-индекс */
@@ -2272,7 +2280,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
 
   for (it = 0; it < o->iters; it++) {
     double emitted = 0, absorbed = 0, lost = 0, recycled = 0, e_sum = 0, area_sum = 0;
-    double lh_cap = 1e300, lh_seen = 0.0; /* §893 */
+    double lh_cap = 1e300, lh_seen = 0.0;                     /* §893 */
     double dep_main_it = 0, dep_leg_it = 0, hop_spawn_it = 0; /* §896-3 аудит */
     int32_t p;
     memset(Ed, 0, (size_t)nt * sizeof *Ed);
@@ -2297,6 +2305,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       }
       lh_cap = LH_GROWTH * lmax;
       lh_seen = 0.0;
+      leg_budget = 2000000; /* §896-5: бюджет ног на направление */
     }
     if (o->mode == 3 && o->agg && ag.ng > 0) { /* §863: ΣEprev·a групп */
       for (int64_t g = 0; g < ag.ng; g++) {
@@ -2631,9 +2640,9 @@ done:
   free(vindex);
   free(bits);
   free(tab);
-  free(pstamp); /* §852/А1564 */
+  free(pstamp);     /* §852/А1564 */
   free(leg_pstamp); /* §894-c-5 */
-  free(pc);     /* §865/раунды 13+15 */
+  free(pc);         /* §865/раунды 13+15 */
   free(stampv);
   free(nstart); /* §863 */
   free(nlen);

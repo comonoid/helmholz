@@ -589,12 +589,12 @@ int main(int argc, char **argv) {
   int W = 320, H = 240, k27 = 0;
   int frames = 1, have_eye2 = 0; /* §877: ходьба */
   double eye2[3] = {0, 0, 0}, look2[3] = {0, 0, 0};
-  int have_delbox = 0;        /* §879: разрушаемость-прототип */
-  int rgb = 0;                /* §889: RGB-рендер */
-  int clip = 0;               /* §896: кусок = (tri ∩ клетка) */
+  int have_delbox = 0;                            /* §879: разрушаемость-прототип */
+  int rgb = 0;                                    /* §889: RGB-рендер */
+  int clip = 0;                                   /* §896: кусок = (tri ∩ клетка) */
   const char *efile_out = NULL, *efile_in = NULL; /* §898: E sidecar */
-  double expmul = 1.0;        /* §890: множитель экспозиции */
-  const char *blkfile = NULL; /* §882: HBLK v1, mmap-сбор */
+  double expmul = 1.0;                            /* §890: множитель экспозиции */
+  const char *blkfile = NULL;                     /* §882: HBLK v1, mmap-сбор */
   double delbox[6];
   hz_objmesh m;
   hz_pyr py;
@@ -1083,6 +1083,24 @@ int main(int argc, char **argv) {
     t1 = now_sec();
     sw_time = t1 - t0;
     printf("СВИП RGB: 3 канала (%.3f с), E_avg=%.4f\n", sw_time, st.e_avg);
+  } else if (efile_in) {
+    /* §899: E из sidecar — свип пропущен (свободная ходьба) */
+    FILE *fei = fopen(efile_in, "rb");
+    if (!fei) {
+      fprintf(stderr, "pgather: E не читается: %s\n", efile_in);
+      return 2;
+    }
+    for (i = 0; i < m.nt; i++) {
+      double ev;
+      if (fread(&ev, sizeof(double), 1, fei) != 1) {
+        fclose(fei);
+        return 2;
+      }
+      py.pcs[i].e = (float)ev;
+    }
+    fclose(fei);
+    t0 = now_sec();
+    printf("§899: E из %s (свип пропущен)\n", efile_in);
   } else {
     for (i = 0; i < m.nt; i++)
       py.pcs[i].e = 0.0f;

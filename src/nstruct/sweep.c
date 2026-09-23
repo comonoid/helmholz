@@ -689,10 +689,16 @@ typedef struct {
   double Lh_last;            /* §892: диффузное продолжение клетки */
   double lh_cap;             /* §893: кап радианса итерации */
   double lh_seen;            /* §893: максимум радианса за направление */
+  double hop_spawn_e;        /* §896-3: Σ ks·Lin при спавне хопов */
   double *Linmax_prev;       /* §893-b: пер-кусковый max пришедшего радианса */
   double *Linmax_cur;        /* §893-b: текущей итерации */
   int in_leg;                /* §894-c: трубка — нога (пер-хит депозит) */
   double dep_leg, dep_main;  /* §894: Σ депозитов ног / основной трубки */
+  int64_t *leg_pstamp;       /* §894-c-5: штампы ног — отдельное пространство */
+  uint64_t leg_pkey;         /* §894-c-5: ключ штампа ноги (уникален на ногу) */
+  double leg_root;           /* §894-c-5: корень цепи ноги (для порога) */
+  int hop_dep[32];           /* §896-4: глубина цепи каждого хопа */
+  int cur_leg_depth;         /* §896-4: глубина обрабатываемой ноги */
   int64_t dep_cnt;           /* §894: число депозитов */
   double hop_lost_thr;       /* §881/П7: из hop_lost — порогом */
   double hop_lost_cap;       /* §881/П7: из hop_lost — ёмкостью */
@@ -1244,7 +1250,9 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
         double ks = fc->o->ks ? fc->o->ks[p] : 0.0;
         double kdf = front_rho(fc, p);
         if (ks > 1.0 - kdf) ks = 1.0 - kdf > 0.0 ? 1.0 - kdf : 0.0;
-        if (ks > 0.0 && Lin > 0.0 && fc->hop_n < 32) {
+        double lin_hop = ks * Lin;
+        int relay_ok = lin_hop >= 1e-3 * fc->leg_root; /* §894-c-5: порог от КОРНЯ цепи */
+        if (relay_ok && fc->hop_n < 32) {
           const double *nv2 = fc->nrm + 3 * (int64_t)p;
           double dot2 = fc->om[0] * nv2[0] + fc->om[1] * nv2[1] + fc->om[2] * nv2[2];
           double tth = ht[i];
@@ -1253,11 +1261,11 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
             fc->hop_pt[fc->hop_n][q2] = fc->org[q2] + fc->om[q2] * tth;
             fc->hop_dir[fc->hop_n][q2] = fc->om[q2] - 2.0 * dot2 * nv2[q2];
           }
-          fc->hop_lin[fc->hop_n] = ks * Lin;
-          fc->hop_root[fc->hop_n] = Lin;
+          fc->hop_lin[fc->hop_n] = lin_hop;
+          fc->hop_root[fc->hop_n] = fc->leg_root;
           fc->hop_n++;
-        } else if (ks > 0.0 && Lin > 0.0) {
-          fc->hop_lost += ks * Lin;
+        } else if (!relay_ok) {
+          fc->hop_lost += lin_hop; /* порог — доля в lost (баланс цел) */
         }
         double dep = fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / front_depden(fc, p);
         if (fc->in_leg) {
@@ -1934,13 +1942,28 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
         fabs(0.0 - fc->depA - a) > 1e-9 * (1.0 + fabs(a)))
       fc->g6viol++;
     /* §873/T4 шаг 2: зеркальные хопы — LIFO-обработка очереди */
+    int64_t *main_pstamp = fc->pstamp;
+    uint64_t main_pkey = fc->pkey;
     fc->in_leg = 1; /* §894-c: дальше обрабатываются НОГИ */
+    fc->leg_pkey = ((uint64_t)fc->mark << 48) | 1; /* уникальный ключ на ногу */
     while (fc->hop_n > 0) {
+      /* §894-c-5: нога живёт в СВОЁМ штамп-пространстве — штампы ног не
+       * блокируют депозиты основной трубки (гипотеза аудита §896-3) */
+      fc->pstamp = fc->leg_pstamp;
+      fc->pkey = fc->leg_pkey;
       double ai = fc->hop_lin[fc->hop_n - 1];
       const double *pt = fc->hop_pt[fc->hop_n - 1];
       const double *dir = fc->hop_dir[fc->hop_n - 1];
       fc->hop_n--;
       fc->hop_depth++;
+      fc->leg_pkey++; /* уникальный ключ каждой ноге */
+      fc->leg_root = fc->hop_root[fc->hop_n]; /* корень цепи — порог от него */
+      if (fc->hop_dep[fc->hop_n] >= 32) { /* §896-4: цепь длиннее 32 — в lost */
+        fc->hop_lost += ai;
+        fc->hop_n--;
+        continue;
+      }
+      fc->cur_leg_depth = fc->hop_dep[fc->hop_n];
       /* §881/А1618: усечение по глубине снято — нога ниже порога от корня не
        * рождается при спавне; цикл зеркального коридора обрывается порогом */
       for (q = 0; q < 3; q++) {
@@ -2085,6 +2108,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   hz_sw_dir *tab = NULL;
   int32_t *stampv = NULL; /* §851: штампы визитов линий [ncells] */
   int64_t *pstamp = NULL; /* §852/А1564: штамп (трубка × кусок) [nt] */
+  int64_t *leg_pstamp = NULL; /* §894-c-5: штампы ног (отдельное пространство) */
   /* §865/раунд 13: кэш «кусок × трубка» (только path=1) */
   pc_rec *pc = NULL; /* §865/раунды 13+15: кэш «кусок × трубка» (только path=1) */
   int32_t *bstart = NULL, *bpids = NULL, *fillb = NULL; /* §852/А1566: bbox-индекс */
@@ -2210,7 +2234,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       for (int64_t ci = 0; ci < ncluster; ci++)
         nstart[ci] = -1;
     }
-    if (!pstamp || !bstart) {
+    leg_pstamp = (int64_t *)calloc((size_t)nt, sizeof *leg_pstamp);
+    if (!pstamp || !bstart || !leg_pstamp) {
       rc = 2;
       goto done;
     }
@@ -2248,6 +2273,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   for (it = 0; it < o->iters; it++) {
     double emitted = 0, absorbed = 0, lost = 0, recycled = 0, e_sum = 0, area_sum = 0;
     double lh_cap = 1e300, lh_seen = 0.0; /* §893 */
+    double dep_main_it = 0, dep_leg_it = 0, hop_spawn_it = 0; /* §896-3 аудит */
     int32_t p;
     memset(Ed, 0, (size_t)nt * sizeof *Ed);
     for (p = 0; p < nt; p++)
@@ -2330,6 +2356,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.noprop = o->noprop;
         fc.tau0 = o->tau0;
         fc.pstamp = pstamp;
+        fc.leg_pstamp = leg_pstamp;
         fc.pc = pc;
         fc.bstart = bstart;
         fc.bpids = bpids;
@@ -2359,8 +2386,11 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         st->hop_cap += fc.hop_lost_cap;
         st->row_dep += fc.row_dep;
         if (fc.lh_seen > lh_seen) lh_seen = fc.lh_seen;
+        hop_spawn_it += fc.hop_spawn_e;
         st->dep_leg += fc.dep_leg;
         st->dep_main += fc.dep_main;
+        dep_main_it += fc.dep_main;
+        dep_leg_it += fc.dep_leg;
         st->dep_cnt += fc.dep_cnt;
         st->lin_pos += fc.lin_pos;
         st->lin_zero += fc.lin_zero;
@@ -2528,6 +2558,12 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       area_sum += area[p];
     }
     st->e_avg = e_sum / area_sum;
+    if (getenv("HZ_AUDIT"))
+      fprintf(stderr,
+              "AUDIT it=%d E_avg=%.4g emitted=%.1f absorbed=%.1f lost=%.1f dep_main=%.1f "
+              "dep_leg=%.1f hop_spawn=%.1f hop_lost=%.1f\n",
+              it, st->e_avg, emitted, absorbed, lost, dep_main_it, dep_leg_it, hop_spawn_it,
+              st->hop_lost);
     st->emitted = emitted;
     st->recycled = recycled;
     st->absorbed = absorbed;
@@ -2596,6 +2632,7 @@ done:
   free(bits);
   free(tab);
   free(pstamp); /* §852/А1564 */
+  free(leg_pstamp); /* §894-c-5 */
   free(pc);     /* §865/раунды 13+15 */
   free(stampv);
   free(nstart); /* §863 */

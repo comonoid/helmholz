@@ -592,6 +592,7 @@ int main(int argc, char **argv) {
   int have_delbox = 0;        /* §879: разрушаемость-прототип */
   int rgb = 0;                /* §889: RGB-рендер */
   int clip = 0;               /* §896: кусок = (tri ∩ клетка) */
+  const char *efile_out = NULL, *efile_in = NULL; /* §898: E sidecar */
   double expmul = 1.0;        /* §890: множитель экспозиции */
   const char *blkfile = NULL; /* §882: HBLK v1, mmap-сбор */
   double delbox[6];
@@ -654,6 +655,10 @@ int main(int argc, char **argv) {
       k27 = atoi(argv[i] + 4);
     else if (strncmp(argv[i], "expm=", 5) == 0)
       expmul = atof(argv[i] + 5); /* §890 */
+    else if (strncmp(argv[i], "Eout=", 5) == 0)
+      efile_out = argv[i] + 5; /* §898 */
+    else if (strncmp(argv[i], "Ein=", 4) == 0)
+      efile_in = argv[i] + 4; /* §898 */
     else if (strncmp(argv[i], "clip=", 5) == 0)
       clip = atoi(argv[i] + 5); /* §896 */
     else if (strncmp(argv[i], "rgb=", 4) == 0)
@@ -1071,7 +1076,7 @@ int main(int argc, char **argv) {
       so.lep = lepc[ch]; /* kd канала идёт 3-м аргументом hz_sw_run */
       for (i = 0; i < m.nt; i++)
         py.pcs[i].e = 0.0f;
-      if (hz_sw_run(&py, NP, area, nrm, kdc[ch], &so, &st, NULL) != 0) return 2;
+      if (hz_sw_run(&py, nb, area, nrm, kdc[ch], &so, &st, NULL) != 0) return 2;
       for (i = 0; i < m.nt; i++)
         Ec[ch][i] = py.pcs[i].e;
     }
@@ -1082,13 +1087,23 @@ int main(int argc, char **argv) {
     for (i = 0; i < m.nt; i++)
       py.pcs[i].e = 0.0f;
     t0 = now_sec();
-    if (hz_sw_run(&py, NP, area, nrm, kd, &so, &st, NULL) != 0) {
+    if (hz_sw_run(&py, nb, area, nrm, kd, &so, &st, NULL) != 0) {
       fprintf(stderr, "pgather: свип не прошёл\n");
       return 2;
     }
     t1 = now_sec();
     sw_time = t1 - t0;
     printf("СВИП: E_avg=%.4f (%.3f с)\n", st.e_avg, sw_time);
+    if (efile_out) { /* §898: дамп E */
+      FILE *fe = fopen(efile_out, "wb");
+      if (!fe) return 2;
+      for (i = 0; i < NP; i++) {
+        double ev = py.pcs[i].e;
+        fwrite(&ev, sizeof(double), 1, fe);
+      }
+      fclose(fe);
+      printf("§898: E записан в %s (%d кусков)\n", efile_out, NP);
+    }
   }
 
   if (have_delbox) {

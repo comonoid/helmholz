@@ -2136,7 +2136,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   memset(st, 0, sizeof *st);
   if (!py || !area || !nrm || !kd || !o) return 1;
   if (o->iters <= 0) return 1;
-  if (!py->pcs || nt != py->nt) return 1;
+  if (!py->pcs || nt != py->nt) { fprintf(stderr, "DBG nt=%d py->nt=%d\n", nt, py->nt); return 1; }
   if (o->mode == 2 && o->vc && !o->trivert) return 1; /* §852: нужно точное пересечение */
   if (o->mode == 3 && (!o->trivert || !o->tribox || !o->lp || !o->domhi))
     return 1;                                 /* §852: фронт */

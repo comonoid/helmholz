@@ -836,7 +836,7 @@ int main(int argc, char **argv) {
             fwrite(b, 1, 3, f);
           }
         fclose(f);
-        printf("КАДР: %s записан (HBLK v1, силуэт)\n", fname);
+        printf("КАДР: %s записан (HBLK %s)\n", fname, hb.E ? "v2, поле из файла" : "v1, силуэт");
       }
       free(lum);
     }

@@ -1268,7 +1268,36 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
         } else if (!relay_ok) {
           fc->hop_lost += lin_hop; /* порог — доля в lost (баланс цел) */
         }
-        double dep = fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / front_depden(fc, p);
+        /* §911-2: перехват куском не превышает поток трубки — клэмп
+         * csec·μ/depden до 1 (клип-кусок area≪csec прежде давал
+         * dep/Lin до ~87 → самоподкачка → взрыв клипа; на кусках
+         * ≥ клетки отношение ≤1 — битово прежнее) */
+        double dep_ratio = csec * fc->axcos / front_depden(fc, p);
+        if (dep_ratio > 1.0) dep_ratio = 1.0;
+        double dep = fc->w_d * Lin * (1.0 - ks) * dep_ratio;
+        {
+          /* §911-2: прибор депозит/входящий поток — печать первых 20
+           * фактов (piece, area, csec, axcos, dep/Lin) при HZ_DEPDBG=1;
+           * здоровый прогон бесплатен */
+          static int depdbg_init = 0;
+          static int depdbg_on = 0;
+          static int depdbg_n = 0;
+          if (!depdbg_init) {
+            const char *e = getenv("HZ_DEPDBG");
+            depdbg_on = e && e[0] != '\0' && e[0] != '0';
+            depdbg_init = 1;
+          }
+          if (depdbg_on && depdbg_n < 20 && Lin > 0.0 && dep > 2.0 * Lin) {
+            double area_p = fc->area[p];
+#pragma omp critical(depdbg)
+            {
+              fprintf(stderr, "DEPDBG[%d] piece=%d area=%.3g csec=%.3g axcos=%.3g dep/Lin=%.3g\n",
+                      depdbg_n, p, area_p, csec, fc->axcos,
+                      (csec * fc->axcos) / front_depden(fc, p));
+              depdbg_n++;
+            }
+          }
+        }
         if (fc->in_leg) {
           fc->dep_leg += dep;
         } else {
@@ -1281,7 +1310,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
         Lh = front_lh_cap(fc, front_le(fc, p) + kdf * fc->Eprev[p] / (2.0 * M_PI));
         fc->recycled += fc->w_d * (Lh - fc->le) * csec;
         fc->ndep++;
-        sw_accum(fc, p, fc->w_d * Lin * (1.0 - ks) * csec * fc->axcos / front_depden(fc, p));
+        sw_accum(fc, p, fc->w_d * Lin * (1.0 - ks) * dep_ratio);
         Lin = Lh;
       }
       if (nh > 0) {
@@ -2136,7 +2165,10 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   memset(st, 0, sizeof *st);
   if (!py || !area || !nrm || !kd || !o) return 1;
   if (o->iters <= 0) return 1;
-  if (!py->pcs || nt != py->nt) { fprintf(stderr, "DBG nt=%d py->nt=%d\n", nt, py->nt); return 1; }
+  if (!py->pcs || nt != py->nt) {
+    fprintf(stderr, "DBG nt=%d py->nt=%d\n", nt, py->nt);
+    return 1;
+  }
   if (o->mode == 2 && o->vc && !o->trivert) return 1; /* §852: нужно точное пересечение */
   if (o->mode == 3 && (!o->trivert || !o->tribox || !o->lp || !o->domhi))
     return 1;                                 /* §852: фронт */

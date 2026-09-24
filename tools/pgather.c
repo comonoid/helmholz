@@ -344,9 +344,11 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
 }
 
 /* --- §882: HBLK v1 — mmap-сбор (блок = листовая клетка, Morton);
- * §902: v2 — kd/lep/E в файле, освещённый кадр без OBJ */
+ * §902: v2 — kd/lep/E в файле, освещённый кадр без OBJ;
+ * §904: v3 — kd3/lep3 в файле, RGB-кадр без OBJ */
 #define PG_HBLK_MAGIC 0x314B4C4248ULL  /* "HBLK1" */
 #define PG_HBLK_MAGIC2 0x324B4C4248ULL /* "HBLK2" */
+#define PG_HBLK_MAGIC3 0x334B4C4248ULL /* "HBLK3" */
 typedef struct {
   uint8_t *base; /* начало mmap */
   size_t len;
@@ -354,9 +356,11 @@ typedef struct {
   const uint8_t *tab; /* pb_cellrec {cell,start,cnt+pad} 24 Б */
   const int32_t *ids;
   const double *tris; /* 9 double на tri, исходный порядок */
-  const double *kd;   /* §902: v2 — отклик/поле per tri (NULL в v1) */
+  const double *kd;   /* §902: v2/v3 — отклик/поле per tri (NULL в v1) */
   const double *lep;
   const double *E;
+  const double *kd3; /* §904: v3 — каналы для RGB-кадра из файла */
+  const double *lep3;
   int64_t nocc, nx, ny, nz, nt;
   double cell;
   double lo[3];
@@ -386,12 +390,17 @@ static int pg_hblk_open(pg_hblk *h, const char *path) {
   if (h->base == MAP_FAILED) return 2;
   madvise(h->base, h->len, MADV_RANDOM);
   h->hdr = (const uint64_t *)h->base;
-  if (h->hdr[0] != PG_HBLK_MAGIC && h->hdr[0] != PG_HBLK_MAGIC2) return 2;
-  h->kd = h->lep = h->E = NULL;
-  if (h->hdr[0] == PG_HBLK_MAGIC2) { /* §902: слоты отклика и поля */
+  if (h->hdr[0] != PG_HBLK_MAGIC && h->hdr[0] != PG_HBLK_MAGIC2 && h->hdr[0] != PG_HBLK_MAGIC3)
+    return 2;
+  h->kd = h->lep = h->E = h->kd3 = h->lep3 = NULL;
+  if (h->hdr[0] == PG_HBLK_MAGIC2 || h->hdr[0] == PG_HBLK_MAGIC3) { /* §902: отклик/поле */
     h->kd = (const double *)(h->base + h->hdr[13]);
     h->lep = (const double *)(h->base + h->hdr[14]);
     h->E = (const double *)(h->base + h->hdr[15]);
+  }
+  if (h->hdr[0] == PG_HBLK_MAGIC3) { /* §904: каналы */
+    h->kd3 = (const double *)(h->base + h->hdr[16]);
+    h->lep3 = (const double *)(h->base + h->hdr[17]);
   }
   h->nt = (int64_t)h->hdr[1];
   h->nx = (int64_t)h->hdr[2];
@@ -743,7 +752,9 @@ int main(int argc, char **argv) {
            (long long)hb.nocc);
     getrusage(RUSAGE_SELF, &ra);
     {
-      double fwd[3], right[3], up[3], tmpv[3] = {0, 0, 1};
+      /* явная инициализация — анализатор теряет индукцию цикла по ax
+       * (FP-класс diam, прецедент pg_bbox_span/§904) */
+      double fwd[3] = {0, 0, 0}, right[3] = {0, 0, 0}, up[3] = {0, 0, 0}, tmpv[3] = {0, 0, 1};
       double tanf = tan(fov * M_PI / 360.0);
       int64_t nhit2 = 0, tested2 = 0;
       double tA = now_sec(), tB;
@@ -777,6 +788,17 @@ int main(int argc, char **argv) {
         up[ax] = fwd[(ax + 1) % 3] * right[(ax + 2) % 3] - fwd[(ax + 2) % 3] * right[(ax + 1) % 3];
       lum = (double *)malloc((size_t)W * (size_t)H * sizeof *lum);
       if (!lum) return 2;
+      double *LumcB[3] = {NULL, NULL, NULL}; /* §904: RGB из файла */
+      if (rgb) {
+        if (!hb.kd3) {
+          fprintf(stderr, "pgather: rgb=1 требует HBLK3 (v3) - в файле нет kd3/lep3\n");
+          return 2;
+        }
+        for (int ch = 0; ch < 3; ch++) {
+          LumcB[ch] = (double *)malloc((size_t)W * (size_t)H * sizeof *LumcB[ch]);
+          if (!LumcB[ch]) return 2;
+        }
+      }
       /* §886: параллелизм §878/§884 ВКЛЮЧЁН (указание: делать все
        * оптимизации) — строки кадра независимы, файл read-only */
 #pragma omp parallel for schedule(dynamic, 16) private(ax) reduction(+ : tested2, nhit2)
@@ -785,6 +807,7 @@ int main(int argc, char **argv) {
           double sx = (2.0 * (ix + 0.5) / W - 1.0) * tanf;
           double sy = (1.0 - 2.0 * (iy + 0.5) / H) * tanf * (double)H / (double)W;
           double rd[3] = {0, 0, 0}, nn, Lv = 0.0;
+          double Lvc[3] = {0, 0, 0}; /* §904 */
           int32_t hit;
           int64_t tested_loc = 0;
           for (ax = 0; ax < 3; ax++)
@@ -796,9 +819,18 @@ int main(int argc, char **argv) {
           tested2 += tested_loc;
           if (hit >= 0) {
             nhit2++;
-            /* §902: v2 — освещённый кадр из файла (та же формула, что
-             * pg_lcam_hit: le + lep + kd·E/2π); v1 — силуэт */
-            Lv = hb.E ? le + hb.lep[hit] + hb.kd[hit] * hb.E[hit] / (2.0 * M_PI) : le;
+            if (rgb) { /* §904: L_c = le + lep_c + kd_c·E/2π (§889 из файла) */
+              for (int ch = 0; ch < 3; ch++) {
+                Lvc[ch] = le + hb.lep3[3 * (int64_t)hit + ch] +
+                          hb.kd3[3 * (int64_t)hit + ch] * hb.E[hit] / (2.0 * M_PI);
+                LumcB[ch][(size_t)iy * (size_t)W + (size_t)ix] = Lvc[ch];
+              }
+              Lv = Lvc[1]; /* зелёный — яркостная метрика (§889) */
+            } else {
+              /* §902: v2 — освещённый кадр из файла (та же формула, что
+               * pg_lcam_hit: le + lep + kd·E/2π); v1 — силуэт */
+              Lv = hb.E ? le + hb.lep[hit] + hb.kd[hit] * hb.E[hit] / (2.0 * M_PI) : le;
+            }
           }
           lum[(size_t)iy * (size_t)W + (size_t)ix] = Lv;
         }
@@ -817,7 +849,23 @@ int main(int argc, char **argv) {
         f = fopen(fname, "wb");
         if (!f) return 2;
         fprintf(f, "P6\n%d %d\n255\n", W, H);
-        if (hb.E) { /* §902: v2 — серый кадр, нормировка на max (как сбор) */
+        if (rgb) { /* §904: экспозиция по ключевой яркости + гамма (§889) */
+          double expk = 0.0;
+          int64_t npos = 0;
+          for (i = 0; i < W * H; i++)
+            if (LumcB[1][i] > 0) {
+              expk += LumcB[1][i];
+              npos++;
+            }
+          expk = expk * expmul / (npos > 0 ? (double)npos : 1.0) + 1e-9;
+          for (i = 0; i < W * H; i++)
+            for (int ch = 0; ch < 3; ch++) {
+              double v = 255.0 * pow(LumcB[ch][i] / expk < 0 ? 0 : LumcB[ch][i] / expk, 1.0 / 2.2);
+              if (v > 255.0) v = 255.0;
+              unsigned char bb = (unsigned char)v;
+              if (fwrite(&bb, 1, 1, f) != 1) return 2;
+            }
+        } else if (hb.E) { /* §902: v2 — серый кадр, нормировка на max (как сбор) */
           double lmaxv = 0.0;
           for (i = 0; i < W * H; i++)
             if (lum[i] > lmaxv) lmaxv = lum[i];
@@ -836,8 +884,13 @@ int main(int argc, char **argv) {
             fwrite(b, 1, 3, f);
           }
         fclose(f);
-        printf("КАДР: %s записан (HBLK %s)\n", fname, hb.E ? "v2, поле из файла" : "v1, силуэт");
+        printf("КАДР: %s записан (HBLK %s)\n", fname,
+               rgb    ? "v3, RGB из файла"
+               : hb.E ? "v2, поле из файла"
+                      : "v1, силуэт");
       }
+      for (int ch = 0; ch < 3; ch++)
+        free(LumcB[ch]); /* §904 */
       free(lum);
     }
     pg_hblk_close(&hb);

@@ -20,7 +20,7 @@
 
 #include "scene_obj.h"
 
-#define PB_MAGIC 0x324B4C4248ULL /* "HBLK2" little-endian (v2 §902) */
+#define PB_MAGIC 0x334B4C4248ULL /* "HBLK3" little-endian (v3 §904) */
 
 static int64_t pb_morton3(uint32_t x, uint32_t y, uint32_t z) {
   int64_t r = 0;
@@ -209,6 +209,18 @@ int main(int argc, char **argv) {
       }
       fclose(fe);
     }
+    /* §904: kd3/lep3 per tri×канал — цветной кадр из файла (§889) */
+    double *kd3 = (double *)malloc((size_t)m.nt * 3 * sizeof *kd3);
+    double *lep3 = (double *)malloc((size_t)m.nt * 3 * sizeof *lep3);
+    if (!kd3 || !lep3) {
+      fprintf(stderr, "pblock: нет памяти на kd3/lep3\n");
+      return 2;
+    }
+    for (i = 0; i < m.nt; i++)
+      for (int c = 0; c < 3; c++) {
+        kd3[3 * (int64_t)i + c] = m.mtl[m.fm[i]].kd3[c];
+        lep3[3 * (int64_t)i + c] = m.mtl[m.fm[i]].ke3[c];
+      }
     FILE *f = fopen(outfile, "wb");
     if (!f) {
       fprintf(stderr, "pblock: не открыть %s\n", outfile);
@@ -229,6 +241,8 @@ int main(int argc, char **argv) {
     hdr[13] = hdr[12] + (uint64_t)m.nt * 72; /* §902: оффсет kd */
     hdr[14] = hdr[13] + (uint64_t)m.nt * 8;  /* §902: оффсет lep */
     hdr[15] = hdr[14] + (uint64_t)m.nt * 8;  /* §902: оффсет E */
+    hdr[16] = hdr[15] + (uint64_t)m.nt * 8;  /* §904: оффсет kd3 (3·nt) */
+    hdr[17] = hdr[16] + (uint64_t)m.nt * 24; /* §904: оффсет lep3 (3·nt) */
     fwrite(hdr, 8, 24, f);
     fwrite(tab, sizeof *tab, (size_t)nocc, f);
     fwrite(ids, sizeof *ids, (size_t)nids, f);
@@ -240,14 +254,18 @@ int main(int argc, char **argv) {
     fwrite(kd, sizeof *kd, (size_t)m.nt, f);
     fwrite(lep, sizeof *lep, (size_t)m.nt, f);
     fwrite(E, sizeof *E, (size_t)m.nt, f);
+    fwrite(kd3, sizeof *kd3, (size_t)m.nt * 3, f);
+    fwrite(lep3, sizeof *lep3, (size_t)m.nt * 3, f);
     fclose(f);
-    printf("HBLK2: %s — nt=%d, занятых клеток %" PRId64 " из %" PRId64 ", ссылок %" PRId64
+    printf("HBLK3: %s — nt=%d, занятых клеток %" PRId64 " из %" PRId64 ", ссылок %" PRId64
            " (кратность %.2f), E %s\n",
            outfile, m.nt, nocc, ncells, nids, (double)nids / (double)m.nt,
            efile ? "из sidecar" : "нули");
     free(kd);
     free(lep);
     free(E);
+    free(kd3);
+    free(lep3);
   }
   free(occ);
   free(cnt);

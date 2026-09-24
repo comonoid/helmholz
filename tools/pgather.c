@@ -343,8 +343,10 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
   return L;
 }
 
-/* --- §882: HBLK v1 — mmap-сбор (блок = листовая клетка, Morton) --- */
-#define PG_HBLK_MAGIC 0x314B4C4248ULL
+/* --- §882: HBLK v1 — mmap-сбор (блок = листовая клетка, Morton);
+ * §902: v2 — kd/lep/E в файле, освещённый кадр без OBJ */
+#define PG_HBLK_MAGIC 0x314B4C4248ULL  /* "HBLK1" */
+#define PG_HBLK_MAGIC2 0x324B4C4248ULL /* "HBLK2" */
 typedef struct {
   uint8_t *base; /* начало mmap */
   size_t len;
@@ -352,6 +354,9 @@ typedef struct {
   const uint8_t *tab; /* pb_cellrec {cell,start,cnt+pad} 24 Б */
   const int32_t *ids;
   const double *tris; /* 9 double на tri, исходный порядок */
+  const double *kd;   /* §902: v2 — отклик/поле per tri (NULL в v1) */
+  const double *lep;
+  const double *E;
   int64_t nocc, nx, ny, nz, nt;
   double cell;
   double lo[3];
@@ -381,7 +386,13 @@ static int pg_hblk_open(pg_hblk *h, const char *path) {
   if (h->base == MAP_FAILED) return 2;
   madvise(h->base, h->len, MADV_RANDOM);
   h->hdr = (const uint64_t *)h->base;
-  if (h->hdr[0] != PG_HBLK_MAGIC) return 2;
+  if (h->hdr[0] != PG_HBLK_MAGIC && h->hdr[0] != PG_HBLK_MAGIC2) return 2;
+  h->kd = h->lep = h->E = NULL;
+  if (h->hdr[0] == PG_HBLK_MAGIC2) { /* §902: слоты отклика и поля */
+    h->kd = (const double *)(h->base + h->hdr[13]);
+    h->lep = (const double *)(h->base + h->hdr[14]);
+    h->E = (const double *)(h->base + h->hdr[15]);
+  }
   h->nt = (int64_t)h->hdr[1];
   h->nx = (int64_t)h->hdr[2];
   h->ny = (int64_t)h->hdr[3];
@@ -689,9 +700,13 @@ int main(int argc, char **argv) {
     else
       path = argv[i];
   }
-  if (!path || W < 1 || H < 1 || W > PG_WH_MAX || H > PG_WH_MAX || fov < PG_FOV_MIN ||
-      fov > PG_FOV_MAX) {
-    fprintf(stderr, "use: pgather <scene.obj> [lev=N dirs=.. it=N rho=F le=F] "
+  if (!path && !blkfile) { /* §902: с blk= OBJ не обязателен — сцена в файле */
+    fprintf(stderr, "use: pgather <scene.obj | blk=ФАЙЛ> [lev=N dirs=.. it=N rho=F le=F] "
+                    "[eye=X,Y,Z look=X,Y,Z fov=F W=N H=N] [k27=N] [out=ФАЙЛ]\n");
+    return 2;
+  }
+  if (W < 1 || H < 1 || W > PG_WH_MAX || H > PG_WH_MAX || fov < PG_FOV_MIN || fov > PG_FOV_MAX) {
+    fprintf(stderr, "use: pgather <scene.obj | blk=ФАЙЛ> [lev=N dirs=.. it=N rho=F le=F] "
                     "[eye=X,Y,Z look=X,Y,Z fov=F W=N H=N] [k27=N] [out=ФАЙЛ]\n");
     return 2;
   }
@@ -703,13 +718,16 @@ int main(int argc, char **argv) {
     fprintf(stderr, "pgather: frames=N>=2 требует eye2=/look2= (ходьба §877)\n");
     return 2;
   }
-  t0 = now_sec();
-  if (hz_obj_load(&m, path, scale) != 0) {
-    fprintf(stderr, "pgather: не читается %s\n", path);
-    return 2;
+  memset(&m, 0, sizeof m); /* §902: без OBJ меш пуст (blk-путь его не читает) */
+  if (path) {
+    t0 = now_sec();
+    if (hz_obj_load(&m, path, scale) != 0) {
+      fprintf(stderr, "pgather: не читается %s\n", path);
+      return 2;
+    }
+    t1 = now_sec();
+    printf("СТАТЬЯ obj-загрузка: %.2f с (nt=%d, mtl=%d)\n", t1 - t0, m.nt, m.nmtl);
   }
-  t1 = now_sec();
-  printf("СТАТЬЯ obj-загрузка: %.2f с (nt=%d, mtl=%d)\n", t1 - t0, m.nt, m.nmtl);
 
   if (blkfile) {
     /* --- §882 v1: mmap-сбор, самодостаточный (без пирамиды/свипа).
@@ -766,7 +784,7 @@ int main(int argc, char **argv) {
         for (int ix = 0; ix < W; ix++) {
           double sx = (2.0 * (ix + 0.5) / W - 1.0) * tanf;
           double sy = (1.0 - 2.0 * (iy + 0.5) / H) * tanf * (double)H / (double)W;
-          double rd[3] = {0, 0, 0}, nn;
+          double rd[3] = {0, 0, 0}, nn, Lv = 0.0;
           int32_t hit;
           int64_t tested_loc = 0;
           for (ax = 0; ax < 3; ax++)
@@ -776,8 +794,13 @@ int main(int argc, char **argv) {
             rd[ax] /= nn;
           hit = pg_hblk_nearest(&hb, eye, rd, &tested_loc);
           tested2 += tested_loc;
-          if (hit >= 0) nhit2++;
-          lum[(size_t)iy * (size_t)W + (size_t)ix] = hit >= 0 ? le : 0.0;
+          if (hit >= 0) {
+            nhit2++;
+            /* §902: v2 — освещённый кадр из файла (та же формула, что
+             * pg_lcam_hit: le + lep + kd·E/2π); v1 — силуэт */
+            Lv = hb.E ? le + hb.lep[hit] + hb.kd[hit] * hb.E[hit] / (2.0 * M_PI) : le;
+          }
+          lum[(size_t)iy * (size_t)W + (size_t)ix] = Lv;
         }
       tB = now_sec();
       getrusage(RUSAGE_SELF, &rb);
@@ -794,18 +817,31 @@ int main(int argc, char **argv) {
         f = fopen(fname, "wb");
         if (!f) return 2;
         fprintf(f, "P6\n%d %d\n255\n", W, H);
-        for (i = 0; i < W * H; i++) {
-          unsigned char b[3];
-          b[0] = b[1] = b[2] = (unsigned char)(lum[i] > 0 ? 255 : 0);
-          fwrite(b, 1, 3, f);
-        }
+        if (hb.E) { /* §902: v2 — серый кадр, нормировка на max (как сбор) */
+          double lmaxv = 0.0;
+          for (i = 0; i < W * H; i++)
+            if (lum[i] > lmaxv) lmaxv = lum[i];
+          for (i = 0; i < W * H; i++) {
+            double v = lum[i] / (lmaxv > 0 ? lmaxv : 1.0) * 255.0;
+            unsigned char b[3];
+            if (v > 255.0) v = 255.0;
+            if (v < 0.0) v = 0.0;
+            b[0] = b[1] = b[2] = (unsigned char)v;
+            fwrite(b, 1, 3, f);
+          }
+        } else
+          for (i = 0; i < W * H; i++) {
+            unsigned char b[3];
+            b[0] = b[1] = b[2] = (unsigned char)(lum[i] > 0 ? 255 : 0);
+            fwrite(b, 1, 3, f);
+          }
         fclose(f);
         printf("КАДР: %s записан (HBLK v1, силуэт)\n", fname);
       }
       free(lum);
     }
     pg_hblk_close(&hb);
-    hz_obj_free(&m);
+    if (path) hz_obj_free(&m); /* §902: blk-путь может идти без OBJ */
     return 0;
   }
 
@@ -1088,21 +1124,27 @@ int main(int argc, char **argv) {
     sw_time = t1 - t0;
     printf("СВИП RGB: 3 канала (%.3f с), E_avg=%.4f\n", sw_time, st.e_avg);
   } else if (efile_in) {
-    /* §899: E из sidecar — свип пропущен (свободная ходьба) */
+    /* §899: E из sidecar — свип пропущен (свободная ходьба).
+     * §902: sidecar канонически PER-TRI в ИСХОДНОМ порядке (m.nt double) —
+     * чтобы pblock/E-в-файле читали его без знания о Morton; здесь
+     * разворачиваем в слоты кусков по pcs[i].tri (не-clip: биекция —
+     * битово; clip: куски одного tri делят E — осознанный предел v1). */
+    double *Etri = (double *)malloc((size_t)m.nt * sizeof *Etri);
+    if (!Etri) return 2;
     FILE *fei = fopen(efile_in, "rb");
     if (!fei) {
       fprintf(stderr, "pgather: E не читается: %s\n", efile_in);
       return 2;
     }
-    for (i = 0; i < nb; i++) { /* §901: sidecar писан по nb кускам — читаем nb */
-      double ev;
-      if (fread(&ev, sizeof(double), 1, fei) != 1) {
-        fclose(fei);
-        return 2;
-      }
-      py.pcs[i].e = (float)ev;
+    if (fread(Etri, sizeof(double), (size_t)m.nt, fei) != (size_t)m.nt) {
+      fprintf(stderr, "pgather: E короче nt (%s)\n", efile_in);
+      fclose(fei);
+      return 2;
     }
     fclose(fei);
+    for (i = 0; i < nb; i++)
+      py.pcs[i].e = (float)Etri[py.pcs[i].tri];
+    free(Etri);
     t0 = now_sec();
     printf("§899: E из %s (свип пропущен)\n", efile_in);
   } else {
@@ -1116,15 +1158,20 @@ int main(int argc, char **argv) {
     t1 = now_sec();
     sw_time = t1 - t0;
     printf("СВИП: E_avg=%.4f (%.3f с)\n", st.e_avg, sw_time);
-    if (efile_out) { /* §898: дамп E */
+    if (efile_out) { /* §898: дамп E — §902: per-tri в исходном порядке
+                      * (Etri[tri] = E куска; не-clip — биекция) */
+      double *Etri = (double *)malloc((size_t)m.nt * sizeof *Etri);
+      if (!Etri) return 2;
+      for (i = 0; i < m.nt; i++)
+        Etri[i] = 0.0;
+      for (i = 0; i < nb; i++)
+        Etri[py.pcs[i].tri] = py.pcs[i].e;
       FILE *fe = fopen(efile_out, "wb");
       if (!fe) return 2;
-      for (i = 0; i < nb; i++) {
-        double ev = py.pcs[i].e;
-        fwrite(&ev, sizeof(double), 1, fe);
-      }
+      fwrite(Etri, sizeof(double), (size_t)m.nt, fe);
       fclose(fe);
-      printf("§898: E записан в %s (%d кусков)\n", efile_out, nb);
+      free(Etri);
+      printf("§898: E записан в %s (%d tri)\n", efile_out, m.nt);
     }
   }
 

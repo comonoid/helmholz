@@ -1,12 +1,15 @@
-/* pblock — СЕРИАЛИЗАТОР СЦЕНЫ В ФОРМАТ HBLK v1 (§882): блочная раскладка
- * «блок = листовая клетка», порядок клеток Morton, CSR кусков на диске.
+/* pblock — СЕРИАЛИЗАТОР СЦЕНЫ В ФОРМАТ HBLK (§882 v1, §902 v2): блочная
+ * раскладка «блок = листовая клетка», порядок клеток Morton, CSR на диске.
  *
  * Файл: заголовок + таблица занятых клеток (cell_id Morton, start, count)
  * + tri-id кусков по клеткам + треугольники (9 double, исходный порядок).
+ * v2 (магия «HBLK2»): после треугольников — kd[nt], lep[nt], E[nt]
+ * (double): отклик и ПОЛЕ в файле — освещённый кадр из mmap без OBJ.
+ * E берётся из sidecar §899 (ключ E=Ф); без E= — нули.
  * Читатель (pgather blk=) ходит DDA по сетке из заголовка и подтягивает
  * страницы mmap'ом — геометрия подгружается ходьбой (§2.4 STRUCTURE).
  *
- * Запуск: pblock <scene.obj> [scale=F] [lev=N] [out=ФАЙЛ]
+ * Запуск: pblock <scene.obj> [scale=F] [lev=N] [E=ФАЙЛ] [out=ФАЙЛ]
  * lev — уровень листовой сетки (тот же смысл, что в pgather).
  */
 #include <inttypes.h>
@@ -17,7 +20,7 @@
 
 #include "scene_obj.h"
 
-#define PB_MAGIC 0x314B4C4248ULL /* "HBLK1" little-endian */
+#define PB_MAGIC 0x324B4C4248ULL /* "HBLK2" little-endian (v2 §902) */
 
 static int64_t pb_morton3(uint32_t x, uint32_t y, uint32_t z) {
   int64_t r = 0;
@@ -40,7 +43,7 @@ static int pb_cellcmp(const void *a, const void *b) {
 }
 
 int main(int argc, char **argv) {
-  const char *path = NULL, *outfile = "scene.hblk";
+  const char *path = NULL, *outfile = "scene.hblk", *efile = NULL;
   double scale = 1.0;
   int lev = 6, i, ax;
   hz_objmesh m;
@@ -51,6 +54,8 @@ int main(int argc, char **argv) {
       scale = atof(argv[i] + 6);
     else if (strncmp(argv[i], "out=", 4) == 0)
       outfile = argv[i] + 4;
+    else if (strncmp(argv[i], "E=", 2) == 0)
+      efile = argv[i] + 2; /* §902: sidecar §899, nt doubles */
     else
       path = argv[i];
   }
@@ -179,6 +184,31 @@ int main(int argc, char **argv) {
         }
   }
   { /* запись */
+    /* §902: kd/lep/E per tri — отклик и поле в файле (кадр без OBJ) */
+    double *kd = (double *)malloc((size_t)m.nt * sizeof *kd);
+    double *lep = (double *)malloc((size_t)m.nt * sizeof *lep);
+    double *E = (double *)calloc((size_t)m.nt, sizeof *E);
+    if (!kd || !lep || !E) {
+      fprintf(stderr, "pblock: нет памяти на kd/lep/E\n");
+      return 2;
+    }
+    for (i = 0; i < m.nt; i++) {
+      kd[i] = m.mtl[m.fm[i]].kd;
+      lep[i] = (m.mtl[m.fm[i]].ke3[0] + m.mtl[m.fm[i]].ke3[1] + m.mtl[m.fm[i]].ke3[2]) / 3.0;
+    }
+    if (efile) { /* §899 sidecar: nt doubles, порядок ИСХОДНЫХ tri */
+      FILE *fe = fopen(efile, "rb");
+      if (!fe) {
+        fprintf(stderr, "pblock: E не читается: %s\n", efile);
+        return 2;
+      }
+      if (fread(E, sizeof(double), (size_t)m.nt, fe) != (size_t)m.nt) {
+        fprintf(stderr, "pblock: E короче nt (%s)\n", efile);
+        fclose(fe);
+        return 2;
+      }
+      fclose(fe);
+    }
     FILE *f = fopen(outfile, "wb");
     if (!f) {
       fprintf(stderr, "pblock: не открыть %s\n", outfile);
@@ -193,9 +223,12 @@ int main(int argc, char **argv) {
     memcpy(&hdr[5], lo, 3 * sizeof(double));
     memcpy(&hdr[8], &cell, sizeof(double));
     hdr[9] = (uint64_t)nocc;
-    hdr[10] = 24 * 8;                       /* оффсет таблицы */
-    hdr[11] = 24 * 8 + (uint64_t)nocc * 24; /* оффсет tri-id (int32) */
-    hdr[12] = hdr[11] + (uint64_t)nids * 4; /* оффсет треугольников */
+    hdr[10] = 24 * 8;                        /* оффсет таблицы */
+    hdr[11] = 24 * 8 + (uint64_t)nocc * 24;  /* оффсет tri-id (int32) */
+    hdr[12] = hdr[11] + (uint64_t)nids * 4;  /* оффсет треугольников */
+    hdr[13] = hdr[12] + (uint64_t)m.nt * 72; /* §902: оффсет kd */
+    hdr[14] = hdr[13] + (uint64_t)m.nt * 8;  /* §902: оффсет lep */
+    hdr[15] = hdr[14] + (uint64_t)m.nt * 8;  /* §902: оффсет E */
     fwrite(hdr, 8, 24, f);
     fwrite(tab, sizeof *tab, (size_t)nocc, f);
     fwrite(ids, sizeof *ids, (size_t)nids, f);
@@ -204,10 +237,17 @@ int main(int argc, char **argv) {
       hz_obj_tri(&m, (int32_t)i, p);
       fwrite(p, sizeof(double), 9, f);
     }
+    fwrite(kd, sizeof *kd, (size_t)m.nt, f);
+    fwrite(lep, sizeof *lep, (size_t)m.nt, f);
+    fwrite(E, sizeof *E, (size_t)m.nt, f);
     fclose(f);
-    printf("HBLK: %s — nt=%d, занятых клеток %" PRId64 " из %" PRId64 ", ссылок %" PRId64
-           " (кратность %.2f)\n",
-           outfile, m.nt, nocc, ncells, nids, (double)nids / (double)m.nt);
+    printf("HBLK2: %s — nt=%d, занятых клеток %" PRId64 " из %" PRId64 ", ссылок %" PRId64
+           " (кратность %.2f), E %s\n",
+           outfile, m.nt, nocc, ncells, nids, (double)nids / (double)m.nt,
+           efile ? "из sidecar" : "нули");
+    free(kd);
+    free(lep);
+    free(E);
   }
   free(occ);
   free(cnt);

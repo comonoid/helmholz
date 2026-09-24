@@ -1056,28 +1056,32 @@ int main(int argc, char **argv) {
   double *kdc[3] = {NULL, NULL, NULL}, *lepc[3] = {NULL, NULL, NULL};
   if (rgb) {
     /* §889: три скалярных решения с альбедо/эмиссией канала (классика
-     * радиосити). kd_c = kd3[c], lep_c = ke3[c]; le остаётся общим. */
+     * радиосити). kd_c = kd3[c], lep_c = ke3[c]; le остаётся общим.
+     * §901: всё ПО КУСКАМ (nb): массивы каналов длины nb, kd3/ke3 берутся
+     * по tri куска (py.pcs[i].tri, валиден i<nb в обоих режимах) — иначе
+     * после Morton слот ≠ tri (чужой цвет), а при clip массивы короче nb. */
     if (ksf > 0.0) {
       fprintf(stderr, "pgather: rgb=1 с ksf>0 не совмещается в v1 - отказ\n");
       return 2;
     }
     for (int ch = 0; ch < 3; ch++) {
-      kdc[ch] = (double *)malloc((size_t)m.nt * sizeof *kdc[ch]);
-      lepc[ch] = (double *)malloc((size_t)m.nt * sizeof *lepc[ch]);
-      Ec[ch] = (double *)malloc((size_t)m.nt * sizeof *Ec[ch]);
+      kdc[ch] = (double *)malloc((size_t)nb * sizeof *kdc[ch]);
+      lepc[ch] = (double *)malloc((size_t)nb * sizeof *lepc[ch]);
+      Ec[ch] = (double *)malloc((size_t)nb * sizeof *Ec[ch]);
       if (!kdc[ch] || !lepc[ch] || !Ec[ch]) return 2;
-      for (i = 0; i < m.nt; i++) {
-        kdc[ch][i] = m.mtl[m.fm[i]].kd3[ch];
-        lepc[ch][i] = m.mtl[m.fm[i]].ke3[ch];
+      for (i = 0; i < nb; i++) {
+        int32_t tri = py.pcs[i].tri;
+        kdc[ch][i] = m.mtl[m.fm[tri]].kd3[ch];
+        lepc[ch][i] = m.mtl[m.fm[tri]].ke3[ch];
       }
     }
     t0 = now_sec();
     for (int ch = 0; ch < 3; ch++) {
       so.lep = lepc[ch]; /* kd канала идёт 3-м аргументом hz_sw_run */
-      for (i = 0; i < m.nt; i++)
+      for (i = 0; i < nb; i++)
         py.pcs[i].e = 0.0f;
       if (hz_sw_run(&py, nb, area, nrm, kdc[ch], &so, &st, NULL) != 0) return 2;
-      for (i = 0; i < m.nt; i++)
+      for (i = 0; i < nb; i++)
         Ec[ch][i] = py.pcs[i].e;
     }
     t1 = now_sec();
@@ -1090,7 +1094,7 @@ int main(int argc, char **argv) {
       fprintf(stderr, "pgather: E не читается: %s\n", efile_in);
       return 2;
     }
-    for (i = 0; i < m.nt; i++) {
+    for (i = 0; i < nb; i++) { /* §901: sidecar писан по nb кускам — читаем nb */
       double ev;
       if (fread(&ev, sizeof(double), 1, fei) != 1) {
         fclose(fei);
@@ -1115,12 +1119,12 @@ int main(int argc, char **argv) {
     if (efile_out) { /* §898: дамп E */
       FILE *fe = fopen(efile_out, "wb");
       if (!fe) return 2;
-      for (i = 0; i < NP; i++) {
+      for (i = 0; i < nb; i++) {
         double ev = py.pcs[i].e;
         fwrite(&ev, sizeof(double), 1, fe);
       }
       fclose(fe);
-      printf("§898: E записан в %s (%d кусков)\n", efile_out, NP);
+      printf("§898: E записан в %s (%d кусков)\n", efile_out, nb);
     }
   }
 

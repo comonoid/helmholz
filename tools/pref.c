@@ -613,7 +613,8 @@ int main(int argc, char **argv) {
     rmed = rat[m.nt / 2];
     printf("СВЕРКА: E_avg свипа=%.4f, эталона=%.4f → отношение %.4f\n", eavg_swp, eavg_ref,
            eavg_swp / eavg_ref);
-    printf("СВЕРКА: |Δ| средняя=%.4f, max=%.4f (по кускам); медиана отношения куска=%.4f\n",
+    printf("СВЕРКА (сверка = walk-26, не истина; систематика ±7–14%%, §911-13-2): "
+           "|Δ| средняя=%.4f, max=%.4f (по кускам); медиана отношения куска=%.4f\n",
            dsum / asum, dmax, rmed);
     if (eout) { /* §887: пер-кусковой дамп — tri, центр, kd, ks, Eref, Eswp, ratio */
       FILE *fe = fopen(eout, "w");

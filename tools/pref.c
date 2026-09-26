@@ -290,6 +290,8 @@ int main(int argc, char **argv) {
   double scale = 1.0, le = 1.0, rho = -1.0, ksf = 0.0;
   const char *eout = NULL; /* §887: пер-кусковой дамп E */
   int iters = 30, lev = 6, mort = 1, i, ax;
+  int org_area = 1; /* §911-12: умолчание area — несмещённая выборка (§911-10);
+                     * org=cent — прежний центроидный режим (НК, смещён +23% на plates) */
   int K = PREF_K_DEFAULT;
   hz_objmesh m;
   hz_pyr py;
@@ -298,6 +300,7 @@ int main(int argc, char **argv) {
   double *area = NULL, *nrm = NULL, *kd = NULL, *cent = NULL, *cmin = NULL, *cmax = NULL;
   int32_t *mtl = NULL;
   double cell, *Eref = NULL, *Lout = NULL, *ks = NULL; /* §880 */
+  double *lep = NULL; /* §911-13: per-piece Ke (сцены с излучающим материалом) */
   ref_bbox_csr csr;
 
   for (i = 1; i < argc; i++) {
@@ -315,6 +318,8 @@ int main(int argc, char **argv) {
       ksf = atof(argv[i] + 4); /* §880: зеркальный MC-эталон */
     else if (strncmp(argv[i], "K=", 2) == 0)
       K = atoi(argv[i] + 2);
+    else if (strncmp(argv[i], "org=", 4) == 0) /* §911-12: area (умолчание) | cent (НК) */
+      org_area = strcmp(argv[i] + 4, "cent") != 0;
     else if (strncmp(argv[i], "mort=", 5) == 0)
       mort = atoi(argv[i] + 5);
     else if (strncmp(argv[i], "scale=", 6) == 0)
@@ -340,7 +345,8 @@ int main(int argc, char **argv) {
   Eref = (double *)malloc((size_t)m.nt * sizeof *Eref);
   Lout = (double *)malloc((size_t)m.nt * sizeof *Lout);
   ks = (double *)malloc((size_t)m.nt * sizeof *ks);
-  if (!area || !nrm || !kd || !ks || !cent || !cmin || !cmax || !mtl || !Eref || !Lout) {
+  lep = (double *)malloc((size_t)m.nt * sizeof *lep);
+  if (!area || !nrm || !kd || !ks || !cent || !cmin || !cmax || !mtl || !Eref || !Lout || !lep) {
     fprintf(stderr, "pref: нет памяти\n");
     return 2;
   }
@@ -375,6 +381,7 @@ int main(int argc, char **argv) {
     kd[i] = m.mtl[m.fm[i]].kd;
     ks[i] = ksf * ((m.mtl[m.fm[i]].ks3[0] + m.mtl[m.fm[i]].ks3[1] + m.mtl[m.fm[i]].ks3[2]) / 3.0);
     mtl[i] = m.fm[i];
+    lep[i] = (m.mtl[m.fm[i]].ke3[0] + m.mtl[m.fm[i]].ke3[1] + m.mtl[m.fm[i]].ke3[2]) / 3.0;
   }
   {
     double maxdim = 0.0;
@@ -392,7 +399,8 @@ int main(int argc, char **argv) {
   if (mort &&
       (hz_pyr_morton(&py) != 0 || hz_pyr_permute(&py, area, sizeof *area) != 0 ||
        hz_pyr_permute(&py, nrm, 3 * sizeof *nrm) != 0 || hz_pyr_permute(&py, kd, sizeof *kd) != 0 ||
-       hz_pyr_permute(&py, ks, sizeof *ks) != 0)) { /* §880/А1613 */
+       hz_pyr_permute(&py, ks, sizeof *ks) != 0 ||
+       hz_pyr_permute(&py, lep, sizeof *lep) != 0)) { /* §880/А1613, §911-13 */
     fprintf(stderr, "pref: Morton не прошёл\n");
     return 2;
   }
@@ -410,7 +418,7 @@ int main(int argc, char **argv) {
     int64_t miss_in = 0, miss_out = 0;
     int it;
     for (i = 0; i < m.nt; i++) {
-      Lout[i] = le;
+      Lout[i] = le + lep[i]; /* §911-13: пер-piece Ke */
       Eref[i] = 0.0;
     }
     for (it = 0; it < iters; it++) {
@@ -436,6 +444,8 @@ int main(int argc, char **argv) {
         org[0] = cent[3 * (int64_t)i];
         org[1] = cent[3 * (int64_t)i + 1];
         org[2] = cent[3 * (int64_t)i + 2];
+        double p3[3][3]; /* §911-11: вершины tri для org=area */
+        hz_obj_tri(&m, py.pcs[i].tri, p3);
         /* §880: диффузная доля приёмника — депозит свипа = (1−ks_eff)·L·cos;
          * при ksf=0 множитель 1 — прежний мир (П1) */
         double kse_i = 0.0, kdvis_i = rho < 0 ? kd[i] : rr; /* А1616 */
@@ -450,6 +460,13 @@ int main(int argc, char **argv) {
           double side = (k & 1) ? -1.0 : 1.0; /* обе полусферы (А1471) */
           double om[3];
           int32_t hit;
+          if (org_area) { /* §911-11: начало луча равномерно по площади tri */
+            double r1 = ref_urand(), sr = sqrt(ref_urand());
+            int ax2;
+            for (ax2 = 0; ax2 < 3; ax2++)
+              org[ax2] =
+                  (1.0 - sr) * p3[0][ax2] + sr * (1.0 - r1) * p3[1][ax2] + r1 * sr * p3[2][ax2];
+          }
           om[0] = side * (mu * nrm[3 * (int64_t)i] + s1 * u2[0] + c1 * w2[0]);
           om[1] = side * (mu * nrm[3 * (int64_t)i + 1] + s1 * u2[1] + c1 * w2[1]);
           om[2] = side * (mu * nrm[3 * (int64_t)i + 2] + s1 * u2[2] + c1 * w2[2]);
@@ -490,16 +507,21 @@ int main(int argc, char **argv) {
         eprev = emean;
         eavg_ref = emean;
         for (i = 0; i < m.nt; i++)
-          Lout[i] = le + (rho < 0 ? kd[i] : rr) * Eref[i] / (2.0 * M_PI); /* А1616 */
+          Lout[i] = le + lep[i] + (rho < 0 ? kd[i] : rr) * Eref[i] / (2.0 * M_PI); /* А1616 */
       }
       t1 = now_sec();
       printf("ЭТАЛОН it=%d: E_avg=%.4f (фактор %.2e, %.1f с)\n", it, eavg_ref, factor, t1 - t0);
       if (factor < PREF_FACTOR_STOP && it >= 2) break;
     }
     t1 = now_sec();
-    printf("ЭТАЛОН ИТОГ: E_avg=%.4f, k непрерывной(замкн.)=%.4f, промахов внутр/внеш %" PRId64
-           "/%" PRId64 ", %.1f с\n",
-           eavg_ref, eavg_ref / (2.0 * M_PI * le / (1.0 - rr)), miss_in, miss_out, t1 - t0);
+    if (le > 0.0) /* §911-13: при le=0 знаменатель нулевой (эмиссия из Ke) */
+      printf("ЭТАЛОН ИТОГ: E_avg=%.4f, k непрерывной(замкн.)=%.4f, промахов внутр/внеш %" PRId64
+             "/%" PRId64 ", %.1f с\n",
+             eavg_ref, eavg_ref / (2.0 * M_PI * le / (1.0 - rr)), miss_in, miss_out, t1 - t0);
+    else
+      printf("ЭТАЛОН ИТОГ: E_avg=%.4f (le=0 — эмиссия из Ke, k не определён), промахов внутр/"
+             "внеш %" PRId64 "/%" PRId64 ", %.1f с\n",
+             eavg_ref, miss_in, miss_out, t1 - t0);
   }
 
   /* --- СВИП на том же носителе и СВЕРКА с эталоном ---
@@ -508,6 +530,7 @@ int main(int argc, char **argv) {
    * старым порядком: memset ниже стирал заполненный до него so.trivert). */
   memset(&so, 0, sizeof so);
   so.le = le;
+  so.lep = lep; /* §911-13-2: сцены с Ke — свип СВЕРКИ на той же эмиссии */
   so.rho = rho;
   so.iters = iters;
   so.ndirs = 26;
@@ -615,6 +638,7 @@ int main(int argc, char **argv) {
   }
   free(Eref);
   free(Lout);
+  free(lep);
   free(area);
   free(nrm);
   free(kd);

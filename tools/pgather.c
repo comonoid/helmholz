@@ -631,9 +631,11 @@ int main(int argc, char **argv) {
   int32_t *ktri = NULL, *qmtl = NULL, *qtri = NULL;
   double *qcmin = NULL, *qcmax = NULL, *qcent = NULL;
   double *qarea = NULL, *qnrm = NULL, *qkd = NULL, *qks = NULL, *qlep = NULL;
+  double *qparea = NULL; /* §911-13-3: площадь родительского tri для depden */
   /* §867: данные mode=3, заполняются до memset(&so) — см. блок trivert */
   double *g_tv9 = NULL, *g_tb6 = NULL;
   uint8_t *g_lparr = NULL;
+  int32_t *g_strip_start = NULL, *g_strip_list = NULL; /* §911-13-3 */
   int gather = 0; /* §849: 0 — DDA (умолчание), 1 — brute (путь верификации) */
   pg_bbox_csr csr;
   int64_t dda_steps = 0, dda_tested = 0, sec_rays = 0;
@@ -973,12 +975,13 @@ int main(int argc, char **argv) {
     ktri = (int32_t *)malloc((size_t)4096 * sizeof *ktri);
     qtri = (int32_t *)malloc((size_t)4096 * sizeof *qtri);
     qarea = (double *)malloc((size_t)4096 * sizeof *qarea);
+    qparea = (double *)malloc((size_t)4096 * sizeof *qparea);
     qnrm = (double *)malloc((size_t)4096 * 3 * sizeof *qnrm);
     qkd = (double *)malloc((size_t)4096 * sizeof *qkd);
     qks = (double *)malloc((size_t)4096 * sizeof *qks);
     if (useke) qlep = (double *)malloc((size_t)4096 * sizeof *qlep);
     if (!qcmin || !qcmax || !qcent || !qmtl || !qtri || !qarea || !qnrm || !qkd || !qks ||
-        (useke && !qlep))
+        !qparea || (useke && !qlep))
       return 2;
     for (i = 0; i < m.nt; i++) {
       double tri[3][3];
@@ -1011,12 +1014,13 @@ int main(int argc, char **argv) {
               qmtl = (int32_t *)realloc(qmtl, (size_t)cap2 * sizeof *qmtl);
               qtri = (int32_t *)realloc(qtri, (size_t)cap2 * sizeof *qtri);
               qarea = (double *)realloc(qarea, (size_t)cap2 * sizeof *qarea);
+              qparea = (double *)realloc(qparea, (size_t)cap2 * sizeof *qparea);
               qnrm = (double *)realloc(qnrm, (size_t)cap2 * 3 * sizeof *qnrm);
               qkd = (double *)realloc(qkd, (size_t)cap2 * sizeof *qkd);
               qks = (double *)realloc(qks, (size_t)cap2 * sizeof *qks);
               if (useke) qlep = (double *)realloc(qlep, (size_t)cap2 * sizeof *qlep);
               if (!qcmin || !qcmax || !qcent || !qmtl || !qtri || !qarea || !qnrm || !qkd || !qks ||
-                  (useke && !qlep))
+                  !qparea || (useke && !qlep))
                 return 2;
             }
             for (int q = 0; q < 3; q++) {
@@ -1027,6 +1031,7 @@ int main(int argc, char **argv) {
             qmtl[n2] = m.fm[i];
             qtri[n2] = (int32_t)i;
             qarea[n2] = aa;
+            qparea[n2] = area[i]; /* §911-13-3: depden полоски = площадь tri */
             for (int q = 0; q < 3; q++)
               qnrm[3 * n2 + q] = nrm[3 * (int64_t)i + q];
             qkd[n2] = kd[i];
@@ -1038,9 +1043,19 @@ int main(int argc, char **argv) {
     /* куски: cmin/cmax/cent/mtl → кусочные (для build/CSR), остальные
      * piece-массивы соберутся ниже (kd/ks/lep/nrm/area через ktri) */
     NP = (int32_t)n2;
+    /* §911-13-3: прибор потери площади клипа — Σ полосок против Σ tri */
+    {
+      double sq = 0.0, st = 0.0;
+      for (i = 0; i < n2; i++)
+        sq += qarea[i];
+      for (i = 0; i < m.nt; i++)
+        st += area[i];
+      fprintf(stderr, "CLIPAREALOG: strips=%d Sq=%.4f Stri=%.4f ratio=%.4f\n", (int)n2, sq, st,
+              st > 0 ? sq / st : 0.0);
+    }
     /* свап: дальше вся программа работает в терминах КУСКОВ */
     free(area);
-    area = qarea;
+    area = qarea; /* qparea НЕ освобождается: so.parea ссылается (§911-13-3) */
     free(nrm);
     nrm = qnrm;
     free(kd);
@@ -1050,6 +1065,8 @@ int main(int argc, char **argv) {
     free(lep);
     lep = qlep;
     ktri = qtri;
+    /* §911-13-3: CSR «tri → полоски» строится ПОСЛЕ Мортона (пермутированные
+     * слоты) — см. блок ниже */
     printf("§896: клип — кусков %d из %d треугольников\n", NP, m.nt);
   }
   { /* §867: trivert/tribox/lp для mode=3 (точное пересечение + walk) —
@@ -1102,9 +1119,29 @@ int main(int argc, char **argv) {
       (hz_pyr_morton(&py) != 0 || hz_pyr_permute(&py, area, sizeof *area) != 0 ||
        hz_pyr_permute(&py, nrm, 3 * sizeof *nrm) != 0 || hz_pyr_permute(&py, kd, sizeof *kd) != 0 ||
        hz_pyr_permute(&py, ks, sizeof *ks) != 0 ||
-       (lep && hz_pyr_permute(&py, lep, sizeof *lep) != 0))) { /* §874/А1581 */
+       (lep && hz_pyr_permute(&py, lep, sizeof *lep) != 0) ||
+       (qparea && hz_pyr_permute(&py, qparea, sizeof *qparea) != 0))) { /* §874/А1581, §911-13-3 */
     fprintf(stderr, "pgather: Morton не прошёл\n");
     return 2;
+  }
+  if (clip) { /* §911-13-3: CSR «tri → полоски» ПОСЛЕ Мортона, в
+               * пермутированных слотах (pcs[p].tri = исходный tri) */
+    int32_t *sst = (int32_t *)calloc((size_t)m.nt + 1, sizeof *sst);
+    int32_t *slst = (int32_t *)malloc((size_t)(nb ? nb : 1) * sizeof *slst);
+    int32_t *fill = (int32_t *)malloc((size_t)m.nt * sizeof *fill);
+    int32_t pi;
+    if (!sst || !slst || !fill) return 2;
+    for (pi = 0; pi < nb; pi++)
+      sst[py.pcs[pi].tri + 1]++;
+    for (i = 0; i < m.nt; i++)
+      sst[i + 1] += sst[i];
+    for (i = 0; i < m.nt; i++)
+      fill[i] = sst[i];
+    for (pi = 0; pi < nb; pi++)
+      slst[fill[py.pcs[pi].tri]++] = pi;
+    free(fill);
+    g_strip_start = sst;
+    g_strip_list = slst;
   }
 
   { /* §867: per-node max ℓ_p обязателен для mode=3 (§852) */
@@ -1134,10 +1171,13 @@ int main(int argc, char **argv) {
   so.mode = 3; /* §867: фронт с точным пересечением (был mode=2) */
   so.build = 1;
   so.vc = 1;
-  so.walk = 1;                   /* §867: продакшн-модель А1576/§861 — дефолт потребителя */
-  so.ks = ksf > 0.0 ? ks : NULL; /* §874: ksf=0 — прежний мир (битово, П1) */
-  so.lep = lep;                  /* §874: NULL при useke=0 — побитово прежний мир */
+  so.walk = 1;                     /* §867: продакшн-модель А1576/§861 — дефолт потребителя */
+  so.ks = ksf > 0.0 ? ks : NULL;   /* §874: ksf=0 — прежний мир (битово, П1) */
+  so.lep = lep;                    /* §874: NULL при useke=0 — побитово прежний мир */
+  so.parea = clip ? qparea : NULL; /* §911-13-3: NULL без clip — побитово прежний мир */
   so.trivert = g_tv9;
+  so.strip_start = g_strip_start; /* §911-13-3: NULL без clip */
+  so.strip_list = g_strip_list;
   so.tribox = g_tb6;
   so.lp = g_lparr;
   so.domhi = m.hi;

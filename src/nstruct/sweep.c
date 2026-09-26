@@ -705,6 +705,13 @@ typedef struct {
   double hop_lost_cap;       /* §881/П7: из hop_lost — ёмкостью */
   double row_dep;            /* §887-b: счётчик исполнений row-ветки */
   int64_t lin_pos, lin_zero; /* §887-d: депозиты с Lin>0.5 / <=0.5 */
+  /* §911-6 прибор покрытия (HZ_COVDBG): Σ долей следа (Σ dep_ratio) и число
+   * хитов на (кусок, направление) — сверка с леммой покрытия Σ = μ_пов */
+  double *cov;         /* [nt] Σ dep_ratio куска за направление; NULL — выкл */
+  uint32_t *covn;      /* [nt] число зарегистрированных хитов за направление */
+  double *cov_lit;     /* §911-8: Σ dep_ratio·[Lin>0] — освещённое покрытие */
+  double *cov_e;       /* §911-10: Σ dep_ratio·Lin — вклад с амплитудой света */
+  int64_t lh_cap_hits; /* §911-6: срабатывания капа радианса (A3) */
   /* §881: ёмкость 32 (была 4): на зеркально-плотных сценах цепи длиннее 4 —
    * основной поток (дефект §880); усечение — порогом от корня цепи (А1617) */
   double hop_pt[32][3];
@@ -769,7 +776,10 @@ static double front_le(const front_ctx *fc, int32_t p) {
 #define FRONT_DEP_MIN_SHARE (1.0 / 16.0)
 static double front_depden(const front_ctx *fc, int32_t p) {
   double cell2 = fc->py->cell * fc->py->cell;
-  double d = fc->area[p];
+  /* §911-13-3: у клип-полосок знаменатель — площадь родительского tri
+   * (parea), не полоски: иначе все трубки tri агрегируются на одну полоску
+   * со ставкой 1/D → усиление ×a_tri/D (клип-взрыв §911-3). */
+  double d = fc->o->parea ? fc->o->parea[p] : fc->area[p];
   return d > FRONT_DEP_MIN_SHARE * cell2 ? d : FRONT_DEP_MIN_SHARE * cell2;
 }
 
@@ -786,10 +796,23 @@ static int tri_trace_on(int32_t p) {
   return (int)p == tri_trace_id;
 }
 
-/* §893: ограничитель радианса — Lh не превышает кап итерации */
+/* §911-6: ограничитель радианса — Lh не превышает кап итерации */
 #define LH_GROWTH (1.0 + 0.25) /* §893: рост радианса не быстрее +25 %/итерацию */
+static int sw_covdbg_init = 0;
+static int sw_covdbg_on = 0;
+static int sw_covdbg(void) { /* HZ_COVDBG=1 — прибор покрытия §911-6 */
+  if (!sw_covdbg_init) {
+    const char *e = getenv("HZ_COVDBG");
+    sw_covdbg_on = e && e[0] != '\0' && e[0] != '0';
+    sw_covdbg_init = 1;
+  }
+  return sw_covdbg_on;
+}
 static double front_lh_cap(front_ctx *fc, double lh) {
-  if (lh > fc->lh_cap) lh = fc->lh_cap;
+  if (lh > fc->lh_cap) {
+    lh = fc->lh_cap;
+    fc->lh_cap_hits++; /* §911-6: счёт срабатываний (A3-дефицит цепи) */
+  }
   if (lh > fc->lh_seen) fc->lh_seen = lh;
   return lh;
 }
@@ -1277,6 +1300,12 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
          * — усиление обратной связи полосок, владелец §911-4. */
         double dep_ratio = csec * fc->axcos / front_depden(fc, p);
         if (dep_ratio > 1.0) dep_ratio = 1.0;
+        if (fc->cov) { /* §911-6: Σ долей следа против леммы покрытия */
+          fc->cov[p] += dep_ratio;
+          if (Lin > 0.0) fc->cov_lit[p] += dep_ratio; /* §911-8: с светом цепи */
+          fc->cov_e[p] += dep_ratio * Lin;            /* §911-10: амплитуда */
+          fc->covn[p]++;
+        }
         double dep = fc->w_d * Lin * (1.0 - ks) * dep_ratio;
         {
           /* §911-2: прибор депозит/входящий поток — печать первых 20
@@ -1307,7 +1336,19 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
           fc->dep_main += dep;
           fc->dep_cnt++;
         }
-        fc->Ed[p] += dep;
+        if (fc->o->strip_start) {
+          /* §911-13-3: депозит tri распределяется на ВСЕ полоски tri —
+           * E полосок однородна (гранулярность поля), Σ a_i·E_i =
+           * μ·L·a_tri (консервативность) */
+          int32_t t3 = py->pcs[p].tri;
+          int32_t s0 = fc->o->strip_start[t3], s1 = fc->o->strip_start[t3 + 1], si;
+          for (si = s0; si < s1; si++) {
+            int32_t q = fc->o->strip_list[si];
+            fc->Ed[q] += dep; /* §911-13-3: ровно dep (с axcos) каждой полоске */
+          }
+        } else {
+          fc->Ed[p] += dep;
+        }
         fc->absorbed += fc->w_d * Lin * (1.0 - ks) * csec;
         fc->emitted += fc->w_d * front_le(fc, p) * csec;
         Lh = front_lh_cap(fc, front_le(fc, p) + kdf * fc->Eprev[p] / (2.0 * M_PI));
@@ -2141,6 +2182,10 @@ static void sw_index_piece(const hz_pyr *py, const hz_sw_opts *o, int32_t s, int
 int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, const double *kd,
               const hz_sw_opts *o, hz_sw_stat *st, double *e_hist) {
   double *Ed = NULL, *Eprev = NULL;
+  double *cov = NULL;     /* §911-6: Σ долей следа на кусок (HZ_COVDBG) */
+  uint32_t *covn = NULL;  /* §911-6: число хитов на кусок */
+  double *cov_lit = NULL; /* §911-8: освещённое покрытие */
+  double *cov_e = NULL;   /* §911-10: вклад с амплитудой света */
   int32_t *order = NULL, *vindex = NULL;
   uint64_t *bits = NULL;
   hz_sw_walk *walks = NULL;
@@ -2202,8 +2247,15 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     Linmax_prev = (double *)calloc((size_t)nt, sizeof *Linmax_prev);
     Linmax_cur = (double *)calloc((size_t)nt, sizeof *Linmax_cur);
   }
+  /* §911-6: прибор покрытия (HZ_COVDBG=1) — буферы владельца hz_sw_run */
+  if (o->mode == 3 && sw_covdbg()) {
+    cov = (double *)calloc((size_t)nt, sizeof *cov);
+    covn = (uint32_t *)calloc((size_t)nt, sizeof *covn);
+    cov_lit = (double *)calloc((size_t)nt, sizeof *cov_lit);
+    cov_e = (double *)calloc((size_t)nt, sizeof *cov_e);
+  }
   if (!Ed || !Eprev || !order || !vindex || !bits || !walks || (o->mode == 3 && (!fld || !fldok)) ||
-      (o->mode == 3 && (!Linmax_prev || !Linmax_cur))) {
+      (o->mode == 3 && (!Linmax_prev || !Linmax_cur)) || (cov && !covn)) {
     rc = 2;
     goto done;
   }
@@ -2381,6 +2433,10 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         int32_t mark = (int32_t)(it * (nd + 1) + d + 1);
         memset(&fc, 0, sizeof fc);
         fc.lh_cap = lh_cap;
+        fc.cov = cov; /* §911-6: NULL без HZ_COVDBG — прибора нет */
+        fc.covn = covn;
+        fc.cov_lit = cov_lit;
+        fc.cov_e = cov_e;
         fc.Linmax_prev = Linmax_prev;
         fc.Linmax_cur = Linmax_cur;
         fc.py = py;
@@ -2452,6 +2508,65 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         st->nstamp += fc.nstamp;
         st->nlostseg += fc.nlostseg;
         st->traffic = (fc.nmat + fc.ndesc + fc.njump) * 32 + fc.ncellfront * 40;
+        if (cov) { /* §911-6: отчёт покрытия направления */
+          double num = 0, den = 0, numl = 0, nume = 0;
+          double fuMu = 0, fuE = 0; /* §911-13-3: полные суммы по ВСЕМ кускам */
+          double wr[5];
+          int32_t wp[5];
+          int32_t p;
+          int ntouch = 0, nunder = 0, nover = 0, nw = 0, q;
+          for (q = 0; q < 5; q++) {
+            wr[q] = 1.0;
+            wp[q] = -1;
+          }
+          for (p = 0; p < nt; p++) {
+            double mu = fabs(om[0] * nrm[3 * (int64_t)p] + om[1] * nrm[3 * (int64_t)p + 1] +
+                             om[2] * nrm[3 * (int64_t)p + 2]);
+            double rr;
+            fuMu += area[p] * mu; /* §911-13-3: полный Σa·μ без фильтра touched */
+            fuE += area[p] * cov_e[p];
+            if (covn[p] == 0 || mu < 1e-12) continue;
+            rr = cov[p] / mu;
+            num += area[p] * cov[p];
+            numl += area[p] * cov_lit[p];
+            nume += area[p] * cov_e[p];
+            den += area[p] * mu;
+            ntouch++;
+            if (rr < 0.95) {
+              nunder++;
+            } else if (rr > 1.05) {
+              nover++;
+            }
+            if (fabs(rr - 1.0) > 0.02 && nw < 5) {
+              wr[nw] = rr;
+              wp[nw] = p;
+              nw++;
+            }
+          }
+          fprintf(stderr,
+                  "COVDBG d=%d nd=%d om=(%.4f,%.4f,%.4f) areacov=%.5f litcov=%.5f "
+                  "raw(mu=%.4f lit=%.4f E=%.4f) full(mu=%.3f E=%.3f) ndep=%lld touched=%d "
+                  "under=%d over=%d lhcaps=%lld worst:",
+                  d, nd, om[0], om[1], om[2], den > 0.0 ? num / den : 0.0,
+                  den > 0.0 ? numl / den : 0.0, den, numl, nume, fuMu, fuE, (long long)fc.ndep,
+                  ntouch, nunder, nover, (long long)fc.lh_cap_hits);
+          for (q = 0; q < nw; q++)
+            fprintf(stderr, " p%d=%.3f(a=%.3g,n=%u)", wp[q], wr[q], area[wp[q]], covn[wp[q]]);
+          fprintf(stderr, "\n");
+          if (d == 0 && it == 0) { /* доля площади кусков ниже depden-floor */
+            double sa = 0.0, sf = 0.0, floor_a = csec * FRONT_DEP_MIN_SHARE;
+            for (p = 0; p < nt; p++) {
+              sa += area[p];
+              if (area[p] < floor_a) sf += area[p];
+            }
+            fprintf(stderr, "COVDBG small-area frac (a<%.3g): %.4f (nt=%d)\n", floor_a,
+                    sa > 0.0 ? sf / sa : 0.0, nt);
+          }
+          memset(cov, 0, (size_t)nt * sizeof *cov);
+          memset(covn, 0, (size_t)nt * sizeof *covn);
+          memset(cov_lit, 0, (size_t)nt * sizeof *cov_lit);
+          memset(cov_e, 0, (size_t)nt * sizeof *cov_e);
+        }
         free(fc.pbuf);
         free(fc.abuf); /* скретч растёт только на узловом пути (lp>=2, А1573) */
         free(fc.wbuf);
@@ -2671,6 +2786,10 @@ done:
   free(Linmax_prev);
   free(Linmax_cur);
   free(Eprev);
+  free(cov); /* §911-6 */
+  free(covn);
+  free(cov_lit);
+  free(cov_e);
   free(order);
   free(vindex);
   free(bits);

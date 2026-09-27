@@ -618,6 +618,9 @@ int main(int argc, char **argv) {
   const char *blkfile = NULL;                     /* §882: HBLK v1, mmap-сбор */
   const char *kitpath = NULL;                     /* §914-Ш4: геометрия из КИТА */
   double zone = -1.0;                             /* §915-R3: радиус кольца детальности */
+  int adapt = 0;          /* §915-R4: lpacc-адаптив (0 — битово прежний мир) */
+  double cdelta = 1.0;    /* §862: вес приращения аккумулятора */
+  int lpceil = 4;         /* §866: потолок этажа (из swee3-канона) */
   uint8_t *kitlvl = NULL; /* §915-R3: уровень кита на выбранный треугольник [nt] */
   double delbox[6];
   hz_objmesh m;
@@ -716,6 +719,12 @@ int main(int argc, char **argv) {
       kitpath = argv[i] + 4; /* §914-Ш4: кит вместо OBJ (паритет — Ш4-П1) */
     else if (strncmp(argv[i], "zone=", 5) == 0)
       zone = atof(argv[i] + 5); /* §915-R3: кольца детальности вокруг eye */
+    else if (strncmp(argv[i], "adapt=", 6) == 0)
+      adapt = atoi(argv[i] + 6); /* §915-R4: 1 — lpacc-адаптив этажей (§862) */
+    else if (strncmp(argv[i], "cdelta=", 7) == 0)
+      cdelta = atof(argv[i] + 7);
+    else if (strncmp(argv[i], "lpceil=", 7) == 0)
+      lpceil = atoi(argv[i] + 7);
     else
       path = argv[i];
   }
@@ -1328,6 +1337,18 @@ int main(int argc, char **argv) {
   so.strip_list = g_strip_list;
   so.tribox = g_tb6;
   so.lp = g_lparr;
+  /* §915-R4: адаптивный дробный аккумулятор §862 на РЕАЛЬНОМ свипе;
+   * adapt=0 (умолчание) — so.lpacc NULL, БИТОВО прежний мир */
+  if (adapt) {
+    so.lpacc = (double *)calloc((size_t)m.nt, sizeof(double));
+    if (so.lpacc == NULL) {
+      fprintf(stderr, "pgather: нет памяти (lpacc)\n");
+      return 2;
+    }
+    so.cdelta = cdelta;
+    so.lpapply = 1;
+    so.lpceil = lpceil;
+  }
   so.domhi = m.hi;
   double *Ec[3] = {NULL, NULL, NULL}; /* §889: E по каналам */
   double *kdc[3] = {NULL, NULL, NULL}, *lepc[3] = {NULL, NULL, NULL};
@@ -1399,6 +1420,14 @@ int main(int argc, char **argv) {
     t1 = now_sec();
     sw_time = t1 - t0;
     printf("СВИП: E_avg=%.4f (%.3f с)\n", st.e_avg, sw_time);
+    /* §915-R4: приборы марша — доказательство удешевления этажами
+     * (nmat/ndesc/njump) числом, адаптив (flochg) — отдельно */
+    printf("МАРШ §852: материальных=%lld спусков=%lld прыжков=%lld nlpclamp=%lld визитов=%lld\n",
+           (long long)st.nmat, (long long)st.ndesc, (long long)st.njump, (long long)st.nlpclamp,
+           (long long)st.nvisit);
+    if (so.lpacc != NULL)
+      printf("АДАПТИВ §866: смен этажей Σ=%lld (макс/ит.=%lld)\n", (long long)st.flochg_sum,
+             (long long)st.flochg_max);
     if (efile_out) { /* §898: дамп E — §902: per-tri в исходном порядке
                       * (Etri[tri] = E куска; не-clip — биекция) */
       double *Etri = (double *)malloc((size_t)m.nt * sizeof *Etri);
@@ -1877,7 +1906,8 @@ int main(int argc, char **argv) {
                 * поймана ASAN при прогоне §874) */
   free(g_tb6);
   free(g_lparr);
-  free(kitlvl); /* §915-R3 */
+  free(kitlvl);   /* §915-R3 */
+  free(so.lpacc); /* §915-R4 (NULL-safe) */
   if (gather == 0) pg_bbox_csr_free(&csr);
   free(area);
   free(nrm);

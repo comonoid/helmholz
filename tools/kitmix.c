@@ -1,12 +1,13 @@
-/* kitmix.c — §914-П3: смешанный кит — L0 ближней половины + L1 дальней.
+/* kitmix.c — §914-П3 / §915-R2: смешанный кит по ЗОНЕ.
  *
- * Вход: 2-уровневый кит (после kitdec). Выход: ОДНОуровневый кит,
- * геометрия = L0-треугольники с центроидом z < split плюс
- * L1-треугольники с центроидом z >= split. Аппроксимация камерной
- * зоны для измерения ошибки грубости переносом (без многоуровневого
- * свипа — изоляция ошибки).
+ * Два режима:
+ *   split=S     — плоскость z: L0 ниже, L1 выше (П3-эксперимент);
+ *   eye=,zone=R — КОЛЬЦА вокруг глаза: треугольник уровня i берётся,
+ *                 если ring = min(floor(d/R), nlev-1) == i, d —
+ *                 расстояние центроида до глаза (камерная зона §913).
+ * Выход — одноуровневый кит для обычного pgather (свип не меняется).
  *
- * Синтаксис: kitmix IN.kit OUT.kit split=S
+ * Синтаксис: kitmix IN.kit OUT.kit split=S | eye=X,Y,Z zone=R
  */
 #include "geom/kit.h"
 
@@ -17,12 +18,24 @@
 
 int main(int argc, char **argv) {
   double split = 0.0;
+  double eye[3] = {0, 0, 0}, zone = -1.0; /* zone<0 — режим split */
   if (argc < 3) {
-    fprintf(stderr, "kitmix IN.kit OUT.kit split=S\n");
+    fprintf(stderr, "kitmix IN.kit OUT.kit [split=S | eye=X,Y,Z zone=R]\n");
     return 2;
   }
-  for (int i = 3; i < argc; i++)
-    if (strncmp(argv[i], "split=", 6) == 0) split = atof(argv[i] + 6);
+  for (int i = 3; i < argc; i++) {
+    if (strncmp(argv[i], "split=", 6) == 0)
+      split = atof(argv[i] + 6);
+    else if (strncmp(argv[i], "zone=", 5) == 0)
+      zone = atof(argv[i] + 5);
+    else if (strncmp(argv[i], "eye=", 4) == 0) {
+      if (sscanf(argv[i] + 4, "%lf,%lf,%lf", &eye[0], &eye[1], &eye[2]) != 3) {
+        fprintf(stderr, "kitmix: eye=X,Y,Z\n");
+        return 2;
+      }
+    }
+  }
+  int radial = zone > 0;
 
   hz_kit k;
   hz_kit_init(&k);
@@ -33,36 +46,60 @@ int main(int argc, char **argv) {
   }
   int rc = hz_kit_load(&k, f);
   fclose(f);
-  if (rc != HZ_KIT_OK || k.nlev < 2) {
-    fprintf(stderr, "kitmix: нужен кит с nlev>=2 (rc=%d nlev=%d)\n", rc, k.nlev);
+  if (rc != HZ_KIT_OK || k.nlev < 1) {
+    fprintf(stderr, "kitmix: кит не читается (rc=%d nlev=%d)\n", rc, k.nlev);
     hz_kit_free(&k);
     return 2;
   }
-  const hz_kit_level *A = &k.lev[0]; /* детальный */
-  const hz_kit_level *B = &k.lev[1]; /* грубый */
+  uint32_t vbase[64];
+  uint32_t nv = 0;
+  for (int32_t li = 0; li < k.nlev; li++) {
+    vbase[li] = nv;
+    nv += k.lev[li].nverts;
+  }
 
-  /* Счёт треугольников по половинам. */
-  uint32_t na = 0, nb = 0;
-  for (uint32_t t = 0; t < A->ntris; t++) {
-    double cz = (A->vz[A->ti0[t]] + A->vz[A->ti1[t]] + A->vz[A->ti2[t]]) / 3.0;
-    if (cz < split) na++;
+  /* Счёт: ring(i) == уровень i (радиальный) либо плоскость split. */
+  uint32_t nt = 0;
+  uint32_t took[64] = {0};
+  if (k.nlev > 64) {
+    fprintf(stderr, "kitmix: nlev>64\n");
+    hz_kit_free(&k);
+    return 2;
   }
-  for (uint32_t t = 0; t < B->ntris; t++) {
-    double cz = (B->vz[B->ti0[t]] + B->vz[B->ti1[t]] + B->vz[B->ti2[t]]) / 3.0;
-    if (cz >= split) nb++;
+  for (int32_t li = 0; li < k.nlev; li++) {
+    const hz_kit_level *S = &k.lev[li];
+    for (uint32_t t = 0; t < S->ntris; t++) {
+      double cx = (S->vx[S->ti0[t]] + S->vx[S->ti1[t]] + S->vx[S->ti2[t]]) / 3.0;
+      double cy = (S->vy[S->ti0[t]] + S->vy[S->ti1[t]] + S->vy[S->ti2[t]]) / 3.0;
+      double cz = (S->vz[S->ti0[t]] + S->vz[S->ti1[t]] + S->vz[S->ti2[t]]) / 3.0;
+      int take;
+      if (radial) {
+        double d = sqrt((cx - eye[0]) * (cx - eye[0]) + (cy - eye[1]) * (cy - eye[1]) +
+                        (cz - eye[2]) * (cz - eye[2]));
+        int32_t ring = (int32_t)(d / zone);
+        if (ring > k.nlev - 1) ring = k.nlev - 1;
+        take = (ring == li);
+      } else {
+        take = (li == 0) ? (cz < split) : (cz >= split);
+      }
+      if (take) {
+        took[li]++;
+        nt++;
+      }
+    }
   }
-  uint32_t nt = na + nb;
-  printf("смешивание: L0-близко=%u L1-далеко=%u итого=%u (split=%.3f)\n", na, nb, nt, split);
+  printf("смешивание (nlev=%d, %s): ", k.nlev, radial ? "кольца" : "плоскость");
+  for (int32_t li = 0; li < k.nlev; li++)
+    printf("L%d=%u ", li, took[li]);
+  printf("итого=%u\n", nt);
   if (nt == 0) {
     fprintf(stderr, "kitmix: пустой результат\n");
     hz_kit_free(&k);
     return 2;
   }
 
-  /* Выходной кит: вершины обоих уровней (без переиспользования:
-   * смещение индексов B на A->nverts), треугольники подряд,
-   * грозди-прогоны по источнику. */
-  uint32_t nv = A->nverts + B->nverts;
+  /* Выходной кит: вершины ВСЕХ уровней (смещения vbase), треугольники
+   * подряд по уровням, грозди-прогоны по источнику. */
   hz_kit out;
   hz_kit_init(&out);
   out.nlev = 1;
@@ -94,12 +131,12 @@ int main(int argc, char **argv) {
     hz_kit_free(&k);
     return 2;
   }
-  memcpy(M->vx, A->vx, (size_t)A->nverts * sizeof(double));
-  memcpy(M->vy, A->vy, (size_t)A->nverts * sizeof(double));
-  memcpy(M->vz, A->vz, (size_t)A->nverts * sizeof(double));
-  memcpy(M->vx + A->nverts, B->vx, (size_t)B->nverts * sizeof(double));
-  memcpy(M->vy + A->nverts, B->vy, (size_t)B->nverts * sizeof(double));
-  memcpy(M->vz + A->nverts, B->vz, (size_t)B->nverts * sizeof(double));
+  for (int32_t li = 0; li < k.nlev; li++) {
+    const hz_kit_level *S = &k.lev[li];
+    memcpy(M->vx + vbase[li], S->vx, (size_t)S->nverts * sizeof(double));
+    memcpy(M->vy + vbase[li], S->vy, (size_t)S->nverts * sizeof(double));
+    memcpy(M->vz + vbase[li], S->vz, (size_t)S->nverts * sizeof(double));
+  }
 
   /* Грозди заполняются В ЭТОМ ЖЕ цикле: массив размером nt (гроздь ≥1
    * треугольника ⇒ ncl ≤ nt), после — усечение realloc. Индукция по ci
@@ -113,22 +150,33 @@ int main(int argc, char **argv) {
   }
   uint32_t w = 0;
   uint32_t ncl = 0;
-  int prev_src = -1; /* 0 = L0, 1 = L1 */
-  for (int pass = 0; pass < 2; pass++) {
-    const hz_kit_level *S = pass == 0 ? A : B;
-    uint32_t base = pass == 0 ? 0 : A->nverts;
+  int prev_src = -1;
+  for (int32_t li = 0; li < k.nlev; li++) {
+    const hz_kit_level *S = &k.lev[li];
     for (uint32_t t = 0; t < S->ntris; t++) {
+      double cx = (S->vx[S->ti0[t]] + S->vx[S->ti1[t]] + S->vx[S->ti2[t]]) / 3.0;
+      double cy = (S->vy[S->ti0[t]] + S->vy[S->ti1[t]] + S->vy[S->ti2[t]]) / 3.0;
       double cz = (S->vz[S->ti0[t]] + S->vz[S->ti1[t]] + S->vz[S->ti2[t]]) / 3.0;
-      if (pass == 0 ? !(cz < split) : !(cz >= split)) continue;
-      M->ti0[w] = S->ti0[t] + base;
-      M->ti1[w] = S->ti1[t] + base;
-      M->ti2[w] = S->ti2[t] + base;
-      M->tmtl[w] = S->tmtl[t]; /* материал пережил декимацию (Ш2-фикс) */
-      if (prev_src != pass) {
+      int take;
+      if (radial) {
+        double d = sqrt((cx - eye[0]) * (cx - eye[0]) + (cy - eye[1]) * (cy - eye[1]) +
+                        (cz - eye[2]) * (cz - eye[2]));
+        int32_t ring = (int32_t)(d / zone);
+        if (ring > k.nlev - 1) ring = k.nlev - 1;
+        take = (ring == li);
+      } else {
+        take = (li == 0) ? (cz < split) : (cz >= split);
+      }
+      if (!take) continue;
+      M->ti0[w] = S->ti0[t] + vbase[li];
+      M->ti1[w] = S->ti1[t] + vbase[li];
+      M->ti2[w] = S->ti2[t] + vbase[li];
+      M->tmtl[w] = S->tmtl[t];
+      if (prev_src != li) {
         if (ncl > 0) M->cl[ncl - 1].ntris = w - M->cl[ncl - 1].first_tri;
         M->cl[ncl].first_tri = w;
         ncl++;
-        prev_src = pass;
+        prev_src = li;
       }
       M->tcl[w] = ncl - 1;
       w++;

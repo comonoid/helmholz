@@ -69,6 +69,10 @@ build/scenechk: tools/scenechk.c src/scene_obj.c | build
 build/test_kit: tests/test_kit.c src/geom/kit.c src/geom/kit.h | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_kit.c src/geom/kit.c -lm'
 
+# §914-Ш2': движение фронта по геометрической структуре (кусок с этажом P).
+build/kitwalk: tools/kitwalk.c src/nstruct/pyr.c src/nstruct/pyr.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/kitwalk.c src/nstruct/pyr.c -lm'
+
 # fast tests (seconds)
 test: build/test_octree build/test_octfmt build/test_bounce build/test_kit
 	./build/test_octree

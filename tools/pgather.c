@@ -617,6 +617,8 @@ int main(int argc, char **argv) {
   double expmul = 1.0;                            /* §890: множитель экспозиции */
   const char *blkfile = NULL;                     /* §882: HBLK v1, mmap-сбор */
   const char *kitpath = NULL;                     /* §914-Ш4: геометрия из КИТА */
+  double zone = -1.0;                             /* §915-R3: радиус кольца детальности */
+  uint8_t *kitlvl = NULL; /* §915-R3: уровень кита на выбранный треугольник [nt] */
   double delbox[6];
   hz_objmesh m;
   hz_pyr py;
@@ -712,6 +714,8 @@ int main(int argc, char **argv) {
       scale = atof(argv[i] + 6);
     else if (strncmp(argv[i], "kit=", 4) == 0)
       kitpath = argv[i] + 4; /* §914-Ш4: кит вместо OBJ (паритет — Ш4-П1) */
+    else if (strncmp(argv[i], "zone=", 5) == 0)
+      zone = atof(argv[i] + 5); /* §915-R3: кольца детальности вокруг eye */
     else
       path = argv[i];
   }
@@ -752,17 +756,52 @@ int main(int argc, char **argv) {
       hz_kit_free(&kk);
       return 2;
     }
-    if (kk.nlev != 1) {
-      fprintf(stderr, "pgather: kit= v1 врезки — вырожденный кит (nlev=1)\n");
+    if (kk.nlev > 64) {
+      fprintf(stderr, "pgather: kit= nlev>64\n");
       hz_kit_free(&kk);
       return 2;
     }
+    if (kk.nlev > 1 && zone <= 0) {
+      fprintf(stderr, "pgather: kit= с nlev>1 требует zone=R (fail-closed, §915-R3)\n");
+      hz_kit_free(&kk);
+      return 2;
+    }
+    /* §915-R3: многоуровневый кит — кольца вокруг eye: треугольник
+     * уровня i берётся, если ring = min(floor(d/zone), nlev-1) == i.
+     * Вырожденный nlev=1 идёт прежним путём (битово). */
+    uint32_t vbase[64];
+    uint32_t nvtot = 0;
+    for (int32_t li = 0; li < kk.nlev; li++) {
+      vbase[li] = nvtot;
+      nvtot += kk.lev[li].nverts;
+    }
+    uint32_t ntsel = 0;
+    if (kk.nlev > 1) {
+      for (int32_t li = 0; li < kk.nlev; li++) {
+        const hz_kit_level *S = &kk.lev[li];
+        for (uint32_t t = 0; t < S->ntris; t++) {
+          double cx = (S->vx[S->ti0[t]] + S->vx[S->ti1[t]] + S->vx[S->ti2[t]]) / 3.0;
+          double cy = (S->vy[S->ti0[t]] + S->vy[S->ti1[t]] + S->vy[S->ti2[t]]) / 3.0;
+          double cz2 = (S->vz[S->ti0[t]] + S->vz[S->ti1[t]] + S->vz[S->ti2[t]]) / 3.0;
+          double d = sqrt((cx - eye[0]) * (cx - eye[0]) + (cy - eye[1]) * (cy - eye[1]) +
+                          (cz2 - eye[2]) * (cz2 - eye[2]));
+          int32_t ring = (int32_t)(d / zone);
+          if (ring > kk.nlev - 1) ring = kk.nlev - 1;
+          if (ring == li) ntsel++;
+        }
+      }
+      if (ntsel == 0) {
+        fprintf(stderr, "pgather: кольца зоны пусты (zone=%.3f)\n", zone);
+        hz_kit_free(&kk);
+        return 2;
+      }
+    }
     const hz_kit_level *KL = &kk.lev[0];
-    m.nv = (int32_t)KL->nverts;
-    m.nt = (int32_t)KL->ntris;
+    m.nv = (int32_t)(kk.nlev > 1 ? nvtot : KL->nverts);
+    m.nt = (int32_t)(kk.nlev > 1 ? (int32_t)ntsel : (int32_t)KL->ntris);
     m.nmtl = (int32_t)kk.nmtl;
-    m.v = malloc(3.0 * (size_t)m.nv * sizeof *m.v);
-    m.f = malloc(3.0 * (size_t)m.nt * sizeof *m.f);
+    m.v = malloc(3 * (size_t)m.nv * sizeof *m.v);
+    m.f = malloc(3 * (size_t)m.nt * sizeof *m.f);
     m.fm = malloc((size_t)m.nt * sizeof *m.fm);
     m.mtl = calloc((size_t)(m.nmtl > 0 ? m.nmtl : 1), sizeof *m.mtl);
     m.vn = NULL;
@@ -775,16 +814,51 @@ int main(int argc, char **argv) {
       hz_kit_free(&kk);
       return 2;
     }
-    for (int32_t v = 0; v < m.nv; v++) {
-      m.v[3 * (int64_t)v] = KL->vx[v];
-      m.v[3 * (int64_t)v + 1] = KL->vy[v];
-      m.v[3 * (int64_t)v + 2] = KL->vz[v];
+    for (int32_t li = 0; li < kk.nlev; li++) {
+      const hz_kit_level *S = &kk.lev[li];
+      for (uint32_t v = 0; v < S->nverts; v++) {
+        int64_t dv = (int64_t)(vbase[li] + v);
+        m.v[3 * dv] = S->vx[v];
+        m.v[3 * dv + 1] = S->vy[v];
+        m.v[3 * dv + 2] = S->vz[v];
+      }
     }
-    for (int32_t t = 0; t < m.nt; t++) {
-      m.f[3 * (int64_t)t] = (int32_t)KL->ti0[t];
-      m.f[3 * (int64_t)t + 1] = (int32_t)KL->ti1[t];
-      m.f[3 * (int64_t)t + 2] = (int32_t)KL->ti2[t];
-      m.fm[t] = (int32_t)KL->tmtl[t];
+    if (kk.nlev == 1) {
+      for (int32_t t = 0; t < m.nt; t++) {
+        m.f[3 * (int64_t)t] = (int32_t)KL->ti0[t];
+        m.f[3 * (int64_t)t + 1] = (int32_t)KL->ti1[t];
+        m.f[3 * (int64_t)t + 2] = (int32_t)KL->ti2[t];
+        m.fm[t] = (int32_t)KL->tmtl[t];
+      }
+    } else {
+      /* выбранные треугольники по уровням; kitlvl[ti] = уровень */
+      kitlvl = (uint8_t *)malloc((size_t)m.nt);
+      if (kitlvl == NULL) {
+        fprintf(stderr, "pgather: нет памяти (kitlvl)\n");
+        hz_kit_free(&kk);
+        hz_obj_free(&m);
+        return 2;
+      }
+      int32_t w = 0;
+      for (int32_t li = 0; li < kk.nlev; li++) {
+        const hz_kit_level *S = &kk.lev[li];
+        for (uint32_t t = 0; t < S->ntris; t++) {
+          double cx = (S->vx[S->ti0[t]] + S->vx[S->ti1[t]] + S->vx[S->ti2[t]]) / 3.0;
+          double cy = (S->vy[S->ti0[t]] + S->vy[S->ti1[t]] + S->vy[S->ti2[t]]) / 3.0;
+          double cz2 = (S->vz[S->ti0[t]] + S->vz[S->ti1[t]] + S->vz[S->ti2[t]]) / 3.0;
+          double d = sqrt((cx - eye[0]) * (cx - eye[0]) + (cy - eye[1]) * (cy - eye[1]) +
+                          (cz2 - eye[2]) * (cz2 - eye[2]));
+          int32_t ring = (int32_t)(d / zone);
+          if (ring > kk.nlev - 1) ring = kk.nlev - 1;
+          if (ring != li) continue;
+          m.f[3 * (int64_t)w] = (int32_t)(S->ti0[t] + vbase[li]);
+          m.f[3 * (int64_t)w + 1] = (int32_t)(S->ti1[t] + vbase[li]);
+          m.f[3 * (int64_t)w + 2] = (int32_t)(S->ti2[t] + vbase[li]);
+          m.fm[w] = (int32_t)S->tmtl[t];
+          kitlvl[w] = (uint8_t)li;
+          w++;
+        }
+      }
     }
     for (int32_t mi = 0; mi < m.nmtl; mi++) {
       m.mtl[mi].kd = kk.mtl[mi].kd;
@@ -1168,7 +1242,9 @@ int main(int argc, char **argv) {
         tb6[6 * (int64_t)ti + a2] = lo;
         tb6[6 * (int64_t)ti + 3 + a2] = hi2;
       }
-      lparr[ti] = 0; /* ℓ_p = 0: рабочий уровень листьев (как в pref) */
+      /* §915-R3: ℓ_p = уровень кита треугольника (кольца зоны);
+       * вырожденный кит/OBJ — нули, битово прежний мир */
+      lparr[ti] = (kitlvl != NULL && ti < m.nt) ? kitlvl[ti] : 0;
     }
     g_tv9 = tv9;
     g_tb6 = tb6;
@@ -1801,6 +1877,7 @@ int main(int argc, char **argv) {
                 * поймана ASAN при прогоне §874) */
   free(g_tb6);
   free(g_lparr);
+  free(kitlvl); /* §915-R3 */
   if (gather == 0) pg_bbox_csr_free(&csr);
   free(area);
   free(nrm);

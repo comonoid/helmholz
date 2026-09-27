@@ -133,7 +133,8 @@ typedef struct {
 static int adj_init(adj *A, uint32_t nv, uint32_t nt, const uint32_t *ta, const uint32_t *tb,
                     const uint32_t *tc) {
   A->nt = nt;
-  A->nslot = (int32_t)(3 * nt);
+  A->nslot = (int32_t)(3.0 * (double)nt); /* nt ≤ 1e9×3 < 2^31-1: кит-кэп гарантирует; через double
+                                             без sign-conversion */
   A->cap = A->nslot + 1024;
   A->nextra = 0;
   A->head = malloc((size_t)nv * sizeof(int32_t));
@@ -145,7 +146,7 @@ static int adj_init(adj *A, uint32_t nv, uint32_t nt, const uint32_t *ta, const 
   for (uint32_t t = 0; t < nt; t++) {
     uint32_t vi[3] = {ta[t], tb[t], tc[t]};
     for (int i = 0; i < 3; i++) {
-      int32_t slot = (int32_t)(3 * t + i);
+      int32_t slot = (int32_t)(3) * (int32_t)t + i; /* t < 2^29: 3t < 2^31, кит-кэп */
       A->next[slot] = A->head[vi[i]];
       A->head[vi[i]] = slot;
     }

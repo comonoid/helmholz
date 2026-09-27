@@ -133,8 +133,8 @@ typedef struct {
 static int adj_init(adj *A, uint32_t nv, uint32_t nt, const uint32_t *ta, const uint32_t *tb,
                     const uint32_t *tc) {
   A->nt = nt;
-  A->nslot = (int32_t)(3.0 * (double)nt); /* nt ≤ 1e9×3 < 2^31-1: кит-кэп гарантирует; через double
-                                             без sign-conversion */
+  if (nt > 700000000u) return 1; /* кит-кэп 1e9: 3·nt обязан влезать в int32 */
+  A->nslot = (int32_t)nt * 3;
   A->cap = A->nslot + 1024;
   A->nextra = 0;
   A->head = malloc((size_t)nv * sizeof(int32_t));

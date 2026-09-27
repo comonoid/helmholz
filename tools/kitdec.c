@@ -1,14 +1,21 @@
-/* kitdec.c — §914-Ш2'': декиматор v1, VERTEX CLUSTERING.
+/* kitdec.c — §916: декиматор v2 — QEM EDGE COLLAPSE с запертыми границами.
  *
- * Читает кит (L0), строит ГРУБЫЙ уровень L1: внутренние вершины
- * снапятся в узлы решётки (шаг h = габарит/div, именованная константа),
- * совпавшие склеиваются хешем квантованных ключей, вырожденные
- * треугольники выбрасываются. ГРАНИЧНЫЕ вершины гроздей (вершина
- * принадлежит треугольникам ≥2 гроздей) НЕ двигаются — стык уровней
- * без щелей по построению. Новый уровень дописывается САМЫМ ГРУБЫМ
- * (lev[nlev]) и сохраняется.
+ * Источник — самый грубый уровень кита; новый дописывается ниже по
+ * грубости. Границы гроздей (укрупнение ×4) НЕ ДВИГАЮТСЯ: коллапс «в
+ * граничную вершину» разрешён, её перемещение — нет (стык уровней без
+ * щелей по построению, §2.2 v2). Тонкие фичи защищены стоимостью:
+ * квадрик-ошибка схлопывания колонны велика — v1 их ронял (храм:
+ * дрейф E +51%, §915-R5).
  *
- * Синтаксис: kitdec IN.kit OUT.kit [div=N]   (div по умолчанию 8)
+ * Механика: Q[v] = Σ area·pp^T по прилежащим треугольникам; ребро:
+ * cost = (Q_a+Q_b)(x), x — оптимум квадрики, КЛЭМП к отрезку ребра
+ * (свободный оптимум улетал: площадь 3.6); ЛЕНИВАЯ ПЕРЕОЦЕНКА при
+ * извлечении из кучи (расхождение >10% — ребро возвращается; жадность
+ * по устаревшим ценам рвала меш); переворот нормали — запрет; цель:
+ * живых треугольников ≤ target·источник. Приёмка: площадь ±10% —
+ * ЖЁСТКИЙ гейт записи (НК target≈0 — предсказанный отказ).
+ *
+ * Синтаксис: kitdec IN.kit OUT.kit [target=F]   (F=0.4)
  */
 #include "geom/kit.h"
 
@@ -17,122 +24,152 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* деление габарита для шага решётки: не магия — 8 даёт умеренную
- * редукцию при запертых границах (§914-Ш2''-П1) */
-#define HZ_DEC_DIV_DEFAULT 8
+#define HZ_DEC_TARGET_DEFAULT 0.4
 #define HZ_DEC_AREA_TOL 0.1
-/* ГРОЗДИ УКРУПНЯЮТСЯ на уровень: 4 грозди источника → 1 нового
- * (квадродерево гроздей, STRUCTURE §2.2 v2 «смена уровня — гроздью»).
- * Без этого доля запертых граничных вершин не падает и лестница не
- * грубеет (найдено на room: 66% вершин граничные, редукция 0.3%). */
 #define HZ_DEC_CLUSTER_MERGE 4
+#define HZ_DEC_RECOST_GAP 1.1 /* ленивая переоценка: цена выросла >10% */
 
-/* открытая хеш-таблица квантованных ключей: линейные зонды, степень 2 */
 typedef struct {
-  uint64_t *keys; /* упакованный квантованный ключ (3×21 бит) */
-  int32_t *val;
-  int32_t mask, used;
-} ihash;
+  double a[10];
+} quad;
 
-static int ih_init(ihash *h, int32_t cap2) {
-  h->mask = cap2 - 1;
-  h->used = 0;
-  h->keys = malloc((size_t)cap2 * sizeof(int64_t));
-  h->val = malloc((size_t)cap2 * sizeof(int32_t));
-  if (!h->keys || !h->val) {
-    free(h->keys);
-    free(h->val);
-    h->keys = NULL;
-    h->val = NULL;
-    return 1;
+static void quad_add(quad *r, const quad *q) {
+  for (int i = 0; i < 10; i++)
+    r->a[i] += q->a[i];
+}
+
+static void quad_plane(quad *q, double nx, double ny, double nz, double d, double w) {
+  double v[4] = {nx, ny, nz, d};
+  int k = 0;
+  for (int i = 0; i < 4; i++)
+    for (int j = i; j < 4; j++)
+      q->a[k++] = w * v[i] * v[j];
+}
+
+static double quad_eval(const quad *q, const double x[3]) {
+  double v[4] = {x[0], x[1], x[2], 1.0};
+  static const int idx[4][4] = {{0, 1, 2, 3}, {1, 4, 5, 6}, {2, 5, 7, 8}, {3, 6, 8, 9}};
+  double s = 0;
+  for (int i = 0; i < 4; i++)
+    for (int j = 0; j < 4; j++)
+      s += v[i] * q->a[idx[i][j]] * v[j];
+  return s;
+}
+
+static int quad_argmin(const quad *q, double x[3]) {
+  double m[3][3] = {
+      {q->a[0], q->a[1], q->a[2]}, {q->a[1], q->a[4], q->a[5]}, {q->a[2], q->a[5], q->a[7]}};
+  double rhs[3] = {-q->a[3], -q->a[6], -q->a[8]};
+  double det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) -
+               m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) +
+               m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+  if (fabs(det) < 1e-14) return 0;
+  for (int c = 0; c < 3; c++) {
+    double t[3][3];
+    memcpy(t, m, sizeof t);
+    for (int r = 0; r < 3; r++)
+      t[r][c] = rhs[r];
+    double d = t[0][0] * (t[1][1] * t[2][2] - t[1][2] * t[2][1]) -
+               t[0][1] * (t[1][0] * t[2][2] - t[1][2] * t[2][0]) +
+               t[0][2] * (t[1][0] * t[2][1] - t[1][1] * t[2][0]);
+    x[c] = d / det;
+    if (!isfinite(x[c])) return 0;
   }
-  for (int32_t i = 0; i < cap2; i++)
-    h->val[i] = -1;
-  return 0;
+  return 1;
 }
 
-static void ih_free(ihash *h) {
-  free(h->keys);
-  free(h->val);
+typedef struct {
+  int32_t a, b;
+  double cost;
+} edge_item;
+
+typedef struct {
+  edge_item *h;
+  int32_t n, cap;
+} heap;
+
+static void heap_push(heap *hp, int32_t a, int32_t b, double cost) {
+  if (hp->n >= hp->cap) {
+    int32_t nc = hp->cap ? hp->cap * 2 : 1024;
+    edge_item *nh = realloc(hp->h, (size_t)nc * sizeof *nh);
+    if (nh == NULL) return;
+    hp->h = nh;
+    hp->cap = nc;
+  }
+  int32_t i = hp->n++;
+  hp->h[i].a = a;
+  hp->h[i].b = b;
+  hp->h[i].cost = cost;
+  while (i > 0) {
+    int32_t p = (i - 1) / 2;
+    if (hp->h[p].cost <= hp->h[i].cost) break;
+    edge_item t = hp->h[p];
+    hp->h[p] = hp->h[i];
+    hp->h[i] = t;
+    i = p;
+  }
 }
 
-static uint64_t mix64(uint64_t x) {
-  x ^= x >> 33;
-  x *= 0xff51afd7ed558ccdull;
-  x ^= x >> 33;
-  x *= 0xc4ceb9fe1a85ec53ull;
-  x ^= x >> 33;
-  return x;
-}
-
-/* ключ: (ix,iy,iz) по 21 бит, беззнаковая упаковка */
-static uint64_t pack_key3(int64_t ix, int64_t iy, int64_t iz) {
-  uint64_t ux = (uint64_t)ix, uy = (uint64_t)iy, uz = (uint64_t)iz;
-  return ((ux & 0x1fffffull) << 42) | ((uy & 0x1fffffull) << 21) | (uz & 0x1fffffull);
-}
-
-static int32_t ih_get(ihash *h, uint64_t key, int32_t *next_id) {
-  uint64_t hh = mix64((uint64_t)key);
-  int32_t i = (int32_t)(hh & (uint64_t)h->mask);
+static int heap_pop(heap *hp, edge_item *out) {
+  if (hp->n == 0) return 0;
+  *out = hp->h[0];
+  hp->h[0] = hp->h[--hp->n];
+  int32_t i = 0;
   for (;;) {
-    if (h->val[i] < 0) {
-      h->keys[i] = key;
-      h->val[i] = (*next_id)++;
-      h->used++;
-      return h->val[i];
-    }
-    if (h->keys[i] == key) return h->val[i];
-    i = (i + 1) & h->mask;
+    int32_t l = 2 * i + 1, r = l + 1, m = i;
+    if (l < hp->n && hp->h[l].cost < hp->h[m].cost) m = l;
+    if (r < hp->n && hp->h[r].cost < hp->h[m].cost) m = r;
+    if (m == i) break;
+    edge_item t = hp->h[m];
+    hp->h[m] = hp->h[i];
+    hp->h[i] = t;
+    i = m;
   }
+  return 1;
 }
 
-typedef struct {
-  double *x, *y, *z;
-  uint32_t n;
-} vbuf;
+static int tri_normal(const double p[3][3], double n[3]) {
+  double e1[3] = {p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]};
+  double e2[3] = {p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]};
+  n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+  n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+  n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+  double nn = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  return nn > 0;
+}
 
-static int vb_push(vbuf *v, double px, double py, double pz, uint32_t cap[]) {
-  if (v->n >= cap[0]) {
-    cap[0] = cap[0] ? cap[0] * 2 : 1024;
-    double *nx = realloc(v->x, cap[0] * sizeof(double));
-    double *ny = realloc(v->y, cap[0] * sizeof(double));
-    double *nz = realloc(v->z, cap[0] * sizeof(double));
-    if (!nx || !ny || !nz) {
-      free(nx ? nx : v->x);
-      free(ny ? ny : v->y);
-      free(nz ? nz : v->z);
-      v->x = nx;
-      v->y = ny;
-      v->z = nz;
-      return 1;
-    }
-    v->x = nx;
-    v->y = ny;
-    v->z = nz;
+/* позиция коллапса: оптимум квадрики, клэмп к отрезку ребра */
+static void edge_pos(uint32_t a, uint32_t b, const double *vx, const double *vy, const double *vz,
+                     const quad *qs, double x[3]) {
+  double A[3] = {vx[a], vy[a], vz[a]}, B[3] = {vx[b], vy[b], vz[b]};
+  double cand[3];
+  if (!quad_argmin(qs, cand)) {
+    for (int i = 0; i < 3; i++)
+      x[i] = 0.5 * (A[i] + B[i]);
+    return;
   }
-  v->x[v->n] = px;
-  v->y[v->n] = py;
-  v->z[v->n] = pz;
-  v->n++;
-  return 0;
+  double ab[3] = {B[0] - A[0], B[1] - A[1], B[2] - A[2]};
+  double den = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+  double t = 0.5;
+  if (den > 0) {
+    t = ((cand[0] - A[0]) * ab[0] + (cand[1] - A[1]) * ab[1] + (cand[2] - A[2]) * ab[2]) / den;
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+  }
+  for (int i = 0; i < 3; i++)
+    x[i] = A[i] + t * ab[i];
 }
 
 int main(int argc, char **argv) {
-  int div = HZ_DEC_DIV_DEFAULT;
-  uint32_t *vseen = NULL;
-  unsigned char *isb = NULL;
-  int32_t *map = NULL;
-  vbuf vb = {0};
-  uint32_t *t1a = NULL, *t1b = NULL, *t1c = NULL, *t1cl = NULL;
-  ihash ht = {0};
+  double target = HZ_DEC_TARGET_DEFAULT;
   if (argc < 3) {
-    fprintf(stderr, "kitdec IN.kit OUT.kit [div=N]\n");
+    fprintf(stderr, "kitdec IN.kit OUT.kit [target=F]\n");
     return 2;
   }
   for (int i = 3; i < argc; i++)
-    if (strncmp(argv[i], "div=", 4) == 0) div = atoi(argv[i] + 4);
-  if (div < 1) {
-    fprintf(stderr, "kitdec: div>=1\n");
+    if (strncmp(argv[i], "target=", 7) == 0) target = atof(argv[i] + 7);
+  if (target <= 0.0 || target >= 1.0) {
+    fprintf(stderr, "kitdec: 0 < target < 1\n");
     return 2;
   }
 
@@ -149,245 +186,329 @@ int main(int argc, char **argv) {
     fprintf(stderr, "kitdec: кит не читается (rc=%d)\n", rc);
     return 2;
   }
-  /* источник — САМЫЙ ГРУБЫЙ существующий уровень: лестница растёт
-   * вниз по грубости, а не параллельными копиями L0 */
-  const hz_kit_level *L0 = &k.lev[k.nlev - 1];
-  printf("вход: nlev=%d источник lev[%d]: nv=%u nt=%u nc=%u\n", k.nlev, k.nlev - 1, L0->nverts,
-         L0->ntris, L0->nclust);
+  const hz_kit_level *S = &k.lev[k.nlev - 1];
+  printf("вход: nlev=%d источник lev[%d]: nv=%u nt=%u nc=%u\n", k.nlev, k.nlev - 1, S->nverts,
+         S->ntris, S->nclust);
+  uint32_t nt0 = S->ntris;
 
-  /* шаг решётки от габарита L0 (границы НЕ снапятся — только внутренние) */
-  double ext[3] = {0, 0, 0};
-  for (uint32_t v = 0; v < L0->nverts; v++) {
-    ext[0] += L0->vx[v];
-    ext[1] += L0->vy[v];
-    ext[2] += L0->vz[v];
-  }
-  double cen[3] = {ext[0] / L0->nverts, ext[1] / L0->nverts, ext[2] / L0->nverts};
-  double rad = 0;
-  for (uint32_t v = 0; v < L0->nverts; v++) {
-    double d[3] = {L0->vx[v] - cen[0], L0->vy[v] - cen[1], L0->vz[v] - cen[2]};
-    double r = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
-    if (r > rad) rad = r;
-  }
-  /* решётка ГРУБЕЕТ на уровень: h ×2 за шаг лестницы (геометрическая
-   * прогрессия из бюджета §914); div_effective = div >> (номер уровня) */
-  int diveff = div >> (k.nlev - 1);
-  if (diveff < 1) diveff = 1;
-  double h = 2.0 * rad / (double)diveff;
-  if (h <= 0) {
-    fprintf(stderr, "kitdec: нулевой габарит\n");
-    hz_kit_free(&k);
-    return 2;
-  }
+  uint32_t nv = S->nverts, nt = S->ntris;
+  double *vx = malloc((size_t)nv * sizeof(double));
+  double *vy = malloc((size_t)nv * sizeof(double));
+  double *vz = malloc((size_t)nv * sizeof(double));
+  uint32_t *ta = malloc(4ull * nt), *tb = malloc(4ull * nt), *tc = malloc(4ull * nt);
+  uint32_t *tcl = malloc(4ull * nt), *tmtl = malloc(4ull * nt);
+  quad *Q = calloc((size_t)nv, sizeof(quad));
+  unsigned char *dead = calloc((size_t)nv, 1);
+  unsigned char *isb = calloc((size_t)nv, 1);
+  unsigned char *tdel = calloc((size_t)nt, 1);
+  heap hp = {0};
+  if (!vx || !vy || !vz || !ta || !tb || !tc || !tcl || !tmtl || !Q || !dead || !isb || !tdel)
+    goto fail;
+  memcpy(vx, S->vx, (size_t)nv * sizeof(double));
+  memcpy(vy, S->vy, (size_t)nv * sizeof(double));
+  memcpy(vz, S->vz, (size_t)nv * sizeof(double));
+  memcpy(ta, S->ti0, 4ull * nt);
+  memcpy(tb, S->ti1, 4ull * nt);
+  memcpy(tc, S->ti2, 4ull * nt);
+  memcpy(tcl, S->tcl, 4ull * nt);
+  memcpy(tmtl, S->tmtl, 4ull * nt);
 
-  /* граничные вершины: принадлежат треугольникам ≥2 гроздей */
-  vseen = calloc(L0->nverts, sizeof(uint32_t)); /* битовая маска кластеров ≤ 31 */
-  isb = calloc(L0->nverts, 1);
-  if (!vseen || !isb) {
-    fprintf(stderr, "kitdec: нет памяти\n");
-    free(vseen);
-    free(isb);
-    hz_kit_free(&k);
-    return 2;
-  }
-  for (uint32_t t = 0; t < L0->ntris; t++) {
-    uint32_t c = L0->tcl[t] / HZ_DEC_CLUSTER_MERGE + 1; /* 0 = «не встречался» */
-    const uint32_t vi[3] = {L0->ti0[t], L0->ti1[t], L0->ti2[t]};
+  /* площадь источника — ДО realloc(k.lev) (S висит внутри lev; realloc
+   * его двигал — area0 читала мусор: три прогона давали 2390/2299/2604) */
+  double area0 = 0;
+  for (uint32_t t = 0; t < S->ntris; t++) {
+    double p[3][3];
+    uint32_t vi[3] = {S->ti0[t], S->ti1[t], S->ti2[t]};
     for (int a = 0; a < 3; a++) {
-      uint32_t last = vseen[vi[a]];
-      if (last != 0 && last != c) isb[vi[a]] = 1; /* второй кластер */
-      vseen[vi[a]] = c;
+      p[a][0] = S->vx[vi[a]];
+      p[a][1] = S->vy[vi[a]];
+      p[a][2] = S->vz[vi[a]];
     }
+    double n[3];
+    if (tri_normal(p, n)) area0 += 0.5 * sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
   }
-  uint32_t nbound = 0;
-  for (uint32_t v = 0; v < L0->nverts; v++)
-    if (isb[v]) nbound++;
-  printf("решётка h=%.6f (div=%d, эффективный %d), граничных вершин: %u из %u\n", h, div, diveff,
-         nbound, L0->nverts);
 
-  /* отображение вершин: граница — своя; внутренняя — квантованный ключ */
-  if (ih_init(&ht, 1 << 16)) {
-    fprintf(stderr, "kitdec: нет памяти (hash)\n");
-    free(vseen);
-    free(isb);
-    hz_kit_free(&k);
-    return 2;
-  }
-  map = calloc((size_t)L0->nverts, sizeof(int32_t)); /* calloc: анализатор
-     теряет индукцию заполнения через ih_get (FP-класс), нули её чинят */
-  uint32_t cap[1] = {0};
-  int32_t next_id = 0;
-  if (map == NULL) goto oom;
-  for (uint32_t v = 0; v < L0->nverts; v++) {
-    if (isb[v]) {
-      map[v] = next_id++;
-      if (vb_push(&vb, L0->vx[v], L0->vy[v], L0->vz[v], cap)) goto oom;
-    } else {
-      int64_t kx = (int64_t)floor(L0->vx[v] / h);
-      int64_t ky = (int64_t)floor(L0->vy[v] / h);
-      int64_t kz = (int64_t)floor(L0->vz[v] / h);
-      int32_t id = ih_get(&ht, pack_key3(kx, ky, kz), &next_id);
-      if ((uint32_t)id == vb.n) {
-        /* новая ячейка: представитель — ПЕРВАЯ РЕАЛЬНАЯ вершина ячейки,
-         * не узел решётки (узел растягивал слайверы: площадь 1.25 при
-         * П3-пороге 1.1 — фальсификатор сработал, правка по его finding) */
-        if (vb_push(&vb, L0->vx[v], L0->vy[v], L0->vz[v], cap)) goto oom;
+  { /* границы: вершина в треугольниках ≥2 укрупнённых гроздей */
+    uint32_t *last = calloc((size_t)nv, sizeof(uint32_t));
+    if (last == NULL) goto fail;
+    for (uint32_t t = 0; t < nt; t++) {
+      uint32_t c = tcl[t] / HZ_DEC_CLUSTER_MERGE + 1;
+      uint32_t vi[3] = {ta[t], tb[t], tc[t]};
+      for (int a = 0; a < 3; a++) {
+        uint32_t pv = last[vi[a]];
+        if (pv != 0 && pv != c) isb[vi[a]] = 1;
+        last[vi[a]] = c;
       }
-      map[v] = id;
     }
+    free(last);
   }
 
-  /* треугольники L1: вырожденные выбрасываем; кластер — от исходного */
-  uint32_t ntr1 = 0;
-  t1a = malloc(4ull * L0->ntris);
-  t1b = malloc(4ull * L0->ntris);
-  t1c = malloc(4ull * L0->ntris);
-  t1cl = malloc(4ull * L0->ntris);
-  if (!t1a || !t1b || !t1c || !t1cl) goto oom;
-  for (uint32_t t = 0; t < L0->ntris; t++) {
-    uint32_t a = (uint32_t)map[L0->ti0[t]], b = (uint32_t)map[L0->ti1[t]],
-             c = (uint32_t)map[L0->ti2[t]];
-    if (a == b || b == c || a == c) continue; /* вырожденный — в ноль */
-    t1a[ntr1] = a;
-    t1b[ntr1] = b;
-    t1c[ntr1] = c;
-    t1cl[ntr1] = L0->tcl[t] / HZ_DEC_CLUSTER_MERGE;
-    ntr1++;
-  }
-  printf("L1: nv=%u nt=%u (сокращение %.1f%%)\n", vb.n, ntr1,
-         100.0 * (1.0 - (double)ntr1 / (double)L0->ntris));
-  if (ntr1 == 0 || ntr1 >= L0->ntris) {
-    fprintf(stderr, "kitdec: лестница нарушена (nt1=%u ≥ nt0=%u) — отказ\n", ntr1, L0->ntris);
-    ih_free(&ht);
-    free(vseen);
-    free(isb);
-    free(map);
-    free(vb.x);
-    free(vb.y);
-    free(vb.z);
-    free(t1a);
-    free(t1b);
-    free(t1c);
-    free(t1cl);
-    hz_kit_free(&k);
-    return 2;
-  }
-
-  /* суммы площадей — прибор П3 */
-  double area0 = 0, area1 = 0;
-  for (uint32_t t = 0; t < L0->ntris; t++) {
-    uint32_t vi[3] = {L0->ti0[t], L0->ti1[t], L0->ti2[t]};
-    double q[3][3];
+  for (uint32_t t = 0; t < nt; t++) {
+    double p[3][3];
+    uint32_t vi[3] = {ta[t], tb[t], tc[t]};
     for (int a = 0; a < 3; a++) {
-      q[a][0] = L0->vx[vi[a]];
-      q[a][1] = L0->vy[vi[a]];
-      q[a][2] = L0->vz[vi[a]];
+      p[a][0] = vx[vi[a]];
+      p[a][1] = vy[vi[a]];
+      p[a][2] = vz[vi[a]];
     }
-    double e1[3] = {q[1][0] - q[0][0], q[1][1] - q[0][1], q[1][2] - q[0][2]};
-    double e2[3] = {q[2][0] - q[0][0], q[2][1] - q[0][1], q[2][2] - q[0][2]};
-    double cr[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
-                    e1[0] * e2[1] - e1[1] * e2[0]};
-    area0 += 0.5 * sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
-  }
-  for (uint32_t t = 0; t < ntr1; t++) {
-    double q[3][3];
-    uint32_t vi[3] = {t1a[t], t1b[t], t1c[t]};
-    for (int a = 0; a < 3; a++) {
-      q[a][0] = vb.x[vi[a]];
-      q[a][1] = vb.y[vi[a]];
-      q[a][2] = vb.z[vi[a]];
-    }
-    double e1[3] = {q[1][0] - q[0][0], q[1][1] - q[0][1], q[1][2] - q[0][2]};
-    double e2[3] = {q[2][0] - q[0][0], q[2][1] - q[0][1], q[2][2] - q[0][2]};
-    double cr[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2],
-                    e1[0] * e2[1] - e1[1] * e2[0]};
-    area1 += 0.5 * sqrt(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
-  }
-  printf("площадь: L0=%.4f L1=%.4f отношение=%.4f\n", area0, area1, area1 / area0);
-  if (area0 > 0 && fabs(area1 / area0 - 1.0) > HZ_DEC_AREA_TOL) {
-    fprintf(stderr, "kitdec: площадь вне допуска %.3f (tol %d%%) — уровень НЕ записан\n",
-            area1 / area0, (int)(HZ_DEC_AREA_TOL * 100));
-    ih_free(&ht);
-    free(vseen);
-    free(isb);
-    free(map);
-    free(vb.x);
-    free(vb.y);
-    free(vb.z);
-    free(t1a);
-    free(t1b);
-    free(t1c);
-    free(t1cl);
-    hz_kit_free(&k);
-    return 2;
+    double n[3];
+    if (!tri_normal(p, n)) continue;
+    double nn = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    double ar = 0.5 * nn;
+    double nx = n[0] / nn, ny = n[1] / nn, nz = n[2] / nn;
+    double d = -(nx * p[0][0] + ny * p[0][1] + nz * p[0][2]);
+    quad q;
+    memset(&q, 0, sizeof q);
+    quad_plane(&q, nx, ny, nz, d, ar);
+    quad_add(&Q[vi[0]], &q);
+    quad_add(&Q[vi[1]], &q);
+    quad_add(&Q[vi[2]], &q);
   }
 
-  /* проверка П2: граничные вершины битово в L1 (они вошли как есть) */
-  {
-    uint32_t bad = 0, checked = 0;
-    int32_t *firstof = malloc((size_t)vb.n * sizeof(int32_t));
-    if (firstof == NULL) goto oom;
-    for (uint32_t i = 0; i < vb.n; i++)
-      firstof[i] = -1;
-    for (uint32_t v = 0; v < L0->nverts; v++) {
-      if (!isb[v]) continue;
-      int32_t id = map[v];
-      if (firstof[id] < 0) firstof[id] = (int32_t)v;
-      checked++;
-      /* координаты отображения обязаны совпасть битово */
-      if (memcmp(&vb.x[id], &L0->vx[v], sizeof(double)) != 0 ||
-          memcmp(&vb.y[id], &L0->vy[v], sizeof(double)) != 0 ||
-          memcmp(&vb.z[id], &L0->vz[v], sizeof(double)) != 0)
-        bad++; /* битовое сравнение — НАМЕРЕННО memcmp, не == */
+  for (uint32_t t = 0; t < nt; t++) {
+    uint32_t e[3][2] = {{ta[t], tb[t]}, {tb[t], tc[t]}, {tc[t], ta[t]}};
+    for (int i = 0; i < 3; i++) {
+      if (e[i][0] >= e[i][1]) continue;
+      quad qs = Q[e[i][0]];
+      quad_add(&qs, &Q[e[i][1]]);
+      double x[3];
+      if (isb[e[i][0]]) {
+        x[0] = vx[e[i][0]];
+        x[1] = vy[e[i][0]];
+        x[2] = vz[e[i][0]];
+      } else if (isb[e[i][1]]) {
+        x[0] = vx[e[i][1]];
+        x[1] = vy[e[i][1]];
+        x[2] = vz[e[i][1]];
+      } else {
+        edge_pos(e[i][0], e[i][1], vx, vy, vz, &qs, x);
+      }
+      double cost = quad_eval(&qs, x);
+      if (!isfinite(cost)) continue;
+      heap_push(&hp, (int32_t)e[i][0], (int32_t)e[i][1], cost);
     }
-    free(firstof);
-    printf("граница: проверено %u, расхождений %u %s\n", checked, bad,
-           bad == 0 ? "OK (битово)" : "FAIL");
   }
 
-  /* собрать L1-уровень и дописать самым грубым */
+  uint32_t want = (uint32_t)(target * (double)nt0);
+  uint32_t alive = nt;
+  while (alive > want && hp.n > 0) {
+    edge_item it;
+    if (!heap_pop(&hp, &it)) break;
+    uint32_t a = (uint32_t)it.a, b = (uint32_t)it.b;
+    if (dead[a] || dead[b]) continue;
+    if (isb[a] && isb[b]) continue;
+    double x[3];
+    uint32_t keepv, killv;
+    if (isb[b]) {
+      keepv = b;
+      killv = a;
+    } else {
+      keepv = a;
+      killv = b;
+    }
+    x[0] = vx[keepv];
+    x[1] = vy[keepv];
+    x[2] = vz[keepv];
+    /* LINK CONDITION: у a и b обязано быть ровно 2 общих соседа по
+     * живым треугольникам (два конца ребра в многообразии); иначе
+     * коллапс меняет топологию — складки/дыры, площадь 3.7 на храме.
+     * Отдельная пара проходов, стек вместо множества. */
+    {
+      static unsigned char *mark = NULL;
+      static uint32_t *stk = NULL;
+      if (mark == NULL) mark = calloc((size_t)nv, 1);
+      if (stk == NULL) stk = malloc((size_t)nv * sizeof(uint32_t));
+      if (mark == NULL || stk == NULL) goto fail;
+      uint32_t nstk = 0;
+      for (uint32_t t = 0; t < nt; t++) {
+        if (tdel[t]) continue;
+        uint32_t vi[3] = {ta[t], tb[t], tc[t]};
+        int hasa = 0;
+        for (int i2 = 0; i2 < 3; i2++)
+          if (vi[i2] == a) hasa = 1;
+        if (!hasa) continue;
+        for (int i2 = 0; i2 < 3; i2++)
+          if (vi[i2] != a && !mark[vi[i2]]) {
+            mark[vi[i2]] = 1;
+            stk[nstk++] = vi[i2];
+          }
+      }
+      uint32_t shared = 0;
+      for (uint32_t t = 0; t < nt; t++) {
+        if (tdel[t]) continue;
+        uint32_t vi[3] = {ta[t], tb[t], tc[t]};
+        int hasb = 0;
+        for (int i2 = 0; i2 < 3; i2++)
+          if (vi[i2] == b) hasb = 1;
+        if (!hasb) continue;
+        for (int i2 = 0; i2 < 3; i2++)
+          if (vi[i2] != b && mark[vi[i2]]) shared++;
+      }
+      for (uint32_t i2 = 0; i2 < nstk; i2++)
+        mark[stk[i2]] = 0;
+      if (shared != 2) continue; /* не многообразное ребро — запрет */
+    }
+    int bad = 0; /* переворот нормали — запрет */
+    for (uint32_t t = 0; t < nt && !bad; t++) {
+      if (tdel[t]) continue;
+      uint32_t ia = ta[t], ib = tb[t], ic = tc[t];
+      int hask = (ia == killv || ib == killv || ic == killv);
+      int hasp = (ia == keepv || ib == keepv || ic == keepv);
+      if (!hask || hasp) continue;
+      /* подмена ПО ИНДЕКСАМ: совпадающие координаты разных вершин
+       * (пол/кровля) раньше подменяли не ту вершину */
+      uint32_t ki[3] = {ia, ib, ic};
+      double p[3][3] = {
+          {vx[ia], vy[ia], vz[ia]}, {vx[ib], vy[ib], vz[ib]}, {vx[ic], vy[ic], vz[ic]}};
+      double o[3][3];
+      memcpy(o, p, sizeof o);
+      for (int r = 0; r < 3; r++)
+        if (ki[r] == killv) {
+          o[r][0] = x[0];
+          o[r][1] = x[1];
+          o[r][2] = x[2];
+        }
+      double n1[3], n2[3];
+      if (!tri_normal(p, n1) || !tri_normal(o, n2)) continue;
+      if (n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2] <= 0) bad = 1;
+      {
+        /* запрет раздувания: |n2| ≤ 4·|n1| (площадь ×4) — защита от
+         * цепочек на плоскостях */
+        double a1 = sqrt(n1[0] * n1[0] + n1[1] * n1[1] + n1[2] * n1[2]);
+        double a2 = sqrt(n2[0] * n2[0] + n2[1] * n2[1] + n2[2] * n2[2]);
+        if (a2 > 4.0 * a1 + 1e-12) bad = 1;
+      }
+    }
+    if (bad) continue;
+    /* keepv НЕ ДВИГАЕТСЯ: на плоской кровле оптимум-блуждание тянуло
+     * вершину цепочкой коллапсов (треугольники до 529 м² при рёбрах
+     * 0.4 м). Коллапс = склейка в неподвижную вершину. */
+    dead[killv] = 1;
+    quad_add(&Q[keepv], &Q[killv]);
+    for (uint32_t t = 0; t < nt; t++) {
+      if (tdel[t]) continue;
+      uint32_t *vi[3] = {&ta[t], &tb[t], &tc[t]};
+      int khit = 0;
+      for (int i2 = 0; i2 < 3; i2++)
+        if (*vi[i2] == killv) {
+          *vi[i2] = keepv;
+          khit = 1;
+        }
+      if (khit && (ta[t] == tb[t] || tb[t] == tc[t] || ta[t] == tc[t])) {
+        tdel[t] = 1;
+        alive--;
+      }
+    }
+    /* ПЕРЕ-ДОБАВЛЕНИЕ окружения: без него куча истощалась (5% редукции
+     * при цели 40%); изменившиеся рёбра обязаны вернуться с новой ценой */
+    for (uint32_t t = 0; t < nt; t++) {
+      if (tdel[t]) continue;
+      uint32_t vi[3] = {ta[t], tb[t], tc[t]};
+      int hk = -1;
+      for (int i2 = 0; i2 < 3; i2++)
+        if (vi[i2] == keepv) hk = i2;
+      if (hk < 0) continue;
+      for (int i2 = 0; i2 < 3; i2++) {
+        if (i2 == hk) continue;
+        uint32_t o = vi[i2];
+        if (dead[o] || (isb[o] && isb[keepv])) continue;
+        uint32_t lo = keepv < o ? keepv : o, hi = keepv < o ? o : keepv;
+        quad qs = Q[lo];
+        quad_add(&qs, &Q[hi]);
+        double x2[3];
+        if (isb[lo]) {
+          x2[0] = vx[lo];
+          x2[1] = vy[lo];
+          x2[2] = vz[lo];
+        } else if (isb[hi]) {
+          x2[0] = vx[hi];
+          x2[1] = vy[hi];
+          x2[2] = vz[hi];
+        } else {
+          edge_pos(lo, hi, vx, vy, vz, &qs, x2);
+        }
+        double c2 = quad_eval(&qs, x2);
+        if (isfinite(c2)) heap_push(&hp, (int32_t)lo, (int32_t)hi, c2);
+      }
+    }
+  }
+  printf("после коллапсов: живых треугольников %u из %u (цель ≤ %u)\n", alive, nt0, want);
+
+  uint32_t *remap = malloc((size_t)nv * sizeof(uint32_t));
+  if (remap == NULL) goto fail;
+  uint32_t nnv = 0;
+  for (uint32_t v = 0; v < nv; v++)
+    remap[v] = dead[v] ? 0xFFFFFFFFu : nnv++;
+  uint32_t nnt = alive;
+  if (nnt == 0 || nnt >= nt0) {
+    fprintf(stderr, "kitdec: лестница нарушена (nt=%u против %u) — отказ\n", nnt, nt0);
+    free(remap);
+    goto fail;
+  }
   hz_kit_level *L1 = realloc(k.lev, (size_t)(k.nlev + 1) * sizeof(hz_kit_level));
-  if (L1 == NULL) goto oom;
+  if (L1 == NULL) {
+    free(remap);
+    goto fail;
+  }
   k.lev = L1;
   memset(&k.lev[k.nlev], 0, sizeof(hz_kit_level));
-  /* present-таблица рассчитана на старое nlev: после достройки кит
-   * ЦЕЛИКОМ в памяти — семантика present=NULL («все уровни»).
-   * ASAN поймал чтение present[nlev_old] в validate (0 bytes after). */
-  free(k.present);
-  k.present = NULL;
   hz_kit_level *N = &k.lev[k.nlev];
   k.nlev++;
-  N->nverts = vb.n;
-  N->ntris = ntr1;
-  N->vx = vb.x;
-  N->vy = vb.y;
-  N->vz = vb.z;
-  N->ti0 = t1a;
-  N->ti1 = t1b;
-  N->ti2 = t1c;
-  N->tcl = malloc(4ull * ntr1);
-  N->tmtl = malloc(4ull * ntr1);
-  /* грозди L1: непрерывные прогоны одного t1cl (порядок исходный) */
-  if (!N->tcl || !N->tmtl) goto oom;
-  uint32_t nc1 = 0;
-  for (uint32_t t = 0; t < ntr1; t++) {
-    if (t == 0 || t1cl[t] != t1cl[t - 1]) nc1++;
-    N->tcl[t] = nc1 - 1;
+  free(k.present);
+  k.present = NULL; /* таблица рассчитана на старое nlev (ASAN-урок) */
+  N->nverts = nnv;
+  N->ntris = nnt;
+  N->vx = malloc((size_t)nnv * sizeof(double));
+  N->vy = malloc((size_t)nnv * sizeof(double));
+  N->vz = malloc((size_t)nnv * sizeof(double));
+  N->ti0 = malloc(4ull * nnt);
+  N->ti1 = malloc(4ull * nnt);
+  N->ti2 = malloc(4ull * nnt);
+  N->tcl = malloc(4ull * nnt);
+  N->tmtl = malloc(4ull * nnt);
+  if (!N->vx || !N->vy || !N->vz || !N->ti0 || !N->ti1 || !N->ti2 || !N->tcl || !N->tmtl) {
+    free(remap);
+    goto fail;
   }
-  N->nclust = nc1;
-  N->cl = calloc(nc1 ? nc1 : 1, sizeof(hz_cluster));
-  if (N->cl == NULL) goto oom;
-  uint32_t ci = 0;
-  for (uint32_t t = 0; t < ntr1; t++) {
-    if (t == 0 || t1cl[t] != t1cl[t - 1]) {
-      if (t > 0) ci++;
-      N->cl[ci].first_tri = t;
+  for (uint32_t v = 0; v < nv; v++)
+    if (!dead[v]) {
+      N->vx[remap[v]] = vx[v];
+      N->vy[remap[v]] = vy[v];
+      N->vz[remap[v]] = vz[v];
     }
-    N->cl[ci].ntris++;
-    N->tmtl[t] = L0->tmtl[t]; /* материал ИСХОДНОГО треугольника: грубость не
-      должна менять альбедо (найдено П3: смешанная комната потеряла kd дальней половины) */
+  uint32_t w = 0, ncl = 0;
+  int prev = -1;
+  for (uint32_t t = 0; t < nt; t++) {
+    if (tdel[t]) continue;
+    uint32_t c = tcl[t] / HZ_DEC_CLUSTER_MERGE;
+    if ((int)c != prev) {
+      ncl++;
+      prev = (int)c;
+    }
+    N->ti0[w] = remap[ta[t]];
+    N->ti1[w] = remap[tb[t]];
+    N->ti2[w] = remap[tc[t]];
+    N->tmtl[w] = tmtl[t];
+    N->tcl[w] = ncl - 1;
+    w++;
   }
-  for (uint32_t c = 0; c < nc1; c++) {
+  N->nclust = ncl;
+  N->cl = calloc(ncl ? ncl : 1, sizeof(hz_cluster));
+  if (N->cl == NULL) {
+    free(remap);
+    goto fail;
+  }
+  {
+    uint32_t ci = 0;
+    for (uint32_t t = 0; t < nnt; t++) {
+      if (t == 0 || N->tcl[t] != N->tcl[t - 1]) {
+        if (t > 0) ci++;
+        N->cl[ci].first_tri = t;
+      }
+      N->cl[ci].ntris++;
+    }
+  }
+  for (uint32_t c = 0; c < ncl; c++) {
     hz_cluster *g = &N->cl[c];
     double lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};
     int first = 1;
@@ -406,53 +527,98 @@ int main(int argc, char **argv) {
       g->bmin[ax] = (float)lo[ax];
       g->bmax[ax] = (float)hi[ax];
     }
-    g->err = 0.0f; /* v1: ε не оценивается — прибор площади сверху */
+    g->err = 0.0f;
   }
-  free(t1cl); /* временный: владение уровню НЕ передаётся (ASAN нашёл) */
-  t1cl = NULL;
+
+  double area1 = 0;
+  for (uint32_t t = 0; t < nnt; t++) {
+    double p[3][3];
+    uint32_t vi[3] = {N->ti0[t], N->ti1[t], N->ti2[t]};
+    for (int a = 0; a < 3; a++) {
+      p[a][0] = N->vx[vi[a]];
+      p[a][1] = N->vy[vi[a]];
+      p[a][2] = N->vz[vi[a]];
+    }
+    double n[3];
+    if (tri_normal(p, n)) area1 += 0.5 * sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  }
+  {
+    double mx = 0;
+    uint32_t mxt = 0, nbig = 0;
+    for (uint32_t t = 0; t < nnt; t++) {
+      double p[3][3];
+      uint32_t vi[3] = {N->ti0[t], N->ti1[t], N->ti2[t]};
+      for (int a = 0; a < 3; a++) {
+        p[a][0] = N->vx[vi[a]];
+        p[a][1] = N->vy[vi[a]];
+        p[a][2] = N->vz[vi[a]];
+      }
+      double n[3];
+      double ar = 0;
+      if (tri_normal(p, n)) ar = 0.5 * sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+      if (ar > mx) {
+        mx = ar;
+        mxt = t;
+      }
+      if (ar > 1.0) nbig++;
+    }
+    printf("ДИАГ: max площадь=%.3f (тр %u, вершины %u %u %u), >1м²: %u шт\n", mx, mxt, N->ti0[mxt],
+           N->ti1[mxt], N->ti2[mxt], nbig);
+  }
+  printf("площадь: источник=%.4f новый=%.4f отношение=%.4f\n", area0, area1, area1 / area0);
+  if (area0 > 0 && fabs(area1 / area0 - 1.0) > HZ_DEC_AREA_TOL) {
+    fprintf(stderr, "kitdec: площадь вне допуска %.3f — уровень НЕ записан\n", area1 / area0);
+    free(remap);
+    goto fail;
+  }
+
   rc = hz_kit_validate(&k);
   if (rc != HZ_KIT_OK) {
     fprintf(stderr, "kitdec: итоговый кит невалиден (rc=%d)\n", rc);
-    hz_kit_free(&k);
-    ih_free(&ht);
-    free(vseen);
-    free(isb);
-    free(map);
-    return 2;
+    free(remap);
+    goto fail;
   }
   f = fopen(argv[2], "wb");
   if (f == NULL) {
     fprintf(stderr, "kitdec: не открывается %s\n", argv[2]);
-    hz_kit_free(&k);
-    ih_free(&ht);
-    free(vseen);
-    free(isb);
-    free(map);
-    return 2;
+    free(remap);
+    goto fail;
   }
   rc = hz_kit_save(&k, f);
   if (fclose(f) != 0) rc = HZ_KIT_E_IO;
-  printf("записан %s: nlev=%d (L1: nv=%u nt=%u nc=%u) rc=%d\n", argv[2], k.nlev, N->nverts,
+  printf("записан %s: nlev=%d (новый: nv=%u nt=%u nc=%u) rc=%d\n", argv[2], k.nlev, N->nverts,
          N->ntris, N->nclust, rc);
-  ih_free(&ht);
-  free(vseen);
+  free(remap);
+  free(vx);
+  free(vy);
+  free(vz);
+  free(ta);
+  free(tb);
+  free(tc);
+  free(tcl);
+  free(tmtl);
+  free(Q);
+  free(dead);
   free(isb);
-  free(map);
+  free(tdel);
+  free(hp.h);
   hz_kit_free(&k);
   return rc == HZ_KIT_OK ? 0 : 2;
-oom:
-  fprintf(stderr, "kitdec: нет памяти\n");
-  ih_free(&ht);
-  free(vseen);
+fail:
+  fprintf(stderr, "kitdec: отказ\n");
+  free(vx);
+  free(vy);
+  free(vz);
+  free(ta);
+  free(tb);
+  free(tc);
+  free(tcl);
+  free(tmtl);
+  free(Q);
+  free(dead);
   free(isb);
-  free(map);
-  free(vb.x);
-  free(vb.y);
-  free(vb.z);
-  free(t1a);
-  free(t1b);
-  free(t1c);
-  free(t1cl);
+  free(tdel);
+  free(hp.h);
   hz_kit_free(&k);
   return 2;
 }

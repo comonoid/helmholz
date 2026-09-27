@@ -97,7 +97,7 @@ check:
 	  tools/snap3.c tools/swee3.c tools/pblock.c tools/pref.c \
 	  tools/scenechk.c tools/ppmdiff.c tools/pfmdiff.c tools/fcheck.c \
 	  tools/kitmk.c tools/kitwalk.c tools/kitpages.c tools/kitdec.c tools/kitmix.c \
-	  tools/kitfront.c
+	  tools/kitfront.c tools/gentemple.c
 
 #Г31 - страж для старого ядра реза уехал вместе с ним(archive / geom);
 #для живого слоя контракт FMA не был уговором — страж снят 12 - 09.

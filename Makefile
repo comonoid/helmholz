@@ -49,8 +49,9 @@ build/pblock: tools/pblock.c src/scene_obj.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pblock.c src/scene_obj.c -lm'
 
 build/pgather: tools/pgather.c src/nstruct/pyr.c src/nstruct/pyr.h src/nstruct/sweep.c \
-	src/nstruct/sweep.h src/scene_obj.c | build
-	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pgather.c src/nstruct/pyr.c src/nstruct/sweep.c src/scene_obj.c -lm'
+	src/nstruct/sweep.h src/scene_obj.c src/geom/kit.c src/geom/kit.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pgather.c src/nstruct/pyr.c src/nstruct/sweep.c \
+	  src/scene_obj.c src/geom/kit.c -lm'
 
 build/pref: tools/pref.c src/nstruct/pyr.c src/nstruct/pyr.h src/nstruct/sweep.c \
 	src/nstruct/sweep.h src/scene_obj.c | build
@@ -73,6 +74,10 @@ build/test_kit: tests/test_kit.c src/geom/kit.c src/geom/kit.h | build
 build/kitwalk: tools/kitwalk.c src/nstruct/pyr.c src/nstruct/pyr.h | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/kitwalk.c src/nstruct/pyr.c -lm'
 
+# §914-Ш4: OBJ → вырожденный кит (F64) для проверки паритета pgather.
+build/kitmk: tools/kitmk.c src/geom/kit.c src/geom/kit.h src/scene_obj.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/kitmk.c src/geom/kit.c src/scene_obj.c -lm'
+
 # fast tests (seconds)
 test: build/test_octree build/test_octfmt build/test_bounce build/test_kit
 	./build/test_octree
@@ -85,8 +90,9 @@ check:
 	  tests/test_octree.c tests/test_octfmt.c tests/cbmc_octree.c tests/cbmc_sceneobj.c \
 	  src/nstruct/pyr.c src/nstruct/sweep.c \
 	  src/geom/kit.c tests/test_kit.c \
-	  tools/snap3.c tools/swee3.c tools/pblock.c tools/pgather.c tools/pref.c \
-	  tools/scenechk.c tools/ppmdiff.c tools/pfmdiff.c tools/fcheck.c
+	  tools/snap3.c tools/swee3.c tools/pblock.c tools/pref.c \
+	  tools/scenechk.c tools/ppmdiff.c tools/pfmdiff.c tools/fcheck.c \
+	  tools/kitmk.c tools/kitwalk.c
 
 # Г31-страж для старого ядра реза уехал вместе с ним (archive/geom);
 # для живого слоя контракт FMA не был уговором — страж снят 12-09.

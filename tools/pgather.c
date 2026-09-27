@@ -40,6 +40,7 @@
 
 #include "nstruct/pyr.h"
 #include "nstruct/sweep.h"
+#include "geom/kit.h"
 #include "scene_obj.h"
 
 #define PG_FOV_MIN 5.0   /* ниже — телеобъектив вне смысла синтетических тестов */
@@ -615,6 +616,7 @@ int main(int argc, char **argv) {
   const char *efile_out = NULL, *efile_in = NULL; /* §898: E sidecar */
   double expmul = 1.0;                            /* §890: множитель экспозиции */
   const char *blkfile = NULL;                     /* §882: HBLK v1, mmap-сбор */
+  const char *kitpath = NULL;                     /* §914-Ш4: геометрия из КИТА */
   double delbox[6];
   hz_objmesh m;
   hz_pyr py;
@@ -708,6 +710,8 @@ int main(int argc, char **argv) {
       mort = atoi(argv[i] + 5);
     else if (strncmp(argv[i], "scale=", 6) == 0)
       scale = atof(argv[i] + 6);
+    else if (strncmp(argv[i], "kit=", 4) == 0)
+      kitpath = argv[i] + 4; /* §914-Ш4: кит вместо OBJ (паритет — Ш4-П1) */
     else
       path = argv[i];
   }
@@ -730,7 +734,75 @@ int main(int argc, char **argv) {
     return 2;
   }
   memset(&m, 0, sizeof m); /* §902: без OBJ меш пуст (blk-путь его не читает) */
-  if (path) {
+  if (kitpath) {
+    /* §914-Ш4: кит → hz_objmesh ПОБАЙТОВО (v/f/fm/mtl); дальше весь путь
+     * pgather НЕ меняется — паритет по построению. Требуется F64:
+     * округление вершин сломало бы битовые якоря. */
+    hz_kit kk;
+    FILE *kf = fopen(kitpath, "rb");
+    t0 = now_sec();
+    int krc = kf != NULL ? hz_kit_load(&kk, kf) : HZ_KIT_E_IO;
+    if (kf != NULL) fclose(kf);
+    if (krc != HZ_KIT_OK) {
+      fprintf(stderr, "pgather: кит не читается: %s (rc=%d)\n", kitpath, krc);
+      return 2;
+    }
+    if (!(kk.flags & HZ_KIT_FLAG_F64)) {
+      fprintf(stderr, "pgather: kit= требует F64 (паритет); переиздайте kitmk\n");
+      hz_kit_free(&kk);
+      return 2;
+    }
+    if (kk.nlev != 1) {
+      fprintf(stderr, "pgather: kit= v1 врезки — вырожденный кит (nlev=1)\n");
+      hz_kit_free(&kk);
+      return 2;
+    }
+    const hz_kit_level *KL = &kk.lev[0];
+    m.nv = (int32_t)KL->nverts;
+    m.nt = (int32_t)KL->ntris;
+    m.nmtl = (int32_t)kk.nmtl;
+    m.v = malloc(3.0 * (size_t)m.nv * sizeof *m.v);
+    m.f = malloc(3.0 * (size_t)m.nt * sizeof *m.f);
+    m.fm = malloc((size_t)m.nt * sizeof *m.fm);
+    m.mtl = calloc((size_t)(m.nmtl > 0 ? m.nmtl : 1), sizeof *m.mtl);
+    m.vn = NULL;
+    m.vt = NULL;
+    m.ft = NULL;
+    m.fn = NULL;
+    if (!m.v || !m.f || !m.fm || !m.mtl) {
+      fprintf(stderr, "pgather: нет памяти (kit→mesh)\n");
+      hz_obj_free(&m);
+      hz_kit_free(&kk);
+      return 2;
+    }
+    for (int32_t v = 0; v < m.nv; v++) {
+      m.v[3 * (int64_t)v] = KL->vx[v];
+      m.v[3 * (int64_t)v + 1] = KL->vy[v];
+      m.v[3 * (int64_t)v + 2] = KL->vz[v];
+    }
+    for (int32_t t = 0; t < m.nt; t++) {
+      m.f[3 * (int64_t)t] = (int32_t)KL->ti0[t];
+      m.f[3 * (int64_t)t + 1] = (int32_t)KL->ti1[t];
+      m.f[3 * (int64_t)t + 2] = (int32_t)KL->ti2[t];
+      m.fm[t] = (int32_t)KL->tmtl[t];
+    }
+    for (int32_t mi = 0; mi < m.nmtl; mi++) {
+      m.mtl[mi].kd = kk.mtl[mi].kd;
+      memcpy(m.mtl[mi].kd3, kk.mtl[mi].kd3, 24);
+      memcpy(m.mtl[mi].ks3, kk.mtl[mi].ks3, 24);
+      memcpy(m.mtl[mi].ke3, kk.mtl[mi].ke3, 24);
+    }
+    /* габарит — по вершинам, как у OBJ-пути */
+    for (int32_t v = 0; v < m.nv; v++)
+      for (ax = 0; ax < 3; ax++) {
+        double c = m.v[3 * (int64_t)v + ax];
+        if (v == 0 || c < m.lo[ax]) m.lo[ax] = c;
+        if (v == 0 || c > m.hi[ax]) m.hi[ax] = c;
+      }
+    hz_kit_free(&kk);
+    t1 = now_sec();
+    printf("СТАТЬЯ kit-загрузка: %.2f с (nt=%d, mtl=%d) [§914-Ш4]\n", t1 - t0, m.nt, m.nmtl);
+  } else if (path) {
     t0 = now_sec();
     if (hz_obj_load(&m, path, scale) != 0) {
       fprintf(stderr, "pgather: не читается %s\n", path);

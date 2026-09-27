@@ -31,11 +31,15 @@
 #define HZ_KIT_MAX_NLEV ((int32_t)64)
 #define HZ_KIT_MAX_COUNT ((uint32_t)1000000000u)
 
-/* Формат файла v1. */
+/* Формат файла v2 (Ш4 §914): + материалы, + флаг F64. v1-файлов в
+ * природе нет — версия бампнута, v1 отклоняется. */
 #define HZ_KIT_HDRSIZE 64
 #define HZ_KIT_DIRSIZE 32
-#define HZ_KIT_VERSION 1u
-#define HZ_KIT_FLAG_PAD64 1u /* единственный известный флаг v1 */
+#define HZ_KIT_VERSION 2u
+#define HZ_KIT_FLAG_PAD64 1u /* выравнивание блоков уровней по 64 Б */
+#define HZ_KIT_FLAG_F64                                                                            \
+  2u /* вершины double (8 Б): паритет/архив;                                   \
+      * без флага — float (рабочая лестница) */
 
 /* байтовые офсеты заголовка — тесты мутируют файл по ним */
 #define HZ_KIT_OFF_MAGIC 0
@@ -44,7 +48,8 @@
 #define HZ_KIT_OFF_ENDIAN 16
 #define HZ_KIT_OFF_NLEV 20
 #define HZ_KIT_OFF_CANARY 24
-#define HZ_KIT_OFF_RESERVED 32
+#define HZ_KIT_OFF_RESERVED 32 /* v2: [32,40) нули; [40,44) nmtl; [44,64) нули */
+#define HZ_KIT_OFF_NMTL 40
 
 typedef struct {
   float bmin[3]; /* bbox грозди, метры */
@@ -59,17 +64,30 @@ typedef struct {
 
 typedef struct {
   uint32_t nverts, ntris, nclust;
-  /* SoA; индексы вершин — uint32 (кит ≤ 1e9 вершин, 24-бит уже мало) */
-  float *vx, *vy, *vz;       /* [nverts] */
+  /* SoA; индексы вершин — uint32 (кит ≤ 1e9 вершин, 24-бит уже мало).
+   * В ПАМЯТИ вершины всегда double; флаг F64 файла задаёт ТОЧНОСТЬ
+   * хранения (паритет/архив — double, рабочая лестница — float). */
+  double *vx, *vy, *vz;      /* [nverts] */
   uint32_t *ti0, *ti1, *ti2; /* [ntris] */
   uint32_t *tcl;             /* [ntris] гроздь треугольника */
+  uint32_t *tmtl;            /* [ntris] индекс материала */
   hz_cluster *cl;            /* [nclust], упорядочены по first_tri */
 } hz_kit_level;
+
+/* Материал кита (§2.2 v2: «источники — те же киты, Ke в материале»).
+ * Поля соответствуют hz_obj_mtl (kd, kd3, ks3, ke3) — конверсия в
+ * hz_objmesh побайтовая, паритет pgather по построению. 80 Б
+ * (8 + 3×24); СЕРИЛИЗУЕТСЯ ПОЛЯМИ (kd, kd3, ks3, ke3), не дампом. */
+typedef struct {
+  double kd, kd3[3], ks3[3], ke3[3];
+} hz_kit_mtl;
 
 typedef struct {
   int32_t nlev;      /* ≥ 1; lev[0] = L0 (самый детальный) */
   hz_kit_level *lev; /* [nlev]; lev[nlev-1] — самый грубый */
-  uint32_t flags;    /* флаги сохранения (сейчас только PAD64) */
+  hz_kit_mtl *mtl;   /* [nmtl]; [0] — умолчание (как hz_obj_mtl) */
+  uint32_t nmtl;
+  uint32_t flags; /* PAD64 | F64 */
   /* Раздельность уровней В ПАМЯТИ (§914-R2): present == NULL — все
    * уровни в памяти (программное построение); иначе present[i] = 1
    * только для загруженных. Грубые уровни резидентны БЕЗ детальных:
@@ -114,7 +132,8 @@ typedef enum {
   HZ_KIT_E_RANGE = 14,  /* офсет/размер блока вне файла (u64 overflow) */
   HZ_KIT_E_NAN = 15,    /* не-finite в вершинах/bbox/err */
   HZ_KIT_E_MEM = 16,    /* аллокация */
-  HZ_KIT_E_ARG = 17     /* NULL-аргументы в конструкторах */
+  HZ_KIT_E_ARG = 17,    /* NULL-аргументы в конструкторах */
+  HZ_KIT_E_MTLIDX = 18  /* tmtl ≥ nmtl */
 } hz_kit_status;
 
 #endif

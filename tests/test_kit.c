@@ -28,24 +28,28 @@ static void fill_octa(hz_kit_level *L) {
   L->nverts = 6;
   L->ntris = 8;
   L->nclust = 2;
-  static const float X[6] = {1, -1, 0, 0, 0, 0};
-  static const float Y[6] = {0, 0, 1, -1, 0, 0};
-  static const float Z[6] = {0, 0, 0, 0, 1, -1};
+  static const double X[6] = {1, -1, 0, 0, 0, 0};
+  static const double Y[6] = {0, 0, 1, -1, 0, 0};
+  static const double Z[6] = {0, 0, 0, 0, 1, -1};
   /* 8 граней: верхние 4 + нижние 4, наружная ориентация */
   static const uint32_t T[8][3] = {{0, 2, 4}, {2, 1, 4}, {1, 3, 4}, {3, 0, 4},
                                    {2, 0, 5}, {1, 2, 5}, {3, 1, 5}, {0, 3, 5}};
-  L->vx = malloc(6 * 4);
-  L->vy = malloc(6 * 4);
-  L->vz = malloc(6 * 4);
+  L->vx = malloc(6 * sizeof(double));
+  L->vy = malloc(6 * sizeof(double));
+  L->vz = malloc(6 * sizeof(double));
   L->ti0 = malloc(8 * 4);
   L->ti1 = malloc(8 * 4);
   L->ti2 = malloc(8 * 4);
   L->tcl = malloc(8 * 4);
+  L->tmtl = malloc(8 * 4);
   L->cl = malloc(2 * sizeof(hz_cluster));
-  if (!L->vx || !L->vy || !L->vz || !L->ti0 || !L->ti1 || !L->ti2 || !L->tcl || !L->cl) exit(2);
-  memcpy(L->vx, X, 24);
-  memcpy(L->vy, Y, 24);
-  memcpy(L->vz, Z, 24);
+  if (!L->vx || !L->vy || !L->vz || !L->ti0 || !L->ti1 || !L->ti2 || !L->tcl || !L->tmtl || !L->cl)
+    exit(2);
+  memcpy(L->vx, X, sizeof X);
+  memcpy(L->vy, Y, sizeof Y);
+  memcpy(L->vz, Z, sizeof Z);
+  for (int t = 0; t < 8; t++)
+    L->tmtl[t] = 0;
   for (int t = 0; t < 8; t++) {
     L->ti0[t] = T[t][0];
     L->ti1[t] = T[t][1];
@@ -146,6 +150,18 @@ int main(void) {
   k.nlev = 2;
   k.lev = calloc(2, sizeof(hz_kit_level));
   if (k.lev == NULL) return 2;
+  k.nmtl = 1;
+  k.mtl = calloc(1, sizeof(hz_kit_mtl));
+  if (k.mtl == NULL) {
+    hz_kit_free(&k);
+    return 2;
+  }
+  k.mtl[0].kd = 0.5;
+  for (int c = 0; c < 3; c++) {
+    k.mtl[0].kd3[c] = 0.5;
+    k.mtl[0].ks3[c] = 0.1;
+    k.mtl[0].ke3[c] = 0.0;
+  }
   fill_octa(&k.lev[0]);
   fill_octa_coarse(&k.lev[1]);
   CHECK(hz_kit_validate(&k) == HZ_KIT_OK, "валидность 2-уровневого кита");
@@ -159,7 +175,9 @@ int main(void) {
   fclose(f);
   CHECK(rc == HZ_KIT_OK, "load");
   if (rc == HZ_KIT_OK) {
-    CHECK(l.nlev == 2, "nlev");
+    CHECK(l.nlev == 2 && l.nmtl == 1, "nlev/nmtl");
+    CHECK(l.mtl != NULL && memcmp(&l.mtl[0].kd, &k.mtl[0].kd, sizeof(hz_kit_mtl)) == 0,
+          "материал битово");
     CHECK(same_level(&k.lev[0], &l.lev[0]) && same_level(&k.lev[1], &l.lev[1]),
           "битовое тождество уровней");
   }
@@ -225,12 +243,25 @@ int main(void) {
     hz_kit bad;
     hz_kit_init(&bad);
     bad.nlev = 1;
+    bad.nmtl = 1;
+    bad.mtl = calloc(1, sizeof(hz_kit_mtl));
+    if (bad.mtl == NULL) {
+      hz_kit_free(&bad);
+      return 2;
+    }
+    bad.mtl[0].kd = 0.5;
     bad.lev = calloc(1, sizeof(hz_kit_level));
-    if (bad.lev == NULL) return 2;
+    if (bad.lev == NULL) {
+      hz_kit_free(&bad);
+      return 2;
+    }
     fill_octa(&bad.lev[0]);
     bad.lev[0].ti0[3] = 6; /* ≥ nverts */
     CHECK(hz_kit_validate(&bad) == HZ_KIT_E_TRIDX, "индекс вершины → E_TRIDX");
     bad.lev[0].ti0[3] = 0;
+    bad.lev[0].tmtl[3] = 1; /* ≥ nmtl=1 */
+    CHECK(hz_kit_validate(&bad) == HZ_KIT_E_MTLIDX, "tmtl ≥ nmtl → E_MTLIDX");
+    bad.lev[0].tmtl[3] = 0;
     bad.lev[0].cl[0].ntris = 3; /* покрытие дырявое */
     CHECK(hz_kit_validate(&bad) == HZ_KIT_E_COVER, "дыра в покрытии → E_COVER");
     bad.lev[0].cl[0].ntris = 4;
@@ -255,6 +286,7 @@ int main(void) {
     free(bad.lev[0].ti1);
     free(bad.lev[0].ti2);
     free(bad.lev[0].tcl);
+    free(bad.lev[0].tmtl);
     free(bad.lev[0].cl);
     fill_octa(&bad.lev[0]);
     bad.lev[0].ntris = 4;

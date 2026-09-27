@@ -11,6 +11,7 @@
 #include "nstruct/pyr.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define NQ 16
@@ -188,6 +189,92 @@ int main(void) {
   walk(&py, ltop, 0, 0, om2, &s2);
   printf("NK omega-flip: events %lld vs %lld %s\n", (long long)s1.ev_total, (long long)s2.ev_total,
          s1.ev_total == s2.ev_total ? "OK" : "FAIL");
+
+  /* ---- Ш3: per-уровневая занятость + цепь хопов ---------------------- */
+  printf("\nSh3: per-level occupancy (одна пирамида НА уровень лестницы)\n");
+  hz_pyr plev[NLEV];
+  for (int li = 0; li < NLEV; li++) {
+    memset(&plev[li], 0, sizeof(hz_pyr));
+    /* треугольники ТОЛЬКО уровня li, клетка cell·2^li */
+    int n = 0;
+    for (int t = 0; t < nt_global; t++)
+      if (lp[t] == (uint8_t)li) n++;
+    double *tm = malloc(3 * (size_t)n * sizeof *tm), *tx = malloc(3 * (size_t)n * sizeof *tx),
+           *tc = malloc(3 * (size_t)n * sizeof *tc);
+    int32_t *mm = malloc((size_t)n * sizeof *mm);
+    uint8_t *lpm = malloc((size_t)n);
+    if (!tm || !tx || !tc || !mm || !lpm) {
+      printf("mem FAIL\n");
+      return 2;
+    }
+    int w = 0;
+    for (int t = 0; t < nt_global; t++)
+      if (lp[t] == (uint8_t)li) {
+        memcpy(tm + 3 * w, tmin + 3 * t, 3 * sizeof *tm);
+        memcpy(tx + 3 * w, tmax + 3 * t, 3 * sizeof *tx);
+        memcpy(tc + 3 * w, cen + 3 * t, 3 * sizeof *tc);
+        mm[w] = mtl[t];
+        lpm[w] = 0; /* в своей пирамиде кусок листовой */
+        w++;
+      }
+    double lo[3] = {0, 0, -0.5}, hi[3] = {16, 16, 0.5};
+    double cell = 1.0 * (1 << (2 * li)); /* сторона квода уровня: 1→4→16 */
+    int brc = hz_pyr_build(&plev[li], w, tm, tx, tc, mm, lo, hi, cell);
+    int32_t nu = 0;
+    if (!brc) brc = hz_pyr_set_lp(&plev[li], lpm, &nu);
+    if (brc) {
+      printf("build level %d FAIL\n", li);
+      return 1;
+    }
+    printf("  pyr%d (cell %.0f): grid %dx%dx%d nleaf=%d ncentleaf=%d\n", li, cell, plev[li].nx,
+           plev[li].ny, plev[li].nz, plev[li].nleaf, (int)plev[li].ncentleaf);
+    free(tm);
+    free(tx);
+    free(tc);
+    free(mm);
+    free(lpm);
+  }
+  /* П4 (вырожденность): L0-часть не отличается от смешанной внизу */
+  printf("  P4 degenerate: nleaf(pyr0)=%d vs mixed=%d %s\n", plev[0].nleaf, py.nleaf,
+         plev[0].nleaf == py.nleaf ? "OK" : "FAIL");
+
+  printf("Sh3: цепь хопов (d_p: +0.5/событие; d>=1 → этаж грубее)\n");
+  int64_t total_visits = 0, total_events = 0;
+  int P = 0;
+  for (int hop = 1; hop <= 4; hop++) {
+    walk_stat st;
+    memset(&st, 0, sizeof st);
+    const hz_pyr *pp = &plev[P];
+    int32_t lt = pp->nlev - 1;
+    /* в СВОЕЙ пирамиде кусок листовой (локальный этаж 0): клетка
+     * пирамиды уровня = сторона квода этого уровня */
+    walk(pp, lt, 0, 0, om, &st);
+    printf("  hop%d P=%d: visits=%lld events=%lld\n", hop, P, (long long)st.visits,
+           (long long)st.ev_total);
+    total_visits += st.visits;
+    total_events += st.ev_total;
+    /* полностью диффузный отскок: сразу этаж грубее (§913 п.3);
+     * дробный аккумулятор d_p в реальном свипе копит по ks_eff */
+    if (P < NLEV - 1) P++;
+  }
+  printf("  chain total: visits=%lld events=%lld (naive 3x409=1227)\n", (long long)total_visits,
+         (long long)total_events);
+
+  /* П3 (НК): смешанная занятость даёт P=1 → 81 событие против 9 per-level */
+  walk_stat sm;
+  memset(&sm, 0, sizeof sm);
+  walk(&py, ltop, 0, 1, om, &sm);
+  walk_stat pl;
+  memset(&pl, 0, sizeof pl);
+  {
+    const hz_pyr *pp = &plev[1];
+    walk(pp, pp->nlev - 1, 0, 0, om, &pl); /* свой этаж = листья пирамиды-1 */
+  }
+  printf("NK mixed-vs-perlevel P=1: events %lld vs %lld %s\n", (long long)sm.ev_total,
+         (long long)pl.ev_total, sm.ev_total > pl.ev_total ? "OK (смешение дороже)" : "FAIL");
+
   hz_pyr_free(&py);
+  for (int li = 0; li < NLEV; li++)
+    hz_pyr_free(&plev[li]);
   return 0;
 }

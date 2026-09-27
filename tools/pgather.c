@@ -619,6 +619,7 @@ int main(int argc, char **argv) {
   const char *kitpath = NULL;                     /* §914-Ш4: геометрия из КИТА */
   double zone = -1.0;                             /* §915-R3: радиус кольца детальности */
   int adapt = 0;          /* §915-R4: lpacc-адаптив (0 — битово прежний мир) */
+  int ksdiff = 0;         /* §918: Δ=1−ks (диффузный отскок грубит) */
   double cdelta = 1.0;    /* §862: вес приращения аккумулятора */
   int lpceil = 4;         /* §866: потолок этажа (из swee3-канона) */
   uint8_t *kitlvl = NULL; /* §915-R3: уровень кита на выбранный треугольник [nt] */
@@ -719,6 +720,8 @@ int main(int argc, char **argv) {
       kitpath = argv[i] + 4; /* §914-Ш4: кит вместо OBJ (паритет — Ш4-П1) */
     else if (strncmp(argv[i], "zone=", 5) == 0)
       zone = atof(argv[i] + 5); /* §915-R3: кольца детальности вокруг eye */
+    else if (strncmp(argv[i], "ksdiff=", 7) == 0)
+      ksdiff = atoi(argv[i] + 7); /* §918: диффузность отскока грубит этаж */
     else if (strncmp(argv[i], "adapt=", 6) == 0)
       adapt = atoi(argv[i] + 6); /* §915-R4: 1 — lpacc-адаптив этажей (§862) */
     else if (strncmp(argv[i], "cdelta=", 7) == 0)
@@ -1348,6 +1351,10 @@ int main(int argc, char **argv) {
     so.cdelta = cdelta;
     so.lpapply = 1;
     so.lpceil = lpceil;
+    if (ksdiff) {
+      so.accum_mode = 5; /* §918: Δ = 1−ks_eff — счёт ДИФФУЗНЫХ отскоков */
+      so.ks = ks;        /* ks[p] есть при ksf>0; при NULL — все диффузные */
+    }
   }
   so.domhi = m.hi;
   double *Ec[3] = {NULL, NULL, NULL}; /* §889: E по каналам */

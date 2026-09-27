@@ -23,8 +23,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "kitmix IN.kit OUT.kit [split=S | eye=X,Y,Z zone=R]\n");
     return 2;
   }
+  int levonly = -1; /* §920: весь выход из уровня N */
   for (int i = 3; i < argc; i++) {
-    if (strncmp(argv[i], "split=", 6) == 0)
+    if (strncmp(argv[i], "lev=", 4) == 0)
+      levonly = atoi(argv[i] + 4);
+    else if (strncmp(argv[i], "split=", 6) == 0)
       split = atof(argv[i] + 6);
     else if (strncmp(argv[i], "zone=", 5) == 0)
       zone = atof(argv[i] + 5);
@@ -73,7 +76,9 @@ int main(int argc, char **argv) {
       double cy = (S->vy[S->ti0[t]] + S->vy[S->ti1[t]] + S->vy[S->ti2[t]]) / 3.0;
       double cz = (S->vz[S->ti0[t]] + S->vz[S->ti1[t]] + S->vz[S->ti2[t]]) / 3.0;
       int take;
-      if (radial) {
+      if (levonly >= 0) {
+        take = (li == levonly);
+      } else if (radial) {
         double d = sqrt((cx - eye[0]) * (cx - eye[0]) + (cy - eye[1]) * (cy - eye[1]) +
                         (cz - eye[2]) * (cz - eye[2]));
         int32_t ring = (int32_t)(d / zone);
@@ -158,7 +163,9 @@ int main(int argc, char **argv) {
       double cy = (S->vy[S->ti0[t]] + S->vy[S->ti1[t]] + S->vy[S->ti2[t]]) / 3.0;
       double cz = (S->vz[S->ti0[t]] + S->vz[S->ti1[t]] + S->vz[S->ti2[t]]) / 3.0;
       int take;
-      if (radial) {
+      if (levonly >= 0) {
+        take = (li == levonly);
+      } else if (radial) {
         double d = sqrt((cx - eye[0]) * (cx - eye[0]) + (cy - eye[1]) * (cy - eye[1]) +
                         (cz - eye[2]) * (cz - eye[2]));
         int32_t ring = (int32_t)(d / zone);

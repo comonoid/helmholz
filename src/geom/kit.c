@@ -431,3 +431,230 @@ int hz_kit_load_part(hz_kit *k, FILE *f, int32_t min_lev) {
   }
   return hz_kit_validate(k);
 }
+
+/* --- Ш5 §914: ленивая загрузка (pread диапазонов) ---------------------- */
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static int pread_full(int fd, void *dst, size_t n, uint64_t off) {
+  unsigned char *d = dst;
+  while (n > 0) {
+    ssize_t r = pread(fd, d, n, (off_t)off);
+    if (r <= 0) return HZ_KIT_E_IO;
+    d += r;
+    off += (uint64_t)r;
+    n -= (size_t)r;
+  }
+  return HZ_KIT_OK;
+}
+
+int hz_kit_load_range(hz_kit *k, const char *path, int32_t min_lev) {
+  if (k == NULL || path == NULL) return HZ_KIT_E_ARG;
+  hz_kit_init(k);
+  if (min_lev < 0) return HZ_KIT_E_ARG;
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return HZ_KIT_E_IO;
+  /* Доступ — спайки по офсетам блоков: readahead только тянул бы
+   * страницы НЕзапрошенных уровней (найдено прибором П6). */
+  posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+  struct stat sb;
+  if (fstat(fd, &sb) != 0 || sb.st_size < (off_t)HZ_KIT_HDRSIZE) {
+    close(fd);
+    return HZ_KIT_E_IO;
+  }
+  uint64_t fsize = (uint64_t)sb.st_size;
+  unsigned char h[HZ_KIT_HDRSIZE];
+  int rc = pread_full(fd, h, HZ_KIT_HDRSIZE, 0);
+  if (rc) {
+    close(fd);
+    return rc;
+  }
+  int32_t nlev = 0;
+  uint32_t flags = 0;
+  rc = hz_kit_hdr_decode(h, &nlev, &flags);
+  if (rc) {
+    close(fd);
+    return rc;
+  }
+  k->flags = flags;
+  uint32_t nmtl = 0;
+  memcpy(&nmtl, h + HZ_KIT_OFF_NMTL, 4);
+  if (nmtl > HZ_KIT_MAX_COUNT) {
+    close(fd);
+    return HZ_KIT_E_COUNT;
+  }
+  k->nmtl = nmtl;
+  uint64_t need = (uint64_t)HZ_KIT_HDRSIZE + (uint64_t)HZ_KIT_DIRSIZE * (uint64_t)nlev;
+  if (need > fsize) {
+    close(fd);
+    return HZ_KIT_E_RANGE;
+  }
+  k->lev = calloc((size_t)nlev, sizeof(hz_kit_level));
+  k->present = calloc((size_t)nlev, 1);
+  if (k->lev == NULL || k->present == NULL) {
+    free(k->lev);
+    free(k->present);
+    k->lev = NULL;
+    k->present = NULL;
+    close(fd);
+    return HZ_KIT_E_MEM;
+  }
+  k->nlev = nlev;
+  if (nmtl > 0) {
+    k->mtl = malloc((size_t)nmtl * sizeof(hz_kit_mtl));
+    if (k->mtl == NULL) {
+      hz_kit_free(k);
+      close(fd);
+      return HZ_KIT_E_MEM;
+    }
+    uint64_t moff = (need + HZ_KIT_ALIGN - 1) / HZ_KIT_ALIGN * HZ_KIT_ALIGN;
+    if (moff + (uint64_t)sizeof(hz_kit_mtl) * (uint64_t)nmtl > fsize) {
+      hz_kit_free(k);
+      close(fd);
+      return HZ_KIT_E_RANGE;
+    }
+    for (uint32_t mi = 0; mi < nmtl; mi++) {
+      unsigned char raw[sizeof(hz_kit_mtl)];
+      rc = pread_full(fd, raw, sizeof raw, moff + (uint64_t)mi * sizeof(hz_kit_mtl));
+      if (rc) {
+        hz_kit_free(k);
+        close(fd);
+        return rc;
+      }
+      memcpy(&k->mtl[mi].kd, raw, 8);
+      memcpy(k->mtl[mi].kd3, raw + 8, 24);
+      memcpy(k->mtl[mi].ks3, raw + 32, 24);
+      memcpy(k->mtl[mi].ke3, raw + 56, 24);
+    }
+  }
+  for (int32_t i = 0; i < nlev; i++) {
+    if (i < min_lev) continue; /* диапазоны детальных уровней НЕ читаются */
+    unsigned char ent[HZ_KIT_DIRSIZE];
+    rc = pread_full(fd, ent, HZ_KIT_DIRSIZE,
+                    (uint64_t)HZ_KIT_HDRSIZE + HZ_KIT_DIRSIZE * (uint64_t)i);
+    if (rc) {
+      hz_kit_free(k);
+      close(fd);
+      return rc;
+    }
+    uint32_t hdr[6];
+    memcpy(hdr, ent, 24);
+    uint64_t off;
+    memcpy(&off, ent + 24, 8);
+    hz_kit_level *L = &k->lev[i];
+    L->nverts = hdr[0];
+    L->ntris = hdr[1];
+    L->nclust = hdr[2];
+    if (L->nverts < 3u || L->nverts > HZ_KIT_MAX_COUNT || L->ntris == 0u ||
+        L->ntris > HZ_KIT_MAX_COUNT || L->nclust == 0u || L->nclust > HZ_KIT_MAX_COUNT) {
+      hz_kit_free(k);
+      close(fd);
+      return HZ_KIT_E_COUNT;
+    }
+    int f64 = (flags & HZ_KIT_FLAG_F64) != 0;
+    uint64_t nb = level_bytes(L, f64);
+    if (off > fsize || nb > fsize - off) {
+      hz_kit_free(k);
+      close(fd);
+      return HZ_KIT_E_RANGE;
+    }
+    L->vx = malloc((size_t)L->nverts * sizeof(double));
+    L->vy = malloc((size_t)L->nverts * sizeof(double));
+    L->vz = malloc((size_t)L->nverts * sizeof(double));
+    L->ti0 = malloc(4ull * L->ntris);
+    L->ti1 = malloc(4ull * L->ntris);
+    L->ti2 = malloc(4ull * L->ntris);
+    L->tcl = malloc(4ull * L->ntris);
+    L->tmtl = malloc(4ull * L->ntris);
+    L->cl = malloc(40ull * L->nclust);
+    if (!L->vx || !L->vy || !L->vz || !L->ti0 || !L->ti1 || !L->ti2 || !L->tcl || !L->tmtl ||
+        !L->cl) {
+      level_clear(L);
+      hz_kit_free(k);
+      close(fd);
+      return HZ_KIT_E_MEM;
+    }
+    uint64_t p = off;
+    for (int c = 0; c < 3; c++) {
+      double *dst = c == 0 ? L->vx : (c == 1 ? L->vy : L->vz);
+      if (f64) {
+        rc = pread_full(fd, dst, (size_t)L->nverts * sizeof(double), p);
+        p += (uint64_t)L->nverts * sizeof(double);
+      } else {
+        float *tmp = malloc((size_t)L->nverts * sizeof(float));
+        if (tmp == NULL) {
+          level_clear(L);
+          hz_kit_free(k);
+          close(fd);
+          return HZ_KIT_E_MEM;
+        }
+        rc = pread_full(fd, tmp, (size_t)L->nverts * sizeof(float), p);
+        for (uint32_t v = 0; v < L->nverts && rc == 0; v++)
+          dst[v] = (double)tmp[v];
+        free(tmp);
+        p += (uint64_t)L->nverts * sizeof(float);
+      }
+      if (rc) {
+        level_clear(L);
+        hz_kit_free(k);
+        close(fd);
+        return rc;
+      }
+    }
+    rc = pread_full(fd, L->ti0, 4ull * L->ntris, p) ||
+         pread_full(fd, L->ti1, 4ull * L->ntris, p + 4ull * L->ntris) ||
+         pread_full(fd, L->ti2, 4ull * L->ntris, p + 8ull * L->ntris) ||
+         pread_full(fd, L->tcl, 4ull * L->ntris, p + 12ull * L->ntris) ||
+         pread_full(fd, L->tmtl, 4ull * L->ntris, p + 16ull * L->ntris);
+    if (rc) {
+      level_clear(L);
+      hz_kit_free(k);
+      close(fd);
+      return rc;
+    }
+    p += 20ull * L->ntris;
+    for (uint32_t c = 0; c < L->nclust; c++) {
+      unsigned char raw[40];
+      rc = pread_full(fd, raw, 40, p);
+      if (rc) {
+        level_clear(L);
+        hz_kit_free(k);
+        close(fd);
+        return rc;
+      }
+      hz_cluster *g = &L->cl[c];
+      memcpy(g->bmin, raw, 12);
+      memcpy(g->bmax, raw + 12, 12);
+      memcpy(&g->err, raw + 24, 4);
+      memcpy(&g->first_tri, raw + 28, 4);
+      memcpy(&g->ntris, raw + 32, 4);
+      p += 40;
+    }
+    int vrc = level_validate(L, nmtl);
+    if (vrc != HZ_KIT_OK) {
+      level_clear(L);
+      hz_kit_free(k);
+      close(fd);
+      return vrc;
+    }
+    k->present[i] = 1;
+  }
+  rc = hz_kit_validate(k);
+  if (rc != HZ_KIT_OK) {
+    hz_kit_free(k);
+    close(fd);
+    return rc;
+  }
+  close(fd);
+  return HZ_KIT_OK;
+}
+#else
+int hz_kit_load_range(hz_kit *k, const char *path, int32_t min_lev) {
+  (void)k;
+  (void)path;
+  (void)min_lev;
+  return HZ_KIT_E_ARG; /* win32 вне линии (linux-стенд) */
+}
+#endif

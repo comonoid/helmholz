@@ -220,6 +220,23 @@ int main(void) {
     if (prc == HZ_KIT_OK) hz_kit_free(&p);
   }
 
+  printf("kit: Ш5 — mmap-путь битово равен fread-пути\n");
+  {
+    hz_kit p2;
+    int mrc = hz_kit_load_range(&p2, path, 0);
+    CHECK(mrc == HZ_KIT_OK, "load_mmap(все уровни)");
+    if (mrc == HZ_KIT_OK) {
+      CHECK(p2.nlev == 2 && same_level(&k.lev[0], &p2.lev[0]) && same_level(&k.lev[1], &p2.lev[1]),
+            "mmap: уровни битово те же");
+      CHECK(p2.nmtl == k.nmtl && memcmp(p2.mtl, k.mtl, k.nmtl * sizeof(hz_kit_mtl)) == 0,
+            "mmap: материалы битово те же");
+      hz_kit_free(&p2);
+    }
+    mrc = hz_kit_load_range(&p2, path, 1); /* грубые без L0 */
+    CHECK(mrc == HZ_KIT_OK && p2.present[0] == 0 && p2.present[1] == 1, "load_mmap(min_lev=1)");
+    if (mrc == HZ_KIT_OK) hz_kit_free(&p2);
+  }
+
   printf("kit: НК — каждый инвариант даёт СВОЙ код\n");
   save_kit(&k);
   CHECK(reload_mut(HZ_KIT_OFF_MAGIC, 0xdeadbeefu) == HZ_KIT_E_MAGIC, "magic → E_MAGIC");

@@ -111,6 +111,15 @@ int hz_kit_load(hz_kit *k, FILE *f); /* в неинициализированн�
  * hz_kit_load. Возврат — код hz_kit_status. */
 int hz_kit_load_part(hz_kit *k, FILE *f, int32_t min_lev);
 
+/* Ш5 §914: ЛЕНИВАЯ загрузка — страницы файла касаются ТОЛЬКО для
+ * загруженных уровней (раздельность как физика; прибор П6 — mincore).
+ * Реализация: pread точных диапазонов + POSIX_FADV_RANDOM (без
+ * readahead). Чистого mmap-нуль-копирования здесь НЕТ СОЗНАТЕЛЬНО:
+ * gcc-analyzer не моделирует mmap и считает отображение
+ * неинициализированным (FP-класс, урок CLAUDE.md); pread даёт ту же
+ * страницу-физику при чистом гейте. Возврат — код hz_kit_status. */
+int hz_kit_load_range(hz_kit *k, const char *path, int32_t min_lev);
+
 /* Чистая половина загрузки — декодер заголовка (под CBMC: без FILE*). */
 int hz_kit_hdr_decode(const unsigned char h[HZ_KIT_HDRSIZE], int32_t *nlev, uint32_t *flags);
 

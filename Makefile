@@ -1,20 +1,20 @@
-# helmholz — НОВАЯ СТРУКТУРА (nstruct) + общий слой. Toolchain via nix-shell
-# (see CLAUDE.md).
+#helmholz — НОВАЯ СТРУКТУРА(nstruct) + общий слой.Toolchain via nix - shell
+#(see CLAUDE.md).
 #
-# 12-09: старый геометрический путь (src/p* conveyor, src/cut, transport-солвер,
-# pfield/pwalk/render3 и их стенды) ПЕРЕНЕСЁН В archive/geom по указанию
-# пользователя — исходники §914 создаются заново; старые якоря сверяются через
-# git-историю. Волновая линия в wave/ — без изменений (запрет действует).
-# Живая линия: src/nstruct/ (пирамида, свип), pgather/pref (сбор и эталон),
-# общий слой: octree, scene_obj, image, transport/dirs3+quad (test_bounce).
+# 12 - 09 : старый геометрический путь(src / p * conveyor, src / cut, transport - солвер,
+#pfield / pwalk / render3 и их стенды) ПЕРЕНЕСЁН В archive / geom по указанию
+#пользователя — исходники §914 создаются заново; старые якоря сверяются через
+#git - историю.Волновая линия в wave / — без изменений(запрет действует).
+#Живая линия : src / nstruct / (пирамида, свип), pgather / pref(сбор и эталон),
+#общий слой : octree, scene_obj, image, transport / dirs3 + quad(test_bounce).
 PKGS = gcc lapack blas pkg-config
 RUN  = nix-shell -p $(PKGS) --run
 WARN = -Wall -Wextra -Wshadow -Wconversion -Wsign-conversion -Wpointer-arith \
        -Wnull-dereference -Wcast-qual -Wwrite-strings -Wvla -Wformat=2 -Wundef \
        -Wstrict-prototypes -Wold-style-definition -Wmissing-prototypes \
        -Wdouble-promotion -Wfloat-equal
-# -ffp-contract=off: Г31 (история в archive/geom) — побитовая воспроизводимость
-# чисел; -ffast-math ЗАПРЕЩЁН по той же причине.
+#- ffp - contract = off : Г31(история в archive / geom) — побитовая воспроизводимость
+#чисел; -ffast - math ЗАПРЕЩЁН по той же причине.
 ARCH   ?= -march=skylake
 CFLAGS = -std=gnu11 -O2 $(ARCH) -fopenmp -ffp-contract=off $(WARN) -I src
 LIBS   = -llapacke -llapack -lblas -lm
@@ -24,20 +24,20 @@ all: build/test_octree build/pgather build/pref
 build:
 	mkdir -p build
 
-# ---- общий слой: октодерево ----
+#-- -- общий слой : октодерево -- --
 build/test_octree: tests/test_octree.c src/octree.c src/octree.h | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_octree.c src/octree.c -lm'
 
 build/test_octfmt: tests/test_octfmt.c src/octree.c src/octree.h | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_octfmt.c src/octree.c -lm'
 
-# ---- О75: нормировка первого отскока (А537) — живой гейт §875/§912 ----
+#-- -- О75 : нормировка первого отскока(А537) — живой гейт §875 /§912 -- --
 build/test_bounce: tests/test_bounce.c src/transport/dirs3.c src/transport/dirs3.h \
                    src/transport/quad.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_bounce.c src/transport/dirs3.c \
 	  src/transport/quad.c -lm'
 
-# ---- НОВАЯ СТРУКТУРА ----
+#-- -- НОВАЯ СТРУКТУРА -- --
 build/snap3: tools/snap3.c src/nstruct/pyr.c src/nstruct/pyr.h src/scene_obj.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/snap3.c src/nstruct/pyr.c src/scene_obj.c -lm'
 
@@ -66,19 +66,23 @@ build/pfmdiff: tools/pfmdiff.c | build
 build/scenechk: tools/scenechk.c src/scene_obj.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/scenechk.c src/scene_obj.c -lm'
 
-# ---- ГЕОМЕТРИЯ v2 (§914, Ш1) ----
+#-- -- ГЕОМЕТРИЯ v2(§914, Ш1) -- --
 build/test_kit: tests/test_kit.c src/geom/kit.c src/geom/kit.h | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tests/test_kit.c src/geom/kit.c -lm'
 
-# §914-Ш2': движение фронта по геометрической структуре (кусок с этажом P).
+# §914 - Ш2': движение фронта по геометрической структуре (кусок с этажом P).
 build/kitwalk: tools/kitwalk.c src/nstruct/pyr.c src/nstruct/pyr.h | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/kitwalk.c src/nstruct/pyr.c -lm'
 
-# §914-Ш4: OBJ → вырожденный кит (F64) для проверки паритета pgather.
+# §914 - Ш4 : OBJ → вырожденный кит(F64) для проверки паритета pgather.
 build/kitmk: tools/kitmk.c src/geom/kit.c src/geom/kit.h src/scene_obj.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/kitmk.c src/geom/kit.c src/scene_obj.c -lm'
 
-# fast tests (seconds)
+# §914 - Ш5 / П6 : touched - страницы mmap при чтении грубых уровней.
+build/kitpages: tools/kitpages.c src/geom/kit.c src/geom/kit.h | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/kitpages.c src/geom/kit.c -lm'
+
+#fast tests(seconds)
 test: build/test_octree build/test_octfmt build/test_bounce build/test_kit
 	./build/test_octree
 	./build/test_octfmt
@@ -92,12 +96,12 @@ check:
 	  src/geom/kit.c tests/test_kit.c \
 	  tools/snap3.c tools/swee3.c tools/pblock.c tools/pref.c \
 	  tools/scenechk.c tools/ppmdiff.c tools/pfmdiff.c tools/fcheck.c \
-	  tools/kitmk.c tools/kitwalk.c
+	  tools/kitmk.c tools/kitwalk.c tools/kitpages.c
 
-# Г31-страж для старого ядра реза уехал вместе с ним (archive/geom);
-# для живого слоя контракт FMA не был уговором — страж снят 12-09.
+#Г31 - страж для старого ядра реза уехал вместе с ним(archive / geom);
+#для живого слоя контракт FMA не был уговором — страж снят 12 - 09.
 
-# СТРАЖ НАБОРА ИНСТРУКЦИЙ: ymm/xmm/fma в горячих объектниках живой линии.
+#СТРАЖ НАБОРА ИНСТРУКЦИЙ : ymm / xmm / fma в горячих объектниках живой линии.
 check-simd: | build
 	nix-shell -p gcc binutils --run 'set -e; \
 	  for f in src/nstruct/pyr.c src/nstruct/sweep.c src/scene_obj.c; do \

@@ -50,13 +50,13 @@
 
 ## КАНОНИЧЕСКИЕ КОМАНДЫ
 
-    # рабочий свип (старый путь — эталон):
-    build/pfield assets/bistro/exterior.obj 0.01 lev=7 nmu=2 xsweep \
-      xthin=1e-2 xsemin=1e-2 xmatrho xit=40 xtol=1e-5 xreltol=1e-5
+    # якорь новой линии (живой, §912): walk в pgather, OMP_NUM_THREADS=1:
+    build/pgather assets/synth/cavity05.obj le=0 dirs=8x16 it=64
+    build/pref  assets/synth/room.obj le=1 it=8 K=4096   # эталон переноса
 
-    # cavity-пары (внешний эталон):
-    build/pfield cavity05.obj 1.0 lev=5 nmu=3 xsweep xfernosolid xmatrho \
-      xthin=1e-2 xsemin=1e-2
+    # СТАРЫЙ ПУТЬ (pfield, sweep старого представления) АРХИВИРОВАН 12-09 в
+    # archive/geom/ — команды и их числа остаются в git-истории и журнале;
+    # pfield больше не собирается из корневого Makefile.
 
 ПРАВИЛА: ограничитель позитивности ВКЛЮЧЁН (`xnolim` не ставить —
 диагностический); битовые `%.17g`-слепки — ТОЛЬКО `OMP_NUM_THREADS=1`;

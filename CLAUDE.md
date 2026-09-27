@@ -73,10 +73,13 @@ new-structure.md (правила и замеры-предшественники 
 **Порядок чтения новой сессии:** START.md → хвост PLAN_ELEMENTS.md →
 STRUCTURE.md (при структурной работе) → PLAN_TRANSPORT.md (при работе вех).
 
-Живой код: `src/transport/`, `src/cut/`, `src/octree.*`, `src/image.*`,
-`src/nstruct/`, `src/p*.c` (пространственное дерево и старый конвейер —
-эталонный путь), `tools/`, `tests/`. Удалять код старого пути нельзя до
-паритета новой структуры — он эталон.
+Живой код (12-09, после переноса старого пути в `archive/geom/`):
+`src/nstruct/` (пирамида, свип), `src/octree.*`, `src/image.*`,
+`src/scene_obj.*`, `src/transport/dirs3+quad` (test_bounce), `tools/`
+(pgather — продакшн, pref — эталон, swee3/snap3), `tests/`. Старый
+геометрический путь (src/p*, src/cut, pfield/pwalk/render3) — в
+`archive/geom/`: поглядывать можно, якоря сверять через git-историю.
+Геометрия v2 (§914) пишется с чистого листа в `src/geom/`.
 
 ## What this is
 3D renderer via numerical solution of the radiative transport equation

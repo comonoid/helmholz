@@ -617,6 +617,17 @@ typedef struct {
   int64_t gmem_n, gmem_cap;
 } sw_agg;
 
+/* §923: списки кусков ОДНОГО уровня владения. Кусок этажа f лежит ровно в
+ * одном месте: f == 0 — в списке своей листовой клетки, f ≥ 1 — в списке
+ * узла-предка уровня f-1. Узел видит ТОЛЬКО свои куски — чужих списков
+ * нет, итерации поддерева на визит нет (урок §922-ДОКЛАД-2). */
+typedef struct {
+  int32_t *off;   /* [n+1] CSR-смещения по узлам уровня (в lvl_pool) */
+  int32_t *pids;  /* база пула кусков этого уровня (сдвиг внутри lvl_pool) */
+  uint8_t *finer; /* [n] под узлом есть куски этажа ≤ l — нужен спуск */
+  int32_t n;      /* число узлов уровня */
+} sw_lvl;
+
 typedef struct {
   const hz_pyr *py;
   const hz_sw_opts *o;
@@ -654,12 +665,38 @@ typedef struct {
   int64_t *nstore_n; /* указатель на счётчик заполнения магазина */
   int64_t nstore_cap;
   int32_t ncluster;
-  int64_t noff[256];   /* смещение уровня в нумерации кластеров узлов */
-  int32_t ncluster0;   /* nleaf: кластеры листов идут первыми */
-  int agg;             /* §863: ключ o->agg */
-  int agg_list;        /* текущий список — узловой (отсортирован, годен для групп) */
-  sw_agg *ag;          /* §863/шаг 2: таблица групп (NULL — путь не активен) */
-  double *abuf, *wbuf; /* скретч взаимодействия: без аллокаций на событие */
+  int64_t noff[256]; /* смещение уровня в нумерации кластеров узлов */
+  int32_t ncluster0; /* nleaf: кластеры листов идут первыми */
+  int agg;           /* §863: ключ o->agg */
+  int agg_list;      /* текущий список — узловой (отсортирован, годен для групп) */
+  /* §923: раскладка по уровням владения (lvls == NULL — прежний мир:
+   * без lpacc/lpapply и в статике lp=; А1638 fail closed) */
+  const sw_lvl *lvls;       /* [py->nlev] */
+  const int32_t *leaf_loff; /* [nleaf+1] листовые списки floor-0 кусков */
+  const int32_t *leaf_lpids;
+  /* §924: представители декимации (reps_on — только живая лестница+walk).
+   * Списки этажей держат id ≥ nt0 — расширенные tri id представителя. */
+  int reps_on;
+  int32_t nt0; /* исходные nt (граница слот/tri-пространств) */
+  int32_t nrep;
+  const int32_t *rep_koff; /* [nrep+1] */
+  const int32_t *rep_kmem; /* [Σдетей] СЛОТы исходных кусков */
+  const double *rep_area;  /* [nrep] */
+  const double *rep_rho;   /* [nrep] */
+  const double *rep_le;    /* [nrep] */
+  const double *rep_atri;  /* [nrep] площадь носителя (§927) */
+  const double *rep_nrm;   /* [3nrep] нормаль носителя (§927) */
+  const double *rep_ep;    /* [nrep] агрегат Eprev детей (раз в итерацию) */
+  /* §928: калибровка k(r,ω) — ω-бин направления, накопители кусочной ветки
+   * (только последняя итерация, только мир сбора HZ_KCALDUMP), этажи для
+   * отсева floor-0 событий (они в reps-мире приходят листами, не rep-хитом). */
+  int dir_bin;                       /* ω-бин = уровень μ квадратуры (HZ_KCAL_NW×1) */
+  double *knum;                      /* [nrep*HZ_KCAL_NW] числитель: Σ dep детей */
+  double *kden;                      /* [nrep*HZ_KCAL_NW] знаменатель: Σ w·csec·axcos·Lin_entry */
+  const uint8_t *kfloor;             /* [nt] этажи (слоты) или NULL */
+  int64_t dbg_node, dbg_leaf, dbg_n; /* §923-дых: визиты/куски нового пути */
+  sw_agg *ag;                        /* §863/шаг 2: таблица групп (NULL — путь не активен) */
+  double *abuf, *wbuf;               /* скретч взаимодействия: без аллокаций на событие */
   int64_t abufcap;
   double hi[3]; /* верх сцены (клетки уровней шире домена на нечётных сетках) */
   /* §864/Б1: кэш размеров уровней (статичны на прогон; иначе level_dims —
@@ -748,6 +785,11 @@ static int front_box_seg(const double blo[3], const double bhi[3], const double 
       if (ta > t0) t0 = ta;
       if (tb < t1) t1 = tb;
     }
+    /* СТАТИКА (§925-с): t0 по осям только растёт, t1 — только сжимается
+     * (max/min коммуникативны) — выход сразу после оси с t0 > t1 БИТОВО
+     * равен проходу всех трёх: оставшиеся оси знак не развернут.
+     * Экономит до двух делений на отвергнутом тесте. */
+    if (t0 > t1) return 0;
   }
   /* t1 == t0 допустимо: вырожденная (плоская) клетка фантомной колонки —
    * стенка на mesh-границе сетки обязана быть достижима для марша (§852) */
@@ -851,7 +893,14 @@ static void sw_accum(front_ctx *fc, int32_t p, double edep) {
        * кардинально (floor аккумулятора растёт на ~1 за отскок);
        * зеркальный (ks→1) Δ→0 — детальность ОРИГИНАЛЬНАЯ. Нормируется
        * на единичный вклад (без edep): правило про счёт отскоков, не про
-       * энергию; cdelta задаёт масштаб шага. */
+       * энергию; cdelta задаёт масштаб шага.
+       * §924: ЭМИТТЕРЫ не грубеют (как зеркальные): агрегат repre-
+       * зентателя разводит le по площади — источники гаснут (ловля
+       * §924-дым: emitted=0, E 4.07→0.075). */
+      if (fc->o->lep && fc->o->lep[p] > 0.0) {
+        d = 0.0;
+        break;
+      }
       d = (fc->o->ks && fc->o->ks[p] >= 0.0) ? 1.0 - fc->o->ks[p]
                                              : 1.0; /* §918: ks нет/не задан — считаем диффузным */
       break;
@@ -1167,6 +1216,11 @@ done:
  * «только реальные пересечения» не совпадает с перехватной на стенках,
  * не выровненных по сетке (box: 0.88 против 4.17), — выбор за
  * фальсификатором А1576. */
+static int64_t g924_hits, g924_lin;   /* §924-дых: rep-депозиты и ΣLin (прибор) */
+static int64_t g924_vis, g924_geohit; /* §927-дых: визиты списков rep, гео-попадания */
+static int64_t g924_kclamp;           /* §927: кулы k(r,ω) (диагностика) */
+static int g924_minf = 1; /* §924-матрика: HZ_REPMINF */
+
 static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double tin, double tout,
                            double *a, double *b) {
   const hz_pyr *py = fc->py;
@@ -1179,6 +1233,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
   if (n <= 0) return;
   if (fc->tau0) return; /* НК: слой не взаимодействует */
   fc->nmat++;
+  g924_vis++;       /* §927-дых: визит списка (любого) */
   if (fc->noprop) { /* НК: фронт не переносится */
     *a = 0.0;
     *b = 0.0;
@@ -1201,7 +1256,9 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
   hp = (int32_t *)fc->wbuf; /* n int32 ≤ n double — места хватает */
   for (u = 0; u < n; u++) {
     int32_t p = ps[u];
-    int32_t tri = py->pcs[p].tri;
+    /* §924: id ≥ nt0 — представитель (id уже РАСШИРЕННЫЙ tri id);
+     * иначе — слот куска */
+    int32_t tri = (fc->reps_on && p >= fc->nt0) ? p : py->pcs[p].tri;
     double tt, bh0, bh1;
     if (fc->agg &&
         fc->agg_list) { /* §872: серия (материал) — culling-единица:
@@ -1231,7 +1288,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
       }
     }
 
-    if (fc->pstamp[py->pcs[p].tri] == fc->pkey) {
+    if (fc->pstamp[tri] == fc->pkey) {
       fc->nstamp++; /* кратность 1 на (кусок, направление) — А1564 */
       continue;
     }
@@ -1274,12 +1331,150 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
       int first = 1;
       for (i = 0; i < nh; i++) {
         int32_t p = hp[i];
+        int32_t tri = (fc->reps_on && p >= fc->nt0) ? p : py->pcs[p].tri; /* §924 */
         double Lh;
-        if (fc->pstamp[py->pcs[p].tri] == fc->pkey) continue;
-        fc->pstamp[py->pcs[p].tri] = fc->pkey;
+        if (fc->pstamp[tri] == fc->pkey) continue;
+        fc->pstamp[tri] = fc->pkey;
         if (first) {
           fc->depA += ai;
           first = 0;
+        }
+        if (fc->reps_on && p >= fc->nt0) { /* §924: ПРЕДСТАВИТЕЛЬ — депозит
+                                            * с раздачей детям по площадям;
+                                            * штамп гасит и вложенных rep'ов
+                                            * (rep_f ⊇ rep_{f+1}), и листья */
+          int32_t r = p - fc->nt0;
+          {
+            static long kcpos = 0, kcneg = 0;
+            if (fc->o->kcal) {
+              double kd9 = fc->o->kcal[(size_t)r * HZ_KCAL_NW + (size_t)fc->dir_bin];
+              if (kd9 > 0)
+                kcpos++;
+              else
+                kcneg++;
+              if ((kcpos + kcneg) % 50000 == 0)
+                fprintf(stderr, "KCDbg pos=%ld neg=%ld\n", kcpos, kcneg);
+            }
+          }
+          if (fc->o->kcal != NULL) { /* §928: КАЛИБРОВАННАЯ таблица k(r,ωbin);
+                                      * ячейка ≤ 0 — fallback на формулу §927 ниже.
+                                      * extraction = k·w·csec·axcos·(Lin+Lh) — база
+                                      * симметрична сбору (тёмная трубка зажигается
+                                      * эмиссией самой цепочки); раздача детям по
+                                      * долям СРЕДИ СВЕЖИХ: Σ депозитов = flux. */
+            double kc = fc->o->kcal[(size_t)r * HZ_KCAL_NW + (size_t)fc->dir_bin];
+            if (kc > 0.0) {
+              double Lh9c =
+                  front_lh_cap(fc, fc->rep_le[r] + fc->rep_rho[r] * fc->rep_ep[r] / (2.0 * M_PI));
+              double freshA = 0.0; /* §928: свежие дети (вложенные репы делят детей —
+                                    * ренормировка вместо потери доли flux) */
+              int32_t nfr = 0;
+              for (int32_t kq = fc->rep_koff[r]; kq < fc->rep_koff[r + 1]; kq++) {
+                int32_t kid = fc->rep_kmem[kq];
+                if (fc->pstamp[py->pcs[kid].tri] == fc->pkey) continue;
+                if (fc->o->lep && fc->o->lep[kid] > 0.0) continue;
+                freshA += fc->area[kid];
+                nfr++;
+              }
+              if (nfr > 0 && freshA > 0.0) {
+                double flux = fc->w_d * csec * fc->axcos * (Lin + Lh9c) * kc;
+                for (int32_t kq = fc->rep_koff[r]; kq < fc->rep_koff[r + 1]; kq++) {
+                  int32_t kid = fc->rep_kmem[kq];
+                  int32_t ktri = py->pcs[kid].tri;
+                  if (fc->pstamp[ktri] == fc->pkey) continue; /* уже получил долю */
+                  if (fc->o->lep && fc->o->lep[kid] > 0.0)
+                    continue; /* §924: эмиттер — своё событие в листе */
+                  fc->pstamp[ktri] = fc->pkey;
+                  double ed = flux * (fc->area[kid] / freshA); /* Σ долей = 1 */
+                  fc->Ed[kid] += ed;
+                  sw_accum(fc, kid, ed); /* этажная логика §918 — на ребёнке */
+                }
+                fc->absorbed += flux; /* §928: = Σ депозитов (ренормировка) */
+                fc->emitted += fc->w_d * fc->rep_le[r] * csec;
+                fc->recycled += fc->w_d * (Lh9c - fc->le) * csec;
+                fc->ndep++;
+                g924_hits++; /* §928: как формульная ветка — честный rep_hits */
+                g924_lin += (int64_t)((Lin + Lh9c) * 1000.0);
+              }
+              /* нет свежих детей (их забрал внешний реп) — ПРОЗРАЧНЫЙ: без
+               * извлечения (иначе двойной счёт одной цепочки), физическое
+               * продолжение Lin ← Lh как у любой поверхности */
+              Lin = Lh9c;
+              continue;
+            }
+          }
+          /* §927: НАПРАВЛЕННЫЙ ПЕРЕХВАТ k(r,ω) = ΣДетей A_i|n_i·ω| /
+           * (A_носителя·|n_r·ω|) — ожидаемые пересечения грозди на
+           * пересечение носителя. Считается тем же циклом, что раздача.
+           * gain петли = 1 по построению: пол (копланарные дети) → k=1,
+           * колонна → k≈2 поперёк, →0 вдоль оси. Кул [0,64] — численная
+           * страховка вырожденных граней (счётчик ниже). */
+          double cosr = fabs(fc->om[0] * fc->rep_nrm[3 * r] + fc->om[1] * fc->rep_nrm[3 * r + 1] +
+                             fc->om[2] * fc->rep_nrm[3 * r + 2]);
+          double knum = 0.0;
+          int32_t k;
+          for (k = fc->rep_koff[r]; k < fc->rep_koff[r + 1]; k++) {
+            int32_t kid = fc->rep_kmem[k];
+            const double *nk = fc->nrm + 3 * (int64_t)kid;
+            knum += fc->area[kid] * fabs(fc->om[0] * nk[0] + fc->om[1] * nk[1] + fc->om[2] * nk[2]);
+          }
+          double kk =
+              (cosr > 1e-12 && fc->rep_atri[r] > 1e-30) ? knum / (fc->rep_atri[r] * cosr) : 1.0;
+          if (kk > 64.0) {
+            kk = 64.0;
+            g924_kclamp++;
+          }
+          if (kk < 1e-6) kk = 1e-6;
+          /* §927-2: ЦЕПОЧКА ПЕРЕСЕЧЕНИЙ — энергосохранение строго:
+           * гроздь обменивалась бы k раз: 1-е пересечение снимает
+           * Φ(Lin), остальные k−1 — по Φ(Lh) (переизлучённое), дробный
+           * хвост — долей. Σ депозитов = Σ извлечённого из трубки
+           * (ловля §927: депозит kΦ при одном изъятии Φ = источник
+           * энергии → разгон ×1.55/ит). Пол (k=1) вырождается в
+           * однократное пересечение — прежняя арифметика. */
+          double Lh9 =
+              front_lh_cap(fc, fc->rep_le[r] + fc->rep_rho[r] * fc->rep_ep[r] / (2.0 * M_PI));
+          double ffull = kk < 1.0 ? kk : 1.0;
+          double frest = kk > 1.0 ? kk - 1.0 : 0.0;
+          double fluxsum = fc->w_d * csec * fc->axcos * (ffull * Lin + frest * Lh9);
+          double edep = fluxsum / fc->rep_area[r];
+          for (int32_t kq = fc->rep_koff[r]; kq < fc->rep_koff[r + 1]; kq++) {
+            int32_t kid = fc->rep_kmem[kq];
+            int32_t ktri = py->pcs[kid].tri;
+            if (fc->pstamp[ktri] == fc->pkey) continue; /* уже получил долю */
+            if (fc->o->lep && fc->o->lep[kid] > 0.0)
+              continue; /* §924: эмиттер — своё событие в листе, штамп не
+                         * вешаем: иначе его листовое событие умрёт */
+            fc->pstamp[ktri] = fc->pkey;
+            fc->Ed[kid] += edep;
+            sw_accum(fc, kid, edep); /* этажная логика §918 — на ребёнке */
+          }
+          Lh = Lh9;
+          fc->absorbed += fc->w_d * csec * (ffull * Lin + frest * Lh9); /* §927-2:
+                                                                         * = Σ депозитов */
+          fc->emitted += fc->w_d * fc->rep_le[r] * csec;
+          fc->recycled += fc->w_d * (Lh - fc->le) * csec;
+          fc->ndep++;
+          g924_hits++;
+          g924_lin += (int64_t)(Lin * 1000.0);
+          {
+            static int repdbg_n = 0; /* §924-дых */
+            static int repdbg_on = -1;
+            if (repdbg_on < 0) repdbg_on = getenv("HZ_DBG924") != NULL;
+            if (repdbg_on && repdbg_n < 6) {
+              int32_t nk = 0;
+              for (int32_t kq = fc->rep_koff[r]; kq < fc->rep_koff[r + 1]; kq++)
+                if (fc->pstamp[py->pcs[fc->rep_kmem[kq]].tri] == fc->pkey) nk++;
+              fprintf(stderr,
+                      "DBG924hit r=%d Lin=%.4g area=%.4g rho=%.3g le=%.3g ep=%.4g kids=%d fresh=%d "
+                      "edep=%.4g Lh=%.4g\n",
+                      r, Lin, fc->rep_area[r], fc->rep_rho[r], fc->rep_le[r], fc->rep_ep[r],
+                      fc->rep_koff[r + 1] - fc->rep_koff[r], nk, edep, Lh);
+              repdbg_n++;
+            }
+          }
+          Lin = Lh;
+          continue;
         }
         double ks = fc->o->ks ? fc->o->ks[p] : 0.0;
         double kdf = front_rho(fc, p);
@@ -1364,9 +1559,37 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
         Lh = front_lh_cap(fc, front_le(fc, p) + kdf * fc->Eprev[p] / (2.0 * M_PI));
         fc->recycled += fc->w_d * (Lh - fc->le) * csec;
         fc->ndep++;
+        g924_hits++; /* §924-дых: событие куска (мир §923) */
+        g924_lin += (int64_t)(Lin * 1000.0);
+        if (fc->knum && !fc->in_leg &&
+            !fc->o->strip_start) { /* §928: калибровка —
+                                    * депозиты серийной цепочки региона, приписанные ОДНОМУ уровню:
+                                    * этажу куска (want-семантика §924) — доставка в reps-мире
+                                    * происходит ТОЛЬКО на уровне хита, считая все уровни, мы бы
+                                    * завысили знаменатель и занизили k */
+          int32_t fl = fc->kfloor != NULL ? (int32_t)fc->kfloor[p] : 1;
+          if (fl < 1) fl = 1;
+          if (fl > fc->o->rep_nlev) fl = fc->o->rep_nlev;
+          int32_t r = fc->o->repof[((size_t)fl - 1u) * (size_t)fc->nt0 + (size_t)p];
+          if (r >= 0) {
+            if (fc->pstamp[fc->nt0 + r] != fc->pkey) { /* вход трубки в регион:
+                                                        * зеркалирует штамп rep-хита.
+                                                        * БАЗА (Lin+Lh): тёмная трубка
+                                                        * зажигается эмиссией САМОЙ
+                                                        * цепочки (le+ρEprev/2π на
+                                                        * каждой поверхности) — извлечение
+                                                        * на входе обязано её видеть */
+              fc->pstamp[fc->nt0 + r] = fc->pkey;
+              fc->kden[(size_t)r * HZ_KCAL_NW + (size_t)fc->dir_bin] +=
+                  fc->w_d * csec * fc->axcos * (Lin + Lh);
+            }
+            fc->knum[(size_t)r * HZ_KCAL_NW + (size_t)fc->dir_bin] += dep;
+          }
+        }
         sw_accum(fc, p, fc->w_d * Lin * (1.0 - ks) * dep_ratio);
         Lin = Lh;
       }
+      g924_geohit += nh; /* §927-дых: гео-попадания (все списки) */
       if (nh > 0) {
         *a = 0.0;
         *b = Lin;
@@ -1429,12 +1652,470 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
   }
 }
 
+/* §923: пересборка раскладки под текущие этажи lpflo (слот-пространство).
+ * Каждый кусок — в ЕДИНСТВЕННЫЙ список уровня своего этажа: f==0 — листовая
+ * клетка, f≥1 — узел-предок уровня f-1 (поиск hz_pyr_node_pos; узел-предок
+ * существует гарантированно — под ним есть его кусок; отказ → лист, fail
+ * closed). finer[l][pos] = «в поддереве есть куски этажа ≤ l» —
+ * распространяется снизу вверх, один поиск родителя на узел. O(nt) счёт +
+ * O(поиски). Вызывается раз в итерацию, после применения этажей. */
+static uint8_t g_dbg923_vis[1 << 20]; /* §923-дых: отметки посещённых листьев (только HZ_DBG923) */
+
+/* §923: клетка bbox → позиция листа; листа нет (фантомная колонка
+ * max-грани, А1578) — фолбэк соседей ±1 (как fb в sw_index_piece,
+ * только walk). *dst[] — до 7 позиций (центр + 6 соседей). */
+static int32_t sw923_leaf_or_nb(const hz_pyr *py, int64_t ix, int64_t iy, int64_t iz, int fb,
+                                int32_t dst[7]) {
+  int32_t n = 0, k;
+  int32_t pos = hz_pyr_leaf_pos(py, ix + py->nx * (iy + py->ny * iz));
+  int64_t nb[3];
+  if (pos >= 0) dst[n++] = pos;
+  if (!fb) return n;
+  nb[0] = ix;
+  nb[1] = iy;
+  nb[2] = iz;
+  for (int ax = 0; ax < 3; ax++) {
+    int64_t mx = nb[ax];
+    for (int sgn = -1; sgn <= 1; sgn += 2) {
+      int64_t lim = ax == 0 ? py->nx : (ax == 1 ? py->ny : py->nz);
+      nb[ax] = mx + sgn;
+      if (nb[ax] >= 0 && nb[ax] < lim) {
+        pos = hz_pyr_leaf_pos(py, nb[0] + py->nx * (nb[1] + py->ny * nb[2]));
+        if (pos >= 0) {
+          int dup = 0;
+          for (k = 0; k < n; k++)
+            if (dst[k] == pos) dup = 1;
+          if (!dup) dst[n++] = pos;
+        }
+      }
+    }
+    nb[ax] = mx;
+  }
+  return n;
+}
+
+/* §923 (v3): пересборка раскладки под текущие этажи lpflo.
+ * Кусок этажа f кладётся во ВСЕ узлы уровня f-1 (f≥1) / базовые клетки
+ * (f==0), которые пересекает его bbox — как А1566 для bpids (владение
+ * клеткой теряет торчащие треугольники, ловля §922-дым: E 0.0112).
+ * finer[l][pos] = «в bbox-перекрытии узла есть куски этажа ≤ l».
+ * Итоговые числа записей известны только после счёта — пулы растятся
+ * здесь (pool_cap/leaf_cap — ёмкости владельца); отказ аллокации →
+ * возврат -1, вызывающий разбирает lvls и возвращается в старый мир. */
+static int sw_levels_build(const hz_pyr *py, const hz_sw_opts *o, const uint8_t *lpflo, int32_t nt,
+                           sw_lvl *lvls, int32_t **pool_io, int32_t *pool_cap, int32_t **leaf_io,
+                           int32_t *leaf_cap, int32_t *leaf_off, const int32_t *bstart,
+                           const int32_t *bpids, int32_t *want) {
+  int32_t l, p, u;
+  int64_t (*dims)[3];
+  static int dbg = -1;
+  /* §928: reps_collect — карты построены для СБОРА калибровки, но списки
+   * уровней остаются кусочными (мир §923) */
+  const int reps_on = (o->nrep > 0 && o->walk && o->repof != NULL && !o->reps_collect);
+  if (reps_on && g924_minf == 1) { /* §924-матрика: HZ_REPMINF (гибрид (в)) */
+    const char *e = getenv("HZ_REPMINF");
+    if (e) {
+      int v = atoi(e);
+      if (v >= 1) g924_minf = v;
+    }
+  }
+  if (py->nlev <= 0) return 0;
+  if (dbg < 0) dbg = getenv("HZ_DBG923") != NULL;
+  dims = (int64_t (*)[3])malloc((size_t)py->nlev * sizeof *dims);
+  if (!dims) return -1;
+  for (l = 0; l < py->nlev; l++) {
+    hz_pyr_level_dims(py, l, dims[l]);
+    for (u = 0; u <= lvls[l].n; u++)
+      lvls[l].off[u] = 0;
+    memset(lvls[l].finer, 0, (size_t)lvls[l].n);
+  }
+  for (u = 0; u <= py->nleaf; u++)
+    leaf_off[u] = 0;
+  if (reps_on && want != NULL) /* §924: метки прошлой итерации гасим */
+    memset(want, 0, (size_t)o->nrep * sizeof *want);
+  /* 1. счёт + finer */
+  for (p = 0; p < nt; p++) {
+    uint8_t f = lpflo[p];
+    int32_t tri = py->pcs[p].tri;
+    int64_t lo[3], hi[3], cspan[6];
+    if (f > (uint8_t)py->nlev) f = 0; /* клэмп отказ-на-лист (А1568) */
+    for (int ax = 0; ax < 3; ax++) {
+      double cmin = o->tribox[6 * (int64_t)tri + ax];
+      double cmax = o->tribox[6 * (int64_t)tri + 3 + ax];
+      double dom = o->domhi[ax] - py->lo[ax];
+      lo[ax] = (int64_t)((cmin - py->lo[ax]) / py->cell);
+      hi[ax] = (int64_t)ceil((cmax - py->lo[ax]) / py->cell) - 1;
+      if (lo[ax] < 0) lo[ax] = 0;
+      if (hi[ax] < lo[ax]) hi[ax] = lo[ax];
+      if (hi[ax] > (int64_t)ceil(dom / py->cell) - 1) hi[ax] = (int64_t)ceil(dom / py->cell) - 1;
+      if (lo[ax] > (int64_t)ceil(dom / py->cell) - 1) lo[ax] = (int64_t)ceil(dom / py->cell) - 1;
+    }
+    { /* консервативный спэн ЗААНЯТОСТИ пирамиды (floor–floor, клэмп; так
+       * строились листья — pyr_bbox_span): им и ТОЛЬКО им метится finer,
+       * иначе листья, существующие только по широкому спэну, становятся
+       * недостижимыми (ловля §923-дым: 980 листьев без визитов, E −5.5%) */
+      for (int ax = 0; ax < 3; ax++) {
+        double cmin = o->tribox[6 * (int64_t)tri + ax];
+        double cmax = o->tribox[6 * (int64_t)tri + 3 + ax];
+        int64_t lim = ax == 0 ? py->nx : (ax == 1 ? py->ny : py->nz);
+        int64_t a0 = (int64_t)((cmin - py->lo[ax]) / py->cell);
+        int64_t a1 = (int64_t)((cmax - py->lo[ax]) / py->cell);
+        if (a0 < 0) a0 = 0;
+        if (a0 > lim - 1) a0 = lim - 1;
+        if (a1 < a0) a1 = a0;
+        if (a1 > lim - 1) a1 = lim - 1;
+        cspan[ax * 2] = a0;
+        cspan[ax * 2 + 1] = a1;
+      }
+    }
+    if (reps_on && (int32_t)f >= g924_minf && (int32_t)f <= o->rep_nlev &&
+        o->repof[((size_t)(int32_t)f - 1u) * (size_t)nt + (size_t)p] >= 0) {
+      /* §924: кусок заменён представителем (want[r]=f — дедуп на гроздь);
+       * счёт узлов и finer — проходы B/C ниже */
+      want[o->repof[((size_t)(int32_t)f - 1u) * (size_t)nt + (size_t)p]] = (int32_t)f;
+      goto rep_kid;
+    }
+    for (l = 0; l < py->nlev; l++) {
+      if (f >= 1 && l + 1 < (int32_t)f) continue; /* глубже своего уровня куска нет */
+      if (f >= 1 && l + 1 == (int32_t)f) {        /* СВОЙ уровень: счёт узлов-предков */
+        int64_t sh = (int64_t)l + 1;
+        for (int64_t az = lo[2] >> sh; az <= hi[2] >> sh; az++)
+          for (int64_t ay = lo[1] >> sh; ay <= hi[1] >> sh; ay++)
+            for (int64_t axx = lo[0] >> sh; axx <= hi[0] >> sh; axx++) {
+              int64_t nid = axx + dims[l][0] * (ay + dims[l][1] * az);
+              int32_t pos = hz_pyr_node_pos(py, l, nid);
+              if (pos >= 0) {
+                lvls[l].off[pos + 1]++;
+              } else { /* узла нет — весь bbox в лист (fail closed, fb А1578) */
+                int fb = (o->walk != 0);
+                for (int64_t iz = lo[2]; iz <= hi[2]; iz++)
+                  for (int64_t iy = lo[1]; iy <= hi[1]; iy++)
+                    for (int64_t ix = lo[0]; ix <= hi[0]; ix++) {
+                      int32_t dst[7];
+                      int32_t nn = sw923_leaf_or_nb(py, ix, iy, iz, fb, dst);
+                      for (int32_t k = 0; k < nn; k++)
+                        leaf_off[dst[k] + 1]++;
+                    }
+              }
+            }
+      } else if (f == 0 && l == 0) {
+        /* floor-0: во все пересекаемые базовые клетки (как bpids, fb А1578) */
+        int fb = (o->walk != 0);
+        for (int64_t iz = lo[2]; iz <= hi[2]; iz++)
+          for (int64_t iy = lo[1]; iy <= hi[1]; iy++)
+            for (int64_t ix = lo[0]; ix <= hi[0]; ix++) {
+              int32_t dst[7];
+              int32_t nn = sw923_leaf_or_nb(py, ix, iy, iz, fb, dst);
+              for (int32_t k = 0; k < nn; k++)
+                leaf_off[dst[k] + 1]++;
+            }
+      }
+      if (f == 0 || l >= (int32_t)f) { /* глубже уровня l есть кусок — finer
+                                        * (по консервативному спэну занятости) */
+        int64_t sh = (int64_t)l + 1;
+        for (int64_t az = cspan[4] >> sh; az <= cspan[5] >> sh; az++)
+          for (int64_t ay = cspan[2] >> sh; ay <= cspan[3] >> sh; ay++)
+            for (int64_t axx = cspan[0] >> sh; axx <= cspan[1] >> sh; axx++) {
+              int64_t nid = axx + dims[l][0] * (ay + dims[l][1] * az);
+              int32_t pos = hz_pyr_node_pos(py, l, nid);
+              if (pos >= 0) lvls[l].finer[pos] = 1;
+            }
+      }
+    }
+    continue;
+  rep_kid:; /* §924: finer rep-куска по СВОЕМУ консервативному спэну —
+             * спэн rep'а (проход C) может не накрыть торчащего ребёнка,
+             * а предки ребёнка обязаны звать спуск */
+    for (l = (int32_t)f - 1; l < py->nlev; l++) {
+      int64_t sh = (int64_t)l + 1;
+      for (int64_t az = cspan[4] >> sh; az <= cspan[5] >> sh; az++)
+        for (int64_t ay = cspan[2] >> sh; ay <= cspan[3] >> sh; ay++)
+          for (int64_t axx = cspan[0] >> sh; axx <= cspan[1] >> sh; axx++) {
+            int64_t nid = axx + dims[l][0] * (ay + dims[l][1] * az);
+            int32_t pos = hz_pyr_node_pos(py, l, nid);
+            if (pos >= 0) lvls[l].finer[pos] = 1;
+          }
+    }
+  }
+  if (reps_on) { /* §924, проход B: счёт want-представителей в узлы их
+                  * спэна (А1578-формула по tribox rep'а, id = nt + r) */
+    for (int32_t r = 0; r < o->nrep; r++) {
+      if (want[r] <= 0) continue;
+      int32_t li = want[r] - 1;
+      int64_t rlo[3], rhi[3];
+      int64_t triid = (int64_t)nt + r;
+      int bad = 0;
+      for (int ax = 0; ax < 3; ax++) {
+        double cmin = o->tribox[6 * triid + ax];
+        double cmax = o->tribox[6 * triid + 3 + ax];
+        double dom = o->domhi[ax] - py->lo[ax];
+        rlo[ax] = (int64_t)((cmin - py->lo[ax]) / py->cell);
+        rhi[ax] = (int64_t)ceil((cmax - py->lo[ax]) / py->cell) - 1;
+        if (rlo[ax] < 0) rlo[ax] = 0;
+        if (rhi[ax] < rlo[ax]) rhi[ax] = rlo[ax];
+        if (rhi[ax] > (int64_t)ceil(dom / py->cell) - 1)
+          rhi[ax] = (int64_t)ceil(dom / py->cell) - 1;
+        if (rlo[ax] > (int64_t)ceil(dom / py->cell) - 1)
+          rlo[ax] = (int64_t)ceil(dom / py->cell) - 1;
+        if (rhi[ax] < rlo[ax]) bad = 1;
+      }
+      if (bad) continue;
+      int64_t sh = (int64_t)li + 1;
+      for (int64_t az = rlo[2] >> sh; az <= rhi[2] >> sh; az++)
+        for (int64_t ay = rlo[1] >> sh; ay <= rhi[1] >> sh; ay++)
+          for (int64_t axx = rlo[0] >> sh; axx <= rhi[0] >> sh; axx++) {
+            int64_t nid = axx + dims[li][0] * (ay + dims[li][1] * az);
+            int32_t pos = hz_pyr_node_pos(py, li, nid);
+            if (pos >= 0) lvls[li].off[pos + 1]++;
+          }
+    }
+  }
+  /* 2. префикс-суммы + рост пулов по ИТОГАМ (записей ≥ nt: bbox-множественность) */
+  for (l = 0; l < py->nlev; l++)
+    for (u = 0; u < lvls[l].n; u++)
+      lvls[l].off[u + 1] += lvls[l].off[u];
+  for (u = 0; u < py->nleaf; u++)
+    leaf_off[u + 1] += leaf_off[u];
+  {
+    int64_t need = 0;
+    int32_t base = 0;
+    int32_t bases[256]; /* nlev ≤ 254 (А1568) + запас */
+    for (l = 0; l < py->nlev; l++)
+      need += lvls[l].off[lvls[l].n];
+    if (need > *pool_cap) {
+      int32_t *np = (int32_t *)realloc(*pool_io, (size_t)need * sizeof *np);
+      if (!np) {
+        free(dims);
+        return -1;
+      }
+      *pool_io = np;
+      *pool_cap = (int32_t)need;
+    }
+    if (leaf_off[py->nleaf] > *leaf_cap) {
+      int32_t *np = (int32_t *)realloc(*leaf_io, (size_t)leaf_off[py->nleaf] * sizeof *np);
+      if (!np) {
+        free(dims);
+        return -1;
+      }
+      *leaf_io = np;
+      *leaf_cap = leaf_off[py->nleaf];
+    }
+    for (l = 0; l < py->nlev; l++) {
+      bases[l] = base;
+      base += lvls[l].off[lvls[l].n];
+      lvls[l].pids = *pool_io + bases[l]; /* ДО заполнения (урок v1) */
+    }
+    /* 3. заполнение — тот же перебор, off/leaf_off как курсоры */
+    for (p = 0; p < nt; p++) {
+      uint8_t f = lpflo[p];
+      int32_t tri = py->pcs[p].tri;
+      int64_t lo[3], hi[3];
+      if (f > (uint8_t)py->nlev) f = 0;
+      for (int ax = 0; ax < 3; ax++) {
+        double cmin = o->tribox[6 * (int64_t)tri + ax];
+        double cmax = o->tribox[6 * (int64_t)tri + 3 + ax];
+        double dom = o->domhi[ax] - py->lo[ax];
+        lo[ax] = (int64_t)((cmin - py->lo[ax]) / py->cell);
+        hi[ax] = (int64_t)ceil((cmax - py->lo[ax]) / py->cell) - 1;
+        if (lo[ax] < 0) lo[ax] = 0;
+        if (hi[ax] < lo[ax]) hi[ax] = lo[ax];
+        if (hi[ax] > (int64_t)ceil(dom / py->cell) - 1) hi[ax] = (int64_t)ceil(dom / py->cell) - 1;
+        if (lo[ax] > (int64_t)ceil(dom / py->cell) - 1) lo[ax] = (int64_t)ceil(dom / py->cell) - 1;
+      }
+      if (reps_on && (int32_t)f >= g924_minf && (int32_t)f <= o->rep_nlev &&
+          o->repof[((size_t)(int32_t)f - 1u) * (size_t)nt + (size_t)p] >= 0)
+        continue; /* §924: кусок представлен — пишет проход D */
+      if (f == 0) {
+        int fb = (o->walk != 0);
+        for (int64_t iz = lo[2]; iz <= hi[2]; iz++)
+          for (int64_t iy = lo[1]; iy <= hi[1]; iy++)
+            for (int64_t ix = lo[0]; ix <= hi[0]; ix++) {
+              int32_t dst[7];
+              int32_t nn = sw923_leaf_or_nb(py, ix, iy, iz, fb, dst);
+              for (int32_t k = 0; k < nn; k++)
+                (*leaf_io)[leaf_off[dst[k]]++] = p;
+            }
+      } else {
+        int32_t li = f - 1;
+        int64_t sh = (int64_t)li + 1;
+        for (int64_t az = lo[2] >> sh; az <= hi[2] >> sh; az++)
+          for (int64_t ay = lo[1] >> sh; ay <= hi[1] >> sh; ay++)
+            for (int64_t axx = lo[0] >> sh; axx <= hi[0] >> sh; axx++) {
+              int64_t nid = axx + dims[li][0] * (ay + dims[li][1] * az);
+              int32_t pos = hz_pyr_node_pos(py, li, nid);
+              if (pos >= 0) {
+                lvls[li].pids[lvls[li].off[pos]++] = p;
+              } else { /* зеркало счёта: отказ узла — bbox в лист (fb А1578) */
+                int fb = (o->walk != 0);
+                for (int64_t iz = lo[2]; iz <= hi[2]; iz++)
+                  for (int64_t iy = lo[1]; iy <= hi[1]; iy++)
+                    for (int64_t ix = lo[0]; ix <= hi[0]; ix++) {
+                      int32_t dst[7];
+                      int32_t nn = sw923_leaf_or_nb(py, ix, iy, iz, fb, dst);
+                      for (int32_t k = 0; k < nn; k++)
+                        (*leaf_io)[leaf_off[dst[k]]++] = p;
+                    }
+              }
+            }
+      }
+    }
+    if (reps_on) { /* §924, проход D: представители в списки уровней */
+      for (int32_t r = 0; r < o->nrep; r++) {
+        if (want[r] <= 0) continue;
+        int32_t li = want[r] - 1;
+        int64_t rlo[3], rhi[3];
+        int64_t triid = (int64_t)nt + r;
+        int bad = 0;
+        for (int ax = 0; ax < 3; ax++) {
+          double cmin = o->tribox[6 * triid + ax];
+          double cmax = o->tribox[6 * triid + 3 + ax];
+          double dom = o->domhi[ax] - py->lo[ax];
+          rlo[ax] = (int64_t)((cmin - py->lo[ax]) / py->cell);
+          rhi[ax] = (int64_t)ceil((cmax - py->lo[ax]) / py->cell) - 1;
+          if (rlo[ax] < 0) rlo[ax] = 0;
+          if (rhi[ax] < rlo[ax]) rhi[ax] = rlo[ax];
+          if (rhi[ax] > (int64_t)ceil(dom / py->cell) - 1)
+            rhi[ax] = (int64_t)ceil(dom / py->cell) - 1;
+          if (rlo[ax] > (int64_t)ceil(dom / py->cell) - 1)
+            rlo[ax] = (int64_t)ceil(dom / py->cell) - 1;
+          if (rhi[ax] < rlo[ax]) bad = 1;
+        }
+        if (bad) continue;
+        int64_t sh = (int64_t)li + 1;
+        for (int64_t az = rlo[2] >> sh; az <= rhi[2] >> sh; az++)
+          for (int64_t ay = rlo[1] >> sh; ay <= rhi[1] >> sh; ay++)
+            for (int64_t axx = rlo[0] >> sh; axx <= rhi[0] >> sh; axx++) {
+              int64_t nid = axx + dims[li][0] * (ay + dims[li][1] * az);
+              int32_t pos = hz_pyr_node_pos(py, li, nid);
+              if (pos >= 0) lvls[li].pids[lvls[li].off[pos]++] = nt + r;
+            }
+      }
+    }
+    for (l = 0; l < py->nlev; l++) {
+      for (u = lvls[l].n; u > 0; u--)
+        lvls[l].off[u] = lvls[l].off[u - 1];
+      lvls[l].off[0] = 0;
+    }
+    for (u = py->nleaf; u > 0; u--)
+      leaf_off[u] = leaf_off[u - 1];
+    leaf_off[0] = 0;
+  }
+  if (dbg) {
+    int64_t fmax = 0, own, fin, nl = 0, entries = 0;
+    fprintf(stderr, "DBG923:");
+    for (p = 0; p < nt; p++)
+      if (lpflo[p] > fmax) fmax = lpflo[p];
+    for (l = 0; l < py->nlev; l++) {
+      own = fin = 0;
+      for (u = 0; u < lvls[l].n; u++) {
+        int32_t c = lvls[l].off[u + 1] - lvls[l].off[u];
+        if (c > 0) own++;
+        entries += c;
+        if (lvls[l].finer[u]) fin++;
+      }
+      fprintf(stderr, " L%d:%d/%d", l, (int)own, (int)fin);
+    }
+    for (u = 0; u < py->nleaf; u++) {
+      if (leaf_off[u + 1] - leaf_off[u] > 0) nl++;
+      entries += leaf_off[u + 1] - leaf_off[u];
+    }
+    fprintf(stderr, " leaves=%d fmax=%d nlev=%d entries=%d\n", (int)nl, (int)fmax, py->nlev,
+            (int)entries);
+  }
+  if (dbg && bstart && bpids) { /* сверка листовых списков с bpids (только все-0) */
+    int64_t dmis = 0, dextra = 0, leafmis = 0, fmax2 = 0;
+    for (p = 0; p < nt; p++)
+      if (lpflo[p] > fmax2) fmax2 = lpflo[p];
+    for (int32_t li2 = 0; li2 < py->nleaf && fmax2 == 0; li2++) {
+      for (int32_t k = leaf_off[li2]; k < leaf_off[li2 + 1]; k++) {
+        int32_t pv = (*leaf_io)[k];
+        int found = 0;
+        for (int32_t q = bstart[li2]; q < bstart[li2 + 1]; q++)
+          if (bpids[q] == pv) found = 1;
+        if (!found) dextra++;
+      }
+      for (int32_t q = bstart[li2]; q < bstart[li2 + 1]; q++) {
+        int found = 0;
+        for (int32_t k = leaf_off[li2]; k < leaf_off[li2 + 1]; k++)
+          if ((*leaf_io)[k] == bpids[q]) found = 1;
+        if (!found) {
+          dmis++;
+          if (leafmis < 8) {
+            int32_t tri2 = py->pcs[bpids[q]].tri;
+            fprintf(stderr, "DBG923mis leaf=%d p=%d tri=%d\n", li2, bpids[q], tri2);
+            leafmis++;
+          }
+        }
+      }
+    }
+    fprintf(stderr, "DBG923verify mis=%lld extra=%lld", (long long)dmis, (long long)dextra);
+    {
+      int64_t nv = 0;
+      for (int32_t li2 = 0; li2 < py->nleaf; li2++)
+        if (leaf_off[li2 + 1] - leaf_off[li2] > 0 && li2 < (1 << 20) && !g_dbg923_vis[li2]) nv++;
+      fprintf(stderr, " unvisited=%lld (nleaf=%d)", (long long)nv, py->nleaf);
+      memset(g_dbg923_vis, 0, sizeof g_dbg923_vis);
+    }
+    fprintf(stderr, "\n");
+  }
+  free(dims);
+  return 0;
+}
+
 /* марш трубки через узел (уровень l, позиция pos; l<0 — лист) на отрезке
- * [tin,tout]; carry a/b сквозной — сечение трубки не делится (А1563) */
+ * [tin,tout]; carry a/b сквозной — сечение трубки не делится (А1563).
+ * §923: спуск промежуточного узла вынесен в front_descend — новый путь
+ * (раскладка по уровням) вызывает его же для спуска к мелким кускам. */
+static void front_descend(front_ctx *fc, int32_t l, int32_t pos, double tin, double tout, double *a,
+                          double *b);
+
 static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, double tout, double *a,
                         double *b) {
   const hz_pyr *py = fc->py;
-  double blo[3], bhi[3];
+  double blo[3], bhi[3], bh0c, bh1c;
+  if (fc->lvls) { /* §923: раскладка по уровням владения */
+    if (l < 0) {  /* лист: только floor-0 куски этой клетки */
+      int32_t n = fc->leaf_loff[pos + 1] - fc->leaf_loff[pos];
+      if (fc->cfront) fc->ncellfront++;
+      if (n > 0) {
+        fc->dbg_leaf++;
+        fc->dbg_n += n;
+      }
+      if (pos < (1 << 20)) g_dbg923_vis[pos] = 1;
+      if (n > 0) {
+        const int32_t *ps = fc->leaf_lpids + fc->leaf_loff[pos];
+        if (fc->o->walk) /* А1576: точный многопопадный проход */
+          front_seg_walk(fc, ps, n, tin, tout, a, b);
+        else {
+          front_node_box(fc, -1, pos, blo, bhi);
+          front_interact(fc, ps, n, blo, bhi, tin, tout, a, b, 1);
+        }
+      }
+      return;
+    }
+    {
+      const sw_lvl *L = &fc->lvls[l];
+      int32_t n = L->off[pos + 1] - L->off[pos];
+      if (n > 0) {
+        fc->dbg_node++;
+        fc->dbg_n += n;
+      }
+      if (n > 0) { /* СВОИ куски (этаж l+1): взаимодействие на сегменте узла.
+                    * Пустота узла не обходится — она покрыта одним
+                    * слэб-тестом сегмента (ход по пустоте уровнем, А1569). */
+        const int32_t *ps = L->pids + L->off[pos];
+        front_node_box(fc, l, pos, blo, bhi);
+        if (fc->o->walk)
+          front_seg_walk(fc, ps, n, tin, tout, a, b);
+        else
+          front_interact(fc, ps, n, blo, bhi, tin, tout, a, b, 0);
+      }
+      if (L->finer[pos]) /* спуск — ТОЛЬКО если под узлом есть более
+                          * мелкие куски; иначе марш стоит на уровне */
+        front_descend(fc, l, pos, tin, tout, a, b);
+      return;
+    }
+  }
   if (l < 0) {        /* лист: базовая клетка */
     fc->agg_list = 0; /* листовой список не отсортирован по материалу */
     if (fc->cfront) fc->ncellfront++;
@@ -1508,7 +2189,14 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
       front_interact(fc, fc->pbuf, n, blo, bhi, tin, tout, a, b, 0);
     return;
   }
-  /* ПРОМЕЖУТОЧНЫЙ: спуск — продолжение DDA на детском уровне */
+  /* ПРОМЕЖУТОЧНЫЙ: спуск — продолжение DDA на детском уровне (§923:
+   * вынесен в front_descend, общий с новым путём) */
+  front_descend(fc, l, pos, tin, tout, a, b);
+}
+
+static void front_descend(front_ctx *fc, int32_t l, int32_t pos, double tin, double tout, double *a,
+                          double *b) {
+  const hz_pyr *py = fc->py;
   fc->ndesc++;
   if (l == 0) {
     /* спуск на ЛИСТЬЯ: узел уровня-0 покрывает 2³ БАЗОВЫХ клетки —
@@ -2126,8 +2814,14 @@ static void front_dir(front_ctx *fc, int32_t *stampv, const double *odir) {
         fc->depA = 0.0; /* G6 — по РОДИТЕЛЬСКОЙ доле ЭТОЙ трубки */
         front_tube(fc, cc, &lostA, &lostB);
         if (lostA > 0.0 || lostB > 0.0) fc->lost += (lostA + lostB) * py->cell * py->cell;
+        /* §923-дых: печать в конце front_dir (после семейств осей) */
       }
   }
+  if (getenv("HZ_DBG923"))
+    fprintf(stderr,
+            "DBG923dir tubes=%lld node=%lld leaf=%lld pieces=%lld absorbed=%.5g emitted=%.5g\n",
+            (long long)fc->ntube, (long long)fc->dbg_node, (long long)fc->dbg_leaf,
+            (long long)fc->dbg_n, fc->absorbed, fc->emitted);
 }
 
 /* А1578: индекс клетки по оси — ТА ЖЕ конвенция, что pyr_axis_index в pyr.c
@@ -2218,7 +2912,30 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   memset(&ag, 0, sizeof ag);
   int nd = 0, d, it, rc = 0;
   double csec;
-  uint8_t *lpflo = NULL; /* §862: этажи (когда задан lpacc) */
+  uint8_t *lpflo = NULL;     /* §862: этажи (когда задан lpacc) — ПРОСТРАНСТВО СЛОТОВ */
+  uint8_t *lpflo_tri = NULL; /* §922/А1632: то же в пространстве ИСХОДНЫХ
+                              * треугольников — hz_pyr_set_lp читает
+                              * lp[pcs[u].tri] (А1491: слот ≠ треугольник);
+                              * прежняя передача lpflo напрямую давала этажи
+                              * не на своих кусках */
+  /* §923: раскладка кусков по уровням владения (только lpacc&&lpapply;
+   * agg-режим — прежний путь: списки уровней не сортированы по mtl) */
+  sw_lvl *lvls = NULL;
+  int32_t *lvls_loff = NULL;                    /* [nleaf+1] */
+  int32_t *lvl_off_all = NULL;                  /* плоские массивы уровней: анализатор не
+                                                 * держит nlev указателей (FP CWE-401) */
+  uint8_t *lvl_finer_all = NULL;                /* §923 */
+  int32_t *lvl_pool = NULL, *lvls_lpids = NULL; /* растятся в sw_levels_build */
+  int32_t lvl_pool_cap = 0, lvls_lpids_cap = 0;
+  /* §924: представители — метки want (дедуп гроздей) и агрегат Eprev */
+  int32_t *rep_want = NULL;
+  double *rep_ep = NULL;
+  /* §928: сбор калибровки k(r,ω) — числитель/знаменатель (HZ_KCALDUMP) */
+  double *knum = NULL, *kden = NULL;
+  const char *kcalpath = NULL;
+  int lvls_ready = 0; /* §923: списки собраны хоть раз; до того fc.lvls = NULL
+                       * (ловля §923-дым: it=0 шёл по ПУСТЫМ спискам — вся
+                       * эмиссия первой итерации терялась, E 0.0000 на it=1) */
 
   memset(st, 0, sizeof *st);
   if (!py || !area || !nrm || !kd || !o) return 1;
@@ -2236,6 +2953,21 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   rc = hz_sw_dir_table(o->ndirs, &tab, &nd);
   if (rc != 0) goto done;
   csec = py->cell * py->cell;
+
+  /* §928: сбор калибровки — только мир сбора (rep-карты есть, представители
+   * НЕ активны: o->reps_collect). Накопление — последняя итерация. */
+  kcalpath = getenv("HZ_KCALDUMP");
+  if (kcalpath != NULL && kcalpath[0] != '\0' && o->reps_collect && o->nrep > 0 &&
+      o->repof != NULL) {
+    knum = (double *)calloc((size_t)o->nrep * HZ_KCAL_NW, sizeof *knum);
+    kden = (double *)calloc((size_t)o->nrep * HZ_KCAL_NW, sizeof *kden);
+    if (!knum || !kden) { /* fail closed: мир без калибровки */
+      free(knum);
+      free(kden);
+      knum = NULL;
+      kden = NULL;
+    }
+  }
 
   Ed = (double *)calloc((size_t)nt, sizeof *Ed);
   Eprev = (double *)calloc((size_t)nt, sizeof *Eprev);
@@ -2256,6 +2988,52 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   if (o->mode == 3) { /* §893-b: пер-кусковый max пришедшего радианса */
     Linmax_prev = (double *)calloc((size_t)nt, sizeof *Linmax_prev);
     Linmax_cur = (double *)calloc((size_t)nt, sizeof *Linmax_cur);
+  }
+  if (o->mode == 3 && o->lpacc && o->lpapply && py->nlev > 0 && !o->agg) {
+    /* §924: буферы представителей — только живая лестница+walk;
+     * §928: reps_collect — представители НЕ активны (сбор в кусочном мире) */
+    if (o->nrep > 0 && o->walk && o->repof != NULL && !o->reps_collect) {
+      rep_want = (int32_t *)calloc((size_t)o->nrep, sizeof *rep_want);
+      rep_ep = (double *)calloc((size_t)o->nrep, sizeof *rep_ep);
+      if (!rep_want || !rep_ep) {
+        free(rep_want);
+        free(rep_ep);
+        rep_want = NULL;
+        rep_ep = NULL; /* fail closed: мир без представителей */
+      }
+    }
+    /* §923: раскладка по уровням владения. Динамическая лестница —
+     * единственный гейт (А1638: статика lp= и без-ключевой мир — прежние
+     * пути; agg — прежний путь, списки уровней не сортированы по mtl). */
+    int32_t nlv = py->nlev;
+    int64_t offcnt = 0, fincnt = 0;
+    for (int32_t l2 = 0; l2 < nlv; l2++) {
+      offcnt += (int64_t)py->nlev_nodes[l2] + 1;
+      fincnt += py->nlev_nodes[l2];
+    }
+    lvls = (sw_lvl *)calloc((size_t)nlv, sizeof *lvls);
+    lvl_off_all = (int32_t *)calloc((size_t)(offcnt > 0 ? offcnt : 1), sizeof *lvl_off_all);
+    lvl_finer_all = (uint8_t *)calloc((size_t)(fincnt > 0 ? fincnt : 1), 1);
+    lvls_loff = (int32_t *)calloc((size_t)py->nleaf + 1, sizeof *lvls_loff);
+    if (lvls && lvl_off_all && lvl_finer_all && lvls_loff) {
+      int64_t o2 = 0, f2 = 0;
+      for (int32_t l2 = 0; l2 < nlv; l2++) {
+        lvls[l2].n = py->nlev_nodes[l2];
+        lvls[l2].off = lvl_off_all + o2;
+        lvls[l2].finer = lvl_finer_all + f2;
+        o2 += (int64_t)py->nlev_nodes[l2] + 1;
+        f2 += py->nlev_nodes[l2];
+      }
+    } else { /* fail closed: мир без раскладки (прежние пути, §863-принцип) */
+      free(lvls);
+      lvls = NULL;
+      free(lvl_off_all);
+      lvl_off_all = NULL;
+      free(lvl_finer_all);
+      lvl_finer_all = NULL;
+      free(lvls_loff);
+      lvls_loff = NULL;
+    }
   }
   /* §911-6: прибор покрытия (HZ_COVDBG=1) — буферы владельца hz_sw_run */
   if (o->mode == 3 && sw_covdbg()) {
@@ -2320,7 +3098,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     }
   }
   if (o->mode == 3) { /* §852/А1564: штамп кратности 1 на (кусок, направление) */
-    pstamp = (int64_t *)calloc((size_t)nt, sizeof *pstamp);
+    pstamp = (int64_t *)calloc((size_t)nt + (size_t)(o->nrep > 0 ? o->nrep : 0),
+                               sizeof *pstamp); /* §924: +штампы представителей */
     bstart = (int32_t *)calloc((size_t)py->nleaf + 1, sizeof *bstart);
     if (o->walk) { /* §863: кэш списков кусков узлов */
       ncluster = (int64_t)py->nleaf;
@@ -2339,7 +3118,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       for (int64_t ci = 0; ci < ncluster; ci++)
         nstart[ci] = -1;
     }
-    leg_pstamp = (int64_t *)calloc((size_t)nt, sizeof *leg_pstamp);
+    leg_pstamp = (int64_t *)calloc((size_t)nt + (size_t)(o->nrep > 0 ? o->nrep : 0),
+                                   sizeof *leg_pstamp); /* §924 */
     if (!pstamp || !bstart || !leg_pstamp) {
       rc = 2;
       goto done;
@@ -2383,6 +3163,16 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     memset(Ed, 0, (size_t)nt * sizeof *Ed);
     for (p = 0; p < nt; p++)
       Eprev[p] = py->pcs[p].e;
+    if (rep_ep != NULL) { /* §924: агрегат Eprev детей по представителям */
+      for (int32_t r = 0; r < o->nrep; r++) {
+        double s = 0.0;
+        for (int32_t k = o->rep_koff[r]; k < o->rep_koff[r + 1]; k++) {
+          int32_t kid = o->rep_kmem[k];
+          s += area[kid] * Eprev[kid];
+        }
+        rep_ep[r] = o->rep_area[r] > 0.0 ? s / o->rep_area[r] : 0.0;
+      }
+    }
     { /* §893-b: swap пер-кускового максимума пришедшего радианса */
       double *swp = Linmax_prev;
       Linmax_prev = Linmax_cur;
@@ -2460,6 +3250,16 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.omcur[1] = om[1];
         fc.omcur[2] = om[2];
         fc.om = fc.omcur;
+        { /* §928: ω-бин = уровень μ квадратуры, схема HZ_KCAL_NW×1
+           * (таб. порядок i*nmu+m → imu = d % nmu); легаси 6/26 — бин 0 */
+          int nmu2 = o->ndirs > 100 ? o->ndirs % 100 : 0;
+          int imu2 = nmu2 > 0 ? d % nmu2 : 0;
+          fc.dir_bin = nmu2 > 0 ? imu2 * HZ_KCAL_NW / nmu2 : 0;
+          if (fc.dir_bin > HZ_KCAL_NW - 1) fc.dir_bin = HZ_KCAL_NW - 1;
+        }
+        fc.knum = (knum != NULL && it == o->iters - 1) ? knum : NULL; /* §928 */
+        fc.kden = (fc.knum != NULL) ? kden : NULL;
+        fc.kfloor = (const uint8_t *)lpflo; /* §928: NULL до первой конверсии */
         fc.w_d = w_d;
         fc.le = o->le;
         fc.lep = o->lep; /* А1576: per-piece эмиссия (NULL — прежний мир) */
@@ -2481,6 +3281,21 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.fld = fld; /* §864/Б1: кэш размеров уровней */
         fc.fldok = fldok;
         fc.agg = o->agg;
+        fc.lvls = lvls_ready ? lvls : NULL;             /* §923: до первой сборки — прежний мир */
+        fc.leaf_loff = lvls_ready ? lvls_loff : NULL;   /* §923 */
+        fc.leaf_lpids = lvls_ready ? lvls_lpids : NULL; /* §923 */
+        /* §924: представители активны только вместе с раскладкой */
+        fc.reps_on = (lvls_ready && rep_want != NULL);
+        fc.nt0 = nt;
+        fc.nrep = o->nrep;
+        fc.rep_koff = o->rep_koff;
+        fc.rep_kmem = o->rep_kmem;
+        fc.rep_area = o->rep_area;
+        fc.rep_rho = o->rep_rho;
+        fc.rep_le = o->rep_le;
+        fc.rep_atri = o->rep_atri;
+        fc.rep_nrm = o->rep_nrm;
+        fc.rep_ep = rep_ep;
         fc.ag = &ag;
         for (int32_t l2 = 0; l2 < py->nlev; l2++)
           fc.noff[l2] = noff[l2];
@@ -2739,6 +3554,24 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     st->lost = lost;
     if (o->mode != 3) st->traffic = (int64_t)nd * ((int64_t)nt * 36 + (int64_t)walks[0].n * 40);
     if (e_hist) e_hist[it] = st->e_avg;
+    { /* §924-дых: E по итерациям */
+      static int itdbg = -1;
+      if (itdbg < 0) itdbg = getenv("HZ_DBG924") != NULL;
+      if (itdbg) {
+        fprintf(stderr,
+                "DBG924it it=%d e_avg=%.4f absorbed=%.5g emitted=%.5g rep_hits=%lld SumLin=%lld\n",
+                it, st->e_avg, st->absorbed, st->emitted, (long long)g924_hits,
+                (long long)g924_lin);
+        if (g924_kclamp)
+          fprintf(stderr, "DBG924k clamp=%lld vis=%lld geohit=%lld\n", (long long)g924_kclamp,
+                  (long long)g924_vis, (long long)g924_geohit);
+        g924_kclamp = 0;
+        g924_vis = 0;
+        g924_geohit = 0;
+      }
+      g924_hits = 0;
+      g924_lin = 0;
+    }
     if (o->mode == 3 && o->lpacc && o->lpapply) { /* §862: этаж = целая часть */
       int32_t nup = 0;
       if (!lpflo) {
@@ -2747,6 +3580,11 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
             sizeof *lpflo); /* 0: первая
                              * конверсия честно посчитает смены относительно fine-этажа */
         if (!lpflo) {
+          rc = 2;
+          goto done;
+        }
+        lpflo_tri = (uint8_t *)calloc((size_t)nt, sizeof *lpflo_tri); /* §922/А1632 */
+        if (!lpflo_tri) {
           rc = 2;
           goto done;
         }
@@ -2774,6 +3612,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
           if (o->lpceil > 0 && fi > o->lpceil) fi = o->lpceil;
           if (lpflo[p] != (uint8_t)fi) nchg++;
           lpflo[p] = (uint8_t)fi;
+          lpflo_tri[py->pcs[p].tri] = (uint8_t)fi; /* §922/А1632: конверсия в tri-пространство */
           h[fi > 15 ? 15 : fi]++;
         }
         if (nchg > st->flochg_max) st->flochg_max = nchg;
@@ -2781,16 +3620,75 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         for (q = 0; q < 16; q++)
           st->flhist[q] = h[q];
       }
-      if (hz_pyr_set_lp(py, lpflo, &nup) != 0) {
+      if (hz_pyr_set_lp(py, lpflo_tri, &nup) != 0) { /* §922/А1632: tri-пространство */
         rc = 2;
         goto done;
+      }
+      if (lvls) { /* §923: перекладка кусков по уровням нового этажа */
+        int brc = sw_levels_build(py, o, lpflo, nt, lvls, &lvl_pool, &lvl_pool_cap, &lvls_lpids,
+                                  &lvls_lpids_cap, lvls_loff, bstart, bpids, rep_want);
+        if (brc == 0) lvls_ready = 1;
+        if (brc != 0) {
+          /* отказ памяти: fail closed — разбор раскладки, старый мир */
+          free(lvls);
+          lvls = NULL;
+          free(lvl_off_all);
+          lvl_off_all = NULL;
+          free(lvl_finer_all);
+          lvl_finer_all = NULL;
+          free(lvls_loff);
+          lvls_loff = NULL;
+        }
       }
     }
   }
 
+  if (knum != NULL) { /* §928: дамп числителя/знаменателя калибровки */
+    hz_kcal_hdr kh;
+    char p2[512];
+    memset(&kh, 0, sizeof kh);
+    memcpy(kh.magic, "KCAL928", sizeof kh.magic);
+    kh.nrep = o->nrep;
+    kh.nw = HZ_KCAL_NW;
+    if (snprintf(p2, sizeof p2, "%s.num", kcalpath) < (int)sizeof p2) {
+      FILE *f = fopen(p2, "wb");
+      if (f != NULL) {
+        fwrite(&kh, sizeof kh, 1, f);
+        fwrite(knum, sizeof *knum, (size_t)o->nrep * HZ_KCAL_NW, f);
+        fclose(f);
+      } else
+        fprintf(stderr, "§928: не открылся %s\n", p2);
+    }
+    if (snprintf(p2, sizeof p2, "%s.den", kcalpath) < (int)sizeof p2) {
+      FILE *f = fopen(p2, "wb");
+      if (f != NULL) {
+        fwrite(&kh, sizeof kh, 1, f);
+        fwrite(kden, sizeof *kden, (size_t)o->nrep * HZ_KCAL_NW, f);
+        fclose(f);
+      } else
+        fprintf(stderr, "§928: не открылся %s\n", p2);
+    }
+    fprintf(stderr, "§928: дамп калибровки %s.{num,den} (nrep=%d nw=%d)\n", kcalpath, (int)o->nrep,
+            HZ_KCAL_NW);
+  }
+
 done:
-  free(lpflo); /* §862 */
-  free(fld);   /* §864/Б1 */
+  free(lpflo);         /* §862 */
+  free(lpflo_tri);     /* §922/А1632 */
+  free(lvls);          /* §923 */
+  free(lvl_off_all);   /* §923: плоские массивы уровней */
+  free(lvl_finer_all); /* §923 */
+  free(lvl_pool);      /* §923 */
+  free(lvls_loff);     /* §923 */
+  free(lvls_lpids);    /* §923 */
+  free(rep_want);      /* §924 */
+  free(rep_ep);        /* §924 */
+  {
+    extern long g_kcdbg_pos;
+  }           /* tag */
+  free(knum); /* §928 */
+  free(kden); /* §928 */
+  free(fld);  /* §864/Б1 */
   free(fldok);
   free(Ed);
   free(Linmax_prev);

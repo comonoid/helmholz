@@ -53,6 +53,10 @@ build/pgather: tools/pgather.c src/nstruct/pyr.c src/nstruct/pyr.h src/nstruct/s
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pgather.c src/nstruct/pyr.c src/nstruct/sweep.c \
 	  src/scene_obj.c src/geom/kit.c -lm'
 
+#-- -- §928: сборка таблицы k(r,ω) из дампов эталона -- --
+build/kcalmk: tools/kcalmk.c src/nstruct/sweep.h | build
+	$(RUN) 'gcc $(CFLAGS) -I. -o $@ tools/kcalmk.c -lm'
+
 build/pref: tools/pref.c src/nstruct/pyr.c src/nstruct/pyr.h src/nstruct/sweep.c \
 	src/nstruct/sweep.h src/scene_obj.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pref.c src/nstruct/pyr.c src/nstruct/sweep.c src/scene_obj.c -lm'

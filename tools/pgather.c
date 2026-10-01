@@ -359,7 +359,7 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
 #define PG_RECV_CELL_CAP 512 /* кэп клеток на треугольник; крупнее — гиганты */
 #define PG_RECV_RMAX 8       /* колец поиска: 8·h покрывает ε уровня и стыки */
 #define PG_RECV_BTOL                                                                                     \
-  1e-9 /* строгая принадлежность: тай-полоса рёбер                    \
+  1e-9 /* строгая принадлежность: тай-полоса рёбер                                  \
         * разбирала бы носитель L0 по соседям и ломала битовое \
         * тождество; зазоры носителя закрывает fallback-центроид */
 
@@ -923,6 +923,434 @@ static double sh_clip_tri(const double tri[3][3], const double blo[3], const dou
   }
 }
 
+/* ---- §924: представители декимации на динамической лестнице ----
+ * Дети(R) = исходные треугольники, чей центроид лежит в R: PIP в плоскости
+ * с запасом + fallback ближайший центроид (как lookup приёмника §921).
+ * Всё в ПРОСТРАНСТВЕ ИСХОДНЫХ ТРЕУГОЛЬНИКОВ; слот-перестановка repof/kmem
+ * делается ПОСЛЕ Мортона отдельно. Приборы О1: nfall, maxkids. */
+typedef struct {
+  int32_t nrep;               /* Σ треугольников уровней L1.. */
+  int32_t nlev_r;             /* kk.nlev-1 */
+  int32_t *repof;             /* [nlev_r*nt]: offset_f + локальный id; -1 нет */
+  int32_t *koff;              /* [nrep+1] CSR детей */
+  int32_t *kmem;              /* [Σдетей] tri-индексы (до Мортона) */
+  double *rarea, *rrho, *rle; /* [nrep] агрегаты по детям */
+  double *rle_area_skip;      /* [nrep] Σ площадей эмиттеров (§924) */
+  double *ratri;              /* [nrep] площадь треугольника-носителя (§927) */
+  double *rnrm;               /* [3nrep] единичная нормаль носителя (§927) */
+  int64_t nfall;              /* О1: fallback-назначения */
+  int32_t maxkids;            /* О1 */
+} pg_reps;
+
+#define PG924_RMAX 12 /* колец поиска; крупнее §921: центроид может уйти дальше */
+
+typedef struct {
+  int64_t *hkey;
+  int32_t *hhead, *tnext;
+  int32_t nreg;
+  uint32_t hmask;
+  double gorg[3], ginv;
+} pg924_grid;
+
+static uint32_t pg924_hash(int64_t x, int64_t y, int64_t z) {
+  uint64_t h = (uint64_t)x * 0x9E3779B97F4A7C15ull ^ (uint64_t)y * 0xC2B2AE3D27D4EB4Full ^
+               (uint64_t)z * 0x165667B19E3779F9ull;
+  h ^= h >> 32;
+  return (uint32_t)h;
+}
+
+/* сетка по центроидам треугольников уровня; 0/память */
+static int pg924_grid_build(pg924_grid *g, const hz_kit_level *S) {
+  memset(g, 0, sizeof *g);
+  double lo[3] = {0, 0, 0}, hi[3] = {0, 0, 0};
+  double mean = 0.0;
+  for (uint32_t t = 0; t < S->ntris; t++) {
+    double cx = (S->vx[S->ti0[t]] + S->vx[S->ti1[t]] + S->vx[S->ti2[t]]) / 3.0;
+    double cy = (S->vy[S->ti0[t]] + S->vy[S->ti1[t]] + S->vy[S->ti1[t]] + S->vy[S->ti2[t]]) /
+                4.0; /* не используется */
+    (void)cy;
+    double cz = (S->vz[S->ti0[t]] + S->vz[S->ti1[t]] + S->vz[S->ti2[t]]) / 3.0;
+    double e0x = S->vx[S->ti1[t]] - S->vx[S->ti0[t]], e0y = S->vy[S->ti1[t]] - S->vy[S->ti0[t]],
+           e0z = S->vz[S->ti1[t]] - S->vz[S->ti0[t]];
+    double e1x = S->vx[S->ti2[t]] - S->vx[S->ti0[t]], e1y = S->vy[S->ti2[t]] - S->vy[S->ti0[t]],
+           e1z = S->vz[S->ti2[t]] - S->vz[S->ti0[t]];
+    double nx = e0y * e1z - e0z * e1y, ny = e0z * e1x - e0x * e1z, nz = e0x * e1y - e0y * e1x;
+    mean += 0.5 * sqrt(nx * nx + ny * ny + nz * nz);
+    if (t == 0 || cx < lo[0]) lo[0] = cx;
+    if (t == 0 || cy < lo[1]) lo[1] = cy;
+    if (t == 0 || cz < lo[2]) lo[2] = cz;
+    if (t == 0 || cx > hi[0]) hi[0] = cx;
+    if (t == 0 || cy > hi[1]) hi[1] = cy;
+    if (t == 0 || cz > hi[2]) hi[2] = cz;
+  }
+  if (S->ntris == 0) return 1;
+  mean /= (double)S->ntris;
+  double h = 2.0 * sqrt(mean > 0 ? mean : 1e-12);
+  for (int a = 0; a < 3; a++) {
+    g->gorg[a] = lo[a] - h;
+    g->ginv = 1.0 / h; /* одинаково по осям: h общий */
+  }
+  int64_t span[3];
+  double dom = 0;
+  for (int a = 0; a < 3; a++) {
+    span[a] = (int64_t)((hi[a] + h - g->gorg[a]) * g->ginv) + 2;
+    dom += (double)(span[a] > 0 ? span[a] : 1);
+  }
+  int64_t ncell = (int64_t)(dom * 2.0);
+  uint32_t cap = 1024;
+  while ((uint64_t)cap < (uint64_t)(S->ntris * 4 < ncell ? ncell : (int64_t)S->ntris * 4))
+    cap <<= 1;
+  g->hmask = cap - 1;
+  g->hkey = malloc((size_t)cap * sizeof *g->hkey);
+  g->hhead = malloc((size_t)cap * sizeof *g->hhead);
+  g->tnext = malloc((size_t)S->ntris * sizeof *g->tnext);
+  if (!g->hkey || !g->hhead || !g->tnext) {
+    free(g->hkey); /* частичные аллокации — не течь (CWE-401) */
+    free(g->hhead);
+    free(g->tnext);
+    g->hkey = NULL;
+    g->hhead = NULL;
+    g->tnext = NULL;
+    return 2;
+  }
+  for (uint32_t s = 0; s < cap; s++) {
+    g->hkey[s] = -1;
+    g->hhead[s] = -1;
+  }
+  g->nreg = 0;
+  for (uint32_t t = 0; t < S->ntris; t++) {
+    double cx = (S->vx[S->ti0[t]] + S->vx[S->ti1[t]] + S->vx[S->ti2[t]]) / 3.0;
+    double cy = (S->vy[S->ti0[t]] + S->vy[S->ti1[t]] + S->vy[S->ti2[t]]) / 3.0;
+    double cz = (S->vz[S->ti0[t]] + S->vz[S->ti1[t]] + S->vz[S->ti2[t]]) / 3.0;
+    int64_t ix = (int64_t)((cx - g->gorg[0]) * g->ginv),
+            iy = (int64_t)((cy - g->gorg[1]) * g->ginv),
+            iz = (int64_t)((cz - g->gorg[2]) * g->ginv);
+    int64_t key = ix * 73856093LL + iy * 19349663LL + iz * 83492791LL;
+    uint32_t s = pg924_hash(ix, iy, iz) & g->hmask;
+    while (g->hkey[s] != -1 && g->hkey[s] != key)
+      s = (s + 1) & g->hmask;
+    if (g->hkey[s] == -1) g->hkey[s] = key;
+    g->tnext[t] = g->hhead[s];
+    g->hhead[s] = (int32_t)t;
+    g->nreg++;
+  }
+  return 0;
+}
+
+static void pg924_grid_free(pg924_grid *g) {
+  free(g->hkey);
+  free(g->hhead);
+  free(g->tnext);
+}
+
+/* треугольник уровня, содержащий q: PIP (точный) либо ближайший
+ * центроид (fallback, считается). Возврат: id треугольника или -1. */
+static int32_t pg924_find(const pg924_grid *g, const hz_kit_level *S, const double q[3],
+                          double ptol, int *fallback) {
+  int64_t c0[3];
+  double bestD = HUGE_VAL; /* точный (PIP): min расстояния до плоскости */
+  double bd2 = HUGE_VAL;   /* fallback: min расстояния до центроида */
+  int32_t bestPIP = -1, bestNear = -1;
+  *fallback = 0;
+  for (int a = 0; a < 3; a++)
+    c0[a] = (int64_t)((q[a] - g->gorg[a]) * g->ginv);
+  for (int rad = 0; rad <= PG924_RMAX; rad++) {
+    for (int dz = -rad; dz <= rad; dz++)
+      for (int dy = -rad; dy <= rad; dy++)
+        for (int dx = -rad; dx <= rad; dx++) {
+          int mx = dx < 0 ? -dx : dx, my = dy < 0 ? -dy : dy, mz = dz < 0 ? -dz : dz;
+          int mr = mx > my ? (mx > mz ? mx : mz) : (my > mz ? my : mz);
+          if (mr != rad) continue; /* только оболочка кольца rad */
+          int64_t ix = c0[0] + dx, iy = c0[1] + dy, iz = c0[2] + dz;
+          int64_t key = ix * 73856093LL + iy * 19349663LL + iz * 83492791LL;
+          uint32_t s = pg924_hash(ix, iy, iz) & g->hmask;
+          while (g->hkey[s] != -1) {
+            if (g->hkey[s] == key) {
+              for (int32_t t = g->hhead[s]; t >= 0; t = g->tnext[t]) {
+                uint32_t i0 = S->ti0[t], i1 = S->ti1[t], i2 = S->ti2[t];
+                double x0 = S->vx[i0], y0 = S->vy[i0], z0 = S->vz[i0];
+                double e1x = S->vx[i1] - x0, e1y = S->vy[i1] - y0, e1z = S->vz[i1] - z0;
+                double e2x = S->vx[i2] - x0, e2y = S->vy[i2] - y0, e2z = S->vz[i2] - z0;
+                double wx = q[0] - x0, wy = q[1] - y0, wz = q[2] - z0;
+                double nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z,
+                       nz = e1x * e2y - e1y * e2x;
+                double n2 = nx * nx + ny * ny + nz * nz;
+                if (n2 > 1e-30) {
+                  double u = (wx * (e2y * nz - e2z * ny) + wy * (e2z * nx - e2x * nz) +
+                              wz * (e2x * ny - e2y * nx)) /
+                             n2;
+                  double v = (wx * (ny * e1z - nz * e1y) + wy * (nz * e1x - nx * e1z) +
+                              wz * (nx * e1y - ny * e1x)) /
+                             n2;
+                  double dn = wx * nx + wy * ny + wz * nz;
+                  double d2 = dn * dn / n2;
+                  if (u >= -1e-9 && v >= -1e-9 && u + v <= 1.0 + 1e-9 && d2 <= ptol * ptol &&
+                      d2 < bestD) {
+                    bestD = d2; /* первый попавшийся достаточно: тай-брейк
+                                 * копланарных не влияет на агрегаты */
+                    bestPIP = t;
+                  }
+                }
+                double gx = (S->vx[i0] + S->vx[i1] + S->vx[i2]) / 3.0;
+                double gy = (S->vy[i0] + S->vy[i1] + S->vy[i2]) / 3.0;
+                double gz = (S->vz[i0] + S->vz[i1] + S->vz[i2]) / 3.0;
+                double ddx = gx - q[0], ddy = gy - q[1], ddz = gz - q[2];
+                double dd2 = ddx * ddx + ddy * ddy + ddz * ddz;
+                if (dd2 < bd2) {
+                  bd2 = dd2;
+                  bestNear = t;
+                }
+              }
+            }
+            s = (s + 1) & g->hmask;
+          }
+        }
+    if (bestPIP >= 0) break; /* точное найдено — дальше не ищем */
+  }
+  if (bestPIP >= 0) return bestPIP;
+  *fallback = 1;
+  return bestNear;
+}
+
+/* Сборка представителей: repof по уровням (PIP/fallback), дети-CSR,
+ * агрегаты, расширение trivert/tribox (id rep = nt + j). 0 — ок. */
+static int pg_reps_build(pg_reps *R, const hz_kit *kk, int32_t nt, const double *area,
+                         const double *kd, const double *lep, double le, double **tv9_io,
+                         double **tb6_io) {
+  memset(R, 0, sizeof *R);
+  R->nlev_r = kk->nlev - 1;
+  if (R->nlev_r <= 0 || nt <= 0) return 1;
+  int32_t *off = (int32_t *)calloc((size_t)kk->nlev, sizeof *off); /* [li] → глобальная база */
+  R->repof = (int32_t *)malloc((size_t)R->nlev_r * (size_t)nt * sizeof *R->repof);
+  if (!off || !R->repof) {
+    free(off);
+    free(R->repof);
+    R->repof = NULL;
+    return 2;
+  }
+  for (int32_t j = 0; j < R->nlev_r * nt; j++)
+    R->repof[j] = -1;
+  /* глобальные id: L1 с нуля (L0 — НЕ представитель) */
+  for (int32_t li = 2; li < kk->nlev; li++)
+    off[li] = off[li - 1] + (int32_t)(int64_t)kk->lev[li - 1].ntris;
+  R->nrep = (kk->nlev >= 2) ? off[kk->nlev - 1] + (int32_t)(int64_t)kk->lev[kk->nlev - 1].ntris : 0;
+  const double *tv9 = *tv9_io; /* точные центроиды исходных треугольников */
+  for (int32_t li = 1; li < kk->nlev; li++) {
+    const hz_kit_level *S = &kk->lev[li];
+    pg924_grid g;
+    if (pg924_grid_build(&g, S) != 0) {
+      free(off);
+      free(R->repof);
+      R->repof = NULL;
+      return 2;
+    }
+    double ptol = 0.25 / g.ginv; /* четверть клетки: PIP в плоскости;
+                                  * допуск в метрах принимал ВЫСОТЫ (колонны
+                                  * проецировались на пол, ловля §924-дым) */
+    for (int32_t t = 0; t < nt; t++) {
+      int fb = 0;
+      double qc[3] = {
+          (tv9[9 * (int64_t)t] + tv9[9 * (int64_t)t + 3] + tv9[9 * (int64_t)t + 6]) / 3.0,
+          (tv9[9 * (int64_t)t + 1] + tv9[9 * (int64_t)t + 4] + tv9[9 * (int64_t)t + 7]) / 3.0,
+          (tv9[9 * (int64_t)t + 2] + tv9[9 * (int64_t)t + 5] + tv9[9 * (int64_t)t + 8]) / 3.0};
+      int32_t r = pg924_find(&g, S, qc, ptol, &fb);
+      if (r >= 0) {
+        R->repof[(li - 1) * nt + t] = off[li] + r;
+        if (fb) R->nfall++;
+      }
+    }
+    { /* §924-дых: раскладка уровня */
+      int32_t used = 0;
+      int32_t *seen = (int32_t *)calloc((size_t)S->ntris, sizeof *seen);
+      for (int32_t t = 0; t < nt; t++) {
+        int32_t r = R->repof[(li - 1) * nt + t];
+        if (r >= 0) {
+          used++;
+          if (r - off[li] >= 0 && (uint32_t)(r - off[li]) < S->ntris) seen[r - off[li]]++;
+        }
+      }
+      int32_t mx = 0, arg = -1;
+      for (uint32_t t = 0; t < S->ntris; t++)
+        if (seen[t] > mx) {
+          mx = seen[t];
+          arg = (int32_t)t;
+        }
+      fprintf(stderr, "DBG924 L%d: назначено %d/%d, maxkids=%d (tri %d из %u)\n", li, used, nt, mx,
+              arg, S->ntris);
+      if (arg >= 0 && mx > nt / 2) { /* аномалия: геометрия победителя */
+        uint32_t i0 = S->ti0[arg], i1 = S->ti1[arg], i2 = S->ti2[arg];
+        double blo[3] = {1e30, 1e30, 1e30}, bhi[3] = {-1e30, -1e30, -1e30};
+        uint32_t vi[3] = {i0, i1, i2};
+        for (int v = 0; v < 3; v++) {
+          double p[3] = {S->vx[vi[v]], S->vy[vi[v]], S->vz[vi[v]]};
+          for (int a = 0; a < 3; a++) {
+            if (p[a] < blo[a]) blo[a] = p[a];
+            if (p[a] > bhi[a]) bhi[a] = p[a];
+          }
+        }
+        fprintf(stderr,
+                "DBG924tri bbox=[%.2f..%.2f %.2f..%.2f %.2f..%.2f] "
+                "v=(%.2f,%.2f,%.2f)(%.2f,%.2f,%.2f)(%.2f,%.2f,%.2f)\n",
+                blo[0], bhi[0], blo[1], bhi[1], blo[2], bhi[2], S->vx[i0], S->vy[i0], S->vz[i0],
+                S->vx[i1], S->vy[i1], S->vz[i1], S->vx[i2], S->vy[i2], S->vz[i2]);
+      }
+      free(seen);
+    }
+    if (getenv("HZ_DBG924")) { /* одна точка под микроскопом */
+      int32_t t = nt / 2;
+      double qc[3] = {
+          (tv9[9 * (int64_t)t] + tv9[9 * (int64_t)t + 3] + tv9[9 * (int64_t)t + 6]) / 3.0,
+          (tv9[9 * (int64_t)t + 1] + tv9[9 * (int64_t)t + 4] + tv9[9 * (int64_t)t + 7]) / 3.0,
+          (tv9[9 * (int64_t)t + 2] + tv9[9 * (int64_t)t + 5] + tv9[9 * (int64_t)t + 8]) / 3.0};
+      int fb2 = 0;
+      int32_t r = pg924_find(&g, S, qc, ptol, &fb2);
+      int64_t cc[3];
+      for (int a = 0; a < 3; a++)
+        cc[a] = (int64_t)((qc[a] - g.gorg[a]) * g.ginv);
+      fprintf(stderr,
+              "DBG924one L%d t=%d q=(%.3f,%.3f,%.3f) cell=(%lld,%lld,%lld) h=%.3f ptol=%.4f -> %d "
+              "fb=%d\n",
+              li, t, qc[0], qc[1], qc[2], (long long)cc[0], (long long)cc[1], (long long)cc[2],
+              1.0 / g.ginv, ptol, r, fb2);
+      for (int probe = 0; probe < 3; probe++) {
+        int32_t t2 = probe == 0 ? 1000 : (probe == 1 ? 40000 : 90000);
+        if (t2 >= nt) continue;
+        double q2[3] = {
+            (tv9[9 * (int64_t)t2] + tv9[9 * (int64_t)t2 + 3] + tv9[9 * (int64_t)t2 + 6]) / 3.0,
+            (tv9[9 * (int64_t)t2 + 1] + tv9[9 * (int64_t)t2 + 4] + tv9[9 * (int64_t)t2 + 7]) / 3.0,
+            (tv9[9 * (int64_t)t2 + 2] + tv9[9 * (int64_t)t2 + 5] + tv9[9 * (int64_t)t2 + 8]) / 3.0};
+        int fb3 = 0;
+        int32_t r3 = pg924_find(&g, S, q2, ptol, &fb3);
+        fprintf(stderr, "DBG924one L%d t=%d q=(%.3f,%.3f,%.3f) -> %d fb=%d repof=%d\n", li, t2,
+                q2[0], q2[1], q2[2], r3, fb3, R->repof[(li - 1) * nt + t2]);
+      }
+    }
+    pg924_grid_free(&g);
+  }
+  /* дети-CSR + агрегаты */
+  int32_t *cnt = (int32_t *)calloc((size_t)R->nrep + 1, sizeof *cnt);
+  R->rarea = (double *)calloc((size_t)R->nrep, sizeof *R->rarea);
+  R->rrho = (double *)calloc((size_t)R->nrep, sizeof *R->rrho);
+  R->rle = (double *)calloc((size_t)R->nrep, sizeof *R->rle);
+  R->rle_area_skip = (double *)calloc((size_t)R->nrep, sizeof *R->rle_area_skip);
+  R->ratri = (double *)calloc((size_t)R->nrep, sizeof *R->ratri);
+  R->rnrm = (double *)calloc((size_t)3 * (size_t)(R->nrep > 0 ? R->nrep : 1), sizeof *R->rnrm);
+  R->kmem = (int32_t *)malloc((size_t)nt * (size_t)R->nlev_r * sizeof *R->kmem);
+  if (!cnt || !R->rarea || !R->rrho || !R->rle || !R->kmem || !R->rle_area_skip || !R->ratri ||
+      !R->rnrm) { /* один отказ-путь: всё снято, течей нет */
+    free(off);
+    free(cnt);
+    free(R->repof);
+    free(R->rarea);
+    free(R->rrho);
+    free(R->rle);
+    free(R->rle_area_skip);
+    free(R->ratri);
+    free(R->rnrm);
+    free(R->kmem);
+    R->repof = NULL;
+    return 2;
+  }
+  for (int32_t j = 0; j < R->nlev_r * nt; j++)
+    if (R->repof[j] >= 0) cnt[R->repof[j] + 1]++;
+  for (int32_t r = 0; r < R->nrep; r++)
+    cnt[r + 1] += cnt[r];
+  R->koff = cnt;
+  {
+    int32_t *fill = (int32_t *)malloc((size_t)R->nrep * sizeof *fill);
+    if (!fill) {
+      free(off);
+      return 2;
+    }
+    for (int32_t r = 0; r < R->nrep; r++)
+      fill[r] = R->koff[r];
+    for (int32_t li = 1; li < kk->nlev; li++)
+      for (int32_t t = 0; t < nt; t++) {
+        int32_t r = R->repof[(li - 1) * nt + t];
+        if (r < 0) continue;
+        R->kmem[fill[r]++] = t;
+        R->rarea[r] += area[t];
+        R->rrho[r] += kd[t] * area[t];
+        if (lep && lep[t] > 0.0)
+          R->rle_area_skip[r] += area[t]; /* §924: эмиттеры —
+                                           * свой le, не rep'а */
+        else if (lep)
+          R->rle[r] += lep[t] * area[t];
+      }
+    free(fill);
+  }
+  for (int32_t r = 0; r < R->nrep; r++) {
+    if (R->rarea[r] > 0) {
+      double anon = R->rarea[r] - R->rle_area_skip[r]; /* площадь не-эмиттеров */
+      R->rrho[r] /= R->rarea[r];
+      /* §924: как front_le = le + lep[p]: ГЛОБАЛЬНЫЙ le плюс средняя Ke
+       * (ловля: rle без le гасил источники, emitted=0) */
+      R->rle[r] = le + (lep ? (anon > 0 ? R->rle[r] / anon : 0.0) : 0.0);
+    } else {
+      R->rrho[r] = kd[0];
+      R->rle[r] = le;
+    }
+    int32_t k = R->koff[r + 1] - R->koff[r];
+    if (k > R->maxkids) R->maxkids = k;
+  }
+  /* расширение trivert/tribox: id rep = nt + j */
+  double *xtv9 = (double *)realloc(*tv9_io, (size_t)(nt + R->nrep) * 9 * sizeof *xtv9);
+  double *xtb6 = (double *)realloc(*tb6_io, (size_t)(nt + R->nrep) * 6 * sizeof *xtb6);
+  if (!xtv9 || !xtb6) {
+    free(off);
+    return 2;
+  }
+  *tv9_io = xtv9;
+  *tb6_io = xtb6;
+  for (int32_t li = 1; li < kk->nlev; li++) {
+    const hz_kit_level *S = &kk->lev[li];
+    for (uint32_t t = 0; t < S->ntris; t++) {
+      int64_t id = (int64_t)nt + off[li] + (int64_t)t;
+      double pp[3][3];
+      for (int v = 0; v < 3; v++) {
+        uint32_t vi = v == 0 ? S->ti0[t] : (v == 1 ? S->ti1[t] : S->ti2[t]);
+        pp[v][0] = S->vx[vi];
+        pp[v][1] = S->vy[vi];
+        pp[v][2] = S->vz[vi];
+      }
+      for (int aa = 0; aa < 9; aa++)
+        xtv9[9 * id + aa] = ((const double *)pp)[aa];
+      { /* §924: отношение площадей поверхность/носитель — компенсация
+         * перехвата (плоский rep ловит трубку 1 раз, гроздь — N) */
+        double e1x = pp[1][0] - pp[0][0], e1y = pp[1][1] - pp[0][1], e1z = pp[1][2] - pp[0][2];
+        double e2x = pp[2][0] - pp[0][0], e2y = pp[2][1] - pp[0][1], e2z = pp[2][2] - pp[0][2];
+        double nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z, nz = e1x * e2y - e1y * e2x;
+        double atri = 0.5 * sqrt(nx * nx + ny * ny + nz * nz);
+        {
+          int64_t rr = off[li] + (int64_t)t;
+          R->ratri[rr] = 0.5 * sqrt(nx * nx + ny * ny + nz * nz);
+          if (R->ratri[rr] > 1e-30) { /* §927: нормаль носителя */
+            double inv = 1.0 / (2.0 * R->ratri[rr]);
+            R->rnrm[3 * rr] = nx * inv;
+            R->rnrm[3 * rr + 1] = ny * inv;
+            R->rnrm[3 * rr + 2] = nz * inv;
+          } else {
+            R->rnrm[3 * rr] = 0.0;
+            R->rnrm[3 * rr + 1] = 1.0;
+            R->rnrm[3 * rr + 2] = 0.0;
+          }
+        }
+      }
+      for (int a2 = 0; a2 < 3; a2++) {
+        double lo = pp[0][a2], hi2 = pp[0][a2];
+        for (int v = 1; v < 3; v++) {
+          if (pp[v][a2] < lo) lo = pp[v][a2];
+          if (pp[v][a2] > hi2) hi2 = pp[v][a2];
+        }
+        xtb6[6 * id + a2] = lo;
+        xtb6[6 * id + 3 + a2] = hi2;
+      }
+    }
+  }
+  free(off);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   const char *path = NULL, *outfile = "img/pgather.ppm";
   /* §875: дефолты потребителя — ПРОДАКШН-МОДЕЛЬ (дихотомия ks §873/874,
@@ -970,9 +1398,18 @@ int main(int argc, char **argv) {
   double *qparea = NULL; /* §911-13-3: площадь родительского tri для depden */
   /* §867: данные mode=3, заполняются до memset(&so) — см. блок trivert */
   double *g_tv9 = NULL, *g_tb6 = NULL;
+  double *g_kcal_tab = NULL; /* §928: таблица kcal= (владелец, живёт до конца) */
   uint8_t *g_lparr = NULL;
   int32_t *g_strip_start = NULL, *g_strip_list = NULL; /* §911-13-3 */
-  int gather = 0; /* §849: 0 — DDA (умолчание), 1 — brute (путь верификации) */
+  pg_reps reps;                                        /* §924 */
+  hz_kit kk; /* §924: живёт до сборки представителей (use_reps) */
+  hz_kit_init(&kk);
+  int use_reps = 0;            /* §924: выставляется в kit-ветке (adapt, без zone) */
+  int use_kit_l0 = 0;          /* §924: кит с уровнями как L0-меш (adapt, без zone) */
+  int reps_collect = 0;        /* §928: HZ_KCALDUMP — карты репов для СБОРА калибровки,
+                                * представители в свипе НЕ активны (мир §923) */
+  const char *kcalpath = NULL; /* §928: kcal= — таблица k(r,ωbin) */
+  int gather = 0;              /* §849: 0 — DDA (умолчание), 1 — brute (путь верификации) */
   pg_bbox_csr csr;
   int64_t dda_steps = 0, dda_tested = 0, sec_rays = 0;
 
@@ -1060,6 +1497,8 @@ int main(int argc, char **argv) {
       cdelta = atof(argv[i] + 7);
     else if (strncmp(argv[i], "lpceil=", 7) == 0)
       lpceil = atoi(argv[i] + 7);
+    else if (strncmp(argv[i], "kcal=", 5) == 0)
+      kcalpath = argv[i] + 5; /* §928: таблица калибровки k(r,ωbin) */
     else
       path = argv[i];
   }
@@ -1086,7 +1525,7 @@ int main(int argc, char **argv) {
     /* §914-Ш4: кит → hz_objmesh ПОБАЙТОВО (v/f/fm/mtl); дальше весь путь
      * pgather НЕ меняется — паритет по построению. Требуется F64:
      * округление вершин сломало бы битовые якоря. */
-    hz_kit kk;
+    /* kk объявлена в scope main (§924) */
     FILE *kf = fopen(kitpath, "rb");
     t0 = now_sec();
     int krc = kf != NULL ? hz_kit_load(&kk, kf) : HZ_KIT_E_IO;
@@ -1105,7 +1544,15 @@ int main(int argc, char **argv) {
       hz_kit_free(&kk);
       return 2;
     }
-    if (kk.nlev > 1 && zone <= 0) {
+    /* §924: adapt+без zone — меш из L0; HZ_NOREPS — то же, но представители
+     * не передаются свипу (диагностический мир §923) */
+    use_kit_l0 = (kk.nlev > 1 && zone <= 0 && adapt && !clip);
+    /* §924-М2: до §925 (кольца) reps — ТОЛЬКО явное включение HZ_REPS=1:
+     * энерго-канон плоского носителя не закрыт (см. таблицу §924-М2).
+     * §928: HZ_KCALDUMP — собрать калибровку в кусочном мире (без HZ_REPS) */
+    reps_collect = (use_kit_l0 && getenv("HZ_KCALDUMP") != NULL);
+    use_reps = use_kit_l0 && getenv("HZ_REPS") != NULL && !reps_collect;
+    if (kk.nlev > 1 && zone <= 0 && !use_kit_l0) {
       fprintf(stderr, "pgather: kit= с nlev>1 требует zone=R (fail-closed, §915-R3)\n");
       hz_kit_free(&kk);
       return 2;
@@ -1120,7 +1567,10 @@ int main(int argc, char **argv) {
       nvtot += kk.lev[li].nverts;
     }
     uint32_t ntsel = 0;
-    if (kk.nlev > 1) {
+    if (use_kit_l0) { /* §924: меш = L0 целиком; уровни —
+                       * представителям (после пирамиды) */
+      ntsel = kk.lev[0].ntris;
+    } else if (kk.nlev > 1) {
       for (int32_t li = 0; li < kk.nlev; li++) {
         const hz_kit_level *S = &kk.lev[li];
         for (uint32_t t = 0; t < S->ntris; t++) {
@@ -1141,7 +1591,7 @@ int main(int argc, char **argv) {
       }
     }
     const hz_kit_level *KL = &kk.lev[0];
-    m.nv = (int32_t)(kk.nlev > 1 ? nvtot : KL->nverts);
+    m.nv = (int32_t)(kk.nlev > 1 && !use_kit_l0 ? nvtot : KL->nverts);
     m.nt = (int32_t)(kk.nlev > 1 ? (int32_t)ntsel : (int32_t)KL->ntris);
     m.nmtl = (int32_t)kk.nmtl;
     m.v = malloc(3 * (size_t)m.nv * sizeof *m.v);
@@ -1158,7 +1608,7 @@ int main(int argc, char **argv) {
       hz_kit_free(&kk);
       return 2;
     }
-    for (int32_t li = 0; li < kk.nlev; li++) {
+    for (int32_t li = 0; li < kk.nlev && (li == 0 || !use_kit_l0); li++) { /* §924: reps — L0 */
       const hz_kit_level *S = &kk.lev[li];
       for (uint32_t v = 0; v < S->nverts; v++) {
         int64_t dv = (int64_t)(vbase[li] + v);
@@ -1167,7 +1617,7 @@ int main(int argc, char **argv) {
         m.v[3 * dv + 2] = S->vz[v];
       }
     }
-    if (kk.nlev == 1) {
+    if (kk.nlev == 1 || use_kit_l0) {
       for (int32_t t = 0; t < m.nt; t++) {
         m.f[3 * (int64_t)t] = (int32_t)KL->ti0[t];
         m.f[3 * (int64_t)t + 1] = (int32_t)KL->ti1[t];
@@ -1217,7 +1667,7 @@ int main(int argc, char **argv) {
         if (v == 0 || c < m.lo[ax]) m.lo[ax] = c;
         if (v == 0 || c > m.hi[ax]) m.hi[ax] = c;
       }
-    hz_kit_free(&kk);
+    if (!use_kit_l0) hz_kit_free(&kk); /* §924: кит живёт до сборки представителей */
     t1 = now_sec();
     printf("СТАТЬЯ kit-загрузка: %.2f с (nt=%d, mtl=%d) [§914-Ш4]\n", t1 - t0, m.nt, m.nmtl);
   } else if (path) {
@@ -1594,6 +2044,18 @@ int main(int argc, char **argv) {
     g_tb6 = tb6;
     g_lparr = lparr;
   }
+  if (use_kit_l0) { /* §924: представители (тре-пространство, до Мортона);
+                     * заодно расширяет g_tv9/g_tb6 (id rep = nt + j) */
+    if (pg_reps_build(&reps, &kk, m.nt, area, kd, lep, le, &g_tv9, &g_tb6) != 0) {
+      fprintf(stderr, "pgather: представители не построились — мир без них (fail closed)\n");
+      memset(&reps, 0, sizeof reps);
+    } else {
+      printf("§924 ПРЕДСТАВИТЕЛИ: %d (уровней %d), fallback=%.2f%%, maxkids=%d\n", (int)reps.nrep,
+             (int)reps.nlev_r, 100.0 * (double)reps.nfall / ((double)m.nt * (double)reps.nlev_r),
+             (int)reps.maxkids);
+    }
+    hz_kit_free(&kk);
+  }
   int32_t nb = clip ? NP : m.nt;
   const double *bcmin = clip ? qcmin : cmin;
   const double *bcmax = clip ? qcmax : cmax;
@@ -1615,6 +2077,27 @@ int main(int argc, char **argv) {
        (qparea && hz_pyr_permute(&py, qparea, sizeof *qparea) != 0))) { /* §874/А1581, §911-13-3 */
     fprintf(stderr, "pgather: Morton не прошёл\n");
     return 2;
+  }
+  if ((use_reps || reps_collect) &&
+      reps.repof !=
+          NULL) { /* §924: слот-перестановка
+                   * repof/kmem; §928: нужна и для сбора (repof в слот-пространстве читает свип) */
+    for (int32_t li = 0; li < reps.nlev_r; li++)
+      if (hz_pyr_permute(&py, reps.repof + (size_t)li * (size_t)m.nt, sizeof(int32_t)) != 0) {
+        fprintf(stderr, "pgather: permute repof — не прошёл\n");
+        return 2;
+      }
+    if (py.perm != NULL) { /* kmem: tri → слот */
+      int32_t *invp = (int32_t *)malloc((size_t)m.nt * sizeof *invp);
+      if (invp != NULL) {
+        for (int32_t s2 = 0; s2 < m.nt; s2++)
+          invp[py.perm[s2]] = s2;
+        int64_t tot = reps.koff[reps.nrep];
+        for (int64_t q2 = 0; q2 < tot; q2++)
+          if (reps.kmem[q2] >= 0 && reps.kmem[q2] < m.nt) reps.kmem[q2] = invp[reps.kmem[q2]];
+        free(invp);
+      }
+    }
   }
   if (clip) { /* §911-13-3: CSR «tri → полоски» ПОСЛЕ Мортона, в
                * пермутированных слотах (pcs[p].tri = исходный tri) */
@@ -1686,6 +2169,48 @@ int main(int argc, char **argv) {
     if (ksdiff) {
       so.accum_mode = 5; /* §918: Δ = 1−ks_eff — счёт ДИФФУЗНЫХ отскоков */
       so.ks = ks;        /* ks[p] есть при ksf>0; при NULL — все диффузные */
+    }
+  }
+  if ((use_reps || reps_collect) && reps.repof != NULL) { /* §924: представители в свип */
+    so.nrep = reps.nrep;
+    so.rep_koff = reps.koff;
+    so.rep_kmem = reps.kmem;
+    so.rep_area = reps.rarea;
+    so.rep_rho = reps.rrho;
+    so.rep_le = reps.rle;
+    so.rep_atri = reps.ratri;
+    so.rep_nrm = reps.rnrm;
+    so.repof = reps.repof;
+    so.rep_nlev = reps.nlev_r;
+    so.reps_collect = reps_collect && !use_reps; /* §928 */
+    if (use_reps && kcalpath != NULL) {          /* §928: таблица калибровки k(r,ωbin) */
+      hz_kcal_hdr kh;
+      FILE *kf = fopen(kcalpath, "rb");
+      double *kt = NULL;
+      if (kf == NULL) {
+        fprintf(stderr, "pgather: kcal=%s не открылся\n", kcalpath);
+        return 2;
+      }
+      if (fread(&kh, sizeof kh, 1, kf) != 1 || memcmp(kh.magic, "KCAL928", 8) != 0 ||
+          kh.nrep != reps.nrep || kh.nw != HZ_KCAL_NW) {
+        fprintf(stderr, "pgather: kcal=%s: битый заголовок (nrep %d≠%d или nw %d≠%d)\n", kcalpath,
+                (int)kh.nrep, (int)reps.nrep, (int)kh.nw, HZ_KCAL_NW);
+        fclose(kf);
+        return 2;
+      }
+      kt = (double *)malloc((size_t)reps.nrep * HZ_KCAL_NW * sizeof *kt);
+      if (kt == NULL || fread(kt, sizeof *kt, (size_t)reps.nrep * HZ_KCAL_NW, kf) !=
+                            (size_t)reps.nrep * HZ_KCAL_NW) {
+        fprintf(stderr, "pgather: kcal=%s: битый массив\n", kcalpath);
+        free(kt);
+        fclose(kf);
+        return 2;
+      }
+      fclose(kf);
+      g_kcal_tab = kt; /* владелец — free в конце (урок CWE-401 §874) */
+      so.kcal = kt;
+      printf("§928 kcal: %s загружена (nrep=%d nw=%d)\n", kcalpath, (int)reps.nrep,
+             (int)HZ_KCAL_NW);
     }
   }
   so.domhi = m.hi;
@@ -2378,9 +2903,19 @@ int main(int argc, char **argv) {
   } /* §877: ходьба */
 
   free(lum);
+  free(reps.repof); /* §924 */
+  free(reps.koff);
+  free(reps.kmem);
+  free(reps.rarea);
+  free(reps.rrho);
+  free(reps.rle);
+  free(reps.rle_area_skip);
+  free(reps.ratri);
+  free(reps.rnrm);
   free(g_tv9); /* §874: утечка trivert/tribox/lp (предсуществующая с §867,
                 * поймана ASAN при прогоне §874) */
   free(g_tb6);
+  free(g_kcal_tab); /* §928 */
   free(g_lparr);
   free(kitlvl);      /* §915-R3 */
   if (rcv != NULL) { /* §921: приёмник */

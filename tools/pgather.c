@@ -359,7 +359,7 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
 #define PG_RECV_CELL_CAP 512 /* кэп клеток на треугольник; крупнее — гиганты */
 #define PG_RECV_RMAX 8       /* колец поиска: 8·h покрывает ε уровня и стыки */
 #define PG_RECV_BTOL                                                                                     \
-  1e-9 /* строгая принадлежность: тай-полоса рёбер                                  \
+  1e-9 /* строгая принадлежность: тай-полоса рёбер                    \
         * разбирала бы носитель L0 по соседям и ломала битовое \
         * тождество; зазоры носителя закрывает fallback-центроид */
 
@@ -945,13 +945,21 @@ typedef struct {
 #define PG924_RMAX 12 /* колец поиска; крупнее §921: центроид может уйти дальше */
 
 typedef struct {
-  int64_t *hkey;
-  int32_t *hhead, *tnext;
+  int32_t *dhead, *tnext; /* §929-Х1b: ПРЯМАЯ сетка head[ncell] + цепочки;
+                           * порядок цепочек = вставка по возрастанию t
+                           * (тот же, что у хэш-версии), порядок обхода
+                           * ячеек — таблицей оболочек: побитово то же */
+  int64_t gnx, gny, gnz;  /* размеры сетки (span) */
+  int64_t ncell;
   int32_t nreg;
-  uint32_t hmask;
   double gorg[3], ginv;
+  double *rmax; /* §929-Х3: max |вершина − центроид| на треугольник —
+                 * предфильтр ПИП (консервативный, побитово безопасный) */
 } pg924_grid;
 
+/* §929-Х1: препcomputed-обход shells rad=0..PG924_RMAX в ТОМ же порядке
+ * (dx,dy,dz по возрастанию Chebyshev-кольца), что и тройной цикл —
+ * убирает ~12× мусорных итераций фильтра mr!=rad. */
 static uint32_t pg924_hash(int64_t x, int64_t y, int64_t z) {
   uint64_t h = (uint64_t)x * 0x9E3779B97F4A7C15ull ^ (uint64_t)y * 0xC2B2AE3D27D4EB4Full ^
                (uint64_t)z * 0x165667B19E3779F9ull;
@@ -991,60 +999,99 @@ static int pg924_grid_build(pg924_grid *g, const hz_kit_level *S) {
     g->ginv = 1.0 / h; /* одинаково по осям: h общий */
   }
   int64_t span[3];
-  double dom = 0;
-  for (int a = 0; a < 3; a++) {
+  for (int a = 0; a < 3; a++)
     span[a] = (int64_t)((hi[a] + h - g->gorg[a]) * g->ginv) + 2;
-    dom += (double)(span[a] > 0 ? span[a] : 1);
-  }
-  int64_t ncell = (int64_t)(dom * 2.0);
-  uint32_t cap = 1024;
-  while ((uint64_t)cap < (uint64_t)(S->ntris * 4 < ncell ? ncell : (int64_t)S->ntris * 4))
-    cap <<= 1;
-  g->hmask = cap - 1;
-  g->hkey = malloc((size_t)cap * sizeof *g->hkey);
-  g->hhead = malloc((size_t)cap * sizeof *g->hhead);
-  g->tnext = malloc((size_t)S->ntris * sizeof *g->tnext);
-  if (!g->hkey || !g->hhead || !g->tnext) {
-    free(g->hkey); /* частичные аллокации — не течь (CWE-401) */
-    free(g->hhead);
+  g->gnx = span[0] > 1 ? span[0] : 1;
+  g->gny = span[1] > 1 ? span[1] : 1;
+  g->gnz = span[2] > 1 ? span[2] : 1;
+  g->ncell = g->gnx * g->gny * g->gnz; /* §929-Х1b: dense, без хэша */
+  g->dhead = (int32_t *)malloc((size_t)g->ncell * sizeof *g->dhead);
+  g->tnext = (int32_t *)malloc((size_t)S->ntris * sizeof *g->tnext);
+  if (!g->dhead || !g->tnext) {
+    free(g->dhead);
     free(g->tnext);
-    g->hkey = NULL;
-    g->hhead = NULL;
+    g->dhead = NULL;
     g->tnext = NULL;
     return 2;
   }
-  for (uint32_t s = 0; s < cap; s++) {
-    g->hkey[s] = -1;
-    g->hhead[s] = -1;
-  }
+  for (int64_t s = 0; s < g->ncell; s++)
+    g->dhead[s] = -1;
   g->nreg = 0;
+  g->rmax = (double *)malloc((size_t)S->ntris * sizeof *g->rmax); /* §929-Х3 */
+  if (g->rmax == NULL) {
+    free(g->dhead); /* §929-Х1b */
+    free(g->tnext);
+    g->dhead = NULL;
+    g->tnext = NULL;
+    return 2;
+  }
   for (uint32_t t = 0; t < S->ntris; t++) {
     double cx = (S->vx[S->ti0[t]] + S->vx[S->ti1[t]] + S->vx[S->ti2[t]]) / 3.0;
     double cy = (S->vy[S->ti0[t]] + S->vy[S->ti1[t]] + S->vy[S->ti2[t]]) / 3.0;
     double cz = (S->vz[S->ti0[t]] + S->vz[S->ti1[t]] + S->vz[S->ti2[t]]) / 3.0;
+    { /* §929-Х3: радиус треугольника от центроида */
+      double ax = S->vx[S->ti0[t]] - cx, ay = S->vy[S->ti0[t]] - cy, az = S->vz[S->ti0[t]] - cz;
+      double bx = S->vx[S->ti1[t]] - cx, by = S->vy[S->ti1[t]] - cy, bz = S->vz[S->ti1[t]] - cz;
+      double ex = S->vx[S->ti2[t]] - cx, ey = S->vy[S->ti2[t]] - cy, ez = S->vz[S->ti2[t]] - cz;
+      double ra = sqrt(ax * ax + ay * ay + az * az), rb = sqrt(bx * bx + by * by + bz * bz),
+             rc = sqrt(ex * ex + ey * ey + ez * ez);
+      g->rmax[t] = ra > rb ? (ra > rc ? ra : rc) : (rb > rc ? rb : rc);
+    }
     int64_t ix = (int64_t)((cx - g->gorg[0]) * g->ginv),
             iy = (int64_t)((cy - g->gorg[1]) * g->ginv),
             iz = (int64_t)((cz - g->gorg[2]) * g->ginv);
-    int64_t key = ix * 73856093LL + iy * 19349663LL + iz * 83492791LL;
-    uint32_t s = pg924_hash(ix, iy, iz) & g->hmask;
-    while (g->hkey[s] != -1 && g->hkey[s] != key)
-      s = (s + 1) & g->hmask;
-    if (g->hkey[s] == -1) g->hkey[s] = key;
-    g->tnext[t] = g->hhead[s];
-    g->hhead[s] = (int32_t)t;
+    if (ix < 0) ix = 0; /* центроиды внутри [lo,hi] с запасом — на всякий */
+    if (iy < 0) iy = 0;
+    if (iz < 0) iz = 0;
+    if (ix >= g->gnx) ix = g->gnx - 1;
+    if (iy >= g->gny) iy = g->gny - 1;
+    if (iz >= g->gnz) iz = g->gnz - 1;
+    int64_t s = ix + g->gnx * (iy + g->gny * iz);
+    g->tnext[t] = g->dhead[s];
+    g->dhead[s] = (int32_t)t;
     g->nreg++;
   }
   return 0;
 }
 
 static void pg924_grid_free(pg924_grid *g) {
-  free(g->hkey);
-  free(g->hhead);
+  free(g->dhead); /* §929-Х1b */
   free(g->tnext);
+  free(g->rmax); /* §929-Х3 */
+}
+
+/* §929-Х1: статические таблицы обхода: смещения (dx,dy,dz) всех
+ * оболочек 0..RMAX в порядке тройного цикла (mr==rad) + границы колец —
+ * тот же порядок посещения ячеек, что до оптимизации (побитово). */
+static const int16_t (*pg924_shells(const uint8_t **shring))[3] {
+  static int16_t tab[(2 * PG924_RMAX + 1) * (2 * PG924_RMAX + 1) * (2 * PG924_RMAX + 1)][3];
+  static uint8_t ring[(2 * PG924_RMAX + 1) * (2 * PG924_RMAX + 1) * (2 * PG924_RMAX + 1)];
+  static int n = -1;
+  if (n < 0) {
+    n = 0;
+    for (int rad = 0; rad <= PG924_RMAX; rad++) {
+      for (int dz = -rad; dz <= rad; dz++)
+        for (int dy = -rad; dy <= rad; dy++)
+          for (int dx = -rad; dx <= rad; dx++) {
+            int mx = dx < 0 ? -dx : dx, my = dy < 0 ? -dy : dy, mz = dz < 0 ? -dz : dz;
+            int mr = mx > my ? (mx > mz ? mx : mz) : (my > mz ? my : mz);
+            if (mr != rad) continue;
+            tab[n][0] = (int16_t)dx;
+            tab[n][1] = (int16_t)dy;
+            tab[n][2] = (int16_t)dz;
+            ring[n] = (uint8_t)rad;
+            n++;
+          }
+    }
+  }
+  if (shring != NULL) *shring = ring;
+  return tab;
 }
 
 /* треугольник уровня, содержащий q: PIP (точный) либо ближайший
- * центроид (fallback, считается). Возврат: id треугольника или -1. */
+ * центроид (fallback, считается). Возврат: id треугольника или -1.
+ * §929: обход по таблице (тот же порядок); ПИП — только если радиус
+ * треугольника достаёт до q (консервативный предфильтр, Х3). */
 static int32_t pg924_find(const pg924_grid *g, const hz_kit_level *S, const double q[3],
                           double ptol, int *fallback) {
   int64_t c0[3];
@@ -1054,58 +1101,58 @@ static int32_t pg924_find(const pg924_grid *g, const hz_kit_level *S, const doub
   *fallback = 0;
   for (int a = 0; a < 3; a++)
     c0[a] = (int64_t)((q[a] - g->gorg[a]) * g->ginv);
-  for (int rad = 0; rad <= PG924_RMAX; rad++) {
-    for (int dz = -rad; dz <= rad; dz++)
-      for (int dy = -rad; dy <= rad; dy++)
-        for (int dx = -rad; dx <= rad; dx++) {
-          int mx = dx < 0 ? -dx : dx, my = dy < 0 ? -dy : dy, mz = dz < 0 ? -dz : dz;
-          int mr = mx > my ? (mx > mz ? mx : mz) : (my > mz ? my : mz);
-          if (mr != rad) continue; /* только оболочка кольца rad */
-          int64_t ix = c0[0] + dx, iy = c0[1] + dy, iz = c0[2] + dz;
-          int64_t key = ix * 73856093LL + iy * 19349663LL + iz * 83492791LL;
-          uint32_t s = pg924_hash(ix, iy, iz) & g->hmask;
-          while (g->hkey[s] != -1) {
-            if (g->hkey[s] == key) {
-              for (int32_t t = g->hhead[s]; t >= 0; t = g->tnext[t]) {
-                uint32_t i0 = S->ti0[t], i1 = S->ti1[t], i2 = S->ti2[t];
-                double x0 = S->vx[i0], y0 = S->vy[i0], z0 = S->vz[i0];
-                double e1x = S->vx[i1] - x0, e1y = S->vy[i1] - y0, e1z = S->vz[i1] - z0;
-                double e2x = S->vx[i2] - x0, e2y = S->vy[i2] - y0, e2z = S->vz[i2] - z0;
-                double wx = q[0] - x0, wy = q[1] - y0, wz = q[2] - z0;
-                double nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z,
-                       nz = e1x * e2y - e1y * e2x;
-                double n2 = nx * nx + ny * ny + nz * nz;
-                if (n2 > 1e-30) {
-                  double u = (wx * (e2y * nz - e2z * ny) + wy * (e2z * nx - e2x * nz) +
-                              wz * (e2x * ny - e2y * nx)) /
-                             n2;
-                  double v = (wx * (ny * e1z - nz * e1y) + wy * (nz * e1x - nx * e1z) +
-                              wz * (nx * e1y - ny * e1x)) /
-                             n2;
-                  double dn = wx * nx + wy * ny + wz * nz;
-                  double d2 = dn * dn / n2;
-                  if (u >= -1e-9 && v >= -1e-9 && u + v <= 1.0 + 1e-9 && d2 <= ptol * ptol &&
-                      d2 < bestD) {
-                    bestD = d2; /* первый попавшийся достаточно: тай-брейк
-                                 * копланарных не влияет на агрегаты */
-                    bestPIP = t;
-                  }
-                }
-                double gx = (S->vx[i0] + S->vx[i1] + S->vx[i2]) / 3.0;
-                double gy = (S->vy[i0] + S->vy[i1] + S->vy[i2]) / 3.0;
-                double gz = (S->vz[i0] + S->vz[i1] + S->vz[i2]) / 3.0;
-                double ddx = gx - q[0], ddy = gy - q[1], ddz = gz - q[2];
-                double dd2 = ddx * ddx + ddy * ddy + ddz * ddz;
-                if (dd2 < bd2) {
-                  bd2 = dd2;
-                  bestNear = t;
-                }
-              }
+  const uint8_t *ring;
+  const int16_t (*sh)[3] = pg924_shells(&ring);
+  const int nsh = (2 * PG924_RMAX + 1) * (2 * PG924_RMAX + 1) * (2 * PG924_RMAX + 1);
+  for (int si = 0; si < nsh; si++) {
+    int64_t ix = c0[0] + sh[si][0], iy = c0[1] + sh[si][1], iz = c0[2] + sh[si][2];
+    if (ix < 0 || iy < 0 || iz < 0 || ix >= g->gnx || iy >= g->gny || iz >= g->gnz) continue;
+    int64_t s = ix + g->gnx * (iy + g->gny * iz); /* §929-Х1b: dense */
+    {
+      {
+        for (int32_t t = g->dhead[s]; t >= 0; t = g->tnext[t]) {
+          uint32_t i0 = S->ti0[t], i1 = S->ti1[t], i2 = S->ti2[t];
+          double x0 = S->vx[i0], y0 = S->vy[i0], z0 = S->vz[i0];
+          double gx = (x0 + S->vx[i1] + S->vx[i2]) / 3.0;
+          double gy = (y0 + S->vy[i1] + S->vy[i2]) / 3.0;
+          double gz = (z0 + S->vz[i1] + S->vz[i2]) / 3.0;
+          double ddx = gx - q[0], ddy = gy - q[1], ddz = gz - q[2];
+          double dd2 = ddx * ddx + ddy * ddy + ddz * ddz;
+          if (dd2 < bd2) {
+            bd2 = dd2;
+            bestNear = t;
+          }
+          { /* §929-Х3: дальний по центроиду треугольник своего радиуса
+             * не достанет — ПИП невозможен, пропускаем арифметику */
+            double rr = g->rmax[t] + ptol;
+            if (dd2 > rr * rr) continue;
+          }
+          double e1x = S->vx[i1] - x0, e1y = S->vy[i1] - y0, e1z = S->vz[i1] - z0;
+          double e2x = S->vx[i2] - x0, e2y = S->vy[i2] - y0, e2z = S->vz[i2] - z0;
+          double wx = q[0] - x0, wy = q[1] - y0, wz = q[2] - z0;
+          double nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z, nz = e1x * e2y - e1y * e2x;
+          double n2 = nx * nx + ny * ny + nz * nz;
+          if (n2 > 1e-30) {
+            double u = (wx * (e2y * nz - e2z * ny) + wy * (e2z * nx - e2x * nz) +
+                        wz * (e2x * ny - e2y * nx)) /
+                       n2;
+            double v = (wx * (ny * e1z - nz * e1y) + wy * (nz * e1x - nx * e1z) +
+                        wz * (nx * e1y - ny * e1x)) /
+                       n2;
+            double dn = wx * nx + wy * ny + wz * nz;
+            double d2 = dn * dn / n2;
+            if (u >= -1e-9 && v >= -1e-9 && u + v <= 1.0 + 1e-9 && d2 <= ptol * ptol &&
+                d2 < bestD) {
+              bestD = d2; /* первый попавшийся достаточно: тай-брейк
+                           * копланарных не влияет на агрегаты */
+              bestPIP = t;
             }
-            s = (s + 1) & g->hmask;
           }
         }
-    if (bestPIP >= 0) break; /* точное найдено — дальше не ищем */
+      }
+    }
+    /* §929: выход после ПОЛНОГО кольца — как исходный break по rad */
+    if (bestPIP >= 0 && (si + 1 == nsh || ring[si + 1] != ring[si])) break;
   }
   if (bestPIP >= 0) return bestPIP;
   *fallback = 1;

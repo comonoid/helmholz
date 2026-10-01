@@ -2004,6 +2004,60 @@ static int sw_levels_build(const hz_pyr *py, const hz_sw_opts *o, const uint8_t 
       leaf_off[u] = leaf_off[u - 1];
     leaf_off[0] = 0;
   }
+  { /* §930-М2 (HZ_DBG930): занятость списков — медиана длины и доля
+     * объёма мини-группы(4 подряд) от объёма списка: решает Б2 */
+    static int m2 = -1;
+    if (m2 < 0) m2 = getenv("HZ_DBG930") != NULL;
+    if (m2) {
+      for (l = 0; l < py->nlev; l++) {
+        int64_t lens_sum = 0, lists = 0, grp_v = 0, lst_v = 0;
+        for (u = 0; u < lvls[l].n; u++) {
+          int32_t c = lvls[l].off[u + 1] - lvls[l].off[u];
+          if (c <= 0) continue;
+          lists++;
+          lens_sum += c;
+          if (c < 8) continue; /* группировать нечего */
+          const int32_t *pid = lvls[l].pids + lvls[l].off[u];
+          double lmin[3] = {0, 0, 0}, lmax[3] = {0, 0, 0};
+          for (int32_t q = 0; q < c; q++) {
+            int64_t tri = pid[q] >= nt ? pid[q] : py->pcs[pid[q]].tri;
+            const double *tb = o->tribox + 6 * tri;
+            for (int a = 0; a < 3; a++) {
+              double mn = tb[a], mx = tb[3 + a];
+              if (q == 0 || mn < lmin[a]) lmin[a] = mn;
+              if (q == 0 || mx > lmax[a]) lmax[a] = mx;
+            }
+          }
+          double lv = 1;
+          for (int a = 0; a < 3; a++)
+            lv *= lmax[a] - lmin[a];
+          lst_v += (int64_t)lv;
+          double gv_sum = 0;
+          for (int32_t g0 = 0; g0 < c; g0 += 4) {
+            int32_t g1 = g0 + 4 < c ? g0 + 4 : c;
+            double gmin[3], gmax[3];
+            for (int32_t q = g0; q < g1; q++) {
+              int64_t tri = pid[q] >= nt ? pid[q] : py->pcs[pid[q]].tri;
+              const double *tb = o->tribox + 6 * tri;
+              for (int a = 0; a < 3; a++) {
+                double mn = tb[a], mx = tb[3 + a];
+                if (q == g0 || mn < gmin[a]) gmin[a] = mn;
+                if (q == g0 || mx > gmax[a]) gmax[a] = mx;
+              }
+            }
+            double gv = 1;
+            for (int a = 0; a < 3; a++)
+              gv *= gmax[a] - gmin[a];
+            gv_sum += gv;
+          }
+          grp_v += (int64_t)gv_sum;
+        }
+        fprintf(stderr, "M2 L%d: списков=%ld ср.длина=%.1f грпп/спск=%.3f\n", l, (long)lists,
+                lists ? (double)lens_sum / (double)lists : 0.0,
+                lst_v > 0 ? (double)grp_v / (double)lst_v : -1.0);
+      }
+    }
+  }
   if (dbg) {
     int64_t fmax = 0, own, fin, nl = 0, entries = 0;
     fprintf(stderr, "DBG923:");

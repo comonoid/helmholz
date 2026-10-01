@@ -108,6 +108,12 @@ typedef struct {
   int64_t *start; /* [nleaf+1] */
   int32_t *pids;  /* [ntotal] */
   int64_t ntotal;
+  /* §930-Г1: мини-группы (4 подряд Мортона) с предвычисленным bbox —
+   * кул одним слэб-тестом до ray-tri кусков клетки; консервативно
+   * (bbox группы ⊇ bbox кусков), сбор побитово тот же */
+  int64_t *gstart; /* [nleaf+1] индексы групп */
+  double *gbox;    /* [6*ngroups] */
+  int64_t ngroups;
 } pg_bbox_csr;
 
 static void pg_bbox_span(const hz_pyr *py, const double cmin[3], const double cmax[3],
@@ -131,6 +137,8 @@ static int64_t pg_cell_id(const hz_pyr *py, int64_t i, int64_t j, int64_t k) {
 static void pg_bbox_csr_free(pg_bbox_csr *csr) {
   free(csr->start);
   free(csr->pids);
+  free(csr->gstart); /* §930-Г1 */
+  free(csr->gbox);
   memset(csr, 0, sizeof *csr);
 }
 
@@ -179,6 +187,45 @@ static int pg_bbox_csr_build(const hz_pyr *py, const double *cmin, const double 
           int32_t pos = hz_pyr_leaf_pos(py, pg_cell_id(py, i, j, k));
           if (pos >= 0) csr->pids[cnt[pos]++] = p;
         }
+  }
+  { /* §930-Г1: группы по 4 подряд (слоты мортона-упорядочены) */
+    int64_t ng = 0;
+    for (li = 0; li < py->nleaf; li++)
+      ng += ((csr->start[li + 1] - csr->start[li]) + 3) >> 2;
+    csr->gstart = (int64_t *)calloc((size_t)py->nleaf + 1, sizeof *csr->gstart);
+    csr->gbox = (double *)malloc((size_t)(ng > 0 ? ng : 1) * 6 * sizeof *csr->gbox);
+    if (!csr->gstart || !csr->gbox) {
+      free(csr->gstart);
+      free(csr->gbox);
+      csr->gstart = NULL;
+      csr->gbox = NULL;
+      return 2; /* fail closed: без групп прежний путь не собирается */
+    }
+    csr->ngroups = ng;
+    {
+      int64_t g = 0;
+      for (li = 0; li < py->nleaf; li++) {
+        csr->gstart[li] = g;
+        for (int64_t s = csr->start[li]; s < csr->start[li + 1]; s += 4) {
+          int64_t e = s + 4 < csr->start[li + 1] ? s + 4 : csr->start[li + 1];
+          double mn[3] = {0, 0, 0}, mx[3] = {0, 0, 0};
+          for (int64_t q = s; q < e; q++) {
+            int32_t tri = py->pcs[csr->pids[q]].tri;
+            for (int a = 0; a < 3; a++) {
+              double lo2 = cmin[3 * (int64_t)tri + a], hi2 = cmax[3 * (int64_t)tri + a];
+              if (q == s || lo2 < mn[a]) mn[a] = lo2;
+              if (q == s || hi2 > mx[a]) mx[a] = hi2;
+            }
+          }
+          for (int a = 0; a < 3; a++) {
+            csr->gbox[6 * g + a] = mn[a];
+            csr->gbox[6 * g + 3 + a] = mx[a];
+          }
+          g++;
+        }
+      }
+      csr->gstart[py->nleaf] = g;
+    }
   }
   free(cnt);
   return 0;
@@ -240,17 +287,57 @@ static int32_t pg_dda(const hz_pyr *py, const pg_bbox_csr *csr, const hz_objmesh
     (*steps)++;
     if (pos >= 0) {
       int64_t s;
-      for (s = csr->start[pos]; s < csr->start[pos + 1]; s++) {
-        int32_t p = csr->pids[s];
-        double p3[3][3], tt;
-        (*tested)++;
-        hz_obj_tri(m, py->pcs[p].tri, p3);
-        tt = pg_ray_tri(eye, rd, p3);
-        if (tt >= 0.0 && (tbest < 0.0 || tt < tbest)) {
-          tbest = tt;
-          best = p;
-        }
+      { /* §930-М3б: кусков в посещённой клетке (развязка Г1) */
+        extern int64_t g_m3b_inlist, g_m3b_visits;
+        g_m3b_inlist += csr->start[pos + 1] - csr->start[pos];
+        g_m3b_visits++;
       }
+      if (csr->gbox != NULL) { /* §930-Г1: кул групп (4 подряд) слэбом */
+        extern int64_t g_m3c_gtests, g_m3c_ghit;
+        for (int64_t g = csr->gstart[pos]; g < csr->gstart[pos + 1]; g++) {
+          const double *gb = csr->gbox + 6 * g;
+          double t0g = -1e30, t1g = 1e30;
+          int miss = 0;
+          for (int a = 0; a < 3; a++) {
+            double inv = 1.0 / rd[a];
+            double ta = (gb[a] - eye[a]) * inv, tb = (gb[3 + a] - eye[a]) * inv;
+            double tlo2 = ta < tb ? ta : tb, thi2 = ta > tb ? ta : tb;
+            if (tlo2 > t0g) t0g = tlo2;
+            if (thi2 < t1g) t1g = thi2;
+            if (t0g > t1g) {
+              miss = 1;
+              break;
+            }
+          }
+          g_m3c_gtests++;
+          if (miss) continue; /* группа мимо — её 4 куска не тестируются */
+          g_m3c_ghit++;
+          int64_t s0 = csr->start[pos] + ((g - csr->gstart[pos]) << 2);
+          int64_t s1e = s0 + 4 < csr->start[pos + 1] ? s0 + 4 : csr->start[pos + 1];
+          for (s = s0; s < s1e; s++) {
+            int32_t p = csr->pids[s];
+            double p3[3][3], tt;
+            (*tested)++;
+            hz_obj_tri(m, py->pcs[p].tri, p3);
+            tt = pg_ray_tri(eye, rd, p3);
+            if (tt >= 0.0 && (tbest < 0.0 || tt < tbest)) {
+              tbest = tt;
+              best = p;
+            }
+          }
+        }
+      } else
+        for (s = csr->start[pos]; s < csr->start[pos + 1]; s++) {
+          int32_t p = csr->pids[s];
+          double p3[3][3], tt;
+          (*tested)++;
+          hz_obj_tri(m, py->pcs[p].tri, p3);
+          tt = pg_ray_tri(eye, rd, p3);
+          if (tt >= 0.0 && (tbest < 0.0 || tt < tbest)) {
+            tbest = tt;
+            best = p;
+          }
+        }
     }
     /* ранний выход: вход в следующую клетку дальше ближайшего попадания */
     tn = tnext[0];
@@ -359,7 +446,7 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
 #define PG_RECV_CELL_CAP 512 /* кэп клеток на треугольник; крупнее — гиганты */
 #define PG_RECV_RMAX 8       /* колец поиска: 8·h покрывает ε уровня и стыки */
 #define PG_RECV_BTOL                                                                                     \
-  1e-9 /* строгая принадлежность: тай-полоса рёбер                                  \
+  1e-9 /* строгая принадлежность: тай-полоса рёбер                    \
         * разбирала бы носитель L0 по соседям и ломала битовое \
         * тождество; зазоры носителя закрывает fallback-центроид */
 
@@ -961,6 +1048,9 @@ typedef struct {
 /* §929-Х1: препcomputed-обход shells rad=0..PG924_RMAX в ТОМ же порядке
  * (dx,dy,dz по возрастанию Chebyshev-кольца), что и тройной цикл —
  * убирает ~12× мусорных итераций фильтра mr!=rad. */
+int64_t g_m3b_inlist, g_m3b_visits; /* §930-М3б */
+int64_t g_m3c_gtests, g_m3c_ghit;   /* §930-Г1-дых */
+
 static uint32_t pg924_hash(int64_t x, int64_t y, int64_t z) {
   uint64_t h = (uint64_t)x * 0x9E3779B97F4A7C15ull ^ (uint64_t)y * 0xC2B2AE3D27D4EB4Full ^
                (uint64_t)z * 0x165667B19E3779F9ull;
@@ -2851,6 +2941,12 @@ int main(int argc, char **argv) {
                (double)dda_steps / ((double)W * (double)H),
                (double)dda_tested / ((double)W * (double)H),
                100.0 * (double)dda_tested / ((double)W * (double)H) / (double)m.nt);
+      printf("M3b: kuskov v kletke (sredn poseshchennoi) %.1f\n",
+             g_m3b_visits ? (double)g_m3b_inlist / (double)g_m3b_visits : 0.0);
+      printf("G1: grupp/luch %.2f, promahov %.1f%%, testov-kuskov/luch %.1f\n",
+             (double)g_m3c_gtests / ((double)W * (double)H),
+             g_m3c_gtests ? 100.0 * (1.0 - (double)g_m3c_ghit / (double)g_m3c_gtests) : 0.0,
+             (double)dda_tested / ((double)W * (double)H));
       printf("СБОР: лучей %d, попало %" PRId64
              " (%.2f %%), средняя яркость %.4f, max %.4f, %.2f с\n",
              W * H, nhit, 100.0 * (double)nhit / ((double)W * (double)H),

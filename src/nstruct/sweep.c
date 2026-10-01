@@ -765,8 +765,12 @@ typedef struct {
 
 /* отрезок [h0,h1] луча (org, om) в коробке, пересечённый с [tin,tout];
  * 0 — пусто */
-static int front_box_seg(const double blo[3], const double bhi[3], const double org[3],
-                         const double om[3], double tin, double tout, double *h0, double *h1) {
+/* §930-В0: always_inline по замеру — нативная стена свипа −12%
+ * (зонд always_inline против обычного O2, храм dirs=4x4 it=2, 2+2
+ * прогона); вызовов 600M+, компилятор сам не инлайнит (раздувание). */
+static inline __attribute__((always_inline)) int
+front_box_seg(const double blo[3], const double bhi[3], const double org[3], const double om[3],
+              double tin, double tout, double *h0, double *h1) {
   double t0 = tin, t1 = tout;
   int ax;
   for (ax = 0; ax < 3; ax++) {
@@ -1219,7 +1223,7 @@ done:
 static int64_t g924_hits, g924_lin;   /* §924-дых: rep-депозиты и ΣLin (прибор) */
 static int64_t g924_vis, g924_geohit; /* §927-дых: визиты списков rep, гео-попадания */
 static int64_t g924_kclamp;           /* §927: кулы k(r,ω) (диагностика) */
-static int g924_minf = 1; /* §924-матрика: HZ_REPMINF */
+static int g924_minf = 1;             /* §924-матрика: HZ_REPMINF */
 
 static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double tin, double tout,
                            double *a, double *b) {
@@ -3685,7 +3689,7 @@ done:
   free(rep_ep);        /* §924 */
   {
     extern long g_kcdbg_pos;
-  }           /* tag */
+  } /* tag */
   free(knum); /* §928 */
   free(kden); /* §928 */
   free(fld);  /* §864/Б1 */

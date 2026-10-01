@@ -359,7 +359,7 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
 #define PG_RECV_CELL_CAP 512 /* кэп клеток на треугольник; крупнее — гиганты */
 #define PG_RECV_RMAX 8       /* колец поиска: 8·h покрывает ε уровня и стыки */
 #define PG_RECV_BTOL                                                                                     \
-  1e-9 /* строгая принадлежность: тай-полоса рёбер                    \
+  1e-9 /* строгая принадлежность: тай-полоса рёбер                                  \
         * разбирала бы носитель L0 по соседям и ломала битовое \
         * тождество; зазоры носителя закрывает fallback-центроид */
 
@@ -955,6 +955,7 @@ typedef struct {
   double gorg[3], ginv;
   double *rmax; /* §929-Х3: max |вершина − центроид| на треугольник —
                  * предфильтр ПИП (консервативный, побитово безопасный) */
+  double gmaxr; /* §930-А: max rmax уровня — граница «ПИП мёртв» */
 } pg924_grid;
 
 /* §929-Х1: препcomputed-обход shells rad=0..PG924_RMAX в ТОМ же порядке
@@ -1051,6 +1052,9 @@ static int pg924_grid_build(pg924_grid *g, const hz_kit_level *S) {
     g->dhead[s] = (int32_t)t;
     g->nreg++;
   }
+  g->gmaxr = 0.0; /* §930-А */
+  for (uint32_t t = 0; t < S->ntris; t++)
+    if (g->rmax[t] > g->gmaxr) g->gmaxr = g->rmax[t];
   return 0;
 }
 
@@ -1153,6 +1157,20 @@ static int32_t pg924_find(const pg924_grid *g, const hz_kit_level *S, const doub
     }
     /* §929: выход после ПОЛНОГО кольца — как исходный break по rad */
     if (bestPIP >= 0 && (si + 1 == nsh || ring[si + 1] != ring[si])) break;
+    /* §930-А: кольцо rad ≥ pipdead — ПИП невозможен (радиус уровня не
+     * достаёт); тогда если bd2 ≤ (rad−1)²h², ближе никто не найдётся —
+     * выход. Оба условия доказанные отсекатели — результат побитово. */
+    {
+      int rad = ring[si];
+      int pipdead = (int)((g->gmaxr + ptol) * g->ginv) + 2;
+      /* §930-А1656: c0 считается УСЕЧЕНИЕМ к нулю (не floor) — q за
+       * пределами сетки лежит до h НИЖЕ вычисленной ячейки, истинная
+       * дистанция кольца rad деградирует до (rad−2)h; граница с
+       * запасом (rad−2), доказано для всех q */
+      if (rad >= pipdead && bd2 < HUGE_VAL &&
+          bd2 <= (double)(rad - 2) * (double)(rad - 2) / (g->ginv * g->ginv))
+        break;
+    }
   }
   if (bestPIP >= 0) return bestPIP;
   *fallback = 1;

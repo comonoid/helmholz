@@ -446,7 +446,7 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
 #define PG_RECV_CELL_CAP 512 /* кэп клеток на треугольник; крупнее — гиганты */
 #define PG_RECV_RMAX 8       /* колец поиска: 8·h покрывает ε уровня и стыки */
 #define PG_RECV_BTOL                                                                                     \
-  1e-9 /* строгая принадлежность: тай-полоса рёбер                    \
+  1e-9 /* строгая принадлежность: тай-полоса рёбер                                  \
         * разбирала бы носитель L0 по соседям и ломала битовое \
         * тождество; зазоры носителя закрывает fallback-центроид */
 
@@ -1529,6 +1529,11 @@ int main(int argc, char **argv) {
   const char *blkfile = NULL;  /* §882: HBLK v1, mmap-сбор */
   const char *kitpath = NULL;  /* §914-Ш4: геометрия из КИТА */
   double zone = -1.0;          /* §915-R3: радиус кольца детальности */
+  double loderr = 0.0;         /* §933-И: экранная ошибка ε (px); >0 — кольца
+                                * ГЕОМЕТРИЧЕСКИЕ (d0, 2d0, 4d0…), d0 выводится
+                                * из ε/H/fov/ребра L0 (§933-ДОП) */
+  const char *emipfile = NULL; /* §933-И: mip-наследование поля — L0-sidecar,
+                                * E грубого tri = Σ E_i·A_i/ΣA_i по детям */
   double repzone = -1.0;       /* §931: кольцо reps — дальнее поле от eye */
   int repnearlp = 0;           /* А1666: этажи ближних только из ближних депозитов */
   double *g_rcent = NULL;      /* §931: центроиды−eye [3·nb], слоты (А1686) */
@@ -1539,6 +1544,8 @@ int main(int argc, char **argv) {
   double cdelta = 1.0;         /* §862: вес приращения аккумулятора */
   int lpceil = 4;              /* §866: потолок этажа (из swee3-канона) */
   uint8_t *kitlvl = NULL;      /* §915-R3: уровень кита на выбранный треугольник [nt] */
+  int32_t *kittri = NULL;      /* §933-И: ЛОКАЛЬНЫЙ tri кита выбранного куска [nt]
+                                * (для mip-наследования E: (уровень, tri) → дети) */
   double delbox[6];
   hz_objmesh m;
   hz_pyr py;
@@ -1649,6 +1656,10 @@ int main(int argc, char **argv) {
       kitpath = argv[i] + 4; /* §914-Ш4: кит вместо OBJ (паритет — Ш4-П1) */
     else if (strncmp(argv[i], "zone=", 5) == 0)
       zone = atof(argv[i] + 5); /* §915-R3: кольца детальности вокруг eye */
+    else if (strncmp(argv[i], "loderr=", 7) == 0)
+      loderr = atof(argv[i] + 7); /* §933-И: экранная ошибка колец, пиксели */
+    else if (strncmp(argv[i], "Emip=", 5) == 0)
+      emipfile = argv[i] + 5; /* §933-И: L0-sidecar с mip-наследованием на кольца */
     else if (strncmp(argv[i], "repszone=", 9) == 0)
       repzone = atof(argv[i] + 9); /* §931: reps — только дальнее поле (А1663);
                                     * читается независимо от kcal= (А1677-в) */
@@ -1724,16 +1735,48 @@ int main(int argc, char **argv) {
     }
     /* §924: adapt+без zone — меш из L0; HZ_NOREPS — то же, но представители
      * не передаются свипу (диагностический мир §923) */
-    use_kit_l0 = (kk.nlev > 1 && zone <= 0 && adapt && !clip);
+    use_kit_l0 = (kk.nlev > 1 && zone <= 0 && adapt && !clip && loderr <= 0.0);
     /* §924-М2: до §925 (кольца) reps — ТОЛЬКО явное включение HZ_REPS=1:
      * энерго-канон плоского носителя не закрыт (см. таблицу §924-М2).
      * §928: HZ_KCALDUMP — собрать калибровку в кусочном мире (без HZ_REPS) */
     reps_collect = (use_kit_l0 && getenv("HZ_KCALDUMP") != NULL);
     use_reps = use_kit_l0 && getenv("HZ_REPS") != NULL && !reps_collect;
-    if (kk.nlev > 1 && zone <= 0 && !use_kit_l0) {
-      fprintf(stderr, "pgather: kit= с nlev>1 требует zone=R (fail-closed, §915-R3)\n");
+    if (kk.nlev > 1 && zone <= 0 && !use_kit_l0 && loderr <= 0.0) {
+      fprintf(stderr,
+              "pgather: kit= с nlev>1 требует zone=R или loderr=E (fail-closed, §915-R3/§933)\n");
       hz_kit_free(&kk);
       return 2;
+    }
+    if (emipfile != NULL && (loderr <= 0.0 || zone > 0.0)) {
+      fprintf(stderr, "pgather: Emip= требует loderr= без zone= (кольцевой меш, §933)\n");
+      hz_kit_free(&kk);
+      return 2;
+    }
+    /* §933-И: d0 ЭКРАННОЙ ОШИБКИ — выводится, не подбирается: ребро s0
+     * уровня ℓ занимает p = s0·H/(2·d·tan(fov/2)) пикселей; p ≤ loderr
+     * даёт уровень floor(log2(d/d0)), d0 = s0·H/(2·loderr·tan(fov/2)).
+     * s0 = sqrt(средней площади L0) — характерное ребро базового меша
+     * (для равноупомянутых треугольников ребро ~ sqrt(A) с точностью
+     * ~1.2; константаloderr=ε поглощает фактор). */
+    double lod_d0 = 0.0;
+    if (loderr > 0.0) {
+      const hz_kit_level *L0 = &kk.lev[0];
+      double asum = 0.0;
+      for (uint32_t t = 0; t < L0->ntris; t++) {
+        double ax0 = L0->vx[L0->ti1[t]] - L0->vx[L0->ti0[t]],
+               ay0 = L0->vy[L0->ti1[t]] - L0->vy[L0->ti0[t]],
+               az0 = L0->vz[L0->ti1[t]] - L0->vz[L0->ti0[t]];
+        double ax1 = L0->vx[L0->ti2[t]] - L0->vx[L0->ti0[t]],
+               ay1 = L0->vy[L0->ti2[t]] - L0->vy[L0->ti0[t]],
+               az1 = L0->vz[L0->ti2[t]] - L0->vz[L0->ti0[t]];
+        double cxp = ay0 * az1 - az0 * ay1, cyp = az0 * ax1 - ax0 * az1,
+               czp = ax0 * ay1 - ay0 * ax1;
+        asum += 0.5 * sqrt(cxp * cxp + cyp * cyp + czp * czp);
+      }
+      double s0 = L0->ntris > 0 ? sqrt(asum / (double)L0->ntris) : 1.0;
+      if (!(s0 > 0.0)) s0 = 1.0;
+      lod_d0 = s0 * (double)H / (2.0 * loderr * tan(fov * M_PI / 360.0));
+      if (!(lod_d0 > 0.0)) lod_d0 = 1e30;
     }
     /* §915-R3: многоуровневый кит — кольца вокруг eye: треугольник
      * уровня i берётся, если ring = min(floor(d/zone), nlev-1) == i.
@@ -1745,6 +1788,8 @@ int main(int argc, char **argv) {
       nvtot += kk.lev[li].nverts;
     }
     uint32_t ntsel = 0;
+    int64_t lod_cnt[64]; /* §933-И: счётчики выбранных треугольников уровней */
+    memset(lod_cnt, 0, sizeof lod_cnt);
     if (use_kit_l0) { /* §924: меш = L0 целиком; уровни —
                        * представителям (после пирамиды) */
       ntsel = kk.lev[0].ntris;
@@ -1757,15 +1802,37 @@ int main(int argc, char **argv) {
           double cz2 = (S->vz[S->ti0[t]] + S->vz[S->ti1[t]] + S->vz[S->ti2[t]]) / 3.0;
           double d = sqrt((cx - eye[0]) * (cx - eye[0]) + (cy - eye[1]) * (cy - eye[1]) +
                           (cz2 - eye[2]) * (cz2 - eye[2]));
-          int32_t ring = (int32_t)(d / zone);
-          if (ring > kk.nlev - 1) ring = kk.nlev - 1;
-          if (ring == li) ntsel++;
+          int32_t ring;
+          if (loderr > 0.0) { /* §933-И: ГЕОМЕТРИЧЕСКИЕ кольца — экранная
+                               * ошибка: уровень +1 на УДВОЕНИЕ дистанции
+                               * (границы d0, 2d0, 4d0…), не на +zone */
+            if (d <= lod_d0)
+              ring = 0;
+            else {
+              ring = (int32_t)floor(log2(d / lod_d0));
+              if (ring > kk.nlev - 1) ring = kk.nlev - 1;
+            }
+          } else {
+            ring = (int32_t)(d / zone);
+            if (ring > kk.nlev - 1) ring = kk.nlev - 1;
+          }
+          if (ring == li) {
+            ntsel++;
+            lod_cnt[li]++;
+          }
         }
       }
       if (ntsel == 0) {
         fprintf(stderr, "pgather: кольца зоны пусты (zone=%.3f)\n", zone);
         hz_kit_free(&kk);
         return 2;
+      }
+      if (loderr > 0.0) { /* §933-И: диагностика экрана — мера П2 */
+        printf("КОЛЬЦА-ЭКР: eps=%.2f px d0=%.3f м, полигонов=%u из %u [", loderr, lod_d0,
+               (unsigned)ntsel, (unsigned)kk.lev[0].ntris);
+        for (int32_t li = 0; li < kk.nlev; li++)
+          printf("%sL%d:%lld", li ? " " : "", li, (long long)lod_cnt[li]);
+        printf("]\n");
       }
     }
     const hz_kit_level *KL = &kk.lev[0];
@@ -1803,10 +1870,14 @@ int main(int argc, char **argv) {
         m.fm[t] = (int32_t)KL->tmtl[t];
       }
     } else {
-      /* выбранные треугольники по уровням; kitlvl[ti] = уровень */
+      /* выбранные треугольники по уровням; kitlvl[ti] = уровень;
+       * §933-И: kittri[w] = ЛОКАЛЬНЫЙ tri (для mip-наследования E) */
       kitlvl = (uint8_t *)malloc((size_t)m.nt);
-      if (kitlvl == NULL) {
-        fprintf(stderr, "pgather: нет памяти (kitlvl)\n");
+      kittri = (int32_t *)malloc((size_t)m.nt * sizeof *kittri);
+      if (kitlvl == NULL || kittri == NULL) {
+        fprintf(stderr, "pgather: нет памяти (kitlvl/kittri)\n");
+        free(kittri);
+        kittri = NULL;
         hz_kit_free(&kk);
         hz_obj_free(&m);
         return 2;
@@ -1820,14 +1891,25 @@ int main(int argc, char **argv) {
           double cz2 = (S->vz[S->ti0[t]] + S->vz[S->ti1[t]] + S->vz[S->ti2[t]]) / 3.0;
           double d = sqrt((cx - eye[0]) * (cx - eye[0]) + (cy - eye[1]) * (cy - eye[1]) +
                           (cz2 - eye[2]) * (cz2 - eye[2]));
-          int32_t ring = (int32_t)(d / zone);
-          if (ring > kk.nlev - 1) ring = kk.nlev - 1;
+          int32_t ring;
+          if (loderr > 0.0) { /* §933-И: как в счётном цикле — битово та же формула */
+            if (d <= lod_d0)
+              ring = 0;
+            else {
+              ring = (int32_t)floor(log2(d / lod_d0));
+              if (ring > kk.nlev - 1) ring = kk.nlev - 1;
+            }
+          } else {
+            ring = (int32_t)(d / zone);
+            if (ring > kk.nlev - 1) ring = kk.nlev - 1;
+          }
           if (ring != li) continue;
           m.f[3 * (int64_t)w] = (int32_t)(S->ti0[t] + vbase[li]);
           m.f[3 * (int64_t)w + 1] = (int32_t)(S->ti1[t] + vbase[li]);
           m.f[3 * (int64_t)w + 2] = (int32_t)(S->ti2[t] + vbase[li]);
           m.fm[w] = (int32_t)S->tmtl[t];
           kitlvl[w] = (uint8_t)li;
+          kittri[w] = (int32_t)t;
           w++;
         }
       }
@@ -1845,7 +1927,9 @@ int main(int argc, char **argv) {
         if (v == 0 || c < m.lo[ax]) m.lo[ax] = c;
         if (v == 0 || c > m.hi[ax]) m.hi[ax] = c;
       }
-    if (!use_kit_l0) hz_kit_free(&kk); /* §924: кит живёт до сборки представителей */
+    if (!use_kit_l0 && emipfile == NULL)
+      hz_kit_free(&kk); /* §924: кит живёт до сборки представителей;
+                         * §933-И: Emip — до mip-наследования поля */
     t1 = now_sec();
     printf("СТАТЬЯ kit-загрузка: %.2f с (nt=%d, mtl=%d) [§914-Ш4]\n", t1 - t0, m.nt, m.nmtl);
   } else if (path) {
@@ -2452,6 +2536,119 @@ int main(int argc, char **argv) {
     t1 = now_sec();
     sw_time = t1 - t0;
     printf("СВИП RGB: 3 канала (%.3f с), E_avg=%.4f\n", sw_time, st.e_avg);
+  } else if (emipfile) {
+    /* §933-И: mip-наследование поля (§933-ДОП): E выбранного ГРУБОГО tri
+     * кольцевого меша = площадь-взвешенное среднее E его L0-детей
+     * (Σ E_i·A_i / Σ A_i — та же арифметика, что rep_ep в свипе).
+     * Дети — PIP центроида L0-tri в грубом tri (pg924_grid, как
+     * pg_reps_build); L0-куски берут своё значение напрямую. Поле
+     * живёт на L0 и наследуется ВНИЗ — грубый уровень НЕ считает. */
+    const hz_kit_level *L0k = &kk.lev[0];
+    if (clip) {
+      fprintf(stderr, "pgather: Emip= несовместим с clip= (fail-closed, §933)\n");
+      return 2;
+    }
+    double *E0 = (double *)malloc((size_t)L0k->ntris * sizeof *E0);
+    double *A0 = (double *)malloc((size_t)L0k->ntris * sizeof *A0);
+    double *sumE = (double *)calloc((size_t)m.nt, sizeof *sumE);
+    double *sumA = (double *)calloc((size_t)m.nt, sizeof *sumA);
+    /* selr[li][t] — уровень-локальный tri → выбранный кусок w (-1 нет);
+     * плоский массив по vbase-подобным смещениям уровней */
+    int64_t ltri_off[HZ_KIT_MAX_NLEV];
+    int32_t *selr = NULL;
+    {
+      int64_t tot = 0;
+      for (int32_t li = 0; li < kk.nlev; li++) {
+        ltri_off[li] = tot;
+        tot += (int64_t)kk.lev[li].ntris;
+      }
+      selr = (int32_t *)malloc((size_t)tot * sizeof *selr);
+    }
+    if (!E0 || !A0 || !sumE || !sumA || !selr) {
+      fprintf(stderr, "pgather: нет памяти (Emip)\n");
+      return 2;
+    }
+    for (int64_t q = 0; q < ltri_off[kk.nlev - 1] + (int64_t)kk.lev[kk.nlev - 1].ntris; q++)
+      selr[q] = -1;
+    for (i = 0; i < m.nt; i++)
+      selr[ltri_off[kitlvl[i]] + kittri[i]] = (int32_t)i;
+    {
+      FILE *fm = fopen(emipfile, "rb");
+      if (!fm || fread(E0, sizeof(double), (size_t)L0k->ntris, fm) != (size_t)L0k->ntris) {
+        fprintf(stderr, "pgather: Emip-файл не читается/короток: %s\n", emipfile);
+        if (fm) fclose(fm);
+        return 2;
+      }
+      fclose(fm);
+    }
+    for (uint32_t t = 0; t < L0k->ntris; t++) { /* площади L0 (кросс-произведение) */
+      double ax0 = L0k->vx[L0k->ti1[t]] - L0k->vx[L0k->ti0[t]],
+             ay0 = L0k->vy[L0k->ti1[t]] - L0k->vy[L0k->ti0[t]],
+             az0 = L0k->vz[L0k->ti1[t]] - L0k->vz[L0k->ti0[t]];
+      double ax1 = L0k->vx[L0k->ti2[t]] - L0k->vx[L0k->ti0[t]],
+             ay1 = L0k->vy[L0k->ti2[t]] - L0k->vy[L0k->ti0[t]],
+             az1 = L0k->vz[L0k->ti2[t]] - L0k->vz[L0k->ti0[t]];
+      double cxp = ay0 * az1 - az0 * ay1, cyp = az0 * ax1 - ax0 * az1, czp = ax0 * ay1 - ay0 * ax1;
+      A0[t] = 0.5 * sqrt(cxp * cxp + cyp * cyp + czp * czp);
+    }
+    int64_t nmiss = 0; /* L0-центроид не нашёл выбранного носителя */
+    { /* сетки PIP — ОДНА на уровень, не на L0-tri (ловля производительности) */
+      pg924_grid gm[HZ_KIT_MAX_NLEV];
+      int gmok[HZ_KIT_MAX_NLEV];
+      for (int32_t li = 1; li < kk.nlev; li++)
+        gmok[li] = pg924_grid_build(&gm[li], &kk.lev[li]) == 0;
+      for (uint32_t t = 0; t < L0k->ntris; t++) {
+        double qc[3] = {
+            (L0k->vx[L0k->ti0[t]] + L0k->vx[L0k->ti1[t]] + L0k->vx[L0k->ti2[t]]) / 3.0,
+            (L0k->vy[L0k->ti0[t]] + L0k->vy[L0k->ti1[t]] + L0k->vy[L0k->ti2[t]]) / 3.0,
+            (L0k->vz[L0k->ti0[t]] + L0k->vz[L0k->ti1[t]] + L0k->vz[L0k->ti2[t]]) / 3.0};
+        int32_t own = selr[ltri_off[0] + (int32_t)t]; /* свой L0-кусок выбран? */
+        if (own >= 0) { /* битово = прямой путь Ein для L0-части меша */
+          sumA[own] = 1.0;
+          sumE[own] = E0[t];
+          continue;
+        }
+        /* иначе — носитель-предок на уровне выше: PIP по уровням,
+         * берём БЛИЖАЙШИЙ выбранный (минимальный li ≥ 1, где tri выбран) */
+        int32_t host = -1;
+        for (int32_t li = 1; li < kk.nlev && host < 0; li++) {
+          if (!gmok[li]) continue;
+          double ptol = 0.25 / gm[li].ginv; /* как pg_reps_build (§924-ловля высот) */
+          int fb;
+          int32_t r = pg924_find(&gm[li], &kk.lev[li], qc, ptol, &fb);
+          if (r >= 0) {
+            int32_t cand = selr[ltri_off[li] + r];
+            if (cand >= 0) host = cand;
+          }
+        }
+        if (host >= 0) {
+          sumE[host] += E0[t] * A0[t];
+          sumA[host] += A0[t];
+        } else
+          nmiss++;
+      }
+      for (int32_t li = 1; li < kk.nlev; li++)
+        if (gmok[li]) pg924_grid_free(&gm[li]);
+    }
+    int64_t nempty = 0;
+    for (i = 0; i < nb; i++) { /* слоты мортон-переставлены — только через
+                                * pcs[i].tri (как ветвь Ein, биекция не-clip) */
+      int32_t w2 = py.pcs[i].tri;
+      double e = kitlvl[w2] == 0 ? sumE[w2] : (sumA[w2] > 0.0 ? sumE[w2] / sumA[w2] : 0.0);
+      if (kitlvl[w2] > 0 && sumA[w2] <= 0.0) nempty++;
+      py.pcs[i].e = (float)e;
+    }
+    printf("§933-И: E mip-наследовано из %s (пропало L0=%lld, пустых грубых=%lld)\n", emipfile,
+           (long long)nmiss, (long long)nempty);
+    free(E0);
+    free(A0);
+    free(sumE);
+    free(sumA);
+    free(selr);
+    free(kittri);
+    kittri = NULL;
+    hz_kit_free(&kk); /* §933-И: кит дожил до mip-наследования */
+    t0 = now_sec();
   } else if (efile_in) {
     /* §899: E из sidecar — свип пропущен (свободная ходьба).
      * §902: sidecar канонически PER-TRI в ИСХОДНОМ порядке (m.nt double) —
@@ -3128,6 +3325,7 @@ int main(int argc, char **argv) {
   free(g_kcal_tab); /* §928 */
   free(g_lparr);
   free(kitlvl);      /* §915-R3 */
+  free(kittri);      /* §933-И (NULL-safe: освобождён раньше в Emip-ветви) */
   if (rcv != NULL) { /* §921: приёмник */
     for (int rk = 0; rk < nrecv; rk++) {
       pg_recv_close(&rcv[rk]);

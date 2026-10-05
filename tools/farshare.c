@@ -53,12 +53,18 @@ int main(int argc, char **argv) {
   double *Ed = NULL, *cent = NULL, *area = NULL, tot = 0, dmaxc = 0;
   FILE *f;
   for (i = 1; i < argc; i++) {
-    if (strncmp(argv[i], "E=", 2) == 0) epath = argv[i] + 2;
-    else if (strncmp(argv[i], "obj=", 4) == 0) opath = argv[i] + 4;
-    else if (strncmp(argv[i], "eye=", 4) == 0) { if (parse3(argv[i] + 4, eye)) goto usage; }
-    else if (strncmp(argv[i], "R=", 2) == 0) rspec = argv[i] + 2;
-    else if (strncmp(argv[i], "mask=", 5) == 0) mtpl = argv[i] + 5;
-    else goto usage;
+    if (strncmp(argv[i], "E=", 2) == 0)
+      epath = argv[i] + 2;
+    else if (strncmp(argv[i], "obj=", 4) == 0)
+      opath = argv[i] + 4;
+    else if (strncmp(argv[i], "eye=", 4) == 0) {
+      if (parse3(argv[i] + 4, eye)) goto usage;
+    } else if (strncmp(argv[i], "R=", 2) == 0)
+      rspec = argv[i] + 2;
+    else if (strncmp(argv[i], "mask=", 5) == 0)
+      mtpl = argv[i] + 5;
+    else
+      goto usage;
   }
   if (epath == NULL || opath == NULL || rspec == NULL) goto usage;
   { /* R-сетка: запятые, без пробелов */
@@ -99,12 +105,12 @@ int main(int argc, char **argv) {
     const double *a = m.v + 3 * (size_t)m.f[3 * i], *b = m.v + 3 * (size_t)m.f[3 * i + 1],
                  *c = m.v + 3 * (size_t)m.f[3 * i + 2];
     double u[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]},
-           v[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]},
-           cx = u[1] * v[2] - u[2] * v[1], cy = u[2] * v[0] - u[0] * v[2],
-           cz = u[0] * v[1] - u[1] * v[0];
+           v[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]}, cx = u[1] * v[2] - u[2] * v[1],
+           cy = u[2] * v[0] - u[0] * v[2], cz = u[0] * v[1] - u[1] * v[0];
     int k;
     area[i] = 0.5 * sqrt(cx * cx + cy * cy + cz * cz);
-    for (k = 0; k < 3; k++) cent[3 * i + k] = (a[k] + b[k] + c[k]) / 3.0 - eye[k];
+    for (k = 0; k < 3; k++)
+      cent[3 * i + k] = (a[k] + b[k] + c[k]) / 3.0 - eye[k];
     {
       double d2 = cent[3 * i] * cent[3 * i] + cent[3 * i + 1] * cent[3 * i + 1] +
                   cent[3 * i + 2] * cent[3 * i + 2];
@@ -112,8 +118,8 @@ int main(int argc, char **argv) {
     }
     tot += Ed[i] * area[i];
   }
-  printf("farshare: nt=%d eye=(%g,%g,%g) max|c−eye|=%.3f ΣEd·A=%.6g\n", (int)m.nt, eye[0],
-         eye[1], eye[2], dmaxc, tot);
+  printf("farshare: nt=%d eye=(%g,%g,%g) max|c−eye|=%.3f ΣEd·A=%.6g\n", (int)m.nt, eye[0], eye[1],
+         eye[2], dmaxc, tot);
   /* САНИТИ А1685 (по ближней доле, до использования маски в гейтах).
    * Тождественность — целочисленными счётчиками, без float-сравнений:
    * R=0 «ближний» ⇔ d≤0 (ждём ноль таких), R=∞ — все (ждём nt). */
@@ -125,9 +131,8 @@ int main(int argc, char **argv) {
       if (d <= 0.0) cn0++;
       if (d <= 1e9 * (1.0 + dmaxc)) cninf++;
     }
-    printf("САНИТИ А1685: near(0)=%d (ждём 0)  near(∞)=%d (ждём %d)  %s\n", (int)cn0,
-           (int)cninf, (int)m.nt,
-           (cn0 == 0 && cninf == m.nt) ? "PASS" : "FAIL — маску в гейты НЕ ДАВАТЬ");
+    printf("САНИТИ А1685: near(0)=%d (ждём 0)  near(∞)=%d (ждём %d)  %s\n", (int)cn0, (int)cninf,
+           (int)m.nt, (cn0 == 0 && cninf == m.nt) ? "PASS" : "FAIL — маску в гейты НЕ ДАВАТЬ");
     if (cn0 != 0 || cninf != m.nt) return 3;
   }
   printf("%6s %12s %12s %10s %6s\n", "R", "D_far", "D_near", "near_tri", "годен");
@@ -136,10 +141,12 @@ int main(int argc, char **argv) {
     int32_t tn = 0, t;
     int8_t *msk = NULL;
     for (t = 0; t < m.nt; t++) {
-      double d = sqrt(cent[3 * t] * cent[3 * t] + cent[3 * t + 1] * cent[3 * t + 1] +
-                      cent[3 * t + 2] * cent[3 * t + 2]);
-      if (d > r) dnf += Ed[t] * area[t];
-      else tn++;
+      double d = sqrt(cent[3 * (int64_t)t] * cent[3 * (int64_t)t] +
+                      cent[3 * t + 1] * cent[3 * t + 1] + cent[3 * t + 2] * cent[3 * t + 2]);
+      if (d > r)
+        dnf += Ed[t] * area[t];
+      else
+        tn++;
     }
     printf("%6g %12.6f %12.6f %10d %6s\n", r, dnf / tot, 1.0 - dnf / tot, (int)tn,
            (dnf / tot >= FS_FARMIN) ? "ДА" : "нет");
@@ -149,8 +156,8 @@ int main(int argc, char **argv) {
       msk = (int8_t *)malloc((size_t)m.nt);
       if (msk == NULL) return 2;
       for (t = 0; t < m.nt; t++) {
-        double d = sqrt(cent[3 * t] * cent[3 * t] + cent[3 * t + 1] * cent[3 * t + 1] +
-                        cent[3 * t + 2] * cent[3 * t + 2]);
+        double d = sqrt(cent[3 * (int64_t)t] * cent[3 * (int64_t)t] +
+                        cent[3 * t + 1] * cent[3 * t + 1] + cent[3 * t + 2] * cent[3 * t + 2]);
         msk[t] = (d <= r) ? 1 : 0;
       }
       f = fopen(path, "wb");
@@ -167,7 +174,6 @@ int main(int argc, char **argv) {
   hz_obj_free(&m);
   return 0;
 usage:
-  fprintf(stderr,
-          "use: farshare E=файл obj=файл eye=X,Y,Z R=2,3,4 [mask=шаблон{R}]\n");
+  fprintf(stderr, "use: farshare E=файл obj=файл eye=X,Y,Z R=2,3,4 [mask=шаблон{R}]\n");
   return 1;
 }

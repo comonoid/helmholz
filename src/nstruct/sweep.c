@@ -687,6 +687,8 @@ typedef struct {
   const double *rep_atri;  /* [nrep] площадь носителя (§927) */
   const double *rep_nrm;   /* [3nrep] нормаль носителя (§927) */
   const double *rep_ep;    /* [nrep] агрегат Eprev детей (раз в итерацию) */
+  int ev_src_far;          /* §931/А1666: текущее событие — дальнее (rep);
+                            * фильтр этажей ближних кусков (ключ rep_near_lp) */
   /* §928: калибровка k(r,ω) — ω-бин направления, накопители кусочной ветки
    * (только последняя итерация, только мир сбора HZ_KCALDUMP), этажи для
    * отсева floor-0 событий (они в reps-мире приходят листами, не rep-хитом). */
@@ -872,8 +874,23 @@ static double front_cos(const front_ctx *fc, int32_t p) {
 /* §862: приращение дробного аккумулятора детальности Δ(материал,угол):
  * темнее материал (ρ) и скользящее падение (1−cosθ, cosθ — к НОРМАЛИ куска)
  * — быстрее набор этажа. Нет lpacc — нет операции (битово прежний мир). */
+/* §931: предикат «далеко» (А1663): центроид куска дальше rep_zone от
+ * rep_eye. rep_zone<=0 / нет rep_cent — весь мир «далеко» = прежний §924,
+ * битово. Квадрат расстояния — без sqrt (детерминизм, тот же порог, что
+ * у farshare: далеко ⇔ d² > zone²). */
+static int sw_far(const hz_sw_opts *o, int32_t p) {
+  const double *c;
+  if (o->rep_zone <= 0.0 || o->rep_cent == NULL) return 1;
+  c = o->rep_cent + 3 * (int64_t)p;
+  return (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]) > o->rep_zone * o->rep_zone ? 1 : 0;
+}
+
 static void sw_accum(front_ctx *fc, int32_t p, double edep) {
   if (!fc->o->lpacc) return;
+  if (fc->o->rep_near_lp && fc->ev_src_far && !sw_far(fc->o, p))
+    return; /* А1666: этажи БЛИЖНИХ кусков — только из ближних депозитов
+             * (после А1662 rep-доли ближним не приходят вовсе — фильтр
+             * страховочный, умолчание ВЫКЛ) */
   {
     double rho = front_rho(fc, p);
     double ct = front_cos(fc, p) / (2.0 * fc->area[p]); /* |cos| к нормали куска */
@@ -1223,6 +1240,8 @@ done:
 static int64_t g924_hits, g924_lin;   /* §924-дых: rep-депозиты и ΣLin (прибор) */
 static int64_t g924_vis, g924_geohit; /* §927-дых: визиты списков rep, гео-попадания */
 static int64_t g924_kclamp;           /* §927: кулы k(r,ω) (диагностика) */
+static int64_t g931_seam, g931_rh;    /* §931/А1668: шов — rep-хиты с точкой
+                                       * пересечения ближе rep_zone; и все rep-хиты */
 static int g924_minf = 1;             /* §924-матрика: HZ_REPMINF */
 
 static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double tin, double tout,
@@ -1348,6 +1367,18 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
                                             * штамп гасит и вложенных rep'ов
                                             * (rep_f ⊇ rep_{f+1}), и листья */
           int32_t r = p - fc->nt0;
+          fc->ev_src_far = 1; /* §931/А1666: событие-источник — дальнее */
+          {                   /* §931/А1668: ШОВ — rep-хит с ТОЧКОЙ пересечения ближе зоны
+                               * (грубый носитель заходит в ближний шар); порог тревоги 5%
+                               * от rep-хитов — тогда усиливать предикат bbox-тестом. */
+            double px = fc->org[0] + fc->om[0] * ht[i] - fc->o->rep_eye[0],
+                   pyy = fc->org[1] + fc->om[1] * ht[i] - fc->o->rep_eye[1],
+                   pz = fc->org[2] + fc->om[2] * ht[i] - fc->o->rep_eye[2];
+            g931_rh++;
+            if (fc->o->rep_zone > 0.0 &&
+                px * px + pyy * pyy + pz * pz <= fc->o->rep_zone * fc->o->rep_zone)
+              g931_seam++;
+          }
           {
             static long kcpos = 0, kcneg = 0;
             if (fc->o->kcal) {
@@ -1375,6 +1406,10 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
               int32_t nfr = 0;
               for (int32_t kq = fc->rep_koff[r]; kq < fc->rep_koff[r + 1]; kq++) {
                 int32_t kid = fc->rep_kmem[kq];
+                if (!sw_far(fc->o, kid))
+                  continue; /* §931/А1662: ближний кусок
+                             * НЕ получает rep-долю — у него
+                             * свои кусочные события */
                 if (fc->pstamp[py->pcs[kid].tri] == fc->pkey) continue;
                 if (fc->o->lep && fc->o->lep[kid] > 0.0) continue;
                 freshA += fc->area[kid];
@@ -1385,6 +1420,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
                 for (int32_t kq = fc->rep_koff[r]; kq < fc->rep_koff[r + 1]; kq++) {
                   int32_t kid = fc->rep_kmem[kq];
                   int32_t ktri = py->pcs[kid].tri;
+                  if (!sw_far(fc->o, kid)) continue;          /* §931/А1662 */
                   if (fc->pstamp[ktri] == fc->pkey) continue; /* уже получил долю */
                   if (fc->o->lep && fc->o->lep[kid] > 0.0)
                     continue; /* §924: эмиттер — своё событие в листе */
@@ -1419,6 +1455,9 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
           int32_t k;
           for (k = fc->rep_koff[r]; k < fc->rep_koff[r + 1]; k++) {
             int32_t kid = fc->rep_kmem[k];
+            if (!sw_far(fc->o, kid))
+              continue; /* §931/А1676: kk — только по
+                         * дальним детям, ДО ffull/frest */
             const double *nk = fc->nrm + 3 * (int64_t)kid;
             knum += fc->area[kid] * fabs(fc->om[0] * nk[0] + fc->om[1] * nk[1] + fc->om[2] * nk[2]);
           }
@@ -1445,6 +1484,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
           for (int32_t kq = fc->rep_koff[r]; kq < fc->rep_koff[r + 1]; kq++) {
             int32_t kid = fc->rep_kmem[kq];
             int32_t ktri = py->pcs[kid].tri;
+            if (!sw_far(fc->o, kid)) continue;          /* §931/А1662/А1676 */
             if (fc->pstamp[ktri] == fc->pkey) continue; /* уже получил долю */
             if (fc->o->lep && fc->o->lep[kid] > 0.0)
               continue; /* §924: эмиттер — своё событие в листе, штамп не
@@ -1481,6 +1521,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
           continue;
         }
         double ks = fc->o->ks ? fc->o->ks[p] : 0.0;
+        fc->ev_src_far = 0; /* §931/А1666: событие-источник — кусковое */
         double kdf = front_rho(fc, p);
         if (ks > 1.0 - kdf) ks = 1.0 - kdf > 0.0 ? 1.0 - kdf : 0.0;
         double lin_hop = ks * Lin;
@@ -1773,9 +1814,10 @@ static int sw_levels_build(const hz_pyr *py, const hz_sw_opts *o, const uint8_t 
       }
     }
     if (reps_on && (int32_t)f >= g924_minf && (int32_t)f <= o->rep_nlev &&
-        o->repof[((size_t)(int32_t)f - 1u) * (size_t)nt + (size_t)p] >= 0) {
+        o->repof[((size_t)(int32_t)f - 1u) * (size_t)nt + (size_t)p] >= 0 && sw_far(o, p)) {
       /* §924: кусок заменён представителем (want[r]=f — дедуп на гроздь);
-       * счёт узлов и finer — проходы B/C ниже */
+       * счёт узлов и finer — проходы B/C ниже. §931: БЛИЖНИЙ кусок не
+       * заменяется (кольцо детальности — кусочный мир §923, битово). */
       want[o->repof[((size_t)(int32_t)f - 1u) * (size_t)nt + (size_t)p]] = (int32_t)f;
       goto rep_kid;
     }
@@ -1927,8 +1969,9 @@ static int sw_levels_build(const hz_pyr *py, const hz_sw_opts *o, const uint8_t 
         if (lo[ax] > (int64_t)ceil(dom / py->cell) - 1) lo[ax] = (int64_t)ceil(dom / py->cell) - 1;
       }
       if (reps_on && (int32_t)f >= g924_minf && (int32_t)f <= o->rep_nlev &&
-          o->repof[((size_t)(int32_t)f - 1u) * (size_t)nt + (size_t)p] >= 0)
-        continue; /* §924: кусок представлен — пишет проход D */
+          o->repof[((size_t)(int32_t)f - 1u) * (size_t)nt + (size_t)p] >= 0 && sw_far(o, p))
+        continue; /* §924: кусок представлен — пишет проход D; §931: только
+                   * дальний (ближний пишет себя, зеркально проходу 1) */
       if (f == 0) {
         int fb = (o->walk != 0);
         for (int64_t iz = lo[2]; iz <= hi[2]; iz++)
@@ -2944,6 +2987,8 @@ static void sw_index_piece(const hz_pyr *py, const hz_sw_opts *o, int32_t s, int
 int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, const double *kd,
               const hz_sw_opts *o, hz_sw_stat *st, double *e_hist) {
   double *Ed = NULL, *Eprev = NULL;
+  g931_rh = 0; /* §931/А1668: счётчик шва — на прогон (вызовы многократны) */
+  g931_seam = 0;
   double *cov = NULL;     /* §911-6: Σ долей следа на кусок (HZ_COVDBG) */
   uint32_t *covn = NULL;  /* §911-6: число хитов на кусок */
   double *cov_lit = NULL; /* §911-8: освещённое покрытие */
@@ -3729,6 +3774,15 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     fprintf(stderr, "§928: дамп калибровки %s.{num,den} (nrep=%d nw=%d)\n", kcalpath, (int)o->nrep,
             HZ_KCAL_NW);
   }
+  if (o->rep_zone > 0.0 && g931_rh > 0) /* §931/А1668: ШОВ — доля rep-хитов,
+                                         * чья точка пересечения ближе зоны;
+                                         * >5% — усиливать предикат bbox-тестом.
+                                         * (0 при it=1 — этажные списки reps
+                                         * строятся после итерации 0) */
+    fprintf(stderr, "§931 шов: rep-хитов=%lld, точка ближе зоны=%lld (%.2f%%)\n",
+            (long long)g931_rh, (long long)g931_seam, 100.0 * (double)g931_seam / (double)g931_rh);
+  g931_rh = 0;
+  g931_seam = 0;
 
 done:
   free(lpflo);         /* §862 */

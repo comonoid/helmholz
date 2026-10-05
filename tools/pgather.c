@@ -446,7 +446,7 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
 #define PG_RECV_CELL_CAP 512 /* кэп клеток на треугольник; крупнее — гиганты */
 #define PG_RECV_RMAX 8       /* колец поиска: 8·h покрывает ε уровня и стыки */
 #define PG_RECV_BTOL                                                                                     \
-  1e-9 /* строгая принадлежность: тай-полоса рёбер                    \
+  1e-9 /* строгая принадлежность: тай-полоса рёбер                                  \
         * разбирала бы носитель L0 по соседям и ломала битовое \
         * тождество; зазоры носителя закрывает fallback-центроид */
 
@@ -1529,6 +1529,9 @@ int main(int argc, char **argv) {
   const char *blkfile = NULL;  /* §882: HBLK v1, mmap-сбор */
   const char *kitpath = NULL;  /* §914-Ш4: геометрия из КИТА */
   double zone = -1.0;          /* §915-R3: радиус кольца детальности */
+  double repzone = -1.0;       /* §931: кольцо reps — дальнее поле от eye */
+  int repnearlp = 0;           /* А1666: этажи ближних только из ближних депозитов */
+  double *g_rcent = NULL;      /* §931: центроиды−eye [3·nb], слоты (А1686) */
   int adapt = 0;               /* §915-R4: lpacc-адаптив (0 — битово прежний мир) */
   int ksdiff = 0;              /* §918: Δ=1−ks (диффузный отскок грубит) */
   double cdelta = 1.0;         /* §862: вес приращения аккумулятора */
@@ -1644,6 +1647,11 @@ int main(int argc, char **argv) {
       kitpath = argv[i] + 4; /* §914-Ш4: кит вместо OBJ (паритет — Ш4-П1) */
     else if (strncmp(argv[i], "zone=", 5) == 0)
       zone = atof(argv[i] + 5); /* §915-R3: кольца детальности вокруг eye */
+    else if (strncmp(argv[i], "repszone=", 9) == 0)
+      repzone = atof(argv[i] + 9); /* §931: reps — только дальнее поле (А1663);
+                                    * читается независимо от kcal= (А1677-в) */
+    else if (strncmp(argv[i], "repnearlp=", 10) == 0)
+      repnearlp = atoi(argv[i] + 10); /* А1666: lpacc-фильтр ближних (умолчание 0) */
     else if (strncmp(argv[i], "ksdiff=", 7) == 0)
       ksdiff = atoi(argv[i] + 7); /* §918: диффузность отскока грубит этаж */
     else if (strncmp(argv[i], "adapt=", 6) == 0)
@@ -2338,7 +2346,30 @@ int main(int argc, char **argv) {
     so.repof = reps.repof;
     so.rep_nlev = reps.nlev_r;
     so.reps_collect = reps_collect && !use_reps; /* §928 */
-    if (use_reps && kcalpath != NULL) {          /* §928: таблица калибровки k(r,ωbin) */
+    /* §931: КОЛЬЦА ДЕТАЛЬНОСТИ. Предикат «далеко» — центроид куска от
+     * глаза КАМЕРЫ (rep_eye без нового ключа, А1663); rep_cent [3·nb] в
+     * слот-порядке, координаты МИНУС глаз (А1686: предвычислено здесь,
+     * в свипе только сравнение). Независимо от kcal=. */
+    if (repzone > 0.0) {
+      g_rcent = (double *)malloc(3u * (size_t)nb * sizeof *g_rcent);
+      if (g_rcent == NULL) {
+        fprintf(stderr, "pgather: нет памяти (rep_cent)\n");
+        return 2;
+      }
+      for (int32_t pr = 0; pr < nb; pr++) {
+        const double *vr = g_tv9 + 9 * (size_t)py.pcs[pr].tri;
+        for (int qr = 0; qr < 3; qr++)
+          g_rcent[3 * pr + qr] = (vr[qr] + vr[3 + qr] + vr[6 + qr]) / 3.0 - eye[qr];
+      }
+      so.rep_zone = repzone;
+      so.rep_cent = g_rcent;
+      for (int qr = 0; qr < 3; qr++)
+        so.rep_eye[qr] = eye[qr];
+      printf("§931: кольцо repszone=%g от глазa (%g,%g,%g), rep_cent=%d слотов\n", repzone, eye[0],
+             eye[1], eye[2], (int)nb);
+    }
+    so.rep_near_lp = repnearlp;         /* А1666 */
+    if (use_reps && kcalpath != NULL) { /* §928: таблица калибровки k(r,ωbin) */
       hz_kcal_hdr kh;
       FILE *kf = fopen(kcalpath, "rb");
       double *kt = NULL;
@@ -3076,6 +3107,7 @@ int main(int argc, char **argv) {
   free(g_tv9); /* §874: утечка trivert/tribox/lp (предсуществующая с §867,
                 * поймана ASAN при прогоне §874) */
   free(g_tb6);
+  free(g_rcent);    /* §931 */
   free(g_kcal_tab); /* §928 */
   free(g_lparr);
   free(kitlvl);      /* §915-R3 */

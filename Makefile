@@ -57,6 +57,10 @@ build/pgather: tools/pgather.c src/nstruct/pyr.c src/nstruct/pyr.h src/nstruct/s
 build/kcalmk: tools/kcalmk.c src/nstruct/sweep.h | build
 	$(RUN) 'gcc $(CFLAGS) -I. -o $@ tools/kcalmk.c -lm'
 
+#-- -- §931 Ш1: доли колец детальности D(R) по зрелому E-дампу -- --
+build/farshare: tools/farshare.c src/scene_obj.c | build
+	$(RUN) 'gcc $(CFLAGS) -o $@ tools/farshare.c src/scene_obj.c -lm'
+
 build/pref: tools/pref.c src/nstruct/pyr.c src/nstruct/pyr.h src/nstruct/sweep.c \
 	src/nstruct/sweep.h src/scene_obj.c | build
 	$(RUN) 'gcc $(CFLAGS) -o $@ tools/pref.c src/nstruct/pyr.c src/nstruct/sweep.c src/scene_obj.c -lm'

@@ -401,6 +401,8 @@ typedef struct {
   const double *lep; /* NULL — нет per-piece эмиссии */
   const double *ks;  /* NULL — дихотомия выключена (ksf=0) */
   const double *nrm;
+  const double *ev; /* §932-Б-Ш6: пер-вершинное E (площадь-взвешенное); NULL —
+                       плоско-кусочный P0 прежнего мира, битово */
   double le, rho;
   int gather;
   double hop_eps;
@@ -408,10 +410,54 @@ typedef struct {
   int64_t *nsec; /* зеркальных вторичных лучей (прибор) */
 } pg_cam;
 
+/* §932-Б-Ш6: E в точке хита — барицентрическая интерполяция пер-вершинных
+ * значений (egour=1); NULL — плоско-кусочный P0, побитово прежний мир.
+ * λ считаются через двойные скалярные произведения (без делений на
+ * ребро); отрицательные хвосты числителя клэмпятся к 0 и сумма λ
+ * нормируется — на ребре/вершине интерполяция вырождается корректно. */
+static double pg_e_hit(const pg_cam *c, const double org[3], const double rd[3], int32_t p,
+                       double thit) {
+  int32_t t = c->py->pcs[p].tri;
+  const double *A = c->m->v + 3 * (int64_t)c->m->f[3 * (int64_t)t];
+  const double *B = c->m->v + 3 * (int64_t)c->m->f[3 * (int64_t)t + 1];
+  const double *C = c->m->v + 3 * (int64_t)c->m->f[3 * (int64_t)t + 2];
+  double e1[3], e2[3], ep[3], P[3];
+  double d11, d12, d22, d1p, d2p, den, u, v, w;
+  int ax;
+  for (ax = 0; ax < 3; ax++) P[ax] = org[ax] + rd[ax] * thit;
+  for (ax = 0; ax < 3; ax++) {
+    e1[ax] = B[ax] - A[ax];
+    e2[ax] = C[ax] - A[ax];
+    ep[ax] = P[ax] - A[ax];
+  }
+  d11 = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2];
+  d12 = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
+  d22 = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
+  d1p = e1[0] * ep[0] + e1[1] * ep[1] + e1[2] * ep[2];
+  d2p = e2[0] * ep[0] + e2[1] * ep[1] + e2[2] * ep[2];
+  den = d11 * d22 - d12 * d12;
+  if (!(den > 1e-30)) return (double)c->py->pcs[p].e; /* вырожденный tri — P0 */
+  u = (d22 * d1p - d12 * d2p) / den;
+  v = (d11 * d2p - d12 * d1p) / den;
+  if (u < 0.0) u = 0.0;
+  if (v < 0.0) v = 0.0;
+  w = 1.0 - u - v;
+  if (w < 0.0) {
+    w = 0.0;
+    if (u + v > 0.0) {
+      u /= u + v;
+      v = 1.0 - u;
+    }
+  }
+  return u * c->ev[c->m->f[3 * (int64_t)t + 1]] + v * c->ev[c->m->f[3 * (int64_t)t + 2]] +
+         w * c->ev[c->m->f[3 * (int64_t)t]];
+}
+
 static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[3], int32_t p,
                           double thit, int depth) {
   double kdvis = c->rho < 0 ? c->kd[p] : c->rho;
-  double L = c->le + (c->lep ? c->lep[p] : 0.0) + kdvis * (double)c->py->pcs[p].e / (2.0 * M_PI);
+  double E = c->ev ? pg_e_hit(c, org, rd, p, thit) : (double)c->py->pcs[p].e;
+  double L = c->le + (c->lep ? c->lep[p] : 0.0) + kdvis * E / (2.0 * M_PI);
   if (c->ks && depth < PG_MIRROR_BOUNCE_MAX) {
     double kse = c->ks[p];
     if (kse > 1.0 - kdvis) kse = 1.0 - kdvis > 0.0 ? 1.0 - kdvis : 0.0;
@@ -1050,6 +1096,7 @@ typedef struct {
  * убирает ~12× мусорных итераций фильтра mr!=rad. */
 int64_t g_m3b_inlist, g_m3b_visits; /* §930-М3б */
 int64_t g_m3c_gtests, g_m3c_ghit;   /* §930-Г1-дых */
+static double *g_egour_ev, *g_egour_ew; /* §932-Б-Ш6: буферы Gouraud (владелец — кадр) */
 
 static uint32_t pg924_hash(int64_t x, int64_t y, int64_t z) {
   uint64_t h = (uint64_t)x * 0x9E3779B97F4A7C15ull ^ (uint64_t)y * 0xC2B2AE3D27D4EB4Full ^
@@ -1534,6 +1581,7 @@ int main(int argc, char **argv) {
                                 * из ε/H/fov/ребра L0 (§933-ДОП) */
   const char *emipfile = NULL; /* §933-И: mip-наследование поля — L0-sidecar,
                                 * E грубого tri = Σ E_i·A_i/ΣA_i по детям */
+  int egour = 0;               /* §932-Б-Ш6: Gouraud-интерполяция E при чтении */
   double repzone = -1.0;       /* §931: кольцо reps — дальнее поле от eye */
   int repnearlp = 0;           /* А1666: этажи ближних только из ближних депозитов */
   double *g_rcent = NULL;      /* §931: центроиды−eye [3·nb], слоты (А1686) */
@@ -1662,6 +1710,9 @@ int main(int argc, char **argv) {
       loderr = atof(argv[i] + 7); /* §933-И: экранная ошибка колец, пиксели */
     else if (strncmp(argv[i], "Emip=", 5) == 0)
       emipfile = argv[i] + 5; /* §933-И: L0-sidecar с mip-наследованием на кольца */
+    else if (strncmp(argv[i], "egour=", 6) == 0)
+      egour = atoi(argv[i] + 6); /* §932-Б-Ш6: барицентрическая интерполяция E
+                                  * при чтении (умолчание 0 — P0 битово) */
     else if (strncmp(argv[i], "repszone=", 9) == 0)
       repzone = atof(argv[i] + 9); /* §931: reps — только дальнее поле (А1663);
                                     * читается независимо от kcal= (А1677-в) */
@@ -3121,6 +3172,36 @@ int main(int argc, char **argv) {
           if (!Lumc[ch]) return 2;
         }
       memset(&cam0, 0, sizeof cam0);
+      { /* §932-Б-Ш6: пер-вершинное E — площадь-взвешенное среднее смежных
+         * кусков (egour=1); отказ памяти — fail closed к P0 (ev=NULL) */
+        double *ev = NULL, *ew = NULL;
+        if (egour) {
+          ev = (double *)calloc((size_t)m.nv, sizeof *ev);
+          ew = (double *)calloc((size_t)m.nv, sizeof *ew);
+          if (ev != NULL && ew != NULL) {
+            int32_t p3;
+            for (p3 = 0; p3 < nb; p3++) {
+              int32_t t3 = py.pcs[p3].tri, k3;
+              double ae = area[p3] * (double)py.pcs[p3].e;
+              for (k3 = 0; k3 < 3; k3++) {
+                int32_t vi = m.f[3 * (int64_t)t3 + k3];
+                if (vi >= 0 && vi < m.nv) {
+                  ev[vi] += ae;
+                  ew[vi] += area[p3];
+                }
+              }
+            }
+            for (int32_t vi = 0; vi < m.nv; vi++)
+              ev[vi] = ew[vi] > 0.0 ? ev[vi] / ew[vi] : 0.0;
+            cam0.ev = ev; /* §932-Б-Ш6: чтение кадра интерполирует */
+          } else {
+            free(ev);
+            free(ew);
+          }
+        }
+        g_egour_ev = ev;   /* освободить после петли кадра */
+        g_egour_ew = ew;
+      }
       cam0.py = &py;
       cam0.csr = &csr;
       cam0.m = &m;
@@ -3208,6 +3289,8 @@ int main(int argc, char **argv) {
         sec_rays += sec_loc;
       }
       t1 = now_sec();
+      free(g_egour_ev); /* §932-Б-Ш6: буферы Gouraud — после петли кадра */
+      free(g_egour_ew);
       if (gather == 0)
         printf("DDA: клеток/луч %.1f, кусков/луч %.1f (%.2f %% от nt)\n",
                (double)dda_steps / ((double)W * (double)H),

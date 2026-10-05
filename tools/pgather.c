@@ -446,7 +446,7 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
 #define PG_RECV_CELL_CAP 512 /* кэп клеток на треугольник; крупнее — гиганты */
 #define PG_RECV_RMAX 8       /* колец поиска: 8·h покрывает ε уровня и стыки */
 #define PG_RECV_BTOL                                                                                     \
-  1e-9 /* строгая принадлежность: тай-полоса рёбер                                  \
+  1e-9 /* строгая принадлежность: тай-полоса рёбер                    \
         * разбирала бы носитель L0 по соседям и ломала битовое \
         * тождество; зазоры носителя закрывает fallback-центроид */
 
@@ -1533,6 +1533,8 @@ int main(int argc, char **argv) {
   int repnearlp = 0;           /* А1666: этажи ближних только из ближних депозитов */
   double *g_rcent = NULL;      /* §931: центроиды−eye [3·nb], слоты (А1686) */
   int adapt = 0;               /* §915-R4: lpacc-адаптив (0 — битово прежний мир) */
+  int travel = 0;              /* §932-А: этажи по пустотному пробегу света */
+  double tvc = 0.0;            /* §932-А: масштаб travel-шага (tvc=0 — НК, битово) */
   int ksdiff = 0;              /* §918: Δ=1−ks (диффузный отскок грубит) */
   double cdelta = 1.0;         /* §862: вес приращения аккумулятора */
   int lpceil = 4;              /* §866: потолок этажа (из swee3-канона) */
@@ -1660,10 +1662,23 @@ int main(int argc, char **argv) {
       cdelta = atof(argv[i] + 7);
     else if (strncmp(argv[i], "lpceil=", 7) == 0)
       lpceil = atoi(argv[i] + 7);
+    else if (strncmp(argv[i], "travel=", 7) == 0)
+      travel = atoi(argv[i] + 7); /* §932-А: этажи по пустотному пробегу */
+    else if (strncmp(argv[i], "tvc=", 4) == 0)
+      tvc = atof(argv[i] + 4); /* §932-А: масштаб travel-шага (cdt члена) */
     else if (strncmp(argv[i], "kcal=", 5) == 0)
       kcalpath = argv[i] + 5; /* §928: таблица калибровки k(r,ωbin) */
     else
       path = argv[i];
+  }
+  if (travel && !adapt) { /* §932/А1705: fail-closed дверь — не молчаливый no-op
+                           * (прецедент «kit= с nlev>1 требует zone=») */
+    fprintf(stderr, "pgather: travel=1 требует adapt=1 (fail-closed, §932)\n");
+    return 2;
+  }
+  if (tvc < 0.0) { /* §932/А1705 */
+    fprintf(stderr, "pgather: tvc= отрицательный не допускается (fail-closed, §932)\n");
+    return 2;
   }
   if (!path && !blkfile) { /* §902: с blk= OBJ не обязателен — сцена в файле */
     fprintf(stderr, "use: pgather <scene.obj | blk=ФАЙЛ> [lev=N dirs=.. it=N rho=F le=F] "
@@ -2333,6 +2348,8 @@ int main(int argc, char **argv) {
       so.accum_mode = 5; /* §918: Δ = 1−ks_eff — счёт ДИФФУЗНЫХ отскоков */
       so.ks = ks;        /* ks[p] есть при ksf>0; при NULL — все диффузные */
     }
+    so.travel = travel; /* §932-А: сюда — только при adapt (гейт выше) */
+    so.tvc = tvc;
   }
   if ((use_reps || reps_collect) && reps.repof != NULL) { /* §924: представители в свип */
     so.nrep = reps.nrep;

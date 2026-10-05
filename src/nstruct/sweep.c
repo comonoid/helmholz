@@ -740,6 +740,13 @@ typedef struct {
   int64_t leg_budget;        /* §896-5: бюджет ног на направление */
   int cur_leg_depth;         /* §896-4: глубина обрабатываемой ноги */
   int64_t dep_cnt;           /* §894: число депозитов */
+  double t_last;             /* §932-А: t последнего материального события трубки
+                              * (−1 — не было; 0 на ноге хопа); монотонный max */
+  double t_cur;              /* §932-А: t текущего хита — проводка в sw_accum */
+  double t_lv;               /* §932-А: ПРОБЕГ текущего события = t_cur − t_last
+                              * НА МОМЕНТ хита (до обновления t_last; <0 — нет
+                              * события-предшественника/инверсия — вклада нет) */
+  double ldom;               /* §932-А: Ldom, диагональ меша (масштаб f=Lv/Ldom) */
   double hop_lost_thr;       /* §881/П7: из hop_lost — порогом */
   double hop_lost_cap;       /* §881/П7: из hop_lost — ёмкостью */
   double row_dep;            /* §887-b: счётчик исполнений row-ветки */
@@ -874,6 +881,12 @@ static double front_cos(const front_ctx *fc, int32_t p) {
 /* §862: приращение дробного аккумулятора детальности Δ(материал,угол):
  * темнее материал (ρ) и скользящее падение (1−cosθ, cosθ — к НОРМАЛИ куска)
  * — быстрее набор этажа. Нет lpacc — нет операции (битово прежний мир). */
+static int64_t g932_n;        /* §932-А: события с пробегом (t_last≥0 ∧ Lv>0) */
+static double g932_fsum;      /* §932-А: Σf (f=Lv/Ldom) — ⟨f⟩ для калибровки tvc */
+static double g932_lvsum;     /* §932-А: ΣLv — ⟨Lv⟩ (стартовый tvc ~ Ldom/⟨Lv⟩) */
+static int64_t g932_hist[16]; /* §932-А: гистограмма f, шаг 1/16 (А1724) */
+static int g932_nomax = -1;   /* §932-А1715: env HZ_TVNOMAX — t_last=ht[i] без
+                               * max (НК с предсказанным провалом) */
 /* §931: предикат «далеко» (А1663): центроид куска дальше rep_zone от
  * rep_eye. rep_zone<=0 / нет rep_cent — весь мир «далеко» = прежний §924,
  * битово. Квадрат расстояния — без sqrt (детерминизм, тот же порог, что
@@ -930,6 +943,41 @@ static void sw_accum(front_ctx *fc, int32_t p, double edep) {
       break; /* §862: форма за событие */
     }
     fc->o->lpacc[p] += fc->o->cdelta * d;
+    if (fc->o->travel && fc->t_lv > 0.0) { /* §932-А: этаж по пустотному пробегу;
+                                            * t_lv≤0 — нет предшественника
+                                            * (прямой свет, А1691), инверсия
+                                            * (А1702) или клеточная/path-ветка —
+                                            * вклада нет автоматически */
+      double lv = fc->t_lv;
+      if (lv > 0.0) {
+        double f = lv / fc->ldom;
+        double gk;
+        if (f > 1.0) f = 1.0;
+        /* А1706+МЕЛОЧИ-4: гашение по ks/lep РЕБЁНКА. В rep-раздаче — просто
+         * 1−ks (ks ≤ 1 по построению); в кусочной ветке — по КЛЭМПНУТОМУ
+         * ks ветки депозита (ks ≤ 1−kdf). Без привязки к accum_mode. */
+        if (fc->o->lep && fc->o->lep[p] > 0.0)
+          gk = 0.0; /* §924-канон: эмиттеры не грубеют */
+        else if (fc->o->ks && fc->o->ks[p] >= 0.0) {
+          if (fc->ev_src_far) {
+            gk = 1.0 - fc->o->ks[p];
+          } else {
+            double ks_c = fc->o->ks[p];
+            double kdf = front_rho(fc, p);
+            if (ks_c > 1.0 - kdf) ks_c = 1.0 - kdf > 0.0 ? 1.0 - kdf : 0.0;
+            gk = 1.0 - ks_c;
+          }
+        } else
+          gk = 1.0;
+        g932_n++; /* А1724: статистика — при любом travel=1, ВНЕ guard'а вклада */
+        g932_fsum += f;
+        g932_lvsum += lv;
+        g932_hist[f >= 1.0 ? 15 : (int)(f * 16.0)]++;
+        if (fc->o->tvc > 0.0)
+          fc->o->lpacc[p] += fc->o->tvc * f * gk; /* tvc — масштаб шага; tvc=0 —
+                                                   * guard, битово без ключа (НК) */
+      }
+    }
   }
   if (fc->o->lphits) fc->o->lphits[p] += 1.0; /* §862-диаг: ранжир (а) */
 }
@@ -1358,6 +1406,16 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
         double Lh;
         if (fc->pstamp[tri] == fc->pkey) continue;
         fc->pstamp[tri] = fc->pkey;
+        if (fc->o->travel) { /* §932-А: проводка t хита, пробега Lv и
+                              * монотонного t_last — СРАЗУ после штампа, ДО
+                              * обоих continue ниже (прозрачный rep — тоже
+                              * материальное событие, А1703); max гасит
+                              * инверсии уровней А1702. Lv — по СТАРОМУ t_last
+                              * (пробег ДО этого хита) */
+          fc->t_cur = ht[i];
+          fc->t_lv = fc->t_last >= 0.0 ? ht[i] - fc->t_last : -1.0;
+          fc->t_last = g932_nomax ? ht[i] : (fc->t_last > ht[i] ? fc->t_last : ht[i]);
+        }
         if (first) {
           fc->depA += ai;
           first = 0;
@@ -2674,6 +2732,9 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
   fc->hop_n = 0; /* §873/T4: состояние хопов — на трубку */
   fc->hop_depth = 0;
   fc->hop_lost = 0.0;
+  fc->t_last = -1.0; /* §932-А: старт трубки — события не было; здесь, а не
+                      * memset'ом fc (он даёт 0.0). Прямой свет (пустотный
+                      * вход трубки) детальность НЕ трогает (А1691) */
   for (q = 0; q < 3; q++)
     fc->org[q] = py->lo[q] + ((double)cc[q] + 0.5) * py->cell;
   if (!front_box_seg(py->lo, fc->hi, fc->org, fc->om, -1e30, 1e30, &h0, &h1)) return;
@@ -2849,6 +2910,8 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
         fc->org[q] = pt[q];
         fc->omcur[q] = dir[q]; /* om указывает на omcur — направление ноги */
       }
+      fc->t_last = 0.0; /* §932-А1704: нога стартует В материальном событии —
+                         * первый хит ноги = полный пробег от зеркала */
       if (!front_box_seg(py->lo, fc->hi, fc->org, fc->om, 0.0, 1e30, &h0, &h1)) continue;
       a = ai;
       b = 0.0;
@@ -2989,6 +3052,12 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   double *Ed = NULL, *Eprev = NULL;
   g931_rh = 0; /* §931/А1668: счётчик шва — на прогон (вызовы многократны) */
   g931_seam = 0;
+  g932_n = 0; /* §932-А: приборы пробега — на прогон (А1724: печать при
+               * любом travel=1, включая tvc=0-НК) */
+  g932_fsum = 0.0;
+  g932_lvsum = 0.0;
+  memset(g932_hist, 0, sizeof g932_hist);
+  if (g932_nomax < 0) g932_nomax = getenv("HZ_TVNOMAX") != NULL; /* §932-А1715 НК */
   double *cov = NULL;     /* §911-6: Σ долей следа на кусок (HZ_COVDBG) */
   uint32_t *covn = NULL;  /* §911-6: число хитов на кусок */
   double *cov_lit = NULL; /* §911-8: освещённое покрытие */
@@ -3053,6 +3122,15 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   if (o->mode == 3 && !py->leaf_lp) return 1; /* §852/А1567: per-node max ℓ_p не задан */
   /* §843: режим 0 (скалярный марш §835) определён только на легаси-наборах */
   if (o->mode == 0 && o->ndirs != 6 && o->ndirs != 26) return 1;
+  if (o->travel && !o->lpacc) { /* §932-А/МЕЛОЧИ-3: fail-closed и для иных
+                                 * вызывающих, не только pgather (А1705) */
+    fprintf(stderr, "hz_sw_run: travel=1 требует lpacc (adapt=1)\n");
+    return 2;
+  }
+  if (o->travel && o->tvc < 0.0) { /* §932-А1705: отрицательный масштаб — отказ */
+    fprintf(stderr, "hz_sw_run: travel=1 требует tvc>=0\n");
+    return 2;
+  }
   rc = hz_sw_dir_table(o->ndirs, &tab, &nd);
   if (rc != 0) goto done;
   csec = py->cell * py->cell;
@@ -3407,6 +3485,13 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.hi[0] = o->domhi[0]; /* меш-граница, не сеточная (§852) */
         fc.hi[1] = o->domhi[1];
         fc.hi[2] = o->domhi[2];
+        if (o->travel) { /* §932-А: Ldom — диагональ меша из py->lo × domhi,
+                          * обе в одних координатах, >0 всегда (аудит-4) */
+          double dx = o->domhi[0] - py->lo[0], dy = o->domhi[1] - py->lo[1],
+                 dz = o->domhi[2] - py->lo[2];
+          fc.ldom = sqrt(dx * dx + dy * dy + dz * dz);
+          if (!(fc.ldom > 0.0)) fc.ldom = 1.0; /* вырожденный меш — страховка */
+        }
         front_dir(&fc, stampv, om);
         st->hop_lost += fc.hop_lost_sum;
         st->hops += fc.hop_hops_sum;
@@ -3783,6 +3868,23 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
             (long long)g931_rh, (long long)g931_seam, 100.0 * (double)g931_seam / (double)g931_rh);
   g931_rh = 0;
   g931_seam = 0;
+  if (o->travel) { /* §932-А: калибровочная печать (А1716/А1724) — ⟨f⟩, ⟨Lv⟩,
+                    * гистограмма; стартовый tvc ~ Ldom/⟨Lv⟩ (ожидание 10–50) */
+    double dx = o->domhi[0] - py->lo[0], dy = o->domhi[1] - py->lo[1], dz = o->domhi[2] - py->lo[2];
+    double ldom = sqrt(dx * dx + dy * dy + dz * dz);
+    if (g932_n > 0)
+      fprintf(stderr,
+              "§932-travel: событий с пробегом=%lld <f>=%.4f <Lv>=%.3f Ldom=%.3f "
+              "стартовый tvc~Ldom/<Lv>=%.1f%s\n",
+              (long long)g932_n, g932_fsum / (double)g932_n, g932_lvsum / (double)g932_n, ldom,
+              ldom / (g932_lvsum / (double)g932_n), g932_nomax ? " [НК HZ_TVNOMAX]" : "");
+    else
+      fprintf(stderr, "§932-travel: событий с пробегом нет (t_last<0 всюду)\n");
+    fprintf(stderr, "§932-travel: гистограмма f=Lv/Ldom (шаг 1/16):");
+    for (int q2 = 0; q2 < 16; q2++)
+      fprintf(stderr, " %d:%lld", q2, (long long)g932_hist[q2]);
+    fprintf(stderr, "\n");
+  }
 
 done:
   free(lpflo);         /* §862 */

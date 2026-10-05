@@ -900,14 +900,25 @@ static double front_cos(const front_ctx *fc, int32_t p) {
 /* §862: приращение дробного аккумулятора детальности Δ(материал,угол):
  * темнее материал (ρ) и скользящее падение (1−cosθ, cosθ — к НОРМАЛИ куска)
  * — быстрее набор этажа. Нет lpacc — нет операции (битово прежний мир). */
-static int64_t g932_n;              /* §932-А: события с пробегом (t_last≥0 ∧ Lv>0) */
-static double g932_fsum;            /* §932-А: Σf (f=Lv/Ldom) — ⟨f⟩ для калибровки tvc */
-static double g932_lvsum;           /* §932-А: ΣLv — ⟨Lv⟩ (стартовый tvc ~ Ldom/⟨Lv⟩) */
-static int64_t g932_hist[16];       /* §932-А: гистограмма f, шаг 1/16 (А1724) */
-static int g932_nomax = -1;         /* §932-А1715: env HZ_TVNOMAX — t_last=ht[i] без
-                                     * max (НК с предсказанным провалом) */
-static int64_t g932b_ev, g932b_big; /* §932-Б: активаций среды; σℓ>3 (А1700-4) */
-static double g932b_abs, g932b_dep; /* §932-Б: Σ поглощённого; Σ депозитов детям */
+static int64_t g932_n;                /* §932-А: события с пробегом (t_last≥0 ∧ Lv>0) */
+static double g932_fsum;              /* §932-А: Σf (f=Lv/Ldom) — ⟨f⟩ для калибровки tvc */
+static double g932_lvsum;             /* §932-А: ΣLv — ⟨Lv⟩ (стартовый tvc ~ Ldom/⟨Lv⟩) */
+static int64_t g932_hist[16];         /* §932-А: гистограмма f, шаг 1/16 (А1724) */
+static int g932_nomax = -1;           /* §932-А1715: env HZ_TVNOMAX — t_last=ht[i] без
+                                       * max (НК с предсказанным провалом) */
+static int64_t g932b_ev, g932b_big;   /* §932-Б: активаций среды; σℓ>3 (А1700-4) */
+static double g932b_abs, g932b_dep;   /* §932-Б: Σ поглощённого; Σ депозитов детям */
+static int64_t g932b_sact;            /* §932-Б-Ш3: активаций с σℓ>0 (статистика σℓ) */
+static double g932b_ssum, g932b_smax; /* §932-Б-Ш3: Σσℓ и max σℓ по активациям */
+static double g932b_edf;              /* §932-Б-Ш3: ФАКТ-Ed флеша (Σ_kid edp·A);
+                                       * сверка с g932b_dep — разбор Вопроса-1:
+                                       * флеш домножает Σpend на axcos последней
+                                       * семьи, события несут axcos своей (Г-flux) */
+static int sw_med_now = -1;           /* §932-Б-Ш3: HZ_MEDNOW — немедленная раздача
+                                       * (ветка Ш1) для разбора Вопроса-1 */
+static int sw_med_t1 = -1;            /* §932-Б-Ш3: HZ_MEDT1 — зонд времени:
+                                       * T=1−x вместо exp (физика НЕВЕРНА, замер
+                                       * доли exp в банке) */
 
 /* §932-Б: ИНКРЕМЕНТНЫЙ БАНК СРЕДЫ (А1710) — ослабить Lin до момента t и
  * раздать поглощённое: (1−ρ_r) — замещённым детям по площадям (+depA,
@@ -927,20 +938,29 @@ static double sw_med_bank(front_ctx *fc, double Lin, double t, double csec) {
       continue;
     }
     {
-      double T = exp(-fc->med_act[k].sig * dt);
-      double dabs = Lin * (1.0 - T); /* радианс-единицы поглощённого СРЕДОЙ */
+      double x = fc->med_act[k].sig * dt;
+      double T = sw_med_t1 ? 1.0 - x : exp(-x); /* Ш3: битово exp(-sig·dt) */
+      double dabs = Lin * (1.0 - T);            /* радианс-единицы поглощённого СРЕДОЙ */
       double flux = fc->w_d * csec * fc->axcos * dabs;
       double fdep = flux * (1.0 - fc->med_act[k].rho); /* депозит детям: поток */
       g932b_abs += flux;
       g932b_dep += fdep;
       fc->absorbed += flux;
-      fc->depA += dabs * (1.0 - fc->med_act[k].rho);            /* А1733: радианс-единицы, как ai */
-      fc->med_act[k].pend += dabs * (1.0 - fc->med_act[k].rho); /* ОТЛОЖЕНО:
-                                                                 * раздача детям —
-                                                                 * один флеш на
-                                                                 * направление (цена
-                                                                 * банка, §932-Б-ИСП) */
-      Lin = Lin * T + fc->med_act[k].rho * dabs;                /* ρ_r — переизлучение в луч */
+      fc->depA += dabs * (1.0 - fc->med_act[k].rho); /* А1733: радианс-единицы, как ai */
+      if (sw_med_now) { /* Ш3/HZ_MEDNOW: немедленная раздача (ветка Ш1) —
+                         * edp с axcos ЭТОЙ семьи, счётчику соответствует */
+        double edp = fdep / fc->med_asum[r];
+        int32_t q;
+        for (q = fc->med_koff[r]; q < fc->med_koff[r + 1]; q++)
+          fc->Ed[fc->med_kmem[q]] += edp;
+      } else {
+        /* Ш3/Г-flux ПРАВКА: pend копится в ЕДИНИЦАХ ПОТОКА (с axcos
+         * события СВОЕЙ семьи осей) — флешу не нужно домножение на
+         * axcos последней семьи (Вопрос-1: 0.5% E_avg и факт-Ed≠деп);
+         * Σ_kid edp·A == g932b_dep по построению */
+        fc->med_act[k].pend += fdep;
+      }
+      Lin = Lin * T + fc->med_act[k].rho * dabs; /* ρ_r — переизлучение в луч */
     }
     fc->med_act[k].tprev = te;
     if (t < tout)
@@ -970,6 +990,12 @@ static void sw_med_enter(front_ctx *fc, int32_t r, double t) {
   if (!(sig > 0.0)) return;               /* просвет: T=1, поглощения нет — честно */
   if (fc->med_nact >= 8) return;          /* ёмкость: сверх — не активируем (счётчик) */
   if (sig * (h1 - h0) > 3.0) g932b_big++; /* А1700-4: вырождение в стену */
+  { /* Ш3: статистика σℓ по активациям (битивно-нейтральный прибор) */
+    double sl = sig * (h1 - h0);
+    g932b_sact++;
+    g932b_ssum += sl;
+    if (sl > g932b_smax) g932b_smax = sl;
+  }
   fc->med_act[fc->med_nact].r = r;
   fc->med_act[fc->med_nact].tin = h0;
   fc->med_act[fc->med_nact].tout = h1;
@@ -3116,15 +3142,16 @@ static void front_dir(front_ctx *fc, int32_t *stampv, const double *odir) {
             (long long)fc->ntube, (long long)fc->dbg_node, (long long)fc->dbg_leaf,
             (long long)fc->dbg_n, fc->absorbed, fc->emitted);
   if (fc->med_on) { /* §932-Б: ФЛЕШ отложенных депозитов — один на направление:
-                     * Σ_kid Ed·A = w·csec·axcos·pend (поток на площадь) */
-    double csec2 = fc->py->cell * fc->py->cell;
+                     * Σ_kid Ed·A = pend (Ш3: pend в единицах потока) */
     for (int mk = 0; mk < fc->med_nact; mk++) /* хвост ПОСЛЕДНЕЙ трубки направления */
       fc->med_pend[fc->med_act[mk].r] += fc->med_act[mk].pend;
     fc->med_nact = 0;
     for (int32_t r = 0; r < fc->nrep; r++) {
       if (fc->med_pend[r] != 0.0) {
-        double edp = fc->w_d * csec2 * fabs(odir[fc->ax]) * fc->med_pend[r] /
-                     fc->med_asum[r]; /* axcos ИЗ odir: omcur портят ноги хопов */
+        /* Ш3/Г-flux: pend уже в единицах потока (axcos события своей
+         * семьи внутри банка) — флеш БЕЗ домножения; Σ_kid edp·A = pend */
+        double edp = fc->med_pend[r] / fc->med_asum[r];
+        g932b_edf += fc->med_pend[r]; /* Ш3: факт-Ed флеша — сверка с деп */
         for (int32_t q = fc->med_koff[r]; q < fc->med_koff[r + 1]; q++)
           fc->Ed[fc->med_kmem[q]] += edp;
         fc->med_pend[r] = 0.0;
@@ -3294,6 +3321,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   /* §928: сбор калибровки — только мир сбора (rep-карты есть, представители
    * НЕ активны: o->reps_collect). Накопление — последняя итерация. */
   kcalpath = getenv("HZ_KCALDUMP");
+  if (sw_med_now < 0) sw_med_now = getenv("HZ_MEDNOW") != NULL; /* Ш3: Вопрос-1 */
+  if (sw_med_t1 < 0) sw_med_t1 = getenv("HZ_MEDT1") != NULL;    /* Ш3: зонд exp */
   if (kcalpath != NULL && kcalpath[0] != '\0' && o->reps_collect && o->nrep > 0 &&
       o->repof != NULL) {
     knum = (double *)calloc((size_t)o->nrep * HZ_KCAL_NW, sizeof *knum);
@@ -4081,10 +4110,21 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
           }
         }
         med_ready = 1;
-        fprintf(stderr,
-                "§932-Б: замещено %d/%d кусков (tau=%.3f, mean_e=%.4g), активаций среды будет "
-                "с итерации далее\n",
-                nsub_tot, (int)nt, o->med_tau, mean_e);
+        { /* Ш3: какие регионы заместились (диагностика стенда) */
+          int32_t r2, nmed = 0;
+          for (r2 = 0; r2 < o->nrep; r2++)
+            if (med_nsub[r2] > 0) nmed++;
+          fprintf(stderr,
+                  "§932-Б: замещено %d/%d кусков (tau=%.3f, mean_e=%.4g), активаций среды будет "
+                  "с итерации далее; регионов с заменой=%d",
+                  nsub_tot, (int)nt, o->med_tau, mean_e, nmed);
+          for (r2 = 0; r2 < o->nrep && nmed > 0; r2++)
+            if (med_nsub[r2] > 0)
+              fprintf(stderr, "%s r%d: n=%d V=%.3g an=(%.3g,%.3g,%.3g)", r2 > 0 ? ";" : ":",
+                      (int)r2, (int)med_nsub[r2], med_v[r2], med_an[3 * r2], med_an[3 * r2 + 1],
+                      med_an[3 * r2 + 2]);
+          fprintf(stderr, "\n");
+        }
       }
       if (lvls) { /* §923: перекладка кусков по уровням нового этажа */
         int brc = sw_levels_build(py, o, lpflo, nt, lvls, &lvl_pool, &lvl_pool_cap, &lvls_lpids,
@@ -4163,9 +4203,13 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
                                    * (1−ρ̄)·Σпогл по построению банка) */
     fprintf(stderr,
             "§932-Б: активаций=%lld, σℓ>3=%lld, поглощено=%.6g, депонировано детям=%.6g "
-            "(доля=%.4f)\n",
+            "(доля=%.15f)\n§932-Б-Ш3: σℓ mean=%.4f max=%.4f (n=%lld), факт-Ed=%.6g "
+            "(отл./счёт=%.3g)%s%s\n",
             (long long)g932b_ev, (long long)g932b_big, g932b_abs, g932b_dep,
-            g932b_abs > 0.0 ? g932b_dep / g932b_abs : 0.0);
+            g932b_abs > 0.0 ? g932b_dep / g932b_abs : 0.0,
+            g932b_sact > 0 ? g932b_ssum / (double)g932b_sact : 0.0, g932b_smax,
+            (long long)g932b_sact, g932b_edf, g932b_dep > 0.0 ? g932b_edf / g932b_dep : 0.0,
+            sw_med_now ? " [MEDNOW]" : "", sw_med_t1 ? " [MEDT1-ЗОНД]" : "");
 
 done:
   free(med_sub);       /* §932-Б */

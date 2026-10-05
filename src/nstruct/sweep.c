@@ -919,6 +919,12 @@ static int sw_med_now = -1;           /* §932-Б-Ш3: HZ_MEDNOW — немед�
 static int sw_med_t1 = -1;            /* §932-Б-Ш3: HZ_MEDT1 — зонд времени:
                                        * T=1−x вместо exp (физика НЕВЕРНА, замер
                                        * доли exp в банке) */
+static int sw_med_scr = -1;           /* §932-Б-Ш4: HZ_MEDSCRAMBLE — НК А1698:
+                                       * детерминированный множитель σ по региону;
+                                       * предсказание: баланс сохраняется
+                                       * (конструктивно), поле дрейфует */
+static int64_t g932b_nest;            /* §932-Б-Ш4: входов при живых средах
+                                       * (вложенные регионы, Б0-в/А1720) */
 
 /* §932-Б: ИНКРЕМЕНТНЫЙ БАНК СРЕДЫ (А1710) — ослабить Lin до момента t и
  * раздать поглощённое: (1−ρ_r) — замещённым детям по площадям (+depA,
@@ -987,8 +993,11 @@ static void sw_med_enter(front_ctx *fc, int32_t r, double t) {
     return;
   an = fc->med_an + 3 * r;
   sig = fabs(an[0] * fc->om[0] + an[1] * fc->om[1] + an[2] * fc->om[2]) / v;
+  if (sw_med_scr) /* Ш4/А1698 НК: σ × (0.25…3.25) по региону, детерминированно */
+    sig *= 0.25 + 3.0 * (double)((unsigned)r % 4u) / 4.0;
   if (!(sig > 0.0)) return;               /* просвет: T=1, поглощения нет — честно */
   if (fc->med_nact >= 8) return;          /* ёмкость: сверх — не активируем (счётчик) */
+  if (fc->med_nact > 0) g932b_nest++; /* Ш4: вход при живых средах (Б0-в/А1720) */
   if (sig * (h1 - h0) > 3.0) g932b_big++; /* А1700-4: вырождение в стену */
   { /* Ш3: статистика σℓ по активациям (битивно-нейтральный прибор) */
     double sl = sig * (h1 - h0);
@@ -3323,6 +3332,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   kcalpath = getenv("HZ_KCALDUMP");
   if (sw_med_now < 0) sw_med_now = getenv("HZ_MEDNOW") != NULL; /* Ш3: Вопрос-1 */
   if (sw_med_t1 < 0) sw_med_t1 = getenv("HZ_MEDT1") != NULL;    /* Ш3: зонд exp */
+  if (sw_med_scr < 0) sw_med_scr = getenv("HZ_MEDSCRAMBLE") != NULL; /* Ш4: НК А1698 */
   if (kcalpath != NULL && kcalpath[0] != '\0' && o->reps_collect && o->nrep > 0 &&
       o->repof != NULL) {
     knum = (double *)calloc((size_t)o->nrep * HZ_KCAL_NW, sizeof *knum);
@@ -4204,12 +4214,13 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     fprintf(stderr,
             "§932-Б: активаций=%lld, σℓ>3=%lld, поглощено=%.6g, депонировано детям=%.6g "
             "(доля=%.15f)\n§932-Б-Ш3: σℓ mean=%.4f max=%.4f (n=%lld), факт-Ed=%.6g "
-            "(отл./счёт=%.3g)%s%s\n",
+            "(отл./счёт=%.3g), вложенных входов=%lld%s%s%s\n",
             (long long)g932b_ev, (long long)g932b_big, g932b_abs, g932b_dep,
             g932b_abs > 0.0 ? g932b_dep / g932b_abs : 0.0,
             g932b_sact > 0 ? g932b_ssum / (double)g932b_sact : 0.0, g932b_smax,
             (long long)g932b_sact, g932b_edf, g932b_dep > 0.0 ? g932b_edf / g932b_dep : 0.0,
-            sw_med_now ? " [MEDNOW]" : "", sw_med_t1 ? " [MEDT1-ЗОНД]" : "");
+            (long long)g932b_nest, sw_med_now ? " [MEDNOW]" : "",
+            sw_med_t1 ? " [MEDT1-ЗОНД]" : "", sw_med_scr ? " [MEDSCRAMBLE-НК]" : "");
 
 done:
   free(med_sub);       /* §932-Б */

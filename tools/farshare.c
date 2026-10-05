@@ -45,7 +45,8 @@ static int mkpath(char *dst, size_t cap, const char *tpl, double r) {
 }
 
 int main(int argc, char **argv) {
-  const char *epath = NULL, *opath = NULL, *mtpl = NULL, *rspec = NULL;
+  const char *epath = NULL, *opath = NULL, *mtpl = NULL, *rspec = NULL, *e2path = NULL;
+  double *E2 = NULL; /* §931 A2: опциональный мир колец для К1-L1/k_far */
   double eye[3] = {0, 0, 0};
   double rs[64];
   int nr = 0, i;
@@ -63,6 +64,8 @@ int main(int argc, char **argv) {
       rspec = argv[i] + 2;
     else if (strncmp(argv[i], "mask=", 5) == 0)
       mtpl = argv[i] + 5;
+    else if (strncmp(argv[i], "E2=", 3) == 0)
+      e2path = argv[i] + 3; /* §931 A2: мир колец против E=REF — К1-L1/k_far */
     else
       goto usage;
   }
@@ -101,6 +104,26 @@ int main(int argc, char **argv) {
   if (Ed == NULL || cent == NULL || area == NULL) return 2;
   if (fread(Ed, sizeof(double), (size_t)m.nt, f) != (size_t)m.nt) return 2;
   fclose(f);
+  if (e2path != NULL) { /* §931 A2: мир колец, тот же контроль nt (А1681) */
+    FILE *f2 = fopen(e2path, "rb");
+    long sz2;
+    if (f2 == NULL) {
+      fprintf(stderr, "farshare: E2 не открылся: %s\n", e2path);
+      return 2;
+    }
+    if (fseek(f2, 0, SEEK_END) != 0) return 2;
+    sz2 = ftell(f2);
+    if (sz2 != (long)m.nt * (long)sizeof(double)) {
+      fprintf(stderr, "farshare: nt E2-файла (%ld) != nt OBJ (%d) — ОТКАЗ\n",
+              sz2 / (long)sizeof(double), (int)m.nt);
+      return 2;
+    }
+    if (fseek(f2, 0, SEEK_SET) != 0) return 2;
+    E2 = (double *)malloc((size_t)m.nt * sizeof *E2);
+    if (E2 == NULL) return 2;
+    if (fread(E2, sizeof(double), (size_t)m.nt, f2) != (size_t)m.nt) return 2;
+    fclose(f2);
+  }
   for (i = 0; i < m.nt; i++) {
     const double *a = m.v + 3 * (size_t)m.f[3 * i], *b = m.v + 3 * (size_t)m.f[3 * i + 1],
                  *c = m.v + 3 * (size_t)m.f[3 * i + 2];
@@ -150,6 +173,29 @@ int main(int argc, char **argv) {
     }
     printf("%6g %12.6f %12.6f %10d %6s\n", r, dnf / tot, 1.0 - dnf / tot, (int)tn,
            (dnf / tot >= FS_FARMIN) ? "ДА" : "нет");
+    if (E2 != NULL) { /* §931 A2: гейты точки против REF (Ed) — К1-L1/k_far
+                       * (А1667/А1669); ближнее множество = маска d<=R */
+      double l1n = 0, sref_n = 0, sworld_n = 0, sref_f = 0, sworld_f = 0, sw_a = 0, ref_a = 0;
+      for (t = 0; t < m.nt; t++) {
+        double d = sqrt(cent[3 * (int64_t)t] * cent[3 * (int64_t)t] +
+                        cent[3 * t + 1] * cent[3 * t + 1] + cent[3 * t + 2] * cent[3 * t + 2]);
+        double wa = E2[t] * area[t], ra = Ed[t] * area[t];
+        sw_a += wa;
+        ref_a += ra;
+        if (d <= r) {
+          l1n += fabs(E2[t] - Ed[t]) * area[t];
+          sref_n += ra;
+          sworld_n += wa;
+        } else {
+          sref_f += ra;
+          sworld_f += wa;
+        }
+      }
+      printf("  К1: L1_near=%.6f (гейт<=0.01)  E_avg_near=%+.4f%% (гейт ±1%%)\n"
+             "  К2: k_far=%.4f  D_far=%.4f  дрейф E_avg=%+.4f%%  граница(конс. k=0.21)=%.2f%%\n",
+             l1n / sref_n, 100.0 * (sworld_n / sref_n - 1.0), sworld_f / sref_f, dnf / tot,
+             100.0 * (sw_a / ref_a - 1.0), 100.0 * 0.79 * dnf / tot);
+    }
     if (mtpl != NULL && (strstr(mtpl, "{R}") != NULL || i == nr - 1)) {
       char path[512];
       if (mkpath(path, sizeof path, mtpl, r) != 0) return 2;
@@ -168,6 +214,7 @@ int main(int argc, char **argv) {
       printf("  маска ближних: %s (int8[%d])\n", path, (int)m.nt);
     }
   }
+  free(E2); /* §931 A2 */
   free(Ed);
   free(cent);
   free(area);

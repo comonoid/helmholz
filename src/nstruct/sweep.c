@@ -759,10 +759,12 @@ typedef struct {
   const int32_t *med_koff; /* [nrep+1] CSR замещённых детей */
   const int32_t *med_kmem; /* [Σ замещённых] слоты детей */
   int64_t *med_stamp;      /* [nrep] pkey активации (повторы гасит) */
+  double *med_pend;        /* [nrep] Σ отложенных депозитов направления */
   struct {
     int32_t r;
-    double tin, tout, sig, rho, tprev;
-  } med_act[8]; /* активные среды трубки (порядок = порядок входа = t_in) */
+    double tin, tout, sig, rho, tprev, pend;
+  } med_act[8]; /* активные среды трубки (порядок = порядок входа = t_in);
+                 * pend — отложенный депозит (радианс), флеш per-region */
   int med_nact;
   double hop_lost_thr;       /* §881/П7: из hop_lost — порогом */
   double hop_lost_cap;       /* §881/П7: из hop_lost — ёмкостью */
@@ -929,20 +931,22 @@ static double sw_med_bank(front_ctx *fc, double Lin, double t, double csec) {
       double dabs = Lin * (1.0 - T); /* радианс-единицы поглощённого СРЕДОЙ */
       double flux = fc->w_d * csec * fc->axcos * dabs;
       double fdep = flux * (1.0 - fc->med_act[k].rho); /* депозит детям: поток */
-      double edp = fdep / fc->med_asum[r];             /* на площадь: Σ Ed·A = fdep */
-      int32_t q;
       g932b_abs += flux;
       g932b_dep += fdep;
       fc->absorbed += flux;
-      fc->depA += dabs * (1.0 - fc->med_act[k].rho); /* А1733: радианс-единицы, как ai */
-      for (q = fc->med_koff[r]; q < fc->med_koff[r + 1]; q++) {
-        int32_t kid = fc->med_kmem[q];
-        fc->Ed[kid] += edp; /* равномерно на площадь: Σ_kid edp·A_kid = fdep */
-      }
-      Lin = Lin * T + fc->med_act[k].rho * dabs; /* ρ_r — переизлучение в луч */
+      fc->depA += dabs * (1.0 - fc->med_act[k].rho);            /* А1733: радианс-единицы, как ai */
+      fc->med_act[k].pend += dabs * (1.0 - fc->med_act[k].rho); /* ОТЛОЖЕНО:
+                                                                 * раздача детям —
+                                                                 * один флеш на
+                                                                 * направление (цена
+                                                                 * банка, §932-Б-ИСП) */
+      Lin = Lin * T + fc->med_act[k].rho * dabs;                /* ρ_r — переизлучение в луч */
     }
     fc->med_act[k].tprev = te;
-    if (t < tout) fc->med_act[m++] = fc->med_act[k]; /* ещё активна */
+    if (t < tout)
+      fc->med_act[m++] = fc->med_act[k]; /* ещё активна */
+    else
+      fc->med_pend[fc->med_act[k].r] += fc->med_act[k].pend; /* регион закрыт */
   }
   fc->med_nact = m;
   return Lin;
@@ -972,6 +976,7 @@ static void sw_med_enter(front_ctx *fc, int32_t r, double t) {
   fc->med_act[fc->med_nact].sig = sig;
   fc->med_act[fc->med_nact].rho = fc->med_rho[r];
   fc->med_act[fc->med_nact].tprev = h0 > t ? h0 : t;
+  fc->med_act[fc->med_nact].pend = 0.0;
   fc->med_nact++;
   g932b_ev++;
 }
@@ -3110,6 +3115,22 @@ static void front_dir(front_ctx *fc, int32_t *stampv, const double *odir) {
             "DBG923dir tubes=%lld node=%lld leaf=%lld pieces=%lld absorbed=%.5g emitted=%.5g\n",
             (long long)fc->ntube, (long long)fc->dbg_node, (long long)fc->dbg_leaf,
             (long long)fc->dbg_n, fc->absorbed, fc->emitted);
+  if (fc->med_on) { /* §932-Б: ФЛЕШ отложенных депозитов — один на направление:
+                     * Σ_kid Ed·A = w·csec·axcos·pend (поток на площадь) */
+    double csec2 = fc->py->cell * fc->py->cell;
+    for (int mk = 0; mk < fc->med_nact; mk++) /* хвост ПОСЛЕДНЕЙ трубки направления */
+      fc->med_pend[fc->med_act[mk].r] += fc->med_act[mk].pend;
+    fc->med_nact = 0;
+    for (int32_t r = 0; r < fc->nrep; r++) {
+      if (fc->med_pend[r] != 0.0) {
+        double edp = fc->w_d * csec2 * fabs(odir[fc->ax]) * fc->med_pend[r] /
+                     fc->med_asum[r]; /* axcos ИЗ odir: omcur портят ноги хопов */
+        for (int32_t q = fc->med_koff[r]; q < fc->med_koff[r + 1]; q++)
+          fc->Ed[fc->med_kmem[q]] += edp;
+        fc->med_pend[r] = 0.0;
+      }
+    }
+  }
 }
 
 /* А1578: индекс клетки по оси — ТА ЖЕ конвенция, что pyr_axis_index в pyr.c
@@ -3357,6 +3378,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   double *med_box = NULL, *med_an = NULL, *med_v = NULL, *med_rho = NULL, *med_asum = NULL;
   int32_t *med_nsub = NULL, *med_koff = NULL, *med_kmem = NULL;
   int64_t *med_stamp = NULL;
+  double *med_pend = NULL;
   int med_ready = 0;
   if (o->medium && o->nrep > 0 && o->repof != NULL) {
     med_sub = (uint8_t *)calloc((size_t)nt, 1);
@@ -3369,6 +3391,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     med_koff = (int32_t *)calloc((size_t)o->nrep + 1, sizeof *med_koff);
     med_kmem = (int32_t *)malloc((size_t)nt * sizeof *med_kmem);
     med_stamp = (int64_t *)calloc((size_t)o->nrep, sizeof *med_stamp);
+    med_pend = (double *)calloc((size_t)o->nrep, sizeof *med_pend);
     if (!med_sub || !med_box || !med_an || !med_v || !med_rho || !med_asum || !med_nsub ||
         !med_koff || !med_kmem || !med_stamp) {
       rc = 2; /* fail closed: мир без среды (память) */
@@ -3662,6 +3685,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
           fc.med_koff = med_koff;
           fc.med_kmem = med_kmem;
           fc.med_stamp = med_stamp;
+          fc.med_pend = med_pend;
         }
         front_dir(&fc, stampv, om);
         st->hop_lost += fc.hop_lost_sum;

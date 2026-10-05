@@ -446,7 +446,7 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
 #define PG_RECV_CELL_CAP 512 /* кэп клеток на треугольник; крупнее — гиганты */
 #define PG_RECV_RMAX 8       /* колец поиска: 8·h покрывает ε уровня и стыки */
 #define PG_RECV_BTOL                                                                                     \
-  1e-9 /* строгая принадлежность: тай-полоса рёбер                                  \
+  1e-9 /* строгая принадлежность: тай-полоса рёбер                    \
         * разбирала бы носитель L0 по соседям и ломала битовое \
         * тождество; зазоры носителя закрывает fallback-центроид */
 
@@ -1540,6 +1540,8 @@ int main(int argc, char **argv) {
   int adapt = 0;               /* §915-R4: lpacc-адаптив (0 — битово прежний мир) */
   int travel = 0;              /* §932-А: этажи по пустотному пробегу света */
   double tvc = 0.0;            /* §932-А: масштаб travel-шага (tvc=0 — НК, битово) */
+  int medium = 0;              /* §932-Б: дальнее поле как статистическая среда */
+  double mtau = 0.0;           /* §932-Б/А1737: порог замещения — доля среднего */
   int ksdiff = 0;              /* §918: Δ=1−ks (диффузный отскок грубит) */
   double cdelta = 1.0;         /* §862: вес приращения аккумулятора */
   int lpceil = 4;              /* §866: потолок этажа (из swee3-канона) */
@@ -1677,6 +1679,10 @@ int main(int argc, char **argv) {
       travel = atoi(argv[i] + 7); /* §932-А: этажи по пустотному пробегу */
     else if (strncmp(argv[i], "tvc=", 4) == 0)
       tvc = atof(argv[i] + 4); /* §932-А: масштаб travel-шага (cdt члена) */
+    else if (strncmp(argv[i], "medium=", 7) == 0)
+      medium = atoi(argv[i] + 7); /* §932-Б: статистическая среда дальнего поля */
+    else if (strncmp(argv[i], "mtau=", 5) == 0)
+      mtau = atof(argv[i] + 5); /* §932-Б/А1737: порог замещения, доля среднего */
     else if (strncmp(argv[i], "kcal=", 5) == 0)
       kcalpath = argv[i] + 5; /* §928: таблица калибровки k(r,ωbin) */
     else
@@ -1689,6 +1695,14 @@ int main(int argc, char **argv) {
   }
   if (tvc < 0.0) { /* §932/А1705 */
     fprintf(stderr, "pgather: tvc= отрицательный не допускается (fail-closed, §932)\n");
+    return 2;
+  }
+  if (medium && !adapt) { /* §932-Б/А1738: среда требует адаптив (lpacc_e) */
+    fprintf(stderr, "pgather: medium=1 требует adapt=1 (fail-closed, §932-Б)\n");
+    return 2;
+  }
+  if (medium && mtau <= 0.0) {
+    fprintf(stderr, "pgather: medium=1 требует mtau>0 (порог замещения, §932-Б)\n");
     return 2;
   }
   if (!path && !blkfile) { /* §902: с blk= OBJ не обязателен — сцена в файле */
@@ -2434,6 +2448,20 @@ int main(int argc, char **argv) {
     }
     so.travel = travel; /* §932-А: сюда — только при adapt (гейт выше) */
     so.tvc = tvc;
+    if (medium) {      /* §932-Б: аккумулятор Σдепозитов + режим среды */
+      if (!use_reps) { /* А1738: среда требует reps-инфраструктуру (kit+HZ_REPS) */
+        fprintf(stderr,
+                "pgather: medium=1 требует kit= с уровнями и HZ_REPS=1 (fail-closed, §932-Б)\n");
+        return 2;
+      }
+      so.lpacc_e = (double *)calloc((size_t)m.nt, sizeof(double));
+      if (so.lpacc_e == NULL) {
+        fprintf(stderr, "pgather: нет памяти (lpacc_e)\n");
+        return 2;
+      }
+      so.medium = 1;
+      so.med_tau = mtau;
+    }
   }
   if ((use_reps || reps_collect) && reps.repof != NULL) { /* §924: представители в свип */
     so.nrep = reps.nrep;
@@ -2592,16 +2620,15 @@ int main(int argc, char **argv) {
       A0[t] = 0.5 * sqrt(cxp * cxp + cyp * cyp + czp * czp);
     }
     int64_t nmiss = 0; /* L0-центроид не нашёл выбранного носителя */
-    { /* сетки PIP — ОДНА на уровень, не на L0-tri (ловля производительности) */
+    {                  /* сетки PIP — ОДНА на уровень, не на L0-tri (ловля производительности) */
       pg924_grid gm[HZ_KIT_MAX_NLEV];
       int gmok[HZ_KIT_MAX_NLEV];
       for (int32_t li = 1; li < kk.nlev; li++)
         gmok[li] = pg924_grid_build(&gm[li], &kk.lev[li]) == 0;
       for (uint32_t t = 0; t < L0k->ntris; t++) {
-        double qc[3] = {
-            (L0k->vx[L0k->ti0[t]] + L0k->vx[L0k->ti1[t]] + L0k->vx[L0k->ti2[t]]) / 3.0,
-            (L0k->vy[L0k->ti0[t]] + L0k->vy[L0k->ti1[t]] + L0k->vy[L0k->ti2[t]]) / 3.0,
-            (L0k->vz[L0k->ti0[t]] + L0k->vz[L0k->ti1[t]] + L0k->vz[L0k->ti2[t]]) / 3.0};
+        double qc[3] = {(L0k->vx[L0k->ti0[t]] + L0k->vx[L0k->ti1[t]] + L0k->vx[L0k->ti2[t]]) / 3.0,
+                        (L0k->vy[L0k->ti0[t]] + L0k->vy[L0k->ti1[t]] + L0k->vy[L0k->ti2[t]]) / 3.0,
+                        (L0k->vz[L0k->ti0[t]] + L0k->vz[L0k->ti1[t]] + L0k->vz[L0k->ti2[t]]) / 3.0};
         int32_t own = selr[ltri_off[0] + (int32_t)t]; /* свой L0-кусок выбран? */
         if (own >= 0) { /* битово = прямой путь Ein для L0-части меша */
           sumA[own] = 1.0;
@@ -3338,7 +3365,8 @@ int main(int argc, char **argv) {
     free(rayAD);
     free(rayMX);
   }
-  free(so.lpacc); /* §915-R4 (NULL-safe) */
+  free(so.lpacc);   /* §915-R4 (NULL-safe) */
+  free(so.lpacc_e); /* §932-Б (NULL-safe) */
   if (gather == 0) pg_bbox_csr_free(&csr);
   free(area);
   free(nrm);

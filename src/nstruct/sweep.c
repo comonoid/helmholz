@@ -720,33 +720,50 @@ typedef struct {
    * ограничена HZ_MIRROR_BOUNCE_MAX: при ks ≤ 0.95 вклад (n+1)-го
    * отражения < 0.95ⁿ < 0.82 уже при n=4; невлезающие доли идут в lost
    * (баланс не нарушается). */
-  int hop_n;                 /* элементов в очереди */
-  int hop_depth;             /* выполнено хопов (диагностика; усечения больше нет) */
-  double hop_lost;           /* доля, вытесненная порогом/ёмкостью (в lost) */
-  double hop_lost_sum;       /* §881: Σ по трубкам направления */
-  int64_t hop_hops_sum;      /* §881: Σ хопов по трубкам направления */
-  double Lh_last;            /* §892: диффузное продолжение клетки */
-  double lh_cap;             /* §893: кап радианса итерации */
-  double lh_seen;            /* §893: максимум радианса за направление */
-  double hop_spawn_e;        /* §896-3: Σ ks·Lin при спавне хопов */
-  double *Linmax_prev;       /* §893-b: пер-кусковый max пришедшего радианса */
-  double *Linmax_cur;        /* §893-b: текущей итерации */
-  int in_leg;                /* §894-c: трубка — нога (пер-хит депозит) */
-  double dep_leg, dep_main;  /* §894: Σ депозитов ног / основной трубки */
-  int64_t *leg_pstamp;       /* §894-c-5: штампы ног — отдельное пространство */
-  uint64_t leg_pkey;         /* §894-c-5: ключ штампа ноги (уникален на ногу) */
-  double leg_root;           /* §894-c-5: корень цепи ноги (для порога) */
-  int hop_dep[32];           /* §896-4: глубина цепи каждого хопа */
-  int64_t leg_budget;        /* §896-5: бюджет ног на направление */
-  int cur_leg_depth;         /* §896-4: глубина обрабатываемой ноги */
-  int64_t dep_cnt;           /* §894: число депозитов */
-  double t_last;             /* §932-А: t последнего материального события трубки
-                              * (−1 — не было; 0 на ноге хопа); монотонный max */
-  double t_cur;              /* §932-А: t текущего хита — проводка в sw_accum */
-  double t_lv;               /* §932-А: ПРОБЕГ текущего события = t_cur − t_last
-                              * НА МОМЕНТ хита (до обновления t_last; <0 — нет
-                              * события-предшественника/инверсия — вклада нет) */
-  double ldom;               /* §932-А: Ldom, диагональ меша (масштаб f=Lv/Ldom) */
+  int hop_n;                /* элементов в очереди */
+  int hop_depth;            /* выполнено хопов (диагностика; усечения больше нет) */
+  double hop_lost;          /* доля, вытесненная порогом/ёмкостью (в lost) */
+  double hop_lost_sum;      /* §881: Σ по трубкам направления */
+  int64_t hop_hops_sum;     /* §881: Σ хопов по трубкам направления */
+  double Lh_last;           /* §892: диффузное продолжение клетки */
+  double lh_cap;            /* §893: кап радианса итерации */
+  double lh_seen;           /* §893: максимум радианса за направление */
+  double hop_spawn_e;       /* §896-3: Σ ks·Lin при спавне хопов */
+  double *Linmax_prev;      /* §893-b: пер-кусковый max пришедшего радианса */
+  double *Linmax_cur;       /* §893-b: текущей итерации */
+  int in_leg;               /* §894-c: трубка — нога (пер-хит депозит) */
+  double dep_leg, dep_main; /* §894: Σ депозитов ног / основной трубки */
+  int64_t *leg_pstamp;      /* §894-c-5: штампы ног — отдельное пространство */
+  uint64_t leg_pkey;        /* §894-c-5: ключ штампа ноги (уникален на ногу) */
+  double leg_root;          /* §894-c-5: корень цепи ноги (для порога) */
+  int hop_dep[32];          /* §896-4: глубина цепи каждого хопа */
+  int64_t leg_budget;       /* §896-5: бюджет ног на направление */
+  int cur_leg_depth;        /* §896-4: глубина обрабатываемой ноги */
+  int64_t dep_cnt;          /* §894: число депозитов */
+  double t_last;            /* §932-А: t последнего материального события трубки
+                             * (−1 — не было; 0 на ноге хопа); монотонный max */
+  double t_cur;             /* §932-А: t текущего хита — проводка в sw_accum */
+  double t_lv;              /* §932-А: ПРОБЕГ текущего события = t_cur − t_last
+                             * НА МОМЕНТ хита (до обновления t_last; <0 — нет
+                             * события-предшественника/инверсия — вклада нет) */
+  double ldom;              /* §932-А: Ldom, диагональ меша (масштаб f=Lv/Ldom) */
+  /* §932-Б: статистическая среда (агрегаты — владелец hz_sw_run,
+   * пересчитываются со sw_levels_build, А1711; fc только ссылается) */
+  int med_on;              /* среда активна (агрегаты построены) */
+  const double *med_box;   /* [6nrep] bbox объединения замещённых детей */
+  const double *med_an;    /* [3nrep] Σ A_i·n_i замещённых (σ = |an·ω|/V) */
+  const double *med_v;     /* [nrep] V_r — объём bbox */
+  const double *med_rho;   /* [nrep] площадь-среднее ρ_r */
+  const double *med_asum;  /* [nrep] Σ площадей замещённых (нормировка) */
+  const int32_t *med_nsub; /* [nrep] замещённых детей (0 — обычный rep) */
+  const int32_t *med_koff; /* [nrep+1] CSR замещённых детей */
+  const int32_t *med_kmem; /* [Σ замещённых] слоты детей */
+  int64_t *med_stamp;      /* [nrep] pkey активации (повторы гасит) */
+  struct {
+    int32_t r;
+    double tin, tout, sig, rho, tprev;
+  } med_act[8]; /* активные среды трубки (порядок = порядок входа = t_in) */
+  int med_nact;
   double hop_lost_thr;       /* §881/П7: из hop_lost — порогом */
   double hop_lost_cap;       /* §881/П7: из hop_lost — ёмкостью */
   double row_dep;            /* §887-b: счётчик исполнений row-ветки */
@@ -881,12 +898,83 @@ static double front_cos(const front_ctx *fc, int32_t p) {
 /* §862: приращение дробного аккумулятора детальности Δ(материал,угол):
  * темнее материал (ρ) и скользящее падение (1−cosθ, cosθ — к НОРМАЛИ куска)
  * — быстрее набор этажа. Нет lpacc — нет операции (битово прежний мир). */
-static int64_t g932_n;        /* §932-А: события с пробегом (t_last≥0 ∧ Lv>0) */
-static double g932_fsum;      /* §932-А: Σf (f=Lv/Ldom) — ⟨f⟩ для калибровки tvc */
-static double g932_lvsum;     /* §932-А: ΣLv — ⟨Lv⟩ (стартовый tvc ~ Ldom/⟨Lv⟩) */
-static int64_t g932_hist[16]; /* §932-А: гистограмма f, шаг 1/16 (А1724) */
-static int g932_nomax = -1;   /* §932-А1715: env HZ_TVNOMAX — t_last=ht[i] без
-                               * max (НК с предсказанным провалом) */
+static int64_t g932_n;              /* §932-А: события с пробегом (t_last≥0 ∧ Lv>0) */
+static double g932_fsum;            /* §932-А: Σf (f=Lv/Ldom) — ⟨f⟩ для калибровки tvc */
+static double g932_lvsum;           /* §932-А: ΣLv — ⟨Lv⟩ (стартовый tvc ~ Ldom/⟨Lv⟩) */
+static int64_t g932_hist[16];       /* §932-А: гистограмма f, шаг 1/16 (А1724) */
+static int g932_nomax = -1;         /* §932-А1715: env HZ_TVNOMAX — t_last=ht[i] без
+                                     * max (НК с предсказанным провалом) */
+static int64_t g932b_ev, g932b_big; /* §932-Б: активаций среды; σℓ>3 (А1700-4) */
+static double g932b_abs, g932b_dep; /* §932-Б: Σ поглощённого; Σ депозитов детям */
+
+/* §932-Б: ИНКРЕМЕНТНЫЙ БАНК СРЕДЫ (А1710) — ослабить Lin до момента t и
+ * раздать поглощённое: (1−ρ_r) — замещённым детям по площадям (+depA,
+ * А1733/G6), ρ_r — переизлучение в луч. Банк на каждом событии и
+ * границе сегмента: Σ банков = интегралу Беера ТОЧНО (двойного счёта
+ * нет: Δabs всегда от ТЕКУЩЕГО Lin). Активные среды — в порядке входа
+ * (вложенные: внешняя раньше, ослабления перемножаются, Б0-в). */
+static double sw_med_bank(front_ctx *fc, double Lin, double t, double csec) {
+  int k, m = 0;
+  for (k = 0; k < fc->med_nact; k++) {
+    int32_t r = fc->med_act[k].r;
+    double tout = fc->med_act[k].tout, tprev = fc->med_act[k].tprev;
+    double te = tout < t ? tout : t;
+    double dt = te - tprev;
+    if (dt <= 0.0) { /* ещё жива (t < tprev не бывает: события сортированы) */
+      fc->med_act[m++] = fc->med_act[k];
+      continue;
+    }
+    {
+      double T = exp(-fc->med_act[k].sig * dt);
+      double dabs = Lin * (1.0 - T); /* радианс-единицы поглощённого СРЕДОЙ */
+      double flux = fc->w_d * csec * fc->axcos * dabs;
+      double fdep = flux * (1.0 - fc->med_act[k].rho); /* депозит детям: поток */
+      double edp = fdep / fc->med_asum[r];             /* на площадь: Σ Ed·A = fdep */
+      int32_t q;
+      g932b_abs += flux;
+      g932b_dep += fdep;
+      fc->absorbed += flux;
+      fc->depA += dabs * (1.0 - fc->med_act[k].rho); /* А1733: радианс-единицы, как ai */
+      for (q = fc->med_koff[r]; q < fc->med_koff[r + 1]; q++) {
+        int32_t kid = fc->med_kmem[q];
+        fc->Ed[kid] += edp; /* равномерно на площадь: Σ_kid edp·A_kid = fdep */
+      }
+      Lin = Lin * T + fc->med_act[k].rho * dabs; /* ρ_r — переизлучение в луч */
+    }
+    fc->med_act[k].tprev = te;
+    if (t < tout) fc->med_act[m++] = fc->med_act[k]; /* ещё активна */
+  }
+  fc->med_nact = m;
+  return Lin;
+}
+
+/* §932-Б: ВИРТУАЛЬНОЕ СОБЫТИЕ ВХОДА (А1695/А1709) — bbox региона на всю
+ * трубку (front_box_seg, М2-детерминизм), σ = |Σ A n·ω|/V (А1737),
+ * повторные входы гасит штамп (pkey). t — t события входа. */
+static void sw_med_enter(front_ctx *fc, int32_t r, double t) {
+  double h0, h1, sig, v;
+  const double *an;
+  if (fc->med_stamp[r] == fc->pkey) return; /* уже активирована этой трубкой */
+  fc->med_stamp[r] = fc->pkey;
+  v = fc->med_v[r];
+  if (!(v > 1e-30)) return; /* вырожденный регион — среда не взаимодействует */
+  if (!front_box_seg(fc->med_box + 6 * r, fc->med_box + 6 * r + 3, fc->org, fc->om, -1e30, 1e30,
+                     &h0, &h1))
+    return;
+  an = fc->med_an + 3 * r;
+  sig = fabs(an[0] * fc->om[0] + an[1] * fc->om[1] + an[2] * fc->om[2]) / v;
+  if (!(sig > 0.0)) return;               /* просвет: T=1, поглощения нет — честно */
+  if (fc->med_nact >= 8) return;          /* ёмкость: сверх — не активируем (счётчик) */
+  if (sig * (h1 - h0) > 3.0) g932b_big++; /* А1700-4: вырождение в стену */
+  fc->med_act[fc->med_nact].r = r;
+  fc->med_act[fc->med_nact].tin = h0;
+  fc->med_act[fc->med_nact].tout = h1;
+  fc->med_act[fc->med_nact].sig = sig;
+  fc->med_act[fc->med_nact].rho = fc->med_rho[r];
+  fc->med_act[fc->med_nact].tprev = h0 > t ? h0 : t;
+  fc->med_nact++;
+  g932b_ev++;
+}
 /* §931: предикат «далеко» (А1663): центроид куска дальше rep_zone от
  * rep_eye. rep_zone<=0 / нет rep_cent — весь мир «далеко» = прежний §924,
  * битово. Квадрат расстояния — без sqrt (детерминизм, тот же порог, что
@@ -979,7 +1067,8 @@ static void sw_accum(front_ctx *fc, int32_t p, double edep) {
       }
     }
   }
-  if (fc->o->lphits) fc->o->lphits[p] += 1.0; /* §862-диаг: ранжир (а) */
+  if (fc->o->lphits) fc->o->lphits[p] += 1.0;    /* §862-диаг: ранжир (а) */
+  if (fc->o->lpacc_e) fc->o->lpacc_e[p] += edep; /* §932-Б/А1737: Σдепозитов */
 }
 
 /* §864/Б1: размеры уровня из кэша (статичны на прогон) */
@@ -1331,6 +1420,17 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
      * иначе — слот куска */
     int32_t tri = (fc->reps_on && p >= fc->nt0) ? p : py->pcs[p].tri;
     double tt, bh0, bh1;
+    if (fc->med_on && !fc->in_leg && p >= fc->nt0 && fc->med_nsub[p - fc->nt0] > 0) {
+      /* §932-Б: СРЕДА — вход в bbox региона (виртуальное событие), не
+       * ray-tri носителя; повторные входы гасит med_stamp при активации */
+      if (front_box_seg(fc->med_box + 6 * (p - fc->nt0), fc->med_box + 6 * (p - fc->nt0) + 3,
+                        fc->org, fc->om, tin, tout, &bh0, &bh1)) {
+        ht[nh] = bh0;
+        hp[nh] = p;
+        nh++;
+      }
+      continue;
+    }
     if (fc->agg &&
         fc->agg_list) { /* §872: серия (материал) — culling-единица:
                          * union bbox серии против [tin,tout] ОДНИМ slab-тестом; промах — вся
@@ -1415,6 +1515,20 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
           fc->t_cur = ht[i];
           fc->t_lv = fc->t_last >= 0.0 ? ht[i] - fc->t_last : -1.0;
           fc->t_last = g932_nomax ? ht[i] : (fc->t_last > ht[i] ? fc->t_last : ht[i]);
+        }
+        if (fc->med_on && !fc->in_leg) { /* §932-Б: ослабление средой до
+                                          * события (А1710), затем — сам
+                                          * случай: вход или кусковый хит */
+          int32_t rr = (fc->reps_on && p >= fc->nt0) ? p - fc->nt0 : -1;
+          Lin = sw_med_bank(fc, Lin, ht[i], csec);
+          if (rr >= 0 && fc->med_nsub[rr] > 0) { /* ВИРТУАЛЬНЫЙ ВХОД (А1695) */
+            sw_med_enter(fc, rr, ht[i]);
+            if (first) {
+              fc->depA += ai;
+              first = 0;
+            }
+            continue; /* носитель-поверхность не взаимодействует */
+          }
         }
         if (first) {
           fc->depA += ai;
@@ -1692,7 +1806,11 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
         sw_accum(fc, p, fc->w_d * Lin * (1.0 - ks) * dep_ratio);
         Lin = Lh;
       }
-      g924_geohit += nh; /* §927-дых: гео-попадания (все списки) */
+      g924_geohit += nh;             /* §927-дых: гео-попадания (все списки) */
+      if (fc->med_on && !fc->in_leg) /* §932-Б: банк до ГРАНИЦЫ сегмента —
+                                      * состояние переживает сегмент (А1719),
+                                      * инкрементность точна, двойного счёта нет */
+        Lin = sw_med_bank(fc, Lin, tout, csec);
       if (nh > 0) {
         *a = 0.0;
         *b = Lin;
@@ -1808,7 +1926,7 @@ static int32_t sw923_leaf_or_nb(const hz_pyr *py, int64_t ix, int64_t iy, int64_
 static int sw_levels_build(const hz_pyr *py, const hz_sw_opts *o, const uint8_t *lpflo, int32_t nt,
                            sw_lvl *lvls, int32_t **pool_io, int32_t *pool_cap, int32_t **leaf_io,
                            int32_t *leaf_cap, int32_t *leaf_off, const int32_t *bstart,
-                           const int32_t *bpids, int32_t *want) {
+                           const int32_t *bpids, int32_t *want, const uint8_t *med_sub) {
   int32_t l, p, u;
   int64_t (*dims)[3];
   static int dbg = -1;
@@ -1872,7 +1990,10 @@ static int sw_levels_build(const hz_pyr *py, const hz_sw_opts *o, const uint8_t 
       }
     }
     if (reps_on && (int32_t)f >= g924_minf && (int32_t)f <= o->rep_nlev &&
-        o->repof[((size_t)(int32_t)f - 1u) * (size_t)nt + (size_t)p] >= 0 && sw_far(o, p)) {
+        o->repof[((size_t)(int32_t)f - 1u) * (size_t)nt + (size_t)p] >= 0 && sw_far(o, p) &&
+        (med_sub == NULL || med_sub[p])) { /* §932-Б: среда ЗАМЕЩАЕТ reps для
+                                            * энергетически малых кусков (А1737);
+                                            * med_sub==NULL — прежний §924-мир */
       /* §924: кусок заменён представителем (want[r]=f — дедуп на гроздь);
        * счёт узлов и finer — проходы B/C ниже. §931: БЛИЖНИЙ кусок не
        * заменяется (кольцо детальности — кусочный мир §923, битово). */
@@ -2027,9 +2148,11 @@ static int sw_levels_build(const hz_pyr *py, const hz_sw_opts *o, const uint8_t 
         if (lo[ax] > (int64_t)ceil(dom / py->cell) - 1) lo[ax] = (int64_t)ceil(dom / py->cell) - 1;
       }
       if (reps_on && (int32_t)f >= g924_minf && (int32_t)f <= o->rep_nlev &&
-          o->repof[((size_t)(int32_t)f - 1u) * (size_t)nt + (size_t)p] >= 0 && sw_far(o, p))
+          o->repof[((size_t)(int32_t)f - 1u) * (size_t)nt + (size_t)p] >= 0 && sw_far(o, p) &&
+          (med_sub == NULL || med_sub[p]))
         continue; /* §924: кусок представлен — пишет проход D; §931: только
-                   * дальний (ближний пишет себя, зеркально проходу 1) */
+                   * дальний (ближний пишет себя, зеркально проходу 1);
+                   * §932-Б: med_sub — замещённый средой кусок тоже пишет D */
       if (f == 0) {
         int fb = (o->walk != 0);
         for (int64_t iz = lo[2]; iz <= hi[2]; iz++)
@@ -2732,6 +2855,7 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
   fc->hop_n = 0; /* §873/T4: состояние хопов — на трубку */
   fc->hop_depth = 0;
   fc->hop_lost = 0.0;
+  fc->med_nact = 0;  /* §932-Б: активные среды — на трубку (штампы гасят повторы) */
   fc->t_last = -1.0; /* §932-А: старт трубки — события не было; здесь, а не
                       * memset'ом fc (он даёт 0.0). Прямой свет (пустотный
                       * вход трубки) детальность НЕ трогает (А1691) */
@@ -3057,6 +3181,10 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   g932_fsum = 0.0;
   g932_lvsum = 0.0;
   memset(g932_hist, 0, sizeof g932_hist);
+  g932b_ev = 0; /* §932-Б: приборы среды — на прогон */
+  g932b_big = 0;
+  g932b_abs = 0.0;
+  g932b_dep = 0.0;
   if (g932_nomax < 0) g932_nomax = getenv("HZ_TVNOMAX") != NULL; /* §932-А1715 НК */
   double *cov = NULL;     /* §911-6: Σ долей следа на кусок (HZ_COVDBG) */
   uint32_t *covn = NULL;  /* §911-6: число хитов на кусок */
@@ -3129,6 +3257,13 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   }
   if (o->travel && o->tvc < 0.0) { /* §932-А1705: отрицательный масштаб — отказ */
     fprintf(stderr, "hz_sw_run: travel=1 требует tvc>=0\n");
+    return 2;
+  }
+  if (o->medium && (o->med_tau <= 0.0 || o->lpacc_e == NULL || o->nrep <= 0 || o->repof == NULL ||
+                    o->reps_collect || !o->walk)) {
+    /* §932-Б/А1738: fail-closed — среда требует reps-инфраструктуру,
+     * адаптив (lpacc_e) и выключена в мире kcal-сбора */
+    fprintf(stderr, "hz_sw_run: medium=1 требует mtau>0, lpacc_e, nrep>0, walk, !reps_collect\n");
     return 2;
   }
   rc = hz_sw_dir_table(o->ndirs, &tab, &nd);
@@ -3214,6 +3349,30 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       lvl_finer_all = NULL;
       free(lvls_loff);
       lvls_loff = NULL;
+    }
+  }
+  /* §932-Б: массивы среды — владелец hz_sw_run, агрегаты пересчитываются
+   * со sw_levels_build (А1711); med_sub — решение замещения куска */
+  uint8_t *med_sub = NULL;
+  double *med_box = NULL, *med_an = NULL, *med_v = NULL, *med_rho = NULL, *med_asum = NULL;
+  int32_t *med_nsub = NULL, *med_koff = NULL, *med_kmem = NULL;
+  int64_t *med_stamp = NULL;
+  int med_ready = 0;
+  if (o->medium && o->nrep > 0 && o->repof != NULL) {
+    med_sub = (uint8_t *)calloc((size_t)nt, 1);
+    med_box = (double *)calloc((size_t)o->nrep * 6, sizeof *med_box);
+    med_an = (double *)calloc((size_t)o->nrep * 3, sizeof *med_an);
+    med_v = (double *)calloc((size_t)o->nrep, sizeof *med_v);
+    med_rho = (double *)calloc((size_t)o->nrep, sizeof *med_rho);
+    med_asum = (double *)calloc((size_t)o->nrep, sizeof *med_asum);
+    med_nsub = (int32_t *)calloc((size_t)o->nrep, sizeof *med_nsub);
+    med_koff = (int32_t *)calloc((size_t)o->nrep + 1, sizeof *med_koff);
+    med_kmem = (int32_t *)malloc((size_t)nt * sizeof *med_kmem);
+    med_stamp = (int64_t *)calloc((size_t)o->nrep, sizeof *med_stamp);
+    if (!med_sub || !med_box || !med_an || !med_v || !med_rho || !med_asum || !med_nsub ||
+        !med_koff || !med_kmem || !med_stamp) {
+      rc = 2; /* fail closed: мир без среды (память) */
+      goto done;
     }
   }
   /* §911-6: прибор покрытия (HZ_COVDBG=1) — буферы владельца hz_sw_run */
@@ -3491,6 +3650,18 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
                  dz = o->domhi[2] - py->lo[2];
           fc.ldom = sqrt(dx * dx + dy * dy + dz * dz);
           if (!(fc.ldom > 0.0)) fc.ldom = 1.0; /* вырожденный меш — страховка */
+        }
+        if (o->medium) { /* §932-Б: среда — указатели на агрегаты владельца */
+          fc.med_on = med_ready;
+          fc.med_box = med_box;
+          fc.med_an = med_an;
+          fc.med_v = med_v;
+          fc.med_rho = med_rho;
+          fc.med_asum = med_asum;
+          fc.med_nsub = med_nsub;
+          fc.med_koff = med_koff;
+          fc.med_kmem = med_kmem;
+          fc.med_stamp = med_stamp;
         }
         front_dir(&fc, stampv, om);
         st->hop_lost += fc.hop_lost_sum;
@@ -3812,9 +3983,88 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         rc = 2;
         goto done;
       }
+      if (med_sub != NULL) { /* §932-Б/А1737: замещение — энергетическая
+                              * малость: lpacc_e[p] < τ·mean(lpacc_e);
+                              * зеркала/эмиттеры НЕ замещаются (А1732);
+                              * агрегаты регионов пересчитываются вместе
+                              * со списками (А1711) */
+        double mean_e = 0.0;
+        int32_t p2, nsub_tot = 0;
+        for (p2 = 0; p2 < nt; p2++)
+          mean_e += o->lpacc_e[p2];
+        if (nt > 0) mean_e /= (double)nt;
+        memset(med_nsub, 0, (size_t)o->nrep * sizeof *med_nsub);
+        memset(med_an, 0, (size_t)o->nrep * 3 * sizeof *med_an);
+        memset(med_asum, 0, (size_t)o->nrep * sizeof *med_asum);
+        memset(med_rho, 0, (size_t)o->nrep * sizeof *med_rho);
+        for (int32_t ar = 0; ar < o->nrep * 6; ar++) {
+          med_box[ar] = ar % 6 < 3 ? 1e30 : -1e30; /* пустой union-bbox */
+        }
+        memset(med_koff, 0, (size_t)(o->nrep + 1) * sizeof *med_koff);
+        for (p2 = 0; p2 < nt; p2++) {
+          int32_t f = lpflo[p2], r = -1;
+          if (f < 1 || f > o->rep_nlev) {
+            med_sub[p2] = 0;
+            continue;
+          }
+          r = o->repof[((size_t)f - 1u) * (size_t)nt + (size_t)p2];
+          med_sub[p2] = (int32_t)(r >= 0 && o->lpacc_e[p2] < o->med_tau * mean_e &&
+                                  !(o->ks && o->ks[p2] > 0.0) && !(o->lep && o->lep[p2] > 0.0))
+                            ? 1
+                            : 0;
+          if (!med_sub[p2]) continue;
+          { /* агрегаты: ΣA, ΣA·n, ρ-среднее, bbox-union (tribox детей) */
+            int32_t tr = py->pcs[p2].tri;
+            double a2 = area[p2];
+            med_nsub[r]++;
+            med_asum[r] += a2;
+            med_rho[r] += a2 * (o->rho >= 0.0 ? o->rho : kd[p2]);
+            for (int ax = 0; ax < 3; ax++) {
+              med_an[3 * r + ax] += a2 * nrm[3 * (int64_t)p2 + ax];
+              double lo2 = o->tribox[6 * (int64_t)tr + ax],
+                     hi2 = o->tribox[6 * (int64_t)tr + 3 + ax];
+              if (lo2 < med_box[6 * r + ax]) med_box[6 * r + ax] = lo2;
+              if (hi2 > med_box[6 * r + 3 + ax]) med_box[6 * r + 3 + ax] = hi2;
+            }
+          }
+        }
+        for (int32_t r = 0; r < o->nrep; r++) { /* CSR: counting-sort детей */
+          med_koff[r + 1] = med_koff[r] + med_nsub[r];
+          if (med_asum[r] > 0.0)
+            med_rho[r] /= med_asum[r];
+          else
+            med_rho[r] = 0.0;
+          if (med_nsub[r] > 0) {
+            double vx = med_box[6 * r + 3] - med_box[6 * r],
+                   vy = med_box[6 * r + 4] - med_box[6 * r + 1],
+                   vz = med_box[6 * r + 5] - med_box[6 * r + 2];
+            med_v[r] = (vx > 0.0 ? vx : 0.0) * (vy > 0.0 ? vy : 0.0) * (vz > 0.0 ? vz : 0.0);
+          }
+        }
+        { /* заполнение kmem по koff-курсорам (koff портится → копия) */
+          int32_t *cur = (int32_t *)malloc((size_t)(o->nrep + 1) * sizeof *cur);
+          if (cur != NULL) {
+            memcpy(cur, med_koff, (size_t)(o->nrep + 1) * sizeof *cur);
+            for (p2 = 0; p2 < nt; p2++) {
+              if (!med_sub[p2]) continue;
+              int32_t f = lpflo[p2];
+              int32_t r = o->repof[((size_t)f - 1u) * (size_t)nt + (size_t)p2];
+              med_kmem[cur[r]++] = p2;
+            }
+            for (int32_t r = 0; r < o->nrep; r++)
+              nsub_tot += med_nsub[r];
+            free(cur);
+          }
+        }
+        med_ready = 1;
+        fprintf(stderr,
+                "§932-Б: замещено %d/%d кусков (tau=%.3f, mean_e=%.4g), активаций среды будет "
+                "с итерации далее\n",
+                nsub_tot, (int)nt, o->med_tau, mean_e);
+      }
       if (lvls) { /* §923: перекладка кусков по уровням нового этажа */
         int brc = sw_levels_build(py, o, lpflo, nt, lvls, &lvl_pool, &lvl_pool_cap, &lvls_lpids,
-                                  &lvls_lpids_cap, lvls_loff, bstart, bpids, rep_want);
+                                  &lvls_lpids_cap, lvls_loff, bstart, bpids, rep_want, med_sub);
         if (brc == 0) lvls_ready = 1;
         if (brc != 0) {
           /* отказ памяти: fail closed — разбор раскладки, старый мир */
@@ -3885,8 +4135,25 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       fprintf(stderr, " %d:%lld", q2, (long long)g932_hist[q2]);
     fprintf(stderr, "\n");
   }
+  if (o->medium && g932b_ev >= 0) /* §932-Б: приборы среды (баланс: Σдеп =
+                                   * (1−ρ̄)·Σпогл по построению банка) */
+    fprintf(stderr,
+            "§932-Б: активаций=%lld, σℓ>3=%lld, поглощено=%.6g, депонировано детям=%.6g "
+            "(доля=%.4f)\n",
+            (long long)g932b_ev, (long long)g932b_big, g932b_abs, g932b_dep,
+            g932b_abs > 0.0 ? g932b_dep / g932b_abs : 0.0);
 
 done:
+  free(med_sub);       /* §932-Б */
+  free(med_box);       /* §932-Б */
+  free(med_an);        /* §932-Б */
+  free(med_v);         /* §932-Б */
+  free(med_rho);       /* §932-Б */
+  free(med_asum);      /* §932-Б */
+  free(med_nsub);      /* §932-Б */
+  free(med_koff);      /* §932-Б */
+  free(med_kmem);      /* §932-Б */
+  free(med_stamp);     /* §932-Б */
   free(lpflo);         /* §862 */
   free(lpflo_tri);     /* §922/А1632 */
   free(lvls);          /* §923 */

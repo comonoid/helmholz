@@ -4233,6 +4233,7 @@ done:
   free(med_koff);      /* §932-Б */
   free(med_kmem);      /* §932-Б */
   free(med_stamp);     /* §932-Б */
+  free(med_pend);      /* §932-Б (ASAN-ловля Ш3: не освобождался с Ш2) */
   free(lpflo);         /* §862 */
   free(lpflo_tri);     /* §922/А1632 */
   free(lvls);          /* §923 */

@@ -1594,6 +1594,7 @@ int main(int argc, char **argv) {
   double mtau = 0.0;           /* §932-Б/А1737: порог замещения — доля среднего */
   int coldf = 0;               /* §932-Б/Ш9: стартовый этаж микрокусков */
   int cellacc = 0;             /* §932-Б/Ш9-ЗОНД: клеточный приём */
+  int tmap = 0;                /* Ш9: тон-маппинг серого кадра (эксп. по среднему) */
   double colda = 0.0;          /* §932-Б/Ш9: порог площади для старта, м² */
   int ksdiff = 0;              /* §918: Δ=1−ks (диффузный отскок грубит) */
   double cdelta = 1.0;         /* §862: вес приращения аккумулятора */
@@ -1749,6 +1750,8 @@ int main(int argc, char **argv) {
       colda = atof(argv[i] + 6); /* §932-Б/Ш9: порог площади, м² (0 — выкл) */
     else if (strncmp(argv[i], "cellacc=", 8) == 0)
       cellacc = atoi(argv[i] + 8); /* §932-Б/Ш9-ЗОНД: клеточный приём */
+    else if (strncmp(argv[i], "tmap=", 5) == 0)
+      tmap = atoi(argv[i] + 5); /* Ш9: экспозиция+гамма в сером кадре */
     else if (strncmp(argv[i], "kcal=", 5) == 0)
       kcalpath = argv[i] + 5; /* §928: таблица калибровки k(r,ωbin) */
     else
@@ -3435,6 +3438,26 @@ int main(int argc, char **argv) {
               unsigned char bb = (unsigned char)v;
               if (fwrite(&bb, 1, 1, f) != 1) return 2;
             }
+        } else if (tmap) {
+          /* §932-Б/Ш9: экспозиция+гамма в СЕРОМ пути (как rgb): expk =
+           * среднее положительных × expmul; лечит «хвост давит кадр»
+           * (лампы Ke=30 делали max ~2000 и чёрный кадр); умолчание
+           * выкл — прежняя нормировка на max, битово */
+          double expk = 0.0;
+          int64_t npos = 0;
+          for (i = 0; i < W * H; i++)
+            if (lum[i] > 0) {
+              expk += lum[i];
+              npos++;
+            }
+          expk = expk * expmul / (npos > 0 ? (double)npos : 1.0) + 1e-9;
+          for (i = 0; i < W * H; i++) {
+            double v = 255.0 * pow(lum[i] / expk < 0 ? 0 : lum[i] / expk, 1.0 / 2.2);
+            unsigned char b[3];
+            if (v > 255.0) v = 255.0;
+            b[0] = b[1] = b[2] = (unsigned char)v;
+            fwrite(b, 1, 3, f);
+          }
         } else
           for (i = 0; i < W * H; i++) {
             double v = lum[i] / (lmax > 0 ? lmax : 1.0) * 255.0;
@@ -3445,7 +3468,8 @@ int main(int argc, char **argv) {
             fwrite(b, 1, 3, f);
           }
         fclose(f);
-        printf("КАДР: %s записан (P6, нормировка на max кадра)\n", fname);
+        printf("КАДР: %s записан (P6, %s)\n", fname,
+               tmap ? "экспозиция по среднему + гамма (tmap)" : "нормировка на max кадра");
       }
     } /* базис камеры */
   } /* §877: ходьба */

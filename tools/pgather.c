@@ -1592,6 +1592,9 @@ int main(int argc, char **argv) {
   double tvc = 0.0;            /* §932-А: масштаб travel-шага (tvc=0 — НК, битово) */
   int medium = 0;              /* §932-Б: дальнее поле как статистическая среда */
   double mtau = 0.0;           /* §932-Б/А1737: порог замещения — доля среднего */
+  int coldf = 0;               /* §932-Б/Ш9: стартовый этаж микрокусков */
+  int cellacc = 0;             /* §932-Б/Ш9-ЗОНД: клеточный приём */
+  double colda = 0.0;          /* §932-Б/Ш9: порог площади для старта, м² */
   int ksdiff = 0;              /* §918: Δ=1−ks (диффузный отскок грубит) */
   double cdelta = 1.0;         /* §862: вес приращения аккумулятора */
   int lpceil = 4;              /* §866: потолок этажа (из swee3-канона) */
@@ -1740,6 +1743,12 @@ int main(int argc, char **argv) {
       medium = atoi(argv[i] + 7); /* §932-Б: статистическая среда дальнего поля */
     else if (strncmp(argv[i], "mtau=", 5) == 0)
       mtau = atof(argv[i] + 5); /* §932-Б/А1737: порог замещения, доля среднего */
+    else if (strncmp(argv[i], "coldf=", 6) == 0)
+      coldf = atoi(argv[i] + 6); /* §932-Б/Ш9: стартовый этаж микрокусков */
+    else if (strncmp(argv[i], "colda=", 6) == 0)
+      colda = atof(argv[i] + 6); /* §932-Б/Ш9: порог площади, м² (0 — выкл) */
+    else if (strncmp(argv[i], "cellacc=", 8) == 0)
+      cellacc = atoi(argv[i] + 8); /* §932-Б/Ш9-ЗОНД: клеточный приём */
     else if (strncmp(argv[i], "kcal=", 5) == 0)
       kcalpath = argv[i] + 5; /* §928: таблица калибровки k(r,ωbin) */
     else
@@ -2471,6 +2480,7 @@ int main(int argc, char **argv) {
   if (gather == 0) printf("СТАТЬЯ bbox-CSR: %.2f с\n", t1 - t0);
   memset(&so, 0, sizeof so);
   so.le = le;
+  so.cellacc = cellacc; /* §932-Б/Ш9-ЗОНД: клеточный приём (0 — битово) */
   so.rho = rho;
   so.iters = iters;
   so.tau0 = tau0;
@@ -2497,6 +2507,8 @@ int main(int argc, char **argv) {
       return 2;
     }
     so.cdelta = cdelta;
+    so.cold_f = coldf; /* §932-Б/Ш9: холодный старт этажа (0 — выкл) */
+    so.cold_a = colda;
     so.lpapply = 1;
     so.lpceil = lpceil;
     if (ksdiff) {

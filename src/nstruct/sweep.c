@@ -760,6 +760,9 @@ typedef struct {
   const int32_t *med_kmem; /* [Σ замещённых] слоты детей */
   int64_t *med_stamp;      /* [nrep] pkey активации (повторы гасит) */
   double *med_pend;        /* [nrep] Σ отложенных депозитов направления */
+  double *ced;             /* [nleaf] §932-Б/Ш9-ЗОНД: клеточный аккумулятор
+                            * приёма (NULL — выкл); раздача детям по
+                            * площадям в конце итерации */
   struct {
     int32_t r;
     double tin, tout, sig, rho, tprev, pend;
@@ -925,6 +928,8 @@ static int sw_med_scr = -1;           /* §932-Б-Ш4: HZ_MEDSCRAMBLE — НК �
                                        * (конструктивно), поле дрейфует */
 static int64_t g932b_nest;            /* §932-Б-Ш4: входов при живых средах
                                        * (вложенные регионы, Б0-в/А1720) */
+static double g932c_dep;              /* §932-Б/Ш9-ЗОНД: Σ клеточного приёма */
+static int64_t g932c_n;               /* §932-Б/Ш9-ЗОНД: куско-раздач за прогон */
 
 /* §932-Б: ИНКРЕМЕНТНЫЙ БАНК СРЕДЫ (А1710) — ослабить Lin до момента t и
  * раздать поглощённое: (1−ρ_r) — замещённым детям по площадям (+depA,
@@ -1422,7 +1427,7 @@ static int64_t g931_seam, g931_rh;    /* §931/А1668: шов — rep-хиты �
 static int g924_minf = 1;             /* §924-матрика: HZ_REPMINF */
 
 static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double tin, double tout,
-                           double *a, double *b) {
+                           double *a, double *b, int32_t cpos) {
   const hz_pyr *py = fc->py;
   double csec = py->cell * py->cell; /* сечение БАЗОВОЙ клетки — инвариант А1563 */
   double ai = *a, bi = *b, Lin = ai + bi;
@@ -1434,6 +1439,12 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
   if (fc->tau0) return; /* НК: слой не взаимодействует */
   fc->nmat++;
   g924_vis++;       /* §927-дых: визит списка (любого) */
+  /* §932-Б/Ш9-ЗОНД: КЛЕТОЧНЫЙ ПРИЁМ — накопитель на лист (Lin НА ВХОДЕ
+   * сегмента; раздача детям по площадям в конце итерации). Зонд, НЕ
+   * канон: сосуществует с пер-хит депозитами (двойной счёт на хитовых
+   * кусках — меряется); умолчание cellacc=0 — битово прежний мир. */
+  if (fc->ced != NULL && Lin > 0.0)
+    fc->ced[cpos] += fc->w_d * Lin * csec * fc->axcos;
   if (fc->noprop) { /* НК: фронт не переносится */
     *a = 0.0;
     *b = 0.0;
@@ -2407,7 +2418,7 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
       if (n > 0) {
         const int32_t *ps = fc->leaf_lpids + fc->leaf_loff[pos];
         if (fc->o->walk) /* А1576: точный многопопадный проход */
-          front_seg_walk(fc, ps, n, tin, tout, a, b);
+          front_seg_walk(fc, ps, n, tin, tout, a, b, pos); /* Ш9: лист — в зонд */
         else {
           front_node_box(fc, -1, pos, blo, bhi);
           front_interact(fc, ps, n, blo, bhi, tin, tout, a, b, 1);
@@ -2428,7 +2439,7 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
         const int32_t *ps = L->pids + L->off[pos];
         front_node_box(fc, l, pos, blo, bhi);
         if (fc->o->walk)
-          front_seg_walk(fc, ps, n, tin, tout, a, b);
+          front_seg_walk(fc, ps, n, tin, tout, a, b, -1); /* Ш9: узел — вне клеточного зонда */
         else
           front_interact(fc, ps, n, blo, bhi, tin, tout, a, b, 0);
       }
@@ -2444,7 +2455,7 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
     front_node_box(fc, -1, pos, blo, bhi);
     if (fc->o->walk) /* А1576: точный многопопадный проход */
       front_seg_walk(fc, fc->bpids + fc->bstart[pos], fc->bstart[pos + 1] - fc->bstart[pos], tin,
-                     tout, a, b);
+                     tout, a, b, pos); /* Ш9: лист — в зонд */
     else
       front_interact(fc, fc->bpids + fc->bstart[pos], fc->bstart[pos + 1] - fc->bstart[pos], blo,
                      bhi, tin, tout, a, b, 1);
@@ -2506,7 +2517,7 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
      * Предикат А1566 «bbox ⊆ клетка» валиден ТОЛЬКО на листовом отрезке
      * (bbox ⊆ БАЗОВАЯ клетка). */
     if (fc->o->walk) /* А1576: точный многопопадный проход */
-      front_seg_walk(fc, ps, n, tin, tout, a, b);
+      front_seg_walk(fc, ps, n, tin, tout, a, b, -1); /* Ш9: узел — вне зонда */
     else
       front_interact(fc, fc->pbuf, n, blo, bhi, tin, tout, a, b, 0);
     return;
@@ -3419,6 +3430,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   int64_t *med_stamp = NULL;
   double *med_pend = NULL;
   int med_ready = 0;
+  double *ced = NULL, *casum = NULL; /* §932-Б/Ш9-ЗОНД (goto done раньше блока) */
   if (o->medium && o->nrep > 0 && o->repof != NULL) {
     med_sub = (uint8_t *)calloc((size_t)nt, 1);
     med_box = (double *)calloc((size_t)o->nrep * 6, sizeof *med_box);
@@ -3556,6 +3568,27 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       fillb = NULL;
     }
   }
+  /* §932-Б/Ш9-ЗОНД: клеточный приём — аккумулятор на лист + суммы
+   * площадей детей клетки (раздача ced/ΣA в конце итерации);
+   * объявлены ВЕРХом (goto done до этого блока — анализатор) */
+  ced = (double *)calloc((size_t)py->nleaf, sizeof *ced);
+  casum = (double *)calloc((size_t)py->nleaf, sizeof *casum);
+  if (o->cellacc && bstart != NULL) {
+    ced = (double *)calloc((size_t)py->nleaf, sizeof *ced);
+    casum = (double *)calloc((size_t)py->nleaf, sizeof *casum);
+    if (!ced || !casum) { /* fail closed: зонд выкл, мир прежний */
+      free(ced);
+      free(casum);
+      ced = NULL;
+      casum = NULL;
+    } else {
+      for (int32_t c2 = 0; c2 < py->nleaf; c2++) {
+        double s2 = 0.0;
+        for (int32_t q2 = bstart[c2]; q2 < bstart[c2 + 1]; q2++) s2 += area[bpids[q2]];
+        casum[c2] = s2;
+      }
+    }
+  }
 
   for (it = 0; it < o->iters; it++) {
     double emitted = 0, absorbed = 0, lost = 0, recycled = 0, e_sum = 0, area_sum = 0;
@@ -3672,6 +3705,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.pc = pc;
         fc.bstart = bstart;
         fc.bpids = bpids;
+        fc.ced = ced; /* Ш9-зонд: клеточный аккумулятор (NULL — выкл) */
         fc.mark = mark;
         fc.nstart = nstart;
         fc.nlen = nlen;
@@ -3958,6 +3992,27 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         ag.gwt[g] = 0.0;
       }
     }
+    if (ced != NULL) { /* §932-Б/Ш9-ЗОНД: раздача клеточного приёма —
+                        * Ed[p] += ced/AΣ (одинаково на площадь: Σ Ed·A =
+                        * ced); ПОСЛЕ пер-хит депозитов = двойной счёт на
+                        * хитовых кусках (зонд-семантика, меряется) */
+      double cedtot = 0.0;
+      int64_t cedn = 0;
+      for (int32_t c2 = 0; c2 < py->nleaf; c2++) {
+        double q2 = ced[c2];
+        if (q2 > 0.0 && casum[c2] > 0.0) {
+          double e2 = q2 / casum[c2];
+          for (int32_t q3 = bstart[c2]; q3 < bstart[c2 + 1]; q3++) {
+            Ed[bpids[q3]] += e2;
+            cedn++;
+          }
+          cedtot += q2;
+          ced[c2] = 0.0;
+        }
+      }
+      g932c_dep += cedtot;
+      g932c_n += cedn;
+    }
     for (p = 0; p < nt; p++) {
       py->pcs[p].e = (float)Ed[p];
       e_sum += Ed[p] * area[p];
@@ -4030,6 +4085,20 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
             if (fi < o->lpbase) fi = o->lpbase;
           } else {
             fi = fl >= 255.0 ? 255 : (fl < 0.0 ? 0 : (int32_t)fl);
+          }
+          /* §932-Б/Ш9: ХОЛОДНЫЙ СТАРТ — микрокусок (area < colda) стартует
+           * на этаже coldf: реп-носитель ловит депозиты линий и раздаёт
+           * детям по площадям (§924-канон); иначе яйцо-курица: без
+           * депозитов этаж не набирается никогда (Ш8-4, 96.2% нулей).
+           * Требует rep'а на этом этаже — иначе кусочно (fail-closed). */
+          if (o->cold_f > 0 && o->cold_a > 0.0 && area[p] < o->cold_a &&
+              fi < o->cold_f) {
+            int32_t fc2 = o->cold_f;
+            if (fc2 > (int32_t)py->nlev) fc2 = (int32_t)py->nlev;
+            if (fc2 > o->rep_nlev) fc2 = o->rep_nlev;
+            if (o->repof != NULL && fc2 >= 1 &&
+                o->repof[((size_t)fc2 - 1u) * (size_t)nt + (size_t)p] >= 0)
+              fi = fc2;
           }
           if (o->lpceil > 0 && fi > o->lpceil) fi = o->lpceil;
           if (lpflo[p] != (uint8_t)fi) nchg++;
@@ -4221,6 +4290,10 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
             (long long)g932b_sact, g932b_edf, g932b_dep > 0.0 ? g932b_edf / g932b_dep : 0.0,
             (long long)g932b_nest, sw_med_now ? " [MEDNOW]" : "",
             sw_med_t1 ? " [MEDT1-ЗОНД]" : "", sw_med_scr ? " [MEDSCRAMBLE-НК]" : "");
+  if (o->cellacc) /* §932-Б/Ш9-ЗОНД: клеточный приём (двойной счёт с
+                   * пер-хит — семантика зонда, НЕ канон) */
+    fprintf(stderr, "§932-Б-Ш9: клеточный приём: Σ=%.6g, раздач=%lld (зонд)\n", g932c_dep,
+            (long long)g932c_n);
 
 done:
   free(med_sub);       /* §932-Б */
@@ -4234,6 +4307,8 @@ done:
   free(med_kmem);      /* §932-Б */
   free(med_stamp);     /* §932-Б */
   free(med_pend);      /* §932-Б (ASAN-ловля Ш3: не освобождался с Ш2) */
+  free(ced);           /* §932-Б/Ш9-зонд */
+  free(casum);         /* §932-Б/Ш9-зонд */
   free(lpflo);         /* §862 */
   free(lpflo_tri);     /* §922/А1632 */
   free(lvls);          /* §923 */

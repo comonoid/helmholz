@@ -1443,7 +1443,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
    * сегмента; раздача детям по площадям в конце итерации). Зонд, НЕ
    * канон: сосуществует с пер-хит депозитами (двойной счёт на хитовых
    * кусках — меряется); умолчание cellacc=0 — битово прежний мир. */
-  if (fc->ced != NULL && Lin > 0.0)
+  if (fc->ced != NULL && cpos >= 0 && Lin > 0.0) /* cpos=-1: узел — вне зонда */
     fc->ced[cpos] += fc->w_d * Lin * csec * fc->axcos;
   if (fc->noprop) { /* НК: фронт не переносится */
     *a = 0.0;
@@ -3571,8 +3571,6 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   /* §932-Б/Ш9-ЗОНД: клеточный приём — аккумулятор на лист + суммы
    * площадей детей клетки (раздача ced/ΣA в конце итерации);
    * объявлены ВЕРХом (goto done до этого блока — анализатор) */
-  ced = (double *)calloc((size_t)py->nleaf, sizeof *ced);
-  casum = (double *)calloc((size_t)py->nleaf, sizeof *casum);
   if (o->cellacc && bstart != NULL) {
     ced = (double *)calloc((size_t)py->nleaf, sizeof *ced);
     casum = (double *)calloc((size_t)py->nleaf, sizeof *casum);

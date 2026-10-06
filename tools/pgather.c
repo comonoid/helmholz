@@ -2782,7 +2782,8 @@ int main(int argc, char **argv) {
     }
     t1 = now_sec();
     sw_time = t1 - t0;
-    printf("СВИП: E_avg=%.4f (%.3f с)\n", st.e_avg, sw_time);
+    printf("СВИП: E_avg=%.4f (%.3f с), кусков с E==0: %lld (инвариант позитивности, Ш9)\n",
+           st.e_avg, sw_time, (long long)st.zero_e);
     /* §915-R4: приборы марша — доказательство удешевления этажами
      * (nmat/ndesc/njump) числом, адаптив (flochg) — отдельно */
     printf("МАРШ §852: материальных=%lld спусков=%lld прыжков=%lld nlpclamp=%lld визитов=%lld\n",

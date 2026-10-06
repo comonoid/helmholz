@@ -4013,10 +4013,18 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       g932c_dep += cedtot;
       g932c_n += cedn;
     }
-    for (p = 0; p < nt; p++) {
-      py->pcs[p].e = (float)Ed[p];
-      e_sum += Ed[p] * area[p];
-      area_sum += area[p];
+    { /* §932-Б/Ш9: ИНВАРИАНТ ПОЗИТИВНОСТИ — у незамкнутого куска E>0
+       * после ≥1 итерации (диффузный фон строго положителен; точные
+       * нули = дыра в приёмнике — доказано Ш8-4: 96.2% нулей на UE).
+       * Прибор: доля кусков с E==0; канон-гейт = 0 для открытых сцен. */
+      int64_t nz = 0;
+      for (p = 0; p < nt; p++) {
+        py->pcs[p].e = (float)Ed[p];
+        e_sum += Ed[p] * area[p];
+        area_sum += area[p];
+        if (!(Ed[p] > 0.0)) nz++;
+      }
+      st->zero_e = nz;
     }
     st->e_avg = e_sum / area_sum;
     if (getenv("HZ_AUDIT"))

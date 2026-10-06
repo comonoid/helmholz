@@ -1561,6 +1561,8 @@ int main(int argc, char **argv) {
   double scale = 1.0, le = 1.0, rho = -1.0, fov = 60.0, ksf = 1.0;
   int useke = 1;
   double eye[3] = {0, 0, 0}, look[3] = {0, 0, 0};
+  double uphint[3] = {0, 0, 0}; /* §932-Б-Ш8: up= — вертикаль сцены; {0} — Z-up (умолчание) */
+  int have_up = 0;              /* флаг: up= задан (без FP-сравнений) */
   int iters = 30, lev = 6, tau0 = 0, noprop = 0, ndirs = 26, mort = 1, i, ax;
   double *lep = NULL; /* §874: per-piece эмиссия (ср. Ke); NULL — прежний мир */
   int W = 320, H = 240, k27 = 0;
@@ -1651,6 +1653,10 @@ int main(int argc, char **argv) {
       parse3(argv[i] + 5, look);
     else if (strncmp(argv[i], "fov=", 4) == 0)
       fov = atof(argv[i] + 4);
+    else if (strncmp(argv[i], "up=", 3) == 0) {
+      parse3(argv[i] + 3, uphint); /* §932-Б-Ш8: вертикаль сцены (Y-up: up=0,1,0) */
+      have_up = 1;
+    }
     else if (strncmp(argv[i], "W=", 2) == 0)
       W = atoi(argv[i] + 2);
     else if (strncmp(argv[i], "H=", 2) == 0)
@@ -3131,6 +3137,12 @@ int main(int argc, char **argv) {
     {
       /* базис камеры */
       double fwd[3], right[3], up[3], tmp[3] = {0, 0, 1};
+      if (have_up) {
+        tmp[0] = uphint[0]; /* §932-Б-Ш8: up= — подсказка вертикали сцены
+                             * (Y-up сцены: up=0,1,0; умолчание Z-up битово) */
+        tmp[1] = uphint[1];
+        tmp[2] = uphint[2];
+      }
       double tanf = tan(fov * M_PI / 360.0);
       for (ax = 0; ax < 3; ax++)
         fwd[ax] = lf[ax] - ef[ax];
@@ -3143,9 +3155,17 @@ int main(int argc, char **argv) {
         for (ax = 0; ax < 3; ax++)
           fwd[ax] /= nn;
       }
-      right[0] = fwd[1] * tmp[2] - fwd[2] * tmp[1];
-      right[1] = fwd[2] * tmp[0] - fwd[0] * tmp[2];
-      right[2] = fwd[0] * tmp[1] - fwd[1] * tmp[0];
+      if (have_up) { /* §932-Б-Ш8: right = tmp×fwd — правый базис с вертикалью
+                      * tmp; прежняя формула fwd×tmp давала зеркальный кадр
+                      * (ловля по визуальной оценке пользователя) */
+        right[0] = tmp[1] * fwd[2] - tmp[2] * fwd[1];
+        right[1] = tmp[2] * fwd[0] - tmp[0] * fwd[2];
+        right[2] = tmp[0] * fwd[1] - tmp[1] * fwd[0];
+      } else {
+        right[0] = fwd[1] * tmp[2] - fwd[2] * tmp[1];
+        right[1] = fwd[2] * tmp[0] - fwd[0] * tmp[2];
+        right[2] = fwd[0] * tmp[1] - fwd[1] * tmp[0];
+      }
       {
         double nn = sqrt(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
         if (nn < 1e-9) { /* взгляд вдоль z — базис от x */

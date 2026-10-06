@@ -13,9 +13,9 @@
 #include <string.h>
 
 int main(int argc, char **argv) {
-  int side = 24, grid = 100;
+  int side = 24, grid = 100, cols = 12, segs = 4;
   if (argc < 2) {
-    fprintf(stderr, "gentemple OUT.obj [side=N grid=M]\n");
+    fprintf(stderr, "gentemple OUT.obj [side=N grid=M cols=N segs=M]\n");
     return 2;
   }
   for (int i = 2; i < argc; i++) {
@@ -23,9 +23,14 @@ int main(int argc, char **argv) {
       side = atoi(argv[i] + 5);
     else if (strncmp(argv[i], "grid=", 5) == 0)
       grid = atoi(argv[i] + 5);
+    else if (strncmp(argv[i], "cols=", 5) == 0)
+      cols = atoi(argv[i] + 5); /* §932-Б-Ш7: грани колонны (было 12) */
+    else if (strncmp(argv[i], "segs=", 5) == 0)
+      segs = atoi(argv[i] + 5); /* §932-Б-Ш7: сегменты высоты (было 4) */
   }
-  if (side < 2 || grid < 4 || side > 64 || grid > 400) {
-    fprintf(stderr, "gentemple: 2<=side<=64, 4<=grid<=400\n");
+  if (side < 2 || grid < 4 || side > 64 || grid > 400 || cols < 3 || cols > 96 || segs < 1 ||
+      segs > 32) {
+    fprintf(stderr, "gentemple: 2<=side<=64, 4<=grid<=400, 3<=cols<=96, 1<=segs<=32\n");
     return 2;
   }
   FILE *f = fopen(argv[1], "w");
@@ -37,9 +42,9 @@ int main(int argc, char **argv) {
   const double S = 40.0;    /* габарит храма, м */
   const double colR = 0.35; /* радиус колонны */
   const double colH = 6.0;  /* высота колонны */
-  const int SIDES = 12;     /* грани колонны */
-  const int SEGS = 4;       /* сегменты высоты */
-  fprintf(f, "# gentemple side=%d grid=%d\n", side, grid);
+  const int SIDES = cols;   /* грани колонны (§932-Б-Ш7: параметр) */
+  const int SEGS = segs;    /* сегменты высоты (§932-Б-Ш7: параметр) */
+  fprintf(f, "# gentemple side=%d grid=%d cols=%d segs=%d\n", side, grid, cols, segs);
 
   /* пол: сетка grid×grid на y=0 */
   double q = S / grid;

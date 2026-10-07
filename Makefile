@@ -162,12 +162,15 @@ lean:
 
 # S6: формальный слой (CBMC) — по функциям, только на опасном.
 # Обе оснастки — с точкой входа `harness` (в них нет main), параметры взяты из
-# их шапок: HZ_BUFN=12 для разборщика (лестница Ш2), HZ_N=17/HZ_L2=2 для октодерева.
+# их шапок: HZ_BUFN=12 для разборщика (лестница Ш2), HZ_N=17/HZ_L2=2 для
+# октодерева. ВАЖНО: у оснастки октодерева в списке файлов обязан быть
+# src/octree.c — иначе CBMC не имеет тела вызываемого hz_oct_validate и его
+# свойства тривиально ПРОВАЛИВАЮТСЯ («no body for callee», 8 из 35; ловля 07-10).
 cbmc:
 	$(RUN) 'scripts/cverify.sh tests/cbmc_sceneobj.c --function harness \
 	  --unwind 14 --unwinding-assertions -DHZ_BUFN=12'
 	$(RUN) 'scripts/cverify.sh tests/cbmc_octree.c --function harness \
-	  --unwind 24 --unwinding-assertions -DHZ_N=17 -DHZ_L2=2'
+	  --unwind 24 --unwinding-assertions -DHZ_N=17 -DHZ_L2=2 src/octree.c'
 
 # --- S7: рантайм-слой -------------------------------------------------------
 SAN = build/san

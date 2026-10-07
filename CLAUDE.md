@@ -142,8 +142,11 @@ Every `.c`/`.h` written or edited goes through this sequence before it is
    preconditions. Not on every file; on the dangerous ones. **07-10: оснастка
    `tests/cbmc_sceneobj.c` два месяца не компилировалась** (сигнатура
    `parse_fvert` разошлась) — то есть слой существовал только на бумаге; стенд
-   починен и теперь проверяется воротами (4591 свойство, VERIFICATION
-   SUCCESSFUL), включая несущее свойство текстурного индекса.
+   починен и теперь проверяется воротами: `make cbmc` даёт 4591 свойство
+   (разборщик, VERIFICATION SUCCESSFUL) и 1645 свойств (октодерево,
+   VERIFICATION SUCCESSFUL), включая несущее свойство текстурного индекса.
+   Оснастке октодерева обязателен `src/octree.c` в списке файлов: без него у
+   CBMC нет тела `hz_oct_validate`, и свойства проваливаются ЛОЖНО.
 4. **Deadweight** (before commits): `make lean` (`scripts/lean.sh`) —
    whole-project unused funcs/members/vars (cross-file; per-file unused already
    caught by S1's `-Wall -Wextra`). Список файлов — из `git ls-files`, не

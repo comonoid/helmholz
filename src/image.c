@@ -81,7 +81,8 @@ int hz_ppm_write(const char *path, const double *intensity, int w, int h) {
   for (int y = 0; y < h; y++) {
     for (int x = 0; x < w; x++) {
       double v = sqrt(intensity[(size_t)y * (size_t)w + (size_t)x] / mx); /* gamma 0.5 */
-      colormap(v, &row[3 * x]);
+      colormap(v, &row[3 * (size_t)x]); /* смещение 64-битное: 3·x может не влезть в int
+                                         * (bugprone-implicit-widening, ловля 07-10) */
     }
     if (fwrite(row, 3, (size_t)w, f) != (size_t)w) rc = 1;
   }
@@ -128,9 +129,9 @@ int hz_ppm_write_signed(const char *path, const double *field, int w, int h) {
       g = 1.0 + v;
       b = 1.0;
     }
-    rgb[3 * i] = (unsigned char)(255.0 * r + 0.5);
-    rgb[3 * i + 1] = (unsigned char)(255.0 * g + 0.5);
-    rgb[3 * i + 2] = (unsigned char)(255.0 * b + 0.5);
+    rgb[3 * (size_t)i] = (unsigned char)(255.0 * r + 0.5);
+    rgb[3 * (size_t)i + 1] = (unsigned char)(255.0 * g + 0.5);
+    rgb[3 * (size_t)i + 2] = (unsigned char)(255.0 * b + 0.5);
   }
   int rc = hz_ppm_write_rgb(path, rgb, w, h);
   free(rgb);

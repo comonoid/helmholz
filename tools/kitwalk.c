@@ -114,7 +114,8 @@ static int build_floor(hz_pyr *py) {
       for (int i = 0; i < nq; i++) {
         double x0 = i * q, y0 = j * q;
         for (int h = 0; h < 2; h++) {
-          double *mn = &tmin[3 * nt], *mx = &tmax[3 * nt], *cn = &cen[3 * nt];
+          double *mn = &tmin[3 * (int64_t)nt], *mx = &tmax[3 * (int64_t)nt],
+                 *cn = &cen[3 * (int64_t)nt];
           mn[0] = x0;
           mn[1] = y0;
           mn[2] = -1e-3;
@@ -210,9 +211,9 @@ int main(void) {
     int w = 0;
     for (int t = 0; t < nt_global; t++)
       if (lp[t] == (uint8_t)li) {
-        memcpy(tm + 3 * w, tmin + 3 * t, 3 * sizeof *tm);
-        memcpy(tx + 3 * w, tmax + 3 * t, 3 * sizeof *tx);
-        memcpy(tc + 3 * w, cen + 3 * t, 3 * sizeof *tc);
+        memcpy(tm + 3 * (int64_t)w, tmin + 3 * (int64_t)t, 3 * sizeof *tm);
+        memcpy(tx + 3 * (int64_t)w, tmax + 3 * (int64_t)t, 3 * sizeof *tx);
+        memcpy(tc + 3 * (int64_t)w, cen + 3 * (int64_t)t, 3 * sizeof *tc);
         mm[w] = mtl[t];
         lpm[w] = 0; /* в своей пирамиде кусок листовой */
         w++;

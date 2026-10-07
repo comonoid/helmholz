@@ -111,7 +111,7 @@ int main(int argc, char **argv) {
     /* 4 стены по периметру: углы 0-1, 1-2, 2-3, 3-0 */
     static const int ed[4][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 0}};
     for (int k = 0; k < 4; k++) {
-      long a0 = 1 + vb + 2 * ed[k][0], a1 = 1 + vb + 2 * ed[k][1];
+      long a0 = 1 + vb + 2 * (long)ed[k][0], a1 = 1 + vb + 2 * (long)ed[k][1];
       long b0 = a0 + 1, b1 = a1 + 1;
       fprintf(f, "f %ld %ld %ld\nf %ld %ld %ld\n", a0, a1, b1, a0, b1, b0);
       nt += 2;

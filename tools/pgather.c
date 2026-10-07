@@ -841,7 +841,7 @@ static int pg_hblk_open(pg_hblk *h, const char *path) {
   int fd = open(path, O_RDONLY);
   if (fd < 0) return 2;
   off_t len = lseek(fd, 0, SEEK_END);
-  if (len < 24 * 8) {
+  if (len < (off_t)24 * 8) { /* приведение к типу сравнения: 24·8 — литерал заголовка HBLK */
     close(fd);
     return 2;
   }
@@ -997,7 +997,8 @@ static int32_t pg_hblk_nearest(const pg_hblk *h, const double org[3], const doub
 static double sh_clip_tri(const double tri[3][3], const double blo[3], const double bhi[3],
                           double out[3][3]) {
   double poly[16][3], tmp[16][3];
-  int np = 3, nt2 = 0, pl;
+  int np = 3, nt2, pl; /* nt2 обнуляется в первом же витке (pl=0) до чтения:
+                        * инициализатор здесь был мёртвым присваиванием (07-10) */
   for (int i = 0; i < 3; i++)
     for (int a = 0; a < 3; a++)
       poly[i][a] = tri[i][a];
@@ -2878,19 +2879,21 @@ int main(int argc, char **argv) {
     for (i = 0; i < m.nt; i++) { /* компактация в порядке кусков фазы A */
       int32_t tri = py.pcs[i].tri;
       if (!keep[tri]) continue;
-      cmin2[3 * p2] = cmin[3 * (int64_t)tri];
-      cmin2[3 * p2 + 1] = cmin[3 * (int64_t)tri + 1];
-      cmin2[3 * p2 + 2] = cmin[3 * (int64_t)tri + 2];
-      cmax2[3 * p2] = cmax[3 * (int64_t)tri];
-      cmax2[3 * p2 + 1] = cmax[3 * (int64_t)tri + 1];
-      cmax2[3 * p2 + 2] = cmax[3 * (int64_t)tri + 2];
-      cent2[3 * p2] = cent[3 * (int64_t)tri];
-      cent2[3 * p2 + 1] = cent[3 * (int64_t)tri + 1];
-      cent2[3 * p2 + 2] = cent[3 * (int64_t)tri + 2];
+      /* смещения ЛЕВОЙ части тоже 64-битные: справа уже (int64_t)tri, а 3·p2
+       * в int при p2 в сотни миллионов переполнилось бы (ловля 07-10) */
+      cmin2[3 * (int64_t)p2] = cmin[3 * (int64_t)tri];
+      cmin2[3 * (int64_t)p2 + 1] = cmin[3 * (int64_t)tri + 1];
+      cmin2[3 * (int64_t)p2 + 2] = cmin[3 * (int64_t)tri + 2];
+      cmax2[3 * (int64_t)p2] = cmax[3 * (int64_t)tri];
+      cmax2[3 * (int64_t)p2 + 1] = cmax[3 * (int64_t)tri + 1];
+      cmax2[3 * (int64_t)p2 + 2] = cmax[3 * (int64_t)tri + 2];
+      cent2[3 * (int64_t)p2] = cent[3 * (int64_t)tri];
+      cent2[3 * (int64_t)p2 + 1] = cent[3 * (int64_t)tri + 1];
+      cent2[3 * (int64_t)p2 + 2] = cent[3 * (int64_t)tri + 2];
       area2[p2] = area[i];
-      nrm2[3 * p2] = nrm[3 * (int64_t)i];
-      nrm2[3 * p2 + 1] = nrm[3 * (int64_t)i + 1];
-      nrm2[3 * p2 + 2] = nrm[3 * (int64_t)i + 2];
+      nrm2[3 * (int64_t)p2] = nrm[3 * (int64_t)i];
+      nrm2[3 * (int64_t)p2 + 1] = nrm[3 * (int64_t)i + 1];
+      nrm2[3 * (int64_t)p2 + 2] = nrm[3 * (int64_t)i + 2];
       kd2[p2] = kd[i];
       ks2[p2] = ks[i];
       if (lep2) lep2[p2] = lep[i];

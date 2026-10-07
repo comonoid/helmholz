@@ -37,11 +37,11 @@ static void fill_octa(hz_kit_level *L) {
   L->vx = malloc(6 * sizeof(double));
   L->vy = malloc(6 * sizeof(double));
   L->vz = malloc(6 * sizeof(double));
-  L->ti0 = malloc(8 * 4);
-  L->ti1 = malloc(8 * 4);
-  L->ti2 = malloc(8 * 4);
-  L->tcl = malloc(8 * 4);
-  L->tmtl = malloc(8 * 4);
+  L->ti0 = malloc((size_t)8 * 4);
+  L->ti1 = malloc((size_t)8 * 4);
+  L->ti2 = malloc((size_t)8 * 4);
+  L->tcl = malloc((size_t)8 * 4);
+  L->tmtl = malloc((size_t)8 * 4);
   L->cl = malloc(2 * sizeof(hz_cluster));
   if (!L->vx || !L->vy || !L->vz || !L->ti0 || !L->ti1 || !L->ti2 || !L->tcl || !L->tmtl || !L->cl)
     exit(2);

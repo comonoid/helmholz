@@ -48,7 +48,8 @@ static int build_pyr(hz_pyr *py, int nq, double cell, uint8_t lpv) {
   for (int j = 0; j < nq; j++)
     for (int i = 0; i < nq; i++)
       for (int h = 0; h < 2; h++) {
-        double *mn = &tmin[3 * nt], *mx = &tmax[3 * nt], *cn = &cen[3 * nt];
+        double *mn = &tmin[3 * (int64_t)nt], *mx = &tmax[3 * (int64_t)nt],
+               *cn = &cen[3 * (int64_t)nt];
         mn[0] = i * q;
         mn[1] = j * q;
         mn[2] = -1e-3;
@@ -187,7 +188,6 @@ int main(void) {
            (long long)st.visits, (long long)st.events_l0, (long long)st.events_l1, absorbed_hop);
     if (np == 0) break;
   }
-  alive += np > 0 ? 0 : 0;
   for (int u = 0; u < np; u++)
     alive += pcs[u].E; /* хвост живых */
   double bal = emitted - absorbed - alive;

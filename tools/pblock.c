@@ -239,14 +239,14 @@ int main(int argc, char **argv) {
     memcpy(&hdr[5], lo, 3 * sizeof(double));
     memcpy(&hdr[8], &cell, sizeof(double));
     hdr[9] = (uint64_t)nocc;
-    hdr[10] = 24 * 8;                        /* оффсет таблицы */
-    hdr[11] = 24 * 8 + (uint64_t)nocc * 24;  /* оффсет tri-id (int32) */
-    hdr[12] = hdr[11] + (uint64_t)nids * 4;  /* оффсет треугольников */
-    hdr[13] = hdr[12] + (uint64_t)m.nt * 72; /* §902: оффсет kd */
-    hdr[14] = hdr[13] + (uint64_t)m.nt * 8;  /* §902: оффсет lep */
-    hdr[15] = hdr[14] + (uint64_t)m.nt * 8;  /* §902: оффсет E */
-    hdr[16] = hdr[15] + (uint64_t)m.nt * 8;  /* §904: оффсет kd3 (3·nt) */
-    hdr[17] = hdr[16] + (uint64_t)m.nt * 24; /* §904: оффсет lep3 (3·nt) */
+    hdr[10] = (uint64_t)24 * 8;                       /* оффсет таблицы */
+    hdr[11] = (uint64_t)24 * 8 + (uint64_t)nocc * 24; /* оффсет tri-id (int32) */
+    hdr[12] = hdr[11] + (uint64_t)nids * 4;           /* оффсет треугольников */
+    hdr[13] = hdr[12] + (uint64_t)m.nt * 72;          /* §902: оффсет kd */
+    hdr[14] = hdr[13] + (uint64_t)m.nt * 8;           /* §902: оффсет lep */
+    hdr[15] = hdr[14] + (uint64_t)m.nt * 8;           /* §902: оффсет E */
+    hdr[16] = hdr[15] + (uint64_t)m.nt * 8;           /* §904: оффсет kd3 (3·nt) */
+    hdr[17] = hdr[16] + (uint64_t)m.nt * 24;          /* §904: оффсет lep3 (3·nt) */
     fwrite(hdr, 8, 24, f);
     fwrite(tab, sizeof *tab, (size_t)nocc, f);
     fwrite(ids, sizeof *ids, (size_t)nids, f);

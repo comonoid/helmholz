@@ -259,7 +259,7 @@ int main(int argc, char **argv) {
       hz_obj_tri(&m, ti, pp);
       for (int v = 0; v < 3; v++)
         for (aa = 0; aa < 3; aa++)
-          tv9[9 * (int64_t)ti + 3 * v + aa] = pp[v][aa];
+          tv9[9 * (int64_t)ti + 3 * (int64_t)v + aa] = pp[v][aa];
       for (ax = 0; ax < 3; ax++) {
         double lo = pp[0][ax], hi = pp[0][ax];
         for (int v = 1; v < 3; v++) {

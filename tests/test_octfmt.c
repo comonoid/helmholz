@@ -262,12 +262,12 @@ int main(void) {
 
   {
     long c0 = HZ_OCT_HDRSIZE; /* child0[i] lives at c0 + 4*i */
-    patch_i32(b, n, c0 + 4 * 5, -2, HZ_OCT_E_CHILD_NEG, "child0 = -2");
-    patch_i32(b, n, c0 + 4 * 1, 1, HZ_OCT_E_CYCLE, "child0[1] = 1 (self-loop)");
-    patch_i32(b, n, c0 + 4 * 0, 17, HZ_OCT_E_RANGE, "child block past the arena");
-    patch_i32(b, n, c0 + 4 * 0, 2, HZ_OCT_E_ALIGN, "child0 not at a block start");
-    patch_i32(b, n, c0 + 4 * 2, 9, HZ_OCT_E_TWOPARENT, "block 9 claimed twice");
-    patch_i32(b, n, c0 + 4 * 1, -1, HZ_OCT_E_UNREACHABLE, "block 9 orphaned");
+    patch_i32(b, n, c0 + 4L * 5, -2, HZ_OCT_E_CHILD_NEG, "child0 = -2");
+    patch_i32(b, n, c0 + 4L * 1, 1, HZ_OCT_E_CYCLE, "child0[1] = 1 (self-loop)");
+    patch_i32(b, n, c0 + 4L * 0, 17, HZ_OCT_E_RANGE, "child block past the arena");
+    patch_i32(b, n, c0 + 4L * 0, 2, HZ_OCT_E_ALIGN, "child0 not at a block start");
+    patch_i32(b, n, c0 + 4L * 2, 9, HZ_OCT_E_TWOPARENT, "block 9 claimed twice");
+    patch_i32(b, n, c0 + 4L * 1, -1, HZ_OCT_E_UNREACHABLE, "block 9 orphaned");
   }
 
   {

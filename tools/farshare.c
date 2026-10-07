@@ -125,18 +125,20 @@ int main(int argc, char **argv) {
     fclose(f2);
   }
   for (i = 0; i < m.nt; i++) {
-    const double *a = m.v + 3 * (size_t)m.f[3 * i], *b = m.v + 3 * (size_t)m.f[3 * i + 1],
-                 *c = m.v + 3 * (size_t)m.f[3 * i + 2];
+    const double *a = m.v + 3 * (size_t)m.f[3 * (int64_t)i],
+                 *b = m.v + 3 * (size_t)m.f[3 * (int64_t)i + 1],
+                 *c = m.v + 3 * (size_t)m.f[3 * (int64_t)i + 2];
     double u[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]},
            v[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]}, cx = u[1] * v[2] - u[2] * v[1],
            cy = u[2] * v[0] - u[0] * v[2], cz = u[0] * v[1] - u[1] * v[0];
     int k;
     area[i] = 0.5 * sqrt(cx * cx + cy * cy + cz * cz);
     for (k = 0; k < 3; k++)
-      cent[3 * i + k] = (a[k] + b[k] + c[k]) / 3.0 - eye[k];
+      cent[3 * (int64_t)i + k] = (a[k] + b[k] + c[k]) / 3.0 - eye[k];
     {
-      double d2 = cent[3 * i] * cent[3 * i] + cent[3 * i + 1] * cent[3 * i + 1] +
-                  cent[3 * i + 2] * cent[3 * i + 2];
+      double d2 = cent[3 * (int64_t)i] * cent[3 * (int64_t)i] +
+                  cent[3 * (int64_t)i + 1] * cent[3 * (int64_t)i + 1] +
+                  cent[3 * (int64_t)i + 2] * cent[3 * (int64_t)i + 2];
       if (sqrt(d2) > dmaxc) dmaxc = sqrt(d2);
     }
     tot += Ed[i] * area[i];
@@ -149,8 +151,9 @@ int main(int argc, char **argv) {
   {
     int32_t cn0 = 0, cninf = 0;
     for (i = 0; i < m.nt; i++) {
-      double d = sqrt(cent[3 * i] * cent[3 * i] + cent[3 * i + 1] * cent[3 * i + 1] +
-                      cent[3 * i + 2] * cent[3 * i + 2]);
+      double d = sqrt(cent[3 * (int64_t)i] * cent[3 * (int64_t)i] +
+                      cent[3 * (int64_t)i + 1] * cent[3 * (int64_t)i + 1] +
+                      cent[3 * (int64_t)i + 2] * cent[3 * (int64_t)i + 2]);
       if (d <= 0.0) cn0++;
       if (d <= 1e9 * (1.0 + dmaxc)) cninf++;
     }

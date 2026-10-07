@@ -274,13 +274,17 @@ build/fuzz_ppm: tests/fuzz_ppm.c src/image.c src/image.h | $(FUZZ)
 
 # Зёрна: наши мелкие (tests/fuzz_seeds, в git) + реальные сцены, если assets/
 # скачан (269 МБ, в git не лежит; см. scripts/fetch_scene.sh).
+# SEED_MAX_KB — потолок размера подсеваемой сцены: при FUZZ_MAX_LEN=4096 крупные
+# файлы libFuzzer всё равно обрежет, поэтому по умолчанию 64 КБ; для глубокой
+# кампании — make fuzz FUZZ_MAX_LEN=262144 SEED_MAX_KB=1024.
+SEED_MAX_KB ?= 64
 seed-corpus: | $(FUZZ)
 	@cp -n tests/fuzz_seeds/obj/* $(FUZZ)/corpus_obj/ 2>/dev/null || true
 	@cp -n tests/fuzz_seeds/ppm/* $(FUZZ)/corpus_ppm/ 2>/dev/null || true
 	@if [ -d assets/synth ]; then \
-	  find assets/synth -name '*.obj' -size -64k -exec cp -n {} $(FUZZ)/corpus_obj/ \; 2>/dev/null || true; \
+	  find assets/synth -name '*.obj' -size -$(SEED_MAX_KB)k -exec cp -n {} $(FUZZ)/corpus_obj/ \; 2>/dev/null || true; \
 	fi
-	@echo "  корпус: obj=$$(ls $(FUZZ)/corpus_obj | wc -l) ppm=$$(ls $(FUZZ)/corpus_ppm | wc -l)"
+	@echo "  корпус: obj=$$(ls $(FUZZ)/corpus_obj | wc -l) ppm=$$(ls $(FUZZ)/corpus_ppm | wc -l) (подсев ≤$(SEED_MAX_KB) КБ)"
 
 fuzz: build/fuzz_obj build/fuzz_ppm seed-corpus
 	@echo "=== фаззинг OBJ: $(FUZZ_TIME) с, max_len=$(FUZZ_MAX_LEN) ==="
@@ -290,6 +294,30 @@ fuzz: build/fuzz_obj build/fuzz_ppm seed-corpus
 	./build/fuzz_ppm -max_total_time=$(FUZZ_TIME) -max_len=$(FUZZ_MAX_LEN) -print_final_stats=1 \
 	  -artifact_prefix=$(FUZZ)/artifacts/ $(FUZZ)/corpus_ppm
 	@echo ">>> fuzz: крэши — $(FUZZ)/artifacts/ (пусто = не было)"
+
+# --- TSan/гонки: ЦЕЛЬ ПОДГОТОВЛЕНА, ЗАПУСК — ПО ЯВНОМУ РАЗРЕШЕНИЮ ----------
+# Записанный в журнале долг: «helgrind/tsan не гонялись — битовость П1 служит
+# логическим детектором, но не заменяет tsan» (PLAN_ELEMENTS §…). Гонки ищутся
+# ТОЛЬКО на нескольких потоках, а директива владельца (01-10, жёстко) требует
+# ВСЕ прогоны и числа — при OMP_NUM_THREADS=1. Поэтому цель существует, но в
+# `make gate` НЕ входит и без разрешения владельца не запускается: это проверка
+# КОРРЕКТНОСТИ (не замер), и время в ней не измеряется и не публикуется.
+# Известный источник шума: libgomp не инструментирован, TSan может ругаться на
+# его внутренности — сначала читать стек, потом верить.
+TSAN_THREADS ?= 4
+build/pgather_tsan: tools/pgather.c src/nstruct/pyr.c src/nstruct/sweep.c src/scene_obj.c \
+	src/geom/kit.c | build
+	$(RUN) 'clang $(HZ_BASE) -O1 -g -fno-omit-frame-pointer -fsanitize=thread $(HZ_WARN) \
+	  $(HZ_INC) -o $@ tools/pgather.c src/nstruct/pyr.c src/nstruct/sweep.c src/scene_obj.c \
+	  src/geom/kit.c -llapacke -llapack -lblas -lm'
+
+check-tsan: build/pgather_tsan
+	@echo "=== TSan: $(TSAN_THREADS) потока, сцена $(TSAN_SCENE) — ПРОВЕРКА КОРРЕКТНОСТИ, не замер ==="
+	OMP_NUM_THREADS=$(TSAN_THREADS) TSAN_OPTIONS=halt_on_error=0:second_deadlock_stack=1 \
+	  ./build/pgather_tsan $(TSAN_SCENE) le=0 dirs=8x16 it=1
+	@echo ">>> check-tsan: смотреть выше; отчёт о гонках — только по стекам"
+
+TSAN_SCENE ?= assets/synth/mirror_box.obj
 
 # Хук на дешёвые ступени: «закоммичено» = «S0–S2 пройдены».
 hooks:
@@ -317,5 +345,5 @@ check-simd: | build
 	  gcc $(CFLAGS) -o build/simd_omp tools/ompinfo.c && ./build/simd_omp'
 
 .PHONY: all test check check-deep check-fast check-staged check-simd compile-db \
-	gate gate-baseline gate-digest gate-versions lean cbmc \
+	gate gate-baseline gate-digest gate-versions lean cbmc check-tsan \
 	test-asan test-uninit check-int check-fpe valgrind hooks fuzz seed-corpus

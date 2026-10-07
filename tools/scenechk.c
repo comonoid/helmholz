@@ -75,8 +75,13 @@ int main(int argc, char **argv) {
     if (ar > amax) amax = ar;
     asum += ar;
   }
+  /* ndegen/nquad считает разборщик (отброшенные вырожденные грани и грани
+   * крупнее треугольника) — печатаем: иначе поля никто не читает, и они
+   * числятся мёртвым грузом (lean, 07-10) */
   printf("%s: треугольников %d, вершин %d, нормалей %d, материалов %d\n", argv[1], m.nt, m.nv,
          m.nvn, m.nmtl);
+  printf("  вырожденных (нулевой площади) %lld, граней крупнее треугольника %lld\n",
+         (long long)m.ndegen, (long long)m.nquad);
   printf("  рёбер %lld; с ОДНИМ владельцем %lld (%.2f %%), с двумя %lld, больше двух %lld\n",
          (long long)tot, (long long)c1, 100.0 * (double)c1 / (double)tot, (long long)c2,
          (long long)cm);

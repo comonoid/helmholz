@@ -24,8 +24,12 @@
  * попадало, а fc обнуляется memset — то есть ноги были выключены НЕЯВНО, а
  * присваивание было мёртвым (отсюда -Wunused-but-set-variable). Здесь
  * состояние названо явно. Включение ног — отдельное решение владельца: оно
- * меняет физику зеркальных хопов (ksf=1 — продакшн-дефолт §875). */
+ * меняет физику зеркальных хопов (ksf=1 — продакшн-дефолт §875).
+ * Переопределяется ТОЛЬКО для замера последствий, без правки кода:
+ *   gcc ... -DHZ_SW_LEG_BUDGET=2000000 ...   (make не переопределяет) */
+#ifndef HZ_SW_LEG_BUDGET
 #define HZ_SW_LEG_BUDGET 0
+#endif
 
 /* знаки 26 направлений: 6 осей, 12 рёбер (√2), 8 углов (√3); ЦЕЛЫЕ —
  * сравнение с нулём без float-equal, нормировка отдельной таблицей */
@@ -995,10 +999,12 @@ static void sw_med_enter(front_ctx *fc, int32_t r, double t) {
   fc->med_stamp[r] = fc->pkey;
   v = fc->med_v[r];
   if (!(v > 1e-30)) return; /* вырожденный регион — среда не взаимодействует */
-  if (!front_box_seg(fc->med_box + 6 * r, fc->med_box + 6 * r + 3, fc->org, fc->om, -1e30, 1e30,
-                     &h0, &h1))
+  /* Смещения региональных массивов — в 64 битах: 6·r и 3·r при nrep в сотни
+   * миллионов переполнили бы int (bugprone-implicit-widening, ловля 07-10) */
+  if (!front_box_seg(fc->med_box + 6 * (int64_t)r, fc->med_box + 6 * (int64_t)r + 3, fc->org,
+                     fc->om, -1e30, 1e30, &h0, &h1))
     return;
-  an = fc->med_an + 3 * r;
+  an = fc->med_an + 3 * (int64_t)r;
   sig = fabs(an[0] * fc->om[0] + an[1] * fc->om[1] + an[2] * fc->om[2]) / v;
   if (sw_med_scr) /* Ш4/А1698 НК: σ × (0.25…3.25) по региону, детерминированно */
     sig *= 0.25 + 3.0 * (double)((unsigned)r % 4u) / 4.0;
@@ -1476,8 +1482,9 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
     if (fc->med_on && !fc->in_leg && p >= fc->nt0 && fc->med_nsub[p - fc->nt0] > 0) {
       /* §932-Б: СРЕДА — вход в bbox региона (виртуальное событие), не
        * ray-tri носителя; повторные входы гасит med_stamp при активации */
-      if (front_box_seg(fc->med_box + 6 * (p - fc->nt0), fc->med_box + 6 * (p - fc->nt0) + 3,
-                        fc->org, fc->om, tin, tout, &bh0, &bh1)) {
+      if (front_box_seg(fc->med_box + 6 * (int64_t)(p - fc->nt0),
+                        fc->med_box + 6 * (int64_t)(p - fc->nt0) + 3, fc->org, fc->om, tin, tout,
+                        &bh0, &bh1)) {
         ht[nh] = bh0;
         hp[nh] = p;
         nh++;
@@ -1674,8 +1681,9 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
            * gain петли = 1 по построению: пол (копланарные дети) → k=1,
            * колонна → k≈2 поперёк, →0 вдоль оси. Кул [0,64] — численная
            * страховка вырожденных граней (счётчик ниже). */
-          double cosr = fabs(fc->om[0] * fc->rep_nrm[3 * r] + fc->om[1] * fc->rep_nrm[3 * r + 1] +
-                             fc->om[2] * fc->rep_nrm[3 * r + 2]);
+          double cosr = fabs(fc->om[0] * fc->rep_nrm[3 * (int64_t)r] +
+                             fc->om[1] * fc->rep_nrm[3 * (int64_t)r + 1] +
+                             fc->om[2] * fc->rep_nrm[3 * (int64_t)r + 2]); /* смещение 64-битное */
           double knum = 0.0;
           int32_t k;
           for (k = fc->rep_koff[r]; k < fc->rep_koff[r + 1]; k++) {
@@ -2043,8 +2051,10 @@ static int sw_levels_build(const hz_pyr *py, const hz_sw_opts *o, const uint8_t 
         if (a0 > lim - 1) a0 = lim - 1;
         if (a1 < a0) a1 = a0;
         if (a1 > lim - 1) a1 = lim - 1;
-        cspan[ax * 2] = a0;
-        cspan[ax * 2 + 1] = a1;
+        /* ax ∈ [0,3) по циклу выше — переполнения нет по построению; приведение
+         * к int64_t только чтобы класс widening не шумел на 3-элементном массиве */
+        cspan[(int64_t)ax * 2] = a0;
+        cspan[(int64_t)ax * 2 + 1] = a1;
       }
     }
     if (reps_on && (int32_t)f >= g924_minf && (int32_t)f <= o->rep_nlev &&
@@ -4214,9 +4224,9 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
           else
             med_rho[r] = 0.0;
           if (med_nsub[r] > 0) {
-            double vx = med_box[6 * r + 3] - med_box[6 * r],
-                   vy = med_box[6 * r + 4] - med_box[6 * r + 1],
-                   vz = med_box[6 * r + 5] - med_box[6 * r + 2];
+            double vx = med_box[6 * (int64_t)r + 3] - med_box[6 * (int64_t)r],
+                   vy = med_box[6 * (int64_t)r + 4] - med_box[6 * (int64_t)r + 1],
+                   vz = med_box[6 * (int64_t)r + 5] - med_box[6 * (int64_t)r + 2];
             med_v[r] = (vx > 0.0 ? vx : 0.0) * (vy > 0.0 ? vy : 0.0) * (vz > 0.0 ? vz : 0.0);
           }
         }
@@ -4247,8 +4257,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
           for (r2 = 0; r2 < o->nrep && nmed > 0; r2++)
             if (med_nsub[r2] > 0)
               fprintf(stderr, "%s r%d: n=%d V=%.3g an=(%.3g,%.3g,%.3g)", r2 > 0 ? ";" : ":",
-                      (int)r2, (int)med_nsub[r2], med_v[r2], med_an[3 * r2], med_an[3 * r2 + 1],
-                      med_an[3 * r2 + 2]);
+                      (int)r2, (int)med_nsub[r2], med_v[r2], med_an[3 * (int64_t)r2],
+                      med_an[3 * (int64_t)r2 + 1], med_an[3 * (int64_t)r2 + 2]);
           fprintf(stderr, "\n");
         }
       }
@@ -4419,19 +4429,12 @@ static int sw_cached_table(int ndirs, const hz_sw_dir **tab, int *nd) {
   return 0;
 }
 
-double hz_sw_dirsum(const double n[3], int ndirs) {
-  const hz_sw_dir *tab;
-  int nd, rc, d;
-  double s = 0.0;
-  rc = sw_cached_table(ndirs, &tab, &nd);
-  if (rc != 0) return 0.0;
-  for (d = 0; d < nd; d++)
-    s += tab[d].w * fabs(tab[d].om[0] * n[0] + tab[d].om[1] * n[1] + tab[d].om[2] * n[2]);
-  return s;
-}
-
 /* §842: Σ по ВЫХОДНЫМ направлениям (n·ω > 0) w·|ω·n| — облучённость куска
- * в модели слоя при тёмном окружении. Для точного решения фикстуры. */
+ * в модели слоя при тёмном окружении. Для точного решения фикстуры.
+ *
+ * Здесь был ещё hz_sw_dirsum (Σ по ВСЕМ направлениям) — УДАЛЁН 07-10: у него не
+ * было ни одного вызова ни в живом слое, ни в archive/ (двойник ниже зовётся
+ * tools/swee3.c). Вернуть из git-истории, если понадобится нормализация весов. */
 double hz_sw_exitwsum(const double n[3], int ndirs) {
   const hz_sw_dir *tab;
   int nd, rc, d;

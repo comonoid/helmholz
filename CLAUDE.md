@@ -157,6 +157,15 @@ Every `.c`/`.h` written or edited goes through this sequence before it is
    `-fsanitize=integer,implicit-conversion` по целочисленной топологии),
    `make check-fpe` (FE_INVALID|FE_DIVBYZERO через `tests/fpetrap.c` +
    `LD_PRELOAD`, без правок продуктового кода), `make valgrind`.
+   **Фаззинг недоверенного входа**: `make fuzz` (`FUZZ_TIME` с на цель) —
+   `tests/fuzz_obj.c` (разборщик OBJ: буферный API, без файлового ввода) и
+   `tests/fuzz_ppm.c` (читатель PPM) под libFuzzer + ASan/UBSan; зёрна —
+   `tests/fuzz_seeds/` плюс реальные сцены из `assets/synth`. Это ОТЧЁТ, а не
+   гейт: чистая кампания ничего не доказывает, упавшая — доказывает дефект;
+   артефакты обязаны входить в журнал находкой. Фаззер ДОПОЛНЯЕТ CBMC
+   (границы раскрутки против произвольных байтов), а не заменяет его.
+   CTU в текущем пине не работает (naive-режим не импортирует тела; CodeChecker
+   6.28 отвергает `--ctu` с clang 21.1.8) — повторять только после смены пина.
 6. **GPU layer**: kernels (.cu/.cl/shaders) are NOT seen by the gate — the gate
    covers host C only. For CUDA kernels use `compute-sanitizer` (memcheck +
    racecheck + initcheck) on a small case; keep a CPU reference implementation

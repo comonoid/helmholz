@@ -247,6 +247,44 @@ valgrind: $(FAST_TESTS)
 	$(RUN) 'valgrind --quiet --error-exitcode=1 --leak-check=full ./build/test_kit'
 	@echo ">>> valgrind: утечек и ошибок памяти нет"
 
+# --- S7-фаззинг: НЕДОВЕРЕННЫЙ ВХОД (tests/fuzz_obj.c, tests/fuzz_ppm.c) ------
+# Фаззер дополняет CBMC, а не заменяет его: CBMC доказывает свойства в границах
+# раскрутки, фаззер ищет то, что не придёт в голову автору теста. Находки
+# однозначны (крэш/утечка под ASan+UBSan), поэтому в отчёт, а не в базу.
+# Длительность — параметр: по умолчанию 60 с на цель (для гейта), длинные
+# прогоны — осознанно (FUZZ_TIME=900 make fuzz).
+FUZZ_TIME ?= 60
+FUZZ = build/fuzz
+$(FUZZ):
+	mkdir -p $(FUZZ)/corpus_obj $(FUZZ)/corpus_ppm $(FUZZ)/artifacts
+
+build/fuzz_obj: tests/fuzz_obj.c src/scene_obj.c src/scene_obj.h | $(FUZZ)
+	$(RUN) 'clang $(HZ_BASE) -O1 $(HZ_SAN_FUZZ) $(HZ_WARN) $(HZ_INC) -o $@ \
+	  tests/fuzz_obj.c src/scene_obj.c -lm'
+
+build/fuzz_ppm: tests/fuzz_ppm.c src/image.c src/image.h | $(FUZZ)
+	$(RUN) 'clang $(HZ_BASE) -O1 $(HZ_SAN_FUZZ) $(HZ_WARN) $(HZ_INC) -o $@ \
+	  tests/fuzz_ppm.c src/image.c -lm'
+
+# Зёрна: наши мелкие (tests/fuzz_seeds, в git) + реальные сцены, если assets/
+# скачан (269 МБ, в git не лежит; см. scripts/fetch_scene.sh).
+seed-corpus: | $(FUZZ)
+	@cp -n tests/fuzz_seeds/obj/* $(FUZZ)/corpus_obj/ 2>/dev/null || true
+	@cp -n tests/fuzz_seeds/ppm/* $(FUZZ)/corpus_ppm/ 2>/dev/null || true
+	@if [ -d assets/synth ]; then \
+	  find assets/synth -name '*.obj' -size -64k -exec cp -n {} $(FUZZ)/corpus_obj/ \; 2>/dev/null || true; \
+	fi
+	@echo "  корпус: obj=$$(ls $(FUZZ)/corpus_obj | wc -l) ppm=$$(ls $(FUZZ)/corpus_ppm | wc -l)"
+
+fuzz: build/fuzz_obj build/fuzz_ppm seed-corpus
+	@echo "=== фаззинг OBJ: $(FUZZ_TIME) с ==="
+	./build/fuzz_obj -max_total_time=$(FUZZ_TIME) -print_final_stats=1 \
+	  -artifact_prefix=$(FUZZ)/artifacts/ $(FUZZ)/corpus_obj
+	@echo "=== фаззинг PPM: $(FUZZ_TIME) с ==="
+	./build/fuzz_ppm -max_total_time=$(FUZZ_TIME) -print_final_stats=1 \
+	  -artifact_prefix=$(FUZZ)/artifacts/ $(FUZZ)/corpus_ppm
+	@echo ">>> fuzz: крэши — $(FUZZ)/artifacts/ (пусто = не было)"
+
 # Хук на дешёвые ступени: «закоммичено» = «S0–S2 пройдены».
 hooks:
 	chmod +x .githooks/pre-commit
@@ -274,4 +312,4 @@ check-simd: | build
 
 .PHONY: all test check check-deep check-fast check-staged check-simd compile-db \
 	gate gate-baseline gate-digest gate-versions lean cbmc \
-	test-asan test-uninit check-int check-fpe valgrind hooks
+	test-asan test-uninit check-int check-fpe valgrind hooks fuzz seed-corpus

@@ -37,3 +37,7 @@ HZ_SAN_INT := -fsanitize=integer,implicit-conversion -fno-omit-frame-pointer -g
 # Детерминированный мусор в автоматических переменных вместо случайного:
 # ловит чтение неинициализированного как повторяемый результат.
 HZ_AUTOINIT := -ftrivial-auto-var-init=pattern
+# Фаззинг недоверенного входа (tests/fuzz_obj.c, tests/fuzz_ppm.c): libFuzzer
+# плюс санитайзеры. Только clang; проверено 07-10, что в этом пине работает
+# (синтетический крэш найден, артефакт записан).
+HZ_SAN_FUZZ := -fsanitize=fuzzer,address,undefined -fno-omit-frame-pointer -g

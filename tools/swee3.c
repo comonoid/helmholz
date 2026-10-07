@@ -602,7 +602,7 @@ int main(int argc, char **argv) {
     free(lphits);
   }
   free(lep9); /* А1576: per-piece эмиссия */
-  free(ks); /* §873/T4: per-piece зеркальная доля */
+  free(ks);   /* §873/T4: per-piece зеркальная доля */
   hz_pyr_free(&py);
   hz_obj_free(&m);
   return 0;

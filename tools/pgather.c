@@ -424,7 +424,8 @@ static double pg_e_hit(const pg_cam *c, const double org[3], const double rd[3],
   double e1[3], e2[3], ep[3], P[3];
   double d11, d12, d22, d1p, d2p, den, u, v, w;
   int ax;
-  for (ax = 0; ax < 3; ax++) P[ax] = org[ax] + rd[ax] * thit;
+  for (ax = 0; ax < 3; ax++)
+    P[ax] = org[ax] + rd[ax] * thit;
   for (ax = 0; ax < 3; ax++) {
     e1[ax] = B[ax] - A[ax];
     e2[ax] = C[ax] - A[ax];
@@ -492,7 +493,7 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
 #define PG_RECV_CELL_CAP 512 /* кэп клеток на треугольник; крупнее — гиганты */
 #define PG_RECV_RMAX 8       /* колец поиска: 8·h покрывает ε уровня и стыки */
 #define PG_RECV_BTOL                                                                                     \
-  1e-9 /* строгая принадлежность: тай-полоса рёбер                    \
+  1e-9 /* строгая принадлежность: тай-полоса рёбер                                  \
         * разбирала бы носитель L0 по соседям и ломала битовое \
         * тождество; зазоры носителя закрывает fallback-центроид */
 
@@ -1094,8 +1095,8 @@ typedef struct {
 /* §929-Х1: препcomputed-обход shells rad=0..PG924_RMAX в ТОМ же порядке
  * (dx,dy,dz по возрастанию Chebyshev-кольца), что и тройной цикл —
  * убирает ~12× мусорных итераций фильтра mr!=rad. */
-int64_t g_m3b_inlist, g_m3b_visits; /* §930-М3б */
-int64_t g_m3c_gtests, g_m3c_ghit;   /* §930-Г1-дых */
+int64_t g_m3b_inlist, g_m3b_visits;     /* §930-М3б */
+int64_t g_m3c_gtests, g_m3c_ghit;       /* §930-Г1-дых */
 static double *g_egour_ev, *g_egour_ew; /* §932-Б-Ш6: буферы Gouraud (владелец — кадр) */
 
 static uint32_t pg924_hash(int64_t x, int64_t y, int64_t z) {
@@ -1660,8 +1661,7 @@ int main(int argc, char **argv) {
     else if (strncmp(argv[i], "up=", 3) == 0) {
       parse3(argv[i] + 3, uphint); /* §932-Б-Ш8: вертикаль сцены (Y-up: up=0,1,0) */
       have_up = 1;
-    }
-    else if (strncmp(argv[i], "W=", 2) == 0)
+    } else if (strncmp(argv[i], "W=", 2) == 0)
       W = atoi(argv[i] + 2);
     else if (strncmp(argv[i], "H=", 2) == 0)
       H = atoi(argv[i] + 2);
@@ -3235,7 +3235,7 @@ int main(int argc, char **argv) {
             free(ew);
           }
         }
-        g_egour_ev = ev;   /* освободить после петли кадра */
+        g_egour_ev = ev; /* освободить после петли кадра */
         g_egour_ew = ew;
       }
       cam0.py = &py;

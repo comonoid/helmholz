@@ -1002,7 +1002,7 @@ static void sw_med_enter(front_ctx *fc, int32_t r, double t) {
     sig *= 0.25 + 3.0 * (double)((unsigned)r % 4u) / 4.0;
   if (!(sig > 0.0)) return;               /* просвет: T=1, поглощения нет — честно */
   if (fc->med_nact >= 8) return;          /* ёмкость: сверх — не активируем (счётчик) */
-  if (fc->med_nact > 0) g932b_nest++; /* Ш4: вход при живых средах (Б0-в/А1720) */
+  if (fc->med_nact > 0) g932b_nest++;     /* Ш4: вход при живых средах (Б0-в/А1720) */
   if (sig * (h1 - h0) > 3.0) g932b_big++; /* А1700-4: вырождение в стену */
   { /* Ш3: статистика σℓ по активациям (битивно-нейтральный прибор) */
     double sl = sig * (h1 - h0);
@@ -1438,7 +1438,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
   if (n <= 0) return;
   if (fc->tau0) return; /* НК: слой не взаимодействует */
   fc->nmat++;
-  g924_vis++;       /* §927-дых: визит списка (любого) */
+  g924_vis++; /* §927-дых: визит списка (любого) */
   /* §932-Б/Ш9-ЗОНД: КЛЕТОЧНЫЙ ПРИЁМ — накопитель на лист (Lin НА ВХОДЕ
    * сегмента; раздача детям по площадям в конце итерации). Зонд, НЕ
    * канон: сосуществует с пер-хит депозитами (двойной счёт на хитовых
@@ -2417,7 +2417,7 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
       if (pos < (1 << 20)) g_dbg923_vis[pos] = 1;
       if (n > 0) {
         const int32_t *ps = fc->leaf_lpids + fc->leaf_loff[pos];
-        if (fc->o->walk) /* А1576: точный многопопадный проход */
+        if (fc->o->walk)                                   /* А1576: точный многопопадный проход */
           front_seg_walk(fc, ps, n, tin, tout, a, b, pos); /* Ш9: лист — в зонд */
         else {
           front_node_box(fc, -1, pos, blo, bhi);
@@ -2516,7 +2516,7 @@ static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, doubl
      * ~×1.5/итерацию на cavity05 lp=2). Узел — только точное пересечение.
      * Предикат А1566 «bbox ⊆ клетка» валиден ТОЛЬКО на листовом отрезке
      * (bbox ⊆ БАЗОВАЯ клетка). */
-    if (fc->o->walk) /* А1576: точный многопопадный проход */
+    if (fc->o->walk)                                  /* А1576: точный многопопадный проход */
       front_seg_walk(fc, ps, n, tin, tout, a, b, -1); /* Ш9: узел — вне зонда */
     else
       front_interact(fc, fc->pbuf, n, blo, bhi, tin, tout, a, b, 0);
@@ -3341,8 +3341,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   /* §928: сбор калибровки — только мир сбора (rep-карты есть, представители
    * НЕ активны: o->reps_collect). Накопление — последняя итерация. */
   kcalpath = getenv("HZ_KCALDUMP");
-  if (sw_med_now < 0) sw_med_now = getenv("HZ_MEDNOW") != NULL; /* Ш3: Вопрос-1 */
-  if (sw_med_t1 < 0) sw_med_t1 = getenv("HZ_MEDT1") != NULL;    /* Ш3: зонд exp */
+  if (sw_med_now < 0) sw_med_now = getenv("HZ_MEDNOW") != NULL;      /* Ш3: Вопрос-1 */
+  if (sw_med_t1 < 0) sw_med_t1 = getenv("HZ_MEDT1") != NULL;         /* Ш3: зонд exp */
   if (sw_med_scr < 0) sw_med_scr = getenv("HZ_MEDSCRAMBLE") != NULL; /* Ш4: НК А1698 */
   if (kcalpath != NULL && kcalpath[0] != '\0' && o->reps_collect && o->nrep > 0 &&
       o->repof != NULL) {
@@ -3582,7 +3582,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
     } else {
       for (int32_t c2 = 0; c2 < py->nleaf; c2++) {
         double s2 = 0.0;
-        for (int32_t q2 = bstart[c2]; q2 < bstart[c2 + 1]; q2++) s2 += area[bpids[q2]];
+        for (int32_t q2 = bstart[c2]; q2 < bstart[c2 + 1]; q2++)
+          s2 += area[bpids[q2]];
         casum[c2] = s2;
       }
     }
@@ -4097,8 +4098,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
            * детям по площадям (§924-канон); иначе яйцо-курица: без
            * депозитов этаж не набирается никогда (Ш8-4, 96.2% нулей).
            * Требует rep'а на этом этаже — иначе кусочно (fail-closed). */
-          if (o->cold_f > 0 && o->cold_a > 0.0 && area[p] < o->cold_a &&
-              fi < o->cold_f) {
+          if (o->cold_f > 0 && o->cold_a > 0.0 && area[p] < o->cold_a && fi < o->cold_f) {
             int32_t fc2 = o->cold_f;
             if (fc2 > (int32_t)py->nlev) fc2 = (int32_t)py->nlev;
             if (fc2 > o->rep_nlev) fc2 = o->rep_nlev;
@@ -4294,8 +4294,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
             g932b_abs > 0.0 ? g932b_dep / g932b_abs : 0.0,
             g932b_sact > 0 ? g932b_ssum / (double)g932b_sact : 0.0, g932b_smax,
             (long long)g932b_sact, g932b_edf, g932b_dep > 0.0 ? g932b_edf / g932b_dep : 0.0,
-            (long long)g932b_nest, sw_med_now ? " [MEDNOW]" : "",
-            sw_med_t1 ? " [MEDT1-ЗОНД]" : "", sw_med_scr ? " [MEDSCRAMBLE-НК]" : "");
+            (long long)g932b_nest, sw_med_now ? " [MEDNOW]" : "", sw_med_t1 ? " [MEDT1-ЗОНД]" : "",
+            sw_med_scr ? " [MEDSCRAMBLE-НК]" : "");
   if (o->cellacc) /* §932-Б/Ш9-ЗОНД: клеточный приём (двойной счёт с
                    * пер-хит — семантика зонда, НЕ канон) */
     fprintf(stderr, "§932-Б-Ш9: клеточный приём: Σ=%.6g, раздач=%lld (зонд)\n", g932c_dep,

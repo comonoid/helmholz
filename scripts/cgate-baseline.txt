@@ -99,25 +99,46 @@ tools/snap3.c	S3	bugprone-integer-division	result of integer division used in a 
 # sweep.c:140 — gx/gw заполняет sw_gauss_legendre(nmu, gx, gw); она пишет ВСЕ n
 #   узлов (x[i] и x[n-1-i], i < n/2), а нечётное nmu отвергается ЯВНО в
 #   hz_sw_dir_table (проверка `(nmu & 1)`), о чём и говорит шапка функции
-#   («Чётные n»). Анализатор не связывает guard с цикл заполнения.
+#   («Чётные n»). Анализатор не связывает guard с циклом заполнения.
 # sweep.c:3517 — wpid заполняется в sw_build_walk для КАЖДОГО pos (w->wpid[pos]=p
 #   в цикле по кускам листа), буфер — py->nt записей, а индекс
 #   leaf[k].first < cntot ≤ nt.
-# Метка: ПРОЧИТАНО В КОДЕ. Минимальный репро не собран — по правилу проекта это
-# значит «FP заявлен, но не доказан инструментально»; при следующем заходе в эти
-# функции — проверить репро (долг, не приговор).
-src/nstruct/sweep.c	S3	clang-analyzer-core.UndefinedBinaryOperatorResult	The left operand of '*' is a garbage value	FP (ПРОЧИТАНО В КОДЕ): guard `(nmu & 1)` + заполнение всех узлов; репро не собран (долг)
-src/nstruct/sweep.c	S3	clang-analyzer-core.UndefinedBinaryOperatorResult	The right operand of '^' is a garbage value	FP (ПРОЧИТАНО В КОДЕ): wpid заполняется для всех pos в sw_build_walk; репро не собран (долг)
-tools/pgather.c	S3	clang-analyzer-core.uninitialized.Assign	Assigned value is uninitialized	FP (ПРОЧИТАНО В КОДЕ): dhead инициализируется циклом по ncell (1142-1153), s клампится, ncell=gnx·gny·gnz; репро не собран (долг)
-tools/pref.c	S3	clang-analyzer-core.UndefinedBinaryOperatorResult	The right operand of '-' is a garbage value	FP (ПРОЧИТАНО В КОДЕ): Eref обнуляется циклом по m.nt (421-423) до использования; репро не собран (долг)
+#
+# РЕПРО СОБРАНЫ 07-10 (tests/repro/, команда — в README рядом):
+#   f1_sweep_gx.c   — «левая часть '*'»: прибор считает цикл i<n/2 ПУСТЫМ и
+#       возвращается, не записав '*x' (теряет guard nmu>=2 на входе в статическую
+#       функцию). Снимает срабатывание одна запись на индекс вместо пары
+#       x[i]/x[n-1-i] (f1_fixed.c, 0 предупреждений).
+#   f2_sweep_hash.c — «правая часть '^'»: прибор берёт `npcs != 0` в отборочном
+#       цикле, а через отсортированный pairs[].li перечитывает npcs и допускает
+#       <=0. Ни снимок границы, ни повторная проверка, ни слияние проходов не
+#       снимают — потеря связи «число записей ↔ позиция first».
+#   f3_grid.c       — «присваивается неинициализированное»: прибор теряет
+#       ncell = gnx·gny·gnz >= 1 (тернарные клампы), поэтому цикл инициализации
+#       dhead считается неисполненным. Снимает повторная проверка ncell<=0
+#       (f3_fixed2.c). ВНИМАНИЕ: старый build/probe_triage/repro_1194_fp.c в
+#       текущем пине НЕ воспроизводится — ссылаться на него нельзя.
+#   f4_root2.c      — «правая часть '-'»: на ОДНОМ пути прибора цикл обнуления
+#       Eref пропущен (⇒ m.nt<=0) и тут же цикл чтения выполнен (⇒ m.nt>=1);
+#       такого исполнения не существует, между ними m.nt никто не пишет.
+#   f5_pyr_cut.c    — «составное присваивание по неинициализированной памяти»:
+#       прибор разворачивает цикл инициализации в два конкретных индекса, а
+#       читает lvl[pi] с СИМВОЛЬНЫМ pi и не связывает их. Снимает memset всего
+#       региона (f5_pyr_memset.c).
+# Настоящих дефектов ни в одной из пяти не видно; формальное доказательство
+# F1 через CBMC не закрыто (cbmc 6.9.0 не сходится на этой оснастке — таймаут).
+src/nstruct/sweep.c	S3	clang-analyzer-core.UndefinedBinaryOperatorResult	The left operand of '*' is a garbage value	FP (РЕПРО tests/repro/f1_sweep_gx.c): прибор считает цикл i<n/2 пустым, теряя guard nmu>=2; gx/gw заполнены целиком
+src/nstruct/sweep.c	S3	clang-analyzer-core.UndefinedBinaryOperatorResult	The right operand of '^' is a garbage value	FP (РЕПРО tests/repro/f2_sweep_hash.c): теряется связь «число записей ↔ first»; wpid[first] записан в той же итерации отбора
+tools/pgather.c	S3	clang-analyzer-core.uninitialized.Assign	Assigned value is uninitialized	FP (РЕПРО tests/repro/f3_grid.c): теряется ncell=gnx·gny·gnz≥1; dhead инициализируется по всем ncell, s клампится
+tools/pref.c	S3	clang-analyzer-core.UndefinedBinaryOperatorResult	The right operand of '-' is a garbage value	FP (РЕПРО tests/repro/f4_root2.c): путь прибора невыполним (m.nt<=0 и m.nt>=1 одновременно), между циклами m.nt не пишется
 
-# --- pyr.c: анализатор не берёт верхнюю границу индекса как доказательство ---
-# Код УЖЕ усилен: `if (pi >= 0 && pi < w)` — выше инициализируются ровно w
-# записей lvl[0..w-1], поэтому запись вне диапазона невозможна. clang-analyzer
-# продолжает считать lvl[pi] неинициализированной памятью. Это ЕДИНСТВЕННАЯ
-# запись базы с недоказанным вердиктом: помечена как долг, разобрать отдельно
-# (кандидат на минимальный репро уровня функции hz_pyr_build).
-src/nstruct/pyr.c	S3	clang-analyzer-core.uninitialized.Assign	The left expression of the compound assignment uses uninitialized memory	ДОЛГ: усилено `pi < w`, прибор не принимает; репро не собран — разобрать отдельно
+# --- pyr.c: прибор разворачивает цикл инициализации и теряет связь с индексом ---
+# Код усилен: `if (pi >= 0 && pi < w)`, выше инициализируются ровно w записей
+# lvl[0..w-1]. РЕПРО СОБРАН: tests/repro/f5_pyr_cut.c — прибор разворачивает
+# цикл инициализации в два конкретных индекса (w пришпилено дедупликацией), а
+# lvl[pi] читает с символьным pi; конкретные записи с символьным чтением он не
+# связывает. Снимает срабатывание memset всего региона (f5_pyr_memset.c).
+src/nstruct/pyr.c	S3	clang-analyzer-core.uninitialized.Assign	The left expression of the compound assignment uses uninitialized memory	FP (РЕПРО tests/repro/f5_pyr_cut.c): инициализированы lvl[0..w-1], guard pi<w гарантирует попадание; прибор не связывает развёрнутые записи с символьным индексом
 
 # --- kcalmk.c: находка УСТРАНЕНА, прибор не видит устранения ---
 # Размер выделения задавал заголовок недоверенного файла (CWE-789). Добавлена
@@ -134,5 +155,5 @@ tools/kcalmk.c	S4	-Wanalyzer-tainted-allocation-size	use of attacker-controlled 
 # включает ступень, поэтому запись нужна на каждую ступень (иначе гейт красный
 # ровно на повторе уже разобранного).
 src/nstruct/sweep.c	S4	-Wfloat-equal	comparing floating-point with ‘==’ or ‘!=’ is unsafe	ОСОЗНАННО: тот же точный ноль med_pend (см. запись S1 выше)
-src/nstruct/sweep.c	S4	-Wanalyzer-use-of-uninitialized-value	use of uninitialized value ‘*<unknown>’ [CWE-457]	FP (ПРОЧИТАНО В КОДЕ): gx/gw заполняет sw_gauss_legendre для ВСЕХ узлов, нечётное nmu отвергнуто guard'ом `(nmu & 1)` в hz_sw_dir_table; связь guard↔цикл прибор не держит (тот же корень, что у записи S3 UndefinedBinaryOperatorResult)
-tools/pgather.c	S4	-Wanalyzer-use-of-uninitialized-value	use of uninitialized value ‘*<unknown>’ [CWE-457]	FP (МИНИМАЛЬНЫЙ РЕПРО): build/probe_triage/repro_1194_fp.c — та же функция с локальным nt даёт 0 предупреждений, с S->ntris даёт 2; g->rmax заполняется целиком циклом 1167-1191 до чтения на 1191
+src/nstruct/sweep.c	S4	-Wanalyzer-use-of-uninitialized-value	use of uninitialized value ‘*<unknown>’ [CWE-457]	FP (ПРОЧИТАНО В КОДЕ): тот же корень, что у S3-записи про gx/gw (РЕПРО tests/repro/f1_sweep_gx.c собран для формы S3); на минимальном файле -fanalyzer эту форму НЕ повторяет — S4-близнец остаётся недоказанным
+tools/pgather.c	S4	-Wanalyzer-use-of-uninitialized-value	use of uninitialized value ‘*<unknown>’ [CWE-457]	FP (ПРОЧИТАНО В КОДЕ): в g->rmax пишут в цикле-заполнителе до чтения; прежний repro_1194_fp.c в текущем пине НЕ воспроизводится (0 предупреждений в пользовательском коде) — опираться на него нельзя, S4-близнец недоказан

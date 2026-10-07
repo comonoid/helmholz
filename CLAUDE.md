@@ -117,12 +117,15 @@ Every `.c`/`.h` written or edited goes through this sequence before it is
      система шапок даёт ~4 с фиксированной цены на файл). Блокируют классы с
      прямым дефектом (`clang-analyzer-core.*`, `unix.Stream`, утечка при
      `realloc`, целочисленное деление в FP-контексте, сравнение объектного
-     представления, смещённое расширение; `unix.Malloc` — для `src/**`). В
-     ОТЧЁТ (`build/cgate/advisory/`, 224 находки на 07-10) уходят гигиена
-     (`cert-err34-c` на `atoi` в разборе argv, `misc-include-cleaner`) и
-     «optin»-классы; `bugprone-implicit-widening` — полезен, но требует планового
-     перевода индексации на 64 бита, поэтому до решения он в отчёте. Отчёт
-     печатается сводкой по классам — «не блокирует» не значит «не существует»;
+     представления, смещённое расширение; для `src/**` дополнительно
+     `unix.Malloc` и `bugprone-implicit-widening-of-multiplication-result`). В
+     ОТЧЁТ (`build/cgate/advisory/`, 210 строк на 07-10 после разбора) уходят
+     гигиена (`cert-err34-c` на `atoi` в разборе argv, `misc-include-cleaner`),
+     «optin»-классы и widening в `tools/`/`tests/`. Сплошной перевод индексной
+     арифметики на 64 бита НЕ нужен: порог переполнения `k·i` — 715 млн…2.1 млрд
+     элементов (5.7…150 ГБ буфера), продакшн-сайты починены точечно, остальное —
+     литералы и счётчики ≤512. Отчёт печатается сводкой по классам — «не
+     блокирует» не значит «не существует»;
    - **S4** `gcc -O0 -fanalyzer` — **gates**, но идёт ПОСЛЕДНИМ и под таймаутом
      (44 с на `sweep.c`; на дешёвой ступени красный файл до него не доходит).
    Известный FP-класс gcc-analyzer (аудит diam 07-24): он теряет связь
@@ -130,7 +133,9 @@ Every `.c`/`.h` written or edited goes through this sequence before it is
    фантомные переполнения кучи; защитные условия это НЕ лечат, лечит calloc на
    месте использования. Отсюда правило: в горячих/индексных буферах обёрток
    выделения нет — выделять на месте; похоже на этот класс — сначала минимальный
-   репро, потом правка настоящего кода.
+   репро, потом правка настоящего кода. **Минимальные репро к записям базы
+   лежат в `tests/repro/` (README рядом): доказательство обязано жить в git, а не
+   в `build/`, который чистится.**
    **База и ратчет**: `scripts/cgate-baseline.txt` — разобранные находки с
    вердиктом (`FP (механизм …)` / `ОСОЗНАННО (…§…)`). Гейт валит только НОВОЕ.
    Вердикт «НОВОЕ — требует вердикта» — долг, а не разрешение.
@@ -148,9 +153,16 @@ Every `.c`/`.h` written or edited goes through this sequence before it is
    Оснастке октодерева обязателен `src/octree.c` в списке файлов: без него у
    CBMC нет тела `hz_oct_validate`, и свойства проваливаются ЛОЖНО.
 4. **Deadweight** (before commits): `make lean` (`scripts/lean.sh`) —
-   whole-project unused funcs/members/vars (cross-file; per-file unused already
-   caught by S1's `-Wall -Wextra`). Список файлов — из `git ls-files`, не
+   whole-project unused funcs/vars. Список файлов — из `git ls-files`, не
    рукописный (рукописный список пропускал `tools/pgather.c` и `src/transport/`).
+   Осознанно неиспользуемое (публичный API архивной линии, точки входа
+   CBMC/libFuzzer) вычитается по `scripts/lean-allow.txt`; гейтят
+   `unusedFunction`/`unusedVariable`/`unreadVariable`/`redundantAssignment`, а
+   `unusedStructMember` печатается «к сведению»: cppcheck разбирает заголовок в
+   отрыве от пользователей и зовёт неиспользуемыми все поля структур (в т.ч.
+   `hz_objmesh::nt/v/vn`, которые читает весь проект). Настоящий мёртвый код —
+   удалять: так ушли `hz_sw_dirsum`, `pg924_hash`, `tri_trace_on`, no-op в
+   `tools/kitfront.c`.
 5. **Runtime layer**: `make test-asan` (ASan+UBSan, `detect_leaks=1`),
    `make test-uninit` (`-ftrivial-auto-var-init=pattern` — чтение
    неинициализированного), `make check-int` (clang

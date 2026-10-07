@@ -1,0 +1,33 @@
+# scripts/lean-allow.txt — ОСОЗНАННО неиспользуемое в живом слое.
+#
+# `scripts/lean.sh` ищет мёртвый код по живому набору (src/, tools/, tests/) и
+# потому «не видит» двух законных случаев:
+#   1) публичный API общего слоя, который зовёт АРХИВНАЯ линия (archive/geom/) —
+#      она не собирается из корневого Makefile, но остаётся эталоном и вернётся
+#      при паритете (см. CLAUDE.md: старый путь — ПРОДЮСЕР и ЭТАЛОН);
+#   2) точки входа внешних фреймворков (harness для CBMC, LLVMFuzzerTestOneInput
+#      для libFuzzer) — их зовёт инструмент, а не наш код.
+#
+# Формат: ИМЯ — причина (одна строка; читается человеком, машиной не парсится).
+# Правило: сюда попадает только то, что проверено grep'ом по ВСЕМУ репозиторию
+# ВКЛЮЧАЯ archive/ (кроме wave/, куда входить нельзя). Настоящий мёртвый код
+# (ноль вызовов где угодно) — УДАЛЯТЬ, а не вписывать сюда: так уже разошлись
+# hz_sw_dirsum (удалён 07-10), pg924_hash и tri_trace_on.
+
+hz_pfm_write — API общего слоя (image.c): канонический выход радианса, зовут archive/geom/tools/render3.c, prender.c, pfield.c
+hz_ppm_write — API общего слоя (image.c): единственный писатель PPM, зовут archive/geom/tools/render3.c и test_sweep3.c
+hz_ppm_write_signed — API общего слоя (image.c): визуализация знаковых полей; вызовов нет НИГДЕ, но это парный к двум выше писатель одного формата (удалять тройку целиком или оставить — решение владельца)
+hz_obj_add_quad — API сцены (scene_obj.c): процедурное построение, зовут archive/geom/tools/pflow.c, prad.c
+hz_obj_subdivide — API сцены (scene_obj.c): дробление по площади, зовут archive/geom/tools/prad.c, pvis.c
+hz_obj_weld — API сцены (scene_obj.c): сварка вершин, зовёт archive/geom/tools/prad.c
+harness — точка входа CBMC (tests/cbmc_octree.c, tests/cbmc_sceneobj.c): зовёт cbmc --function harness
+LLVMFuzzerTestOneInput — точка входа libFuzzer (tests/fuzz_obj.c, tests/fuzz_ppm.c)
+
+# --- ложные срабатывания приборов (проверено чтением кода 07-10) ---
+tr3_dirs::n — читается через `const tr3_dirs *d` в tests/test_bounce.c (d->n); cppcheck unusedStructMember не видит чтение через указатель
+tr3_dirs::ox — то же (d->ox[m] в tests/test_bounce.c)
+tr3_dirs::oy — то же (d->oy[m])
+tr3_dirs::oz — то же (d->oz[m])
+tr3_dirs::w — то же (d->w[m])
+tr3_dirs::mir — ЗАДЕЛ/ВОПРОС ВЛАДЕЛЬЦУ: таблица зеркальной перестановки (этап C) заполняется в tr3_dirs_product, но не читается НИГДЕ. Либо этап C не сделан, либо таблица лишняя (3·n int на набор). Удалять или достроить — решение владельца
+tcur — FP cppcheck unreadVariable/DeadStores: присваивание в конце витка DDA читается в начале следующего (`pos = eye[ax] + tcur*rd[ax]`); «мёртвым» выглядит только последний виток

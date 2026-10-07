@@ -120,7 +120,15 @@ tool_versions() {
   printf 'clang-format\t%s\n' "$(clang-format --version 2>/dev/null | awk '{print $NF}')"
 }
 
-live_paths() { git ls-files 'src/*.c' 'src/*.h' 'tools/*.c' 'tools/*.h' 'tests/*.c' 'tests/*.h'; }
+live_paths() {
+  # tests/repro/ — ФИКСТУРЫ базы гейта: урезанные файлы той же формы, что и
+  # места находок, часть намеренно не форматирована и зовёт __CPROVER_assume.
+  # Это НЕ код проекта, и гейт их не судит. Исключение явное, потому что
+  # `git ls-files 'tests/*.c'` их берёт: в pathspec git `*` пересекает `/`
+  # (проверено 07-10 — без этого фильтра хук заблокировал коммит на 15 находках).
+  git ls-files 'src/*.c' 'src/*.h' 'tools/*.c' 'tools/*.h' 'tests/*.c' 'tests/*.h' |
+    grep -v '^tests/repro/'
+}
 
 tool_key() {
   {
@@ -250,6 +258,9 @@ stages_for() {
 #     а не в гейте (иначе гейт красный без действия).
 # unix.Malloc: для src/** БЛОКИРУЕТ (солвер живёт долго), для tools/tests —
 # отчёт: утечка на пути отказа умирает вместе с короткоживущим процессом.
+# implicit-widening: для src/** БЛОКИРУЕТ (проверено 07-10: в продакшне такие
+# сайты существуют и починены — 6·r/3·r в региональных массивах, смещения
+# изображений), для tools/tests — отчёт: там индексы-литералы или счётчики ≤512.
 tidy_blocks() { # $1 = файл, $2 = класс (clang-tidy может отдать список через запятую)
   case "$2" in
     *clang-analyzer-core.* | *clang-analyzer-unix.Stream* | *bugprone-suspicious-realloc-usage* | \
@@ -257,7 +268,11 @@ tidy_blocks() { # $1 = файл, $2 = класс (clang-tidy может отда
       *bugprone-misplaced-widening-cast*) return 0 ;;
   esac
   case "$1" in
-    src/*) case "$2" in *clang-analyzer-unix.Malloc*) return 0 ;; esac ;;
+    src/*)
+      case "$2" in
+        *clang-analyzer-unix.Malloc* | *bugprone-implicit-widening-of-multiplication-result*) return 0 ;;
+      esac
+      ;;
   esac
   return 1
 }
@@ -409,6 +424,7 @@ esac
 
 sel=()
 for f in "${FILES[@]}"; do
+  case "$f" in tests/repro/*) continue ;; esac # фикстуры базы, не код (см. live_paths)
   case "$f" in
     src/*.c | src/*.h | tools/*.c | tools/*.h | tests/*.c | tests/*.h) [ -f "$f" ] && sel+=("$f") ;;
   esac
@@ -431,6 +447,15 @@ HDRHASH="$(header_hash)"
 export TOOLKEY HDRHASH REPORT BASELINE STAGES CACHE STRICT FANALYZER_TIMEOUT FANALYZER_MEM_KB STAGE_TIMEOUT
 
 mkdir -p "$REPORT"/{logs,rows,all,findings,advisory,stamps}
+# БЛОКИРОВКА: два прогона гейта в одном каталоге отчёта затирают друг другу
+# rows/all/advisory и печатают ЛОЖНУЮ сводку (ловля 07-10: параллельный прогон
+# по двум файлам обнулил отчёт полного прогона, а тот отчитался «46 советов»
+# вместо реальных). Ждём освобождения, а не портим отчёт.
+exec 9>"$REPORT/.lock"
+if ! flock -w 3600 9; then
+  echo "cgate: не дождался блокировки $REPORT/.lock (другой прогон больше часа)" >&2
+  exit 2
+fi
 rm -f "$REPORT"/rows/*.tsv "$REPORT"/all/*.tsv "$REPORT"/findings/*.tsv "$REPORT"/advisory/*.tsv 2>/dev/null
 
 if [ "$QUIET" != 1 ]; then

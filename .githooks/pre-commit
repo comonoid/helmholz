@@ -22,8 +22,10 @@ set -uo pipefail
 HZ="$(git rev-parse --show-toplevel)"
 cd "$HZ" || exit 0
 
+# tests/repro/ — фикстуры базы гейта (урезанные файлы, часть намеренно не
+# форматирована и зовёт __CPROVER_assume): это не код проекта, гейт их не судит
 changed="$(git diff --cached --name-only --diff-filter=ACMR |
-  grep -E '^(src|tools|tests)/.*\.(c|h)$' || true)"
+  grep -E '^(src|tools|tests)/.*\.(c|h)$' | grep -v '^tests/repro/' || true)"
 [ -n "$changed" ] || exit 0
 
 n="$(printf '%s\n' "$changed" | wc -l)"

@@ -773,9 +773,16 @@ typedef struct {
   const int32_t *med_kmem; /* [Σ замещённых] слоты детей */
   int64_t *med_stamp;      /* [nrep] pkey активации (повторы гасит) */
   double *med_pend;        /* [nrep] Σ отложенных депозитов направления */
-  double *ced;             /* [nleaf] §932-Б/Ш9-ЗОНД: клеточный аккумулятор
-                            * приёма (NULL — выкл); раздача детям по
-                            * площадям в конце итерации */
+  double *ced;             /* [nleaf] §932-Б/Ш9-ЗОНД + Ш12: клеточный
+                            * приём. cellc=1 (RAW-зонд): Φ_входа звена;
+                            * cellc=2: ИЗВЛЕЧЁННЫЙ поток Φ_вх·(1−e^{−Λ})
+                            * (Λ — сумм. доля перехвата, §932-Б/Ш12-ПЛАН);
+                            * раздача детям по площадям — в конце итерации.
+                            * NULL — клеточный приём выключен */
+  int cellc;               /* §932-Б/Ш12: режим клеточного приёма 0/1/2 */
+  double *cabs;            /* [nleaf] §932-Б/Ш12 (только cellc=2): радианс
+                            * НА ВХОДЕ клетки для этого направления (Lin в
+                            * начале звена, для доли переизлучения клетки) */
   struct {
     int32_t r;
     double tin, tout, sig, rho, tprev, pend;
@@ -805,6 +812,11 @@ typedef struct {
   double depA; /* Σ родительской доли, депонированной кускам (L-единицы) */
   double absorbed, emitted, recycled;
   int64_t g6viol, njump, nmat, ndesc, ncellfront, nstamp, nlostseg, ndep;
+  /* Ш12: инкремент поглощённой СРЕДОЙ доли (радианс-единицы) — банк
+   * sw_med_bank добавляет; разность снимков = доля среды на ЭТОМ звене.
+   * Клеточный приём обязан её учесть: иначе среда и клетка вычтут из трубки
+   * до 2× её потока (консервативность ломается). */
+  double med_rem;
 } front_ctx;
 
 /* отрезок [h0,h1] луча (org, om) в коробке, пересечённый с [tin,tout];
@@ -936,6 +948,9 @@ static int64_t g932b_nest;            /* §932-Б-Ш4: входов при жи�
                                        * (вложенные регионы, Б0-в/А1720) */
 static double g932c_dep;              /* §932-Б/Ш9-ЗОНД: Σ клеточного приёма */
 static int64_t g932c_n;               /* §932-Б/Ш9-ЗОНД: куско-раздач за прогон */
+static int64_t g932c_vis;             /* §932-Б/Ш12: клеточных изъятий за прогон */
+static double g932c_fmax;             /* §932-Б/Ш12: max f изъятия (≤1 по построению) */
+static int64_t g932c_ge1;             /* §932-Б/Ш12-прибор: изъятий с f ≥ 1−1e-12 */
 
 /* §932-Б: ИНКРЕМЕНТНЫЙ БАНК СРЕДЫ (А1710) — ослабить Lin до момента t и
  * раздать поглощённое: (1−ρ_r) — замещённым детям по площадям (+depA,
@@ -958,6 +973,7 @@ static double sw_med_bank(front_ctx *fc, double Lin, double t, double csec) {
       double x = fc->med_act[k].sig * dt;
       double T = sw_med_t1 ? 1.0 - x : exp(-x); /* Ш3: битово exp(-sig·dt) */
       double dabs = Lin * (1.0 - T);            /* радианс-единицы поглощённого СРЕДОЙ */
+      fc->med_rem += dabs;                      /* Ш12: счётчик для клеточного приёма */
       double flux = fc->w_d * csec * fc->axcos * dabs;
       double fdep = flux * (1.0 - fc->med_act[k].rho); /* депозит детям: поток */
       g932b_abs += flux;
@@ -1434,6 +1450,32 @@ static int64_t g931_seam, g931_rh;    /* §931/А1668: шов — rep-хиты �
                                        * пересечения ближе rep_zone; и все rep-хиты */
 static int g924_minf = 1;             /* §924-матрика: HZ_REPMINF */
 
+/* §932-Б/Ш12: макрос-«продолжение» цикла пер-хит событий для
+ * КОНСЕРВАТИВНОГО КЛЕТОЧНОГО ПРИЁМА (cellc=2): листовая клетка набирает
+ * Λ += A_p·|n_p·ω|/(csec·axcos) по кускам своего списка — это ТА ЖЕ Λ, что
+ * знаменатель пер-хит депозита §894-e (там csec·axcos/A_p), только суммой по
+ * клетке; извлекается Δ = Φ_вх·(1−e^{−Λ}) ≤ Φ_вх и раздаётся детям по
+ * площадям (блок «КЛЕТОЧНЫЙ ПРИЁМ» в конце функции). Пер-хит ветка при
+ * cellc=2 кусок НЕ обрабатывает (односчётность). `continue` внешнего цикла —
+ * внутри макроса: `goto` вниз перескочил бы объявления ниже
+ * (-Wjump-misses-init, ловля 07-10). */
+#define SW_CELL_RECEIPT_CONTINUE()                                                                 \
+  do {                                                                                             \
+    if (fc->cellc == 2 && cpos >= 0) {                                                             \
+      double cy = (fc->nrm != NULL) ? front_depden(fc, p) : fc->area[p];                           \
+      double an2 = (fc->nrm != NULL) ? fabs(fc->om[0] * fc->nrm[3 * (int64_t)p] +                  \
+                                            fc->om[1] * fc->nrm[3 * (int64_t)p + 1] +              \
+                                            fc->om[2] * fc->nrm[3 * (int64_t)p + 2])               \
+                                     : 1.0;                                                        \
+      double c2 = (cy > FRONT_DEP_MIN_SHARE * csec && an2 > 1e-12)                                 \
+                      ? (cy / an2) / (csec * fc->axcos)                                            \
+                      : 1.0; /* вырожденная грань */                                               \
+      fc->ced[cpos] += c2;                                                                         \
+      g932c_vis++;                                                                                 \
+      continue;                                                                                    \
+    }                                                                                              \
+  } while (0)
+
 static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double tin, double tout,
                            double *a, double *b, int32_t cpos) {
   const hz_pyr *py = fc->py;
@@ -1443,6 +1485,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
   int32_t *hp;
   int32_t u;
   int64_t nh = 0, i;
+  double med_rem0 = fc->med_rem; /* Ш12: снимок — доля среды на ЭТОМ звене */
   if (n <= 0) return;
   if (fc->tau0) return; /* НК: слой не взаимодействует */
   fc->nmat++;
@@ -1450,7 +1493,8 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
   /* §932-Б/Ш9-ЗОНД: КЛЕТОЧНЫЙ ПРИЁМ — накопитель на лист (Lin НА ВХОДЕ
    * сегмента; раздача детям по площадям в конце итерации). Зонд, НЕ
    * канон: сосуществует с пер-хит депозитами (двойной счёт на хитовых
-   * кусках — меряется); умолчание cellacc=0 — битово прежний мир. */
+   * кусках — так и было задумано в Ш9); умолчание cellc=0 — битово
+   * прежний мир. cellc=2 — консервативная схема Ш12 (см. хвост функции). */
   if (fc->ced != NULL && cpos >= 0 && Lin > 0.0) /* cpos=-1: узел — вне зонда */
     fc->ced[cpos] += fc->w_d * Lin * csec * fc->axcos;
   if (fc->noprop) { /* НК: фронт не переносится */
@@ -1566,12 +1610,13 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
         double Lh;
         if (fc->pstamp[tri] == fc->pkey) continue;
         fc->pstamp[tri] = fc->pkey;
-        if (fc->o->travel) { /* §932-А: проводка t хита, пробега Lv и
-                              * монотонного t_last — СРАЗУ после штампа, ДО
-                              * обоих continue ниже (прозрачный rep — тоже
-                              * материальное событие, А1703); max гасит
-                              * инверсии уровней А1702. Lv — по СТАРОМУ t_last
-                              * (пробег ДО этого хита) */
+        SW_CELL_RECEIPT_CONTINUE(); /* Ш12: клеточный приём — ДО пер-хит ветки */
+        if (fc->o->travel) {        /* §932-А: проводка t хита, пробега Lv и
+                                     * монотонного t_last — СРАЗУ после штампа, ДО
+                                     * обоих continue ниже (прозрачный rep — тоже
+                                     * материальное событие, А1703); max гасит
+                                     * инверсии уровней А1702. Lv — по СТАРОМУ t_last
+                                     * (пробег ДО этого хита) */
           fc->t_cur = ht[i];
           fc->t_lv = fc->t_last >= 0.0 ? ht[i] - fc->t_last : -1.0;
           fc->t_last = g932_nomax ? ht[i] : (fc->t_last > ht[i] ? fc->t_last : ht[i]);
@@ -1872,6 +1917,58 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
                                       * состояние переживает сегмент (А1719),
                                       * инкрементность точна, двойного счёта нет */
         Lin = sw_med_bank(fc, Lin, tout, csec);
+      /* Ш12: КЛЕТОЧНЫЙ ПРИЁМ (cellc=2) — извлечение из трубки и выход из
+       * клетки. Λ собрана в ced[cpos] (см. макрос в цикле пер-хит событий):
+       * Δ = Φ_вх·(1−e^{−Λ}) ≤ Φ_вх (консервативность по построению),
+       * Δ/ΣA_cell раздаётся детям в конце итерации (Σ Ed·A = Δ).
+       * Трубка через клетку: Lin ← Lin·(1−f) + L̄_cell·f, L̄_cell — средний
+       * по площадям Lh кусков списка (клетка как поверхность; для клетки из
+       * одного куска это пер-хит с точностью O(f²)). Носитель-поверхность
+       * (виртуальные входы среды) в списке листа не встречается. */
+      if (fc->cellc == 2 && cpos >= 0 && (fc->ced[cpos] > 0.0 || fc->med_rem > med_rem0)) {
+        double Lin_entry = Lin; /* радианс на входе клетки — для доли
+                                 * переизлучения клетки (cabs) */
+        /* Λ = перехват кусками (ced) + поглощение СРЕДОЙ на звене (разность
+         * снимков банка): оба слагаемых вычитаются из ОДНОЙ трубки, поэтому
+         * складываются ДО экспоненты */
+        double cyc = fc->ced[cpos] + (fc->med_rem - med_rem0);
+        double f = -expm1(-cyc);
+        double Lin_cell = Lin;
+        if (f > 1.0 || !(f == f)) { /* страховка: f ≤ 1 по построению (expm1 > −1);
+                                     * срабатывание = сигнал NaN/Inf в Λ */
+          static int cfw = 0;
+          if (cfw < 8) {
+            cfw++;
+            fprintf(stderr, "Ш12-CLAMP: f=%.17g cyc=%.17g ced=%.17g med=%.17g\n", f, cyc,
+                    fc->ced[cpos], fc->med_rem - med_rem0);
+          }
+          f = 1.0;
+        }
+        if (f > g932c_fmax) g932c_fmax = f;
+        if (f >= 1.0 - 1e-12) g932c_ge1++; /* прибор: исчерпание клетки (f→1) */
+        g932c_vis++;
+        if (Lin > 0.0) { /* L̄_cell — средний по площадям Lh кусков списка */
+          double lsum = 0.0, asum = 0.0;
+          for (int32_t q3 = fc->bstart[cpos]; q3 < fc->bstart[cpos + 1]; q3++) {
+            int32_t q4 = fc->bpids[q3];
+            double lh4 = front_lh_cap(fc, front_le(fc, q4) +
+                                              front_rho(fc, q4) * fc->Eprev[q4] / (2.0 * M_PI));
+            lsum += lh4 * fc->area[q4];
+            asum += fc->area[q4];
+          }
+          if (asum > 0.0) Lin_cell = Lin * (1.0 - f) + (lsum / asum) * f;
+        }
+        fc->ced[cpos] = fc->w_d * Lin_entry * csec * fc->axcos * f;
+        fc->cabs[cpos] = Lin_entry;
+        fc->absorbed += fc->w_d * Lin_entry * csec * fc->axcos * f;
+        fc->depA += ai;
+        if (Lin_cell > 0.0)
+          *b = Lin_cell;
+        else
+          *b = 0.0;
+        *a = 0.0;
+        Lin = Lin_cell;
+      }
       if (nh > 0) {
         *a = 0.0;
         *b = Lin;
@@ -1933,6 +2030,7 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
     }
   }
 }
+#undef SW_CELL_RECEIPT_CONTINUE
 
 /* §923: пересборка раскладки под текущие этажи lpflo (слот-пространство).
  * Каждый кусок — в ЕДИНСТВЕННЫЙ список уровня своего этажа: f==0 — листовая
@@ -3360,6 +3458,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   double *med_pend = NULL;
   int med_ready = 0;
   double *ced = NULL, *casum = NULL; /* §932-Б/Ш9-ЗОНД */
+  double *cabs = NULL;               /* §932-Б/Ш12: радианс входа клетки (cellc=2) */
 
   memset(st, 0, sizeof *st);
   if (!py || !area || !nrm || !kd || !o) return 1;
@@ -3612,17 +3711,23 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       fillb = NULL;
     }
   }
-  /* §932-Б/Ш9-ЗОНД: клеточный приём — аккумулятор на лист + суммы
+  /* §932-Б/Ш9-ЗОНД + Ш12: клеточный приём — аккумулятор на лист + суммы
    * площадей детей клетки (раздача ced/ΣA в конце итерации);
-   * объявлены ВЕРХом (goto done до этого блока — анализатор) */
-  if (o->cellacc && bstart != NULL) {
+   * объявлены ВЕРХом (goto done до этого блока — анализатор).
+   * Ш12: cellc=2 добавляет cabs (радианс входа клетки для доли переизлучения).
+   * Аллокация НА МЕСТЕ (не обёрткой): у gcc-analyzer класс FP на ёмкость↔
+   * счётчик через обёртки выделения (CLAUDE.md, п. 2/S4). */
+  if (o->cellc && bstart != NULL) {
     ced = (double *)calloc((size_t)py->nleaf, sizeof *ced);
     casum = (double *)calloc((size_t)py->nleaf, sizeof *casum);
-    if (!ced || !casum) { /* fail closed: зонд выкл, мир прежний */
+    if (o->cellc == 2) cabs = (double *)calloc((size_t)py->nleaf, sizeof *cabs);
+    if (!ced || !casum || (o->cellc == 2 && !cabs)) { /* fail closed: приём выкл */
       free(ced);
       free(casum);
+      free(cabs);
       ced = NULL;
       casum = NULL;
+      cabs = NULL;
     } else {
       for (int32_t c2 = 0; c2 < py->nleaf; c2++) {
         double s2 = 0.0;
@@ -3754,7 +3859,9 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.pc = pc;
         fc.bstart = bstart;
         fc.bpids = bpids;
-        fc.ced = ced; /* Ш9-зонд: клеточный аккумулятор (NULL — выкл) */
+        fc.cellc = o->cellc; /* Ш12: режим клеточного приёма (0/1/2) */
+        fc.ced = ced;        /* Ш9-зонд + Ш12: клеточный аккумулятор (NULL — выкл) */
+        fc.cabs = cabs;      /* Ш12: радианс входа клетки (только cellc=2) */
         fc.mark = mark;
         fc.nstart = nstart;
         fc.nlen = nlen;
@@ -4042,10 +4149,10 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         ag.gwt[g] = 0.0;
       }
     }
-    if (ced != NULL) { /* §932-Б/Ш9-ЗОНД: раздача клеточного приёма —
-                        * Ed[p] += ced/AΣ (одинаково на площадь: Σ Ed·A =
-                        * ced); ПОСЛЕ пер-хит депозитов = двойной счёт на
-                        * хитовых кусках (зонд-семантика, меряется) */
+    if (ced != NULL) { /* §932-Б/Ш9-ЗОНД + Ш12: раздача клеточного приёма
+                        * детям по площадям: Σ Ed·A = ced (тождество).
+                        * cellc=1: ced — Φ_входа (RAW-зонд). cellc=2: ced —
+                        * ИЗВЛЕЧЁННЫЙ из трубки поток Φ_вх·(1−e^{−Λ}) */
       double cedtot = 0.0;
       int64_t cedn = 0;
       for (int32_t c2 = 0; c2 < py->nleaf; c2++) {
@@ -4347,10 +4454,15 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
             (long long)g932b_sact, g932b_edf, g932b_dep > 0.0 ? g932b_edf / g932b_dep : 0.0,
             (long long)g932b_nest, sw_med_now ? " [MEDNOW]" : "", sw_med_t1 ? " [MEDT1-ЗОНД]" : "",
             sw_med_scr ? " [MEDSCRAMBLE-НК]" : "");
-  if (o->cellacc) /* §932-Б/Ш9-ЗОНД: клеточный приём (двойной счёт с
-                   * пер-хит — семантика зонда, НЕ канон) */
-    fprintf(stderr, "§932-Б-Ш9: клеточный приём: Σ=%.6g, раздач=%lld (зонд)\n", g932c_dep,
+  if (o->cellc == 1) /* §932-Б/Ш9: RAW-зонд (НЕконсервативен, НК Ш12) */
+    fprintf(stderr, "§932-Б-Ш9: клеточный приём RAW-зонд: Σ=%.6g, раздач=%lld\n", g932c_dep,
             (long long)g932c_n);
+  if (o->cellc == 2) /* §932-Б/Ш12: консервативная схема — Σ извлечённого
+                      * из трубок потока (= Σ депозитов клеток тождество) */
+    fprintf(stderr,
+            "§932-Б-Ш12: клеточный приём консервативный: Σизвлечено=%.6g, раздач=%lld, "
+            "изъятий=%lld, maxf=%.17g, f≥1−1e−12: %lld\n",
+            g932c_dep, (long long)g932c_n, (long long)g932c_vis, g932c_fmax, (long long)g932c_ge1);
 
 done:
   free(med_sub);       /* §932-Б */
@@ -4366,6 +4478,7 @@ done:
   free(med_pend);      /* §932-Б (ASAN-ловля Ш3: не освобождался с Ш2) */
   free(ced);           /* §932-Б/Ш9-зонд */
   free(casum);         /* §932-Б/Ш9-зонд */
+  free(cabs);          /* §932-Б/Ш12 */
   free(lpflo);         /* §862 */
   free(lpflo_tri);     /* §922/А1632 */
   free(lvls);          /* §923 */

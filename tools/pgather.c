@@ -1594,7 +1594,7 @@ int main(int argc, char **argv) {
   int medium = 0;              /* §932-Б: дальнее поле как статистическая среда */
   double mtau = 0.0;           /* §932-Б/А1737: порог замещения — доля среднего */
   int coldf = 0;               /* §932-Б/Ш9: стартовый этаж микрокусков */
-  int cellacc = 0;             /* §932-Б/Ш9-ЗОНД: клеточный приём */
+  int cellc = 0;               /* §932-Б/Ш9/Ш12: клеточный приём (0/1/2) */
   int tmap = 0;                /* Ш9: тон-маппинг серого кадра (эксп. по среднему) */
   double colda = 0.0;          /* §932-Б/Ш9: порог площади для старта, м² */
   int ksdiff = 0;              /* §918: Δ=1−ks (диффузный отскок грубит) */
@@ -1748,8 +1748,8 @@ int main(int argc, char **argv) {
       coldf = atoi(argv[i] + 6); /* §932-Б/Ш9: стартовый этаж микрокусков */
     else if (strncmp(argv[i], "colda=", 6) == 0)
       colda = atof(argv[i] + 6); /* §932-Б/Ш9: порог площади, м² (0 — выкл) */
-    else if (strncmp(argv[i], "cellacc=", 8) == 0)
-      cellacc = atoi(argv[i] + 8); /* §932-Б/Ш9-ЗОНД: клеточный приём */
+    else if (strncmp(argv[i], "cellc=", 6) == 0)
+      cellc = atoi(argv[i] + 6); /* §932-Б/Ш9/Ш12: 1=RAW-зонд (НК), 2=консервативный */
     else if (strncmp(argv[i], "tmap=", 5) == 0)
       tmap = atoi(argv[i] + 5); /* Ш9: экспозиция+гамма в сером кадре */
     else if (strncmp(argv[i], "kcal=", 5) == 0)
@@ -2502,7 +2502,7 @@ int main(int argc, char **argv) {
   if (gather == 0) printf("СТАТЬЯ bbox-CSR: %.2f с\n", t1 - t0);
   memset(&so, 0, sizeof so);
   so.le = le;
-  so.cellacc = cellacc; /* §932-Б/Ш9-ЗОНД: клеточный приём (0 — битово) */
+  so.cellc = cellc; /* §932-Б/Ш9/Ш12: клеточный приём (0 — битово) */
   so.rho = rho;
   so.iters = iters;
   so.tau0 = tau0;

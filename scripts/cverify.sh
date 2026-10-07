@@ -30,7 +30,9 @@ case " $* " in *" --unwind "*) UNW="";; *) UNW="--unwind 10 --unwinding-assertio
 # a run that needs more than this is a harness to shrink, not a run to feed.
 CVERIFY_MEM_KB="${CVERIFY_MEM_KB:-16000000}"
 
-nix-shell -p cbmc --run "
+# 07-10: шелл — пин shell.nix (одна версия cbmc для всех прогонов базы/отчёта;
+# раньше каждый вызов поднимал `nix-shell -p cbmc` по текущему каналу).
+nix-shell "$HZ/shell.nix" --run "
 ulimit -v $CVERIFY_MEM_KB || true
 # NIX_HARDENING_ENABLE='': the nix cc-wrapper force-defines _FORTIFY_SOURCE at
 # preprocessing, and fortified glibc wrappers (bits/stdio2.h printf) use

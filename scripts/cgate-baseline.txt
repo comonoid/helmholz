@@ -1,0 +1,138 @@
+# scripts/cgate-baseline.txt — РАЗОБРАННЫЕ находки гейта (база/ратчет).
+#
+# Формат: файл<TAB>ступень<TAB>класс<TAB>текст<TAB>вердикт
+# Ключ (первые 4 колонки) нормирован БЕЗ номера строки: сдвиг строк не обнуляет
+# базу. Имена переменных из note:-строк в текст НЕ входят — см. cgate.sh.
+#
+# ПРАВИЛА:
+#   * гейт валит только НОВОЕ; запись здесь означает «разобрано и объяснено»;
+#   * вердикт «НОВОЕ — требует вердикта» ничего не объясняет — это долг, а не
+#     разрешение; гейт по такой строке не должен считаться зелёным;
+#   * инструменты версие-зависимы: база валидна для версий из шапки. При смене
+#     версии движка (shell.nix) базу пересматривать: make gate-baseline.
+#   * политика S3 (что блокирует, что в отчёт) — в scripts/cgate.sh, tidy_blocks.
+# Инструменты: gcc 15.3.0, clang-tidy 21.1.8, cppcheck 2.18.3, clang-format 21.1.8
+#
+# УСТРАНЕНО В ЭТОМ ЖЕ ЗАХОДЕ (в базу не входит, для истории разбора 07-10):
+#   sweep.c  goto done мимо инициализаторов 15 указателей — НАСТОЯЩАЯ UB (перенос
+#            объявлений выше первого goto; проверено gdb: путь достижим);
+#   sweep.c  нет восстановления pstamp/pkey после ног (§894-c-5) — исправлено;
+#   sweep.c  fc.leg_budget никогда не получал 2000000 (мёртвое присваивание →
+#            ноги были выключены НЕЯВНО) — состояние названо HZ_SW_LEG_BUDGET=0;
+#   sweep.c  memset(NULL) при mode≠3 (Linmax_* выделены только в mode 3);
+#   sweep.c  утечки pbuf_t/pbuf_p при отказе второго realloc (×2 места);
+#   sweep.c  reps_on без want != NULL — разыменование NULL при отказе calloc;
+#   pyr.c    free(fill) на пути отказа; два realloc не в себя; pi без верхней границы;
+#   pgather.c 11× realloc в себя (утечка при отказе), calloc(seen) без проверки,
+#            мёртвые pg924_hash/atri, тени и конверсии;
+#   pview.c  два null-deref (fopen/malloc без проверки), тени, сужение;
+#   pblock.c  неинициализированные поля ключа bsearch;
+#   kcalmk.c размер выделения из ЗАГОЛОВКА недоверенного файла (CWE-789).
+
+# --- sweep.c: точное сравнение с нулём — это НЕ про округление ---
+# fc->med_pend[r] — аккумулятор calloc'а, в который только ПРИБАВЛЯЮТ депозиты.
+# Ноль здесь означает «в регионе r не было ни одного депозита» и достигается
+# точно (calloc), а не накоплением. Замена на >0.0 сузила бы смысл (отрицательный
+# pend — признак ошибки учёта, его надо видеть, а не пропускать).
+src/nstruct/sweep.c	S1	-Werror=float-equal	comparing floating-point with ‘==’ or ‘!=’ is unsafe	ОСОЗНАННО: точный ноль = «депозитов не было» (calloc-аккумулятор, только +=); ср. Ш9-инвариант позитивности
+
+# --- переиспользование double-скретча как int32-массива ---
+# fc->wbuf — скретч, выделенный под double (8 Б), в него кладут int32 (4 Б):
+# «n int32 ≤ n double — места хватает». Буфер получен malloc/realloc, то есть не
+# имеет объявленного типа; выравнивание double строже int32, поэтому на x86-64
+# приведение корректно. На платформах со строгим выравниванием int32 это
+# пришлось бы переписать (порт на GPU — отдельная задача, §882/HBLK).
+src/nstruct/sweep.c	S2	invalidPointerCast	Casting from double * to signed int * is not portable due to different binary data representations on different platforms.	ОСОЗНАННО: скретч под double используется как int32 (выравнивание double строже); переписать при порте
+
+# --- pgather.c: байтовый блок HBLK переосмысляется как SoA-массивы ---
+# Формат HBLK (§882) — байтовый блок: заголовок, затем массивы double/int32 по
+# смещениям; поля структуры получаются приведением базы из unsigned char*.
+# Ровно это и нужно для GPU-порта блока «как есть». cppcheck ругается на сам
+# факт приведения; буфер получен mmap/malloc, выравнивание по double соблюдено.
+tools/pgather.c	S2	invalidPointerCast	Casting between unsigned char * and const double * which have an incompatible binary data representation.	ОСОЗНАННО: формат HBLK §882 — SoA-массивы по смещениям внутри байтового блока (иначе не грузится на GPU как есть)
+
+# --- kitdec.c: 82 предупреждения «прыжок мимо инициализатора» — ИНВЕНТАРЬ ---
+# Разобрано 07-10 инвентарём: собраны имена, чьи инициализаторы перескакиваются
+# (remap, L1, N, nnv, nnt, w, ncl, prev, area1, want, alive и счётчики коллизий),
+# и имена, которые читает метка fail: (vx vy vz ta tb tc tcl tmtl Q dead isb tdel
+# mark stk hp.h A.head A.next A.etri k). Пересечение множеств ПУСТО. Механизм FP:
+# -Wjump-misses-init срабатывает на любой CFG-переход (в том числе `continue` на
+# заголовок цикла), у которого есть ветка, не прошедшая инициализатор, — даже
+# если на пути к метке это имя не читается. Класс опасен (он же дал настоящий
+# дефект в sweep.c:3338), поэтому здесь разбор ФАЙЛА, а не отключение класса.
+tools/kitdec.c	S1	-Werror=jump-misses-init	jump skips variable initialization	FP: инвентарь 07-10 — пересечение «перепрыгнутые имена» × «читает fail:» пусто (22 перехода, 18 имён); инструмент диагностический
+
+# --- сравнение ОБЪЕКТНОГО ПРЕДСТАВЛЕНИЯ: так и задумано там, где гейт битовый ---
+# Проект сверяет БИТОВЫЕ слепки (А1313: при OMP_NUM_THREADS=1), поэтому сравнение
+# через memcmp — не ошибка, а сам критерий: (а) канарейка kit.c:253 ловит
+# повреждение блока по битовому узору double (в т.ч. payload NaN); (б) тесты
+# сверяют представления double/_Complex/hz_cluster, где важны ВСЕ биты, включая
+# знак нуля и NaN. Для структур с padding это работало бы лишь при
+# детерминированном заполнении — оно есть: тест иначе не проходил бы дважды.
+src/geom/kit.c	S3	bugprone-suspicious-memory-comparison,cert-exp42-c,cert-flp37-c	comparing object representation of type 'double' which does not have a unique object representation; consider comparing the values manually	ОСОЗНАННО: memcmp-канарейка битового узора (§914/кит), сравнение представления = критерий
+tests/test_kit.c	S3	bugprone-suspicious-memory-comparison,cert-exp42-c,cert-flp37-c	comparing object representation of type 'double' which does not have a unique object representation; consider comparing the values manually	ОСОЗНАННО: тест сверяет битовый слепок (А1313), а не значение
+tests/test_kit.c	S3	bugprone-suspicious-memory-comparison,cert-exp42-c,cert-flp37-c	comparing object representation of type 'hz_cluster' which does not have a unique object representation; consider comparing the members of the object manually	ОСОЗНАННО: битовый слепок кластера — критерий теста; padding заполняется детерминированно (иначе тест не был бы устойчив)
+tests/test_octfmt.c	S3	bugprone-suspicious-memory-comparison,cert-exp42-c,cert-flp37-c	comparing object representation of type '_Complex double' which does not have a unique object representation; consider comparing the values manually	ОСОЗНАННО: битовый слепок _Complex double — критерий теста
+
+# --- чтение потока после EOF: позиция потока больше не используется ---
+# ppm_tok (src/image.c) и читатель ppmdiff.c идут по потоку ДО конца, конец
+# определяется возвратом EOF у fgetc (стандарт: повторный вызов после EOF сразу
+# возвращает EOF). Позиция потока после неудачной операции стандартом не
+# определена, но она нигде не читается: оба места закрывают файл и работают с
+# уже прочитанным буфером. Класс реален в общем случае; здесь — ОСОЗНАННО.
+src/image.c	S3	clang-analyzer-unix.Stream	File position of the stream might be 'indeterminate' after a failed operation. Can cause undefined behavior	ОСОЗНАННО: позиция потока после EOF не читается, файл закрывается; цикл кончается на EOF по стандарту
+src/image.c	S3	clang-analyzer-unix.Stream	Read function called when stream is in EOF state. Function has no effect	ОСОЗНАННО: то же — fgetc после EOF возвращает EOF и это условие выхода
+tools/ppmdiff.c	S3	clang-analyzer-unix.Stream	File position of the stream might be 'indeterminate' after a failed operation. Can cause undefined behavior	ОСОЗНАННО: позиция потока после EOF не читается
+tools/ppmdiff.c	S3	clang-analyzer-unix.Stream	Read function called when stream is in EOF state. Function has no effect	ОСОЗНАННО: то же
+
+# --- целочисленное деление в FP-контексте: это АДРЕСАЦИЯ, а не арифметика поля ---
+# Вид `(double)(id / d[0])` — вычисление номера клетки по линейному индексу:
+# деление обязано быть целым, приведение к double — уже после него. Класс опасен
+# там, где деление случайно попадает в формулу поля (тогда теряется дробная
+# часть); здесь это индекс. Все три места проверены чтением (pyr.c:544 рядом с
+# `id % d[0]`, sweep.c — там же, snap3.c — та же адресация).
+src/nstruct/pyr.c	S3	bugprone-integer-division	result of integer division used in a floating point context; possible loss of precision	ОСОЗНАННО: адресация клетки — деление обязано быть целым, double уже после (рядом `% d[0]`)
+src/nstruct/sweep.c	S3	bugprone-integer-division	result of integer division used in a floating point context; possible loss of precision	ОСОЗНАННО: то же — номер клетки по линейному индексу
+tools/snap3.c	S3	bugprone-integer-division	result of integer division used in a floating point context; possible loss of precision	ОСОЗНАННО: то же
+
+# --- «мусорное значение» у анализатора: значение заполняется функцией, которую он не моделирует ---
+# sweep.c:140 — gx/gw заполняет sw_gauss_legendre(nmu, gx, gw); она пишет ВСЕ n
+#   узлов (x[i] и x[n-1-i], i < n/2), а нечётное nmu отвергается ЯВНО в
+#   hz_sw_dir_table (проверка `(nmu & 1)`), о чём и говорит шапка функции
+#   («Чётные n»). Анализатор не связывает guard с цикл заполнения.
+# sweep.c:3517 — wpid заполняется в sw_build_walk для КАЖДОГО pos (w->wpid[pos]=p
+#   в цикле по кускам листа), буфер — py->nt записей, а индекс
+#   leaf[k].first < cntot ≤ nt.
+# Метка: ПРОЧИТАНО В КОДЕ. Минимальный репро не собран — по правилу проекта это
+# значит «FP заявлен, но не доказан инструментально»; при следующем заходе в эти
+# функции — проверить репро (долг, не приговор).
+src/nstruct/sweep.c	S3	clang-analyzer-core.UndefinedBinaryOperatorResult	The left operand of '*' is a garbage value	FP (ПРОЧИТАНО В КОДЕ): guard `(nmu & 1)` + заполнение всех узлов; репро не собран (долг)
+src/nstruct/sweep.c	S3	clang-analyzer-core.UndefinedBinaryOperatorResult	The right operand of '^' is a garbage value	FP (ПРОЧИТАНО В КОДЕ): wpid заполняется для всех pos в sw_build_walk; репро не собран (долг)
+tools/pgather.c	S3	clang-analyzer-core.uninitialized.Assign	Assigned value is uninitialized	FP (ПРОЧИТАНО В КОДЕ): dhead инициализируется циклом по ncell (1142-1153), s клампится, ncell=gnx·gny·gnz; репро не собран (долг)
+tools/pref.c	S3	clang-analyzer-core.UndefinedBinaryOperatorResult	The right operand of '-' is a garbage value	FP (ПРОЧИТАНО В КОДЕ): Eref обнуляется циклом по m.nt (421-423) до использования; репро не собран (долг)
+
+# --- pyr.c: анализатор не берёт верхнюю границу индекса как доказательство ---
+# Код УЖЕ усилен: `if (pi >= 0 && pi < w)` — выше инициализируются ровно w
+# записей lvl[0..w-1], поэтому запись вне диапазона невозможна. clang-analyzer
+# продолжает считать lvl[pi] неинициализированной памятью. Это ЕДИНСТВЕННАЯ
+# запись базы с недоказанным вердиктом: помечена как долг, разобрать отдельно
+# (кандидат на минимальный репро уровня функции hz_pyr_build).
+src/nstruct/pyr.c	S3	clang-analyzer-core.uninitialized.Assign	The left expression of the compound assignment uses uninitialized memory	ДОЛГ: усилено `pi < w`, прибор не принимает; репро не собран — разобрать отдельно
+
+# --- kcalmk.c: находка УСТРАНЕНА, прибор не видит устранения ---
+# Размер выделения задавал заголовок недоверенного файла (CWE-789). Добавлена
+# сверка с размером файла: принимается только ровно «заголовок + nrep·nw double»,
+# плюс отдельные проверки на ноль делителя и на «просит больше, чем есть».
+# Проверено НАСТОЯЩИМ входом: подделанный файл из 16 Б с nrep=1e9 отвергается
+# сообщением «заголовок просит больше, чем есть в файле (16 Б)» (артефакт
+# build/probe_kcal/). gcc -fanalyzer по-прежнему видит tainted-размер: он не
+# выводит границу из сверки с размером файла — известное ограничение прибора.
+tools/kcalmk.c	S4	-Wanalyzer-tainted-allocation-size	use of attacker-controlled value ‘(long unsigned int)h.nrep * (long unsigned int)h.nw * 8’ as allocation size without upper-bounds checking [CWE-789]	УСТРАНЕНО (проверено подделанным входом); прибор границу не выводит — ограничение taint-анализа
+
+# --- S4 повторяет то же самое другими именами классов ---
+# -fanalyzer видит те же места, что S1/S3, но называет класс иначе; ключ базы
+# включает ступень, поэтому запись нужна на каждую ступень (иначе гейт красный
+# ровно на повторе уже разобранного).
+src/nstruct/sweep.c	S4	-Wfloat-equal	comparing floating-point with ‘==’ or ‘!=’ is unsafe	ОСОЗНАННО: тот же точный ноль med_pend (см. запись S1 выше)
+src/nstruct/sweep.c	S4	-Wanalyzer-use-of-uninitialized-value	use of uninitialized value ‘*<unknown>’ [CWE-457]	FP (ПРОЧИТАНО В КОДЕ): gx/gw заполняет sw_gauss_legendre для ВСЕХ узлов, нечётное nmu отвергнуто guard'ом `(nmu & 1)` в hz_sw_dir_table; связь guard↔цикл прибор не держит (тот же корень, что у записи S3 UndefinedBinaryOperatorResult)
+tools/pgather.c	S4	-Wanalyzer-use-of-uninitialized-value	use of uninitialized value ‘*<unknown>’ [CWE-457]	FP (МИНИМАЛЬНЫЙ РЕПРО): build/probe_triage/repro_1194_fp.c — та же функция с локальным nt даёт 0 предупреждений, с S->ntris даёт 2; g->rmax заполняется целиком циклом 1167-1191 до чтения на 1191

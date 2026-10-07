@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# .githooks/pre-commit — ДЕШЁВЫЕ ступени гейта на коммите (S0 + S1).
+#
+# Зачем хук: гейт существовал только как проза в CLAUDE.md, и коммит 2cafefa
+# (07-10) лежал красным сразу по четырём файлам — то есть «закоммичено» не
+# означало «прогнано даже дешёвое». Хук закрывает ровно эту щель.
+#
+# Здесь ТОЛЬКО S0 (clang-format, не мутирует) + S1 (gcc -O2 -Werror, включая
+# «goto мимо инициализатора») по изменённым .c/.h живого слоя — единицы секунд.
+# S2 (cppcheck) в хук НЕ входит намеренно: на tools/pgather.c он считается ~38 с
+# (замер 07-10, все конфигурации одинаково), а хук, который ждут минуту,
+# перестают использовать. S2 гоняется в `make check-fast` и `make check`.
+#
+# Дорогое (S3 clang-tidy, S4 -fanalyzer, CBMC, санитайзеры) — на шаге:
+# make check / make gate, а не на коммите.
+#
+# Установка:  make hooks      (git config core.hooksPath .githooks)
+# Снять:      git config --unset core.hooksPath
+# Осознанный обход одного коммита: git commit --no-verify
+set -uo pipefail
+
+HZ="$(git rev-parse --show-toplevel)"
+cd "$HZ" || exit 0
+
+changed="$(git diff --cached --name-only --diff-filter=ACMR |
+  grep -E '^(src|tools|tests)/.*\.(c|h)$' || true)"
+[ -n "$changed" ] || exit 0
+
+n="$(printf '%s\n' "$changed" | wc -l)"
+echo "pre-commit: cgate S0–S1 по $n файлам живого слоя"
+
+if scripts/cgate.sh --staged --stage=0,1; then
+  exit 0
+fi
+
+echo
+echo "pre-commit: ГЕЙТ КРАСНЫЙ — коммит остановлен."
+echo "  находки: build/cgate/findings/   отчёт: build/cgate/report.tsv"
+echo "  разобранная находка вносится в базу: make gate-baseline (и вердикт в файл)"
+echo "  полный гейт: make check-fast (S0–S2) / make check (S0–S4)"
+echo "  осознанный обход: git commit --no-verify"
+exit 1

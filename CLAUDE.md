@@ -91,38 +91,70 @@ operator are shared machinery. Target scene scale: a city.
 ## C CODE QUALITY GATE — MANDATORY, ALWAYS, WHOLE PROJECT
 Every `.c`/`.h` written or edited goes through this sequence before it is
 "done". Not optional, not per-task — all C in the repo, every time.
+**Процедура целиком, с командами и контрактом триажа — в скилле `.dsh/skills/c-gate`.**
 
-1. **Format**: `clang-format -i FILE.c` — config `.clang-format` (LLVM base,
-   2-space, no tabs, col 100, K&R).
-2. **Static-analysis gate**: `scripts/ccheck.sh FILE.c [...]` — three engines
-   in one nix-shell:
-   - `gcc -fanalyzer` (path-sensitive: null-deref / UAF / double-free / leak /
-     taint) — **gates**;
-   - `clang-tidy` (clang-analyzer + bugprone + cert; config `.clang-tidy`) —
-     advisory;
-   - `cppcheck` (bounds / uninit / leak / realloc / portability) — **gates**.
-   Fix until it prints `>>> ccheck: CLEAN`. (gcc-analyzer + cppcheck non-zero =
-   must fix; clang-tidy findings are advisory but read them.)
-   Known gcc-analyzer false-positive class (diam audit 07-24): it loses the
-   capacity↔count link through allocation WRAPPER functions (xmalloc/xcalloc
-   style) and reports phantom heap overflows; guards/if-forms do NOT cure it,
-   inlining the calloc at the use site does. So: no alloc wrappers in
-   hot/indexed-buffer code paths — allocate inline; if a finding looks like
-   this class, build the minimal repro before "fixing" real code around it.
+Исполняемая часть — `scripts/cgate.sh` (ступени S0…S4, порядок по цене, ранний
+выход, кэш, база разобранных находок, отчёт `build/cgate/report.tsv`):
+
+    make check-staged   S0–S1 по изменённым файлам (то же гоняет pre-commit)
+    make check-fast     S0–S2 по всему живому слою (~1 мин, S2 — дорогая)
+    make check          S0–S4 по всему живому слою — главный статический гейт
+    make gate           всё: статика + lean + CBMC + санитайзеры + FPE + valgrind
+
+1. **Format** (S0): `clang-format -i FILE.c` — config `.clang-format` (LLVM
+   base, 2-space, no tabs, col 100, K&R). Проверка не мутирует файл:
+   `clang-format --dry-run --Werror`.
+2. **Static-analysis gate**:
+   - **S1** `gcc -O2 -c -Werror` с общим набором `scripts/cflags.mk`
+     (включая `-Wjump-misses-init` — класс «goto перескакивает инициализатор»;
+     07-10 он дал настоящий `free()` по мусору в `src/nstruct/sweep.c:3338`) —
+     **gates**;
+   - **S2** `cppcheck` (bounds / uninit / leak / realloc / portability) —
+     **gates**;
+   - **S3** `clang-tidy` (clang-analyzer + bugprone + cert; config `.clang-tidy`,
+     флаги из `build/compile_commands.json`) — гейтит **по политике `tidy_blocks`
+     в `scripts/cgate.sh`**, а не по коду возврата (при 46 находках rc=0;
+     система шапок даёт ~4 с фиксированной цены на файл). Блокируют классы с
+     прямым дефектом (`clang-analyzer-core.*`, `unix.Stream`, утечка при
+     `realloc`, целочисленное деление в FP-контексте, сравнение объектного
+     представления, смещённое расширение; `unix.Malloc` — для `src/**`). В
+     ОТЧЁТ (`build/cgate/advisory/`, 224 находки на 07-10) уходят гигиена
+     (`cert-err34-c` на `atoi` в разборе argv, `misc-include-cleaner`) и
+     «optin»-классы; `bugprone-implicit-widening` — полезен, но требует планового
+     перевода индексации на 64 бита, поэтому до решения он в отчёте. Отчёт
+     печатается сводкой по классам — «не блокирует» не значит «не существует»;
+   - **S4** `gcc -O0 -fanalyzer` — **gates**, но идёт ПОСЛЕДНИМ и под таймаутом
+     (44 с на `sweep.c`; на дешёвой ступени красный файл до него не доходит).
+   Известный FP-класс gcc-analyzer (аудит diam 07-24): он теряет связь
+   «ёмкость↔счётчик» через ОБЁРТКИ выделения (xmalloc/xcalloc) и рапортует
+   фантомные переполнения кучи; защитные условия это НЕ лечат, лечит calloc на
+   месте использования. Отсюда правило: в горячих/индексных буферах обёрток
+   выделения нет — выделять на месте; похоже на этот класс — сначала минимальный
+   репро, потом правка настоящего кода.
+   **База и ратчет**: `scripts/cgate-baseline.txt` — разобранные находки с
+   вердиктом (`FP (механизм …)` / `ОСОЗНАННО (…§…)`). Гейт валит только НОВОЕ.
+   Вердикт «НОВОЕ — требует вердикта» — долг, а не разрешение.
 3. **Formal layer** (safety-critical / pointer-heavy code: octree
    traversal/mutation, scene-file parsers, anything on untrusted input):
-   `scripts/cverify.sh FILE.c [--function NAME] [--unwind N]` — CBMC bounded
-   model checking (pointer/bounds/UAF/overflow/leak/div-zero/NaN, no false-neg
-   inside the bound). Per-function with `__CPROVER_assume` preconditions. Not
-   on every file; on the dangerous ones.
-4. **Deadweight** (before commits): `scripts/lean.sh` — whole-project unused
-   funcs/members/vars (cross-file; per-file unused already caught by ccheck's
-   `-Wall -Wextra`).
-5. **Runtime layer** (code that runs on real input): build with
-   `-fsanitize=address,undefined -g` and run, or `valgrind --leak-check=full`.
-   Numerics extra: run once with `-ffpe-trap`-style checks (feenableexcept on
-   FE_INVALID|FE_DIVBYZERO) on a small case to catch NaN sources early.
-6. **GPU layer**: kernels (.cu/.cl/shaders) are NOT seen by ccheck — the gate
+   `make cbmc` или `scripts/cverify.sh FILE.c [--function NAME] [--unwind N]` —
+   CBMC bounded model checking (pointer/bounds/UAF/overflow/leak/div-zero/NaN, no
+   false-neg inside the bound). Per-function with `__CPROVER_assume`
+   preconditions. Not on every file; on the dangerous ones. **07-10: оснастка
+   `tests/cbmc_sceneobj.c` два месяца не компилировалась** (сигнатура
+   `parse_fvert` разошлась) — то есть слой существовал только на бумаге; стенд
+   починен и теперь проверяется воротами (4591 свойство, VERIFICATION
+   SUCCESSFUL), включая несущее свойство текстурного индекса.
+4. **Deadweight** (before commits): `make lean` (`scripts/lean.sh`) —
+   whole-project unused funcs/members/vars (cross-file; per-file unused already
+   caught by S1's `-Wall -Wextra`). Список файлов — из `git ls-files`, не
+   рукописный (рукописный список пропускал `tools/pgather.c` и `src/transport/`).
+5. **Runtime layer**: `make test-asan` (ASan+UBSan, `detect_leaks=1`),
+   `make test-uninit` (`-ftrivial-auto-var-init=pattern` — чтение
+   неинициализированного), `make check-int` (clang
+   `-fsanitize=integer,implicit-conversion` по целочисленной топологии),
+   `make check-fpe` (FE_INVALID|FE_DIVBYZERO через `tests/fpetrap.c` +
+   `LD_PRELOAD`, без правок продуктового кода), `make valgrind`.
+6. **GPU layer**: kernels (.cu/.cl/shaders) are NOT seen by the gate — the gate
    covers host C only. For CUDA kernels use `compute-sanitizer` (memcheck +
    racecheck + initcheck) on a small case; keep a CPU reference implementation
    of every kernel and diff results (bitwise for int paths, tolerance for

@@ -137,6 +137,16 @@
 
 ## КАНОНИЧЕСКИЕ КОМАНДЫ
 
+    # ГЕЙТ КАЧЕСТВА C (07-10; процедура — скилл .dsh/skills/c-gate):
+    make check-staged   # S0–S1 по изменённым файлам — то же гоняет pre-commit
+    make check-fast     # S0–S2 по всему живому слою (~1 мин; S2 = cppcheck)
+    make check          # S0–S4 (главный статический гейт, clang-tidy + -fanalyzer)
+    make gate           # всё: статика + lean + CBMC + ASan/UBSan + int + FPE + valgrind
+    make gate-digest    # таблица ВСЕХ находок (вход для триажа субагентом)
+    scripts/cgate.sh tools/pgather.c   # один файл
+    # база разобранных находок: scripts/cgate-baseline.txt; отчёт: build/cgate/
+    # находка в базу: make gate-baseline (вердикт «НОВОЕ» обязан быть заменён разбором)
+
     # якорь новой линии (живой, §912): walk в pgather, OMP_NUM_THREADS=1:
     build/pgather assets/synth/cavity05.obj le=0 dirs=8x16 it=64
     build/pref  assets/synth/room.obj le=1 it=8 K=4096   # эталон переноса

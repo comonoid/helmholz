@@ -8,24 +8,26 @@
 #   scripts/lean.sh                 # default: all of src/
 #   scripts/lean.sh FILE.c ...      # explicit set (still analyzed together)
 #
-# Per-file unused locals + dead static functions are already caught by ccheck
-# (gcc -Wall -Wextra); this adds the cross-file deadweight cppcheck can only see
-# with all files in scope.
+# Per-file unused locals + dead static functions are already caught by the gate's
+# S1 (gcc -Wall -Wextra); this adds the cross-file deadweight cppcheck can only
+# see with all files in scope.
+#
+# 07-10: список файлов берётся из git (а не рукописный) — прежний рукописный
+# список в Makefile пропускал tools/pgather.c и транспортный слой. Шелл — пин
+# shell.nix (версии движка влияют на находки).
 set -uo pipefail
-HZ=/home/n/helmholz
+HZ="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HZ"
 
 if [ $# -gt 0 ]; then
   FILES=("$@")
 else
-  # src/transport/ — вторая линия (перенос); гейт качества общий для обеих.
-  mapfile -t FILES < <(ls src/*.c src/*.h src/transport/*.c src/transport/*.h \
-                          tools/*.c tests/*.c 2>/dev/null)
+  mapfile -t FILES < <(git ls-files 'src/*.c' 'src/*.h' 'tools/*.c' 'tests/*.c')
 fi
-[ ${#FILES[@]} -ge 1 ] || { echo "lean: no C sources found in src/"; exit 0; }
+[ ${#FILES[@]} -ge 1 ] || { echo "lean: no C sources found"; exit 0; }
 
 echo "=== lean: deadweight over ${#FILES[@]} files (whole-project) ==="
-nix-shell -p cppcheck --run "
+nix-shell "$HZ/shell.nix" --run "
 INC=\"-I$HZ/src\"
 cppcheck --enable=unusedFunction,style --inline-suppr \
   --suppress=missingIncludeSystem --suppress=normalCheckLevelMaxBranches \

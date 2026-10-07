@@ -1461,7 +1461,7 @@ static int g924_minf = 1;             /* §924-матрика: HZ_REPMINF */
  * (-Wjump-misses-init, ловля 07-10). */
 #define SW_CELL_RECEIPT_CONTINUE()                                                                 \
   do {                                                                                             \
-    if (fc->cellc == 2 && cpos >= 0) {                                                             \
+    if (fc->cellc == 2 && cpos >= 0 && fc->ced != NULL) {                                          \
       double cy = (fc->nrm != NULL) ? front_depden(fc, p) : fc->area[p];                           \
       double an2 = (fc->nrm != NULL) ? fabs(fc->om[0] * fc->nrm[3 * (int64_t)p] +                  \
                                             fc->om[1] * fc->nrm[3 * (int64_t)p + 1] +              \
@@ -1925,7 +1925,8 @@ static void front_seg_walk(front_ctx *fc, const int32_t *ps, int32_t n, double t
        * по площадям Lh кусков списка (клетка как поверхность; для клетки из
        * одного куска это пер-хит с точностью O(f²)). Носитель-поверхность
        * (виртуальные входы среды) в списке листа не встречается. */
-      if (fc->cellc == 2 && cpos >= 0 && (fc->ced[cpos] > 0.0 || fc->med_rem > med_rem0)) {
+      if (fc->cellc == 2 && cpos >= 0 && fc->ced != NULL && fc->cabs != NULL &&
+          (fc->ced[cpos] > 0.0 || fc->med_rem > med_rem0)) {
         double Lin_entry = Lin; /* радианс на входе клетки — для доли
                                  * переизлучения клетки (cabs) */
         /* Λ = перехват кусками (ced) + поглощение СРЕДОЙ на звене (разность
@@ -3459,6 +3460,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   int med_ready = 0;
   double *ced = NULL, *casum = NULL; /* §932-Б/Ш9-ЗОНД */
   double *cabs = NULL;               /* §932-Б/Ш12: радианс входа клетки (cellc=2) */
+  int cellc_eff = 0;                 /* §932-Б/Ш12: ДЕЙСТВУЮЩИЙ режим приёма
+                                      * (fail-closed: отказ аллокации гасит) */
 
   memset(st, 0, sizeof *st);
   if (!py || !area || !nrm || !kd || !o) return 1;
@@ -3717,17 +3720,22 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
    * Ш12: cellc=2 добавляет cabs (радианс входа клетки для доли переизлучения).
    * Аллокация НА МЕСТЕ (не обёрткой): у gcc-analyzer класс FP на ёмкость↔
    * счётчик через обёртки выделения (CLAUDE.md, п. 2/S4). */
-  if (o->cellc && bstart != NULL) {
+  cellc_eff = o->cellc;
+  if (cellc_eff && bstart != NULL) {
     ced = (double *)calloc((size_t)py->nleaf, sizeof *ced);
     casum = (double *)calloc((size_t)py->nleaf, sizeof *casum);
-    if (o->cellc == 2) cabs = (double *)calloc((size_t)py->nleaf, sizeof *cabs);
-    if (!ced || !casum || (o->cellc == 2 && !cabs)) { /* fail closed: приём выкл */
+    if (cellc_eff == 2) cabs = (double *)calloc((size_t)py->nleaf, sizeof *cabs);
+    if (!ced || !casum || (cellc_eff == 2 && !cabs)) { /* fail closed: приём выкл */
       free(ced);
       free(casum);
       free(cabs);
       ced = NULL;
       casum = NULL;
       cabs = NULL;
+      cellc_eff = 0; /* Ш12-ловля S3 (07-10): при выключенном приёме ced == NULL,
+                      * а макрос и блок клетки адресуют ced[cpos]/cabs[cpos] —
+                      * путь отказа аллокации давал бы null-deref. Гасим РЕЖИМ, а
+                      * не только указатели: ветка клетки тогда мертва */
     } else {
       for (int32_t c2 = 0; c2 < py->nleaf; c2++) {
         double s2 = 0.0;
@@ -3859,9 +3867,9 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.pc = pc;
         fc.bstart = bstart;
         fc.bpids = bpids;
-        fc.cellc = o->cellc; /* Ш12: режим клеточного приёма (0/1/2) */
-        fc.ced = ced;        /* Ш9-зонд + Ш12: клеточный аккумулятор (NULL — выкл) */
-        fc.cabs = cabs;      /* Ш12: радианс входа клетки (только cellc=2) */
+        fc.cellc = cellc_eff; /* Ш12: действующий режим приёма (0/1/2) */
+        fc.ced = ced;         /* Ш9-зонд + Ш12: клеточный аккумулятор (NULL — выкл) */
+        fc.cabs = cabs;       /* Ш12: радианс входа клетки (только cellc=2) */
         fc.mark = mark;
         fc.nstart = nstart;
         fc.nlen = nlen;
@@ -4454,11 +4462,11 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
             (long long)g932b_sact, g932b_edf, g932b_dep > 0.0 ? g932b_edf / g932b_dep : 0.0,
             (long long)g932b_nest, sw_med_now ? " [MEDNOW]" : "", sw_med_t1 ? " [MEDT1-ЗОНД]" : "",
             sw_med_scr ? " [MEDSCRAMBLE-НК]" : "");
-  if (o->cellc == 1) /* §932-Б/Ш9: RAW-зонд (НЕконсервативен, НК Ш12) */
+  if (cellc_eff == 1) /* §932-Б/Ш9: RAW-зонд (НЕконсервативен, НК Ш12) */
     fprintf(stderr, "§932-Б-Ш9: клеточный приём RAW-зонд: Σ=%.6g, раздач=%lld\n", g932c_dep,
             (long long)g932c_n);
-  if (o->cellc == 2) /* §932-Б/Ш12: консервативная схема — Σ извлечённого
-                      * из трубок потока (= Σ депозитов клеток тождество) */
+  if (cellc_eff == 2) /* §932-Б/Ш12: консервативная схема — Σ извлечённого
+                       * из трубок потока (= Σ депозитов клеток тождество) */
     fprintf(stderr,
             "§932-Б-Ш12: клеточный приём консервативный: Σизвлечено=%.6g, раздач=%lld, "
             "изъятий=%lld, maxf=%.17g, f≥1−1e−12: %lld\n",

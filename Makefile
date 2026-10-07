@@ -254,6 +254,12 @@ valgrind: $(FAST_TESTS)
 # Длительность — параметр: по умолчанию 60 с на цель (для гейта), длинные
 # прогоны — осознанно (FUZZ_TIME=900 make fuzz).
 FUZZ_TIME ?= 60
+# Потолок длины входа. 4096 — умолчание libFuzzer, и оно ОГРАНИЧИВАЕТ кампанию:
+# замер 07-10 шёл именно с ним, то есть входы крупнее 4 КБ не генерировались
+# вовсе (реальные сцены в корпусе до 2651 Б, так что покрытие не пострадало,
+# но глубокий разбор длинного файла так не проверить). Для длинной кампании:
+#   make fuzz FUZZ_TIME=900 FUZZ_MAX_LEN=262144
+FUZZ_MAX_LEN ?= 4096
 FUZZ = build/fuzz
 $(FUZZ):
 	mkdir -p $(FUZZ)/corpus_obj $(FUZZ)/corpus_ppm $(FUZZ)/artifacts
@@ -277,11 +283,11 @@ seed-corpus: | $(FUZZ)
 	@echo "  корпус: obj=$$(ls $(FUZZ)/corpus_obj | wc -l) ppm=$$(ls $(FUZZ)/corpus_ppm | wc -l)"
 
 fuzz: build/fuzz_obj build/fuzz_ppm seed-corpus
-	@echo "=== фаззинг OBJ: $(FUZZ_TIME) с ==="
-	./build/fuzz_obj -max_total_time=$(FUZZ_TIME) -print_final_stats=1 \
+	@echo "=== фаззинг OBJ: $(FUZZ_TIME) с, max_len=$(FUZZ_MAX_LEN) ==="
+	./build/fuzz_obj -max_total_time=$(FUZZ_TIME) -max_len=$(FUZZ_MAX_LEN) -print_final_stats=1 \
 	  -artifact_prefix=$(FUZZ)/artifacts/ $(FUZZ)/corpus_obj
-	@echo "=== фаззинг PPM: $(FUZZ_TIME) с ==="
-	./build/fuzz_ppm -max_total_time=$(FUZZ_TIME) -print_final_stats=1 \
+	@echo "=== фаззинг PPM: $(FUZZ_TIME) с, max_len=$(FUZZ_MAX_LEN) ==="
+	./build/fuzz_ppm -max_total_time=$(FUZZ_TIME) -max_len=$(FUZZ_MAX_LEN) -print_final_stats=1 \
 	  -artifact_prefix=$(FUZZ)/artifacts/ $(FUZZ)/corpus_ppm
 	@echo ">>> fuzz: крэши — $(FUZZ)/artifacts/ (пусто = не было)"
 

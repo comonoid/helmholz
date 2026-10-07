@@ -492,10 +492,10 @@ static double pg_lcam_hit(const pg_cam *c, const double org[3], const double rd[
  * (считается; на носителе L0 тождество с обычным сбором БИТОВОЕ). */
 #define PG_RECV_CELL_CAP 512 /* кэп клеток на треугольник; крупнее — гиганты */
 #define PG_RECV_RMAX 8       /* колец поиска: 8·h покрывает ε уровня и стыки */
-#define PG_RECV_BTOL                                                                                     \
-  1e-9 /* строгая принадлежность: тай-полоса рёбер                                  \
-        * разбирала бы носитель L0 по соседям и ломала битовое \
-        * тождество; зазоры носителя закрывает fallback-центроид */
+/* строгая принадлежность: тай-полоса рёбер разбирала бы носитель L0 по
+ * соседям и ломала битовое тождество; зазоры носителя закрывает
+ * fallback-центроид */
+#define PG_RECV_BTOL 1e-9
 
 typedef struct {
   hz_kit kit;            /* лестница носителей; живёт до конца сбора */
@@ -1099,12 +1099,8 @@ int64_t g_m3b_inlist, g_m3b_visits;     /* §930-М3б */
 int64_t g_m3c_gtests, g_m3c_ghit;       /* §930-Г1-дых */
 static double *g_egour_ev, *g_egour_ew; /* §932-Б-Ш6: буферы Gouraud (владелец — кадр) */
 
-static uint32_t pg924_hash(int64_t x, int64_t y, int64_t z) {
-  uint64_t h = (uint64_t)x * 0x9E3779B97F4A7C15ull ^ (uint64_t)y * 0xC2B2AE3D27D4EB4Full ^
-               (uint64_t)z * 0x165667B19E3779F9ull;
-  h ^= h >> 32;
-  return (uint32_t)h;
-}
+/* pg924_hash удалён 07-10: не вызывался нигде (gcc -Wunused-function) —
+ * вернуть из git-истории, если понадобится хеш клетки */
 
 /* сетка по центроидам треугольников уровня; 0/память */
 static int pg924_grid_build(pg924_grid *g, const hz_kit_level *S) {
@@ -1365,6 +1361,10 @@ static int pg_reps_build(pg_reps *R, const hz_kit *kk, int32_t nt, const double 
     { /* §924-дых: раскладка уровня */
       int32_t used = 0;
       int32_t *seen = (int32_t *)calloc((size_t)S->ntris, sizeof *seen);
+      if (seen == NULL) { /* без seen раскладка уровня не считается — fail closed */
+        free(off);
+        return 2;
+      }
       for (int32_t t = 0; t < nt; t++) {
         int32_t r = R->repof[(li - 1) * nt + t];
         if (r >= 0) {
@@ -1523,7 +1523,6 @@ static int pg_reps_build(pg_reps *R, const hz_kit *kk, int32_t nt, const double 
         double e1x = pp[1][0] - pp[0][0], e1y = pp[1][1] - pp[0][1], e1z = pp[1][2] - pp[0][2];
         double e2x = pp[2][0] - pp[0][0], e2y = pp[2][1] - pp[0][1], e2z = pp[2][2] - pp[0][2];
         double nx = e1y * e2z - e1z * e2y, ny = e1z * e2x - e1x * e2z, nz = e1x * e2y - e1y * e2x;
-        double atri = 0.5 * sqrt(nx * nx + ny * ny + nz * nz);
         {
           int64_t rr = off[li] + (int64_t)t;
           R->ratri[rr] = 0.5 * sqrt(nx * nx + ny * ny + nz * nz);
@@ -1939,7 +1938,9 @@ int main(int argc, char **argv) {
     for (int32_t li = 0; li < kk.nlev && (li == 0 || !use_kit_l0); li++) { /* §924: reps — L0 */
       const hz_kit_level *S = &kk.lev[li];
       for (uint32_t v = 0; v < S->nverts; v++) {
-        int64_t dv = (int64_t)(vbase[li] + v);
+        int64_t dv = vbase[li] + v; /* без (int64_t)-обёртки: сложение уже в int64
+                                     * (vbase — int64_t), обёртка была пустой
+                                     * (bugprone-misplaced-widening-cast) */
         m.v[3 * dv] = S->vx[v];
         m.v[3 * dv + 1] = S->vy[v];
         m.v[3 * dv + 2] = S->vz[v];
@@ -2286,24 +2287,41 @@ int main(int argc, char **argv) {
       for (int64_t cz = i0[2]; cz <= i1[2]; cz++)
         for (int64_t cy = i0[1]; cy <= i1[1]; cy++)
           for (int64_t cx = i0[0]; cx <= i1[0]; cx++) {
-            double blo[3] = {m.lo[0] + cx * cell, m.lo[1] + cy * cell, m.lo[2] + cz * cell};
+            double blo[3] = {m.lo[0] + (double)cx * cell, m.lo[1] + (double)cy * cell,
+                             m.lo[2] + (double)cz * cell};
             double bhi[3] = {blo[0] + cell, blo[1] + cell, blo[2] + cell};
             double outp[3][3];
             double aa = sh_clip_tri(tri, blo, bhi, outp);
             if (aa <= 1e-14) continue;
             if (n2 >= cap2) {
               cap2 *= 2;
-              qcmin = (double *)realloc(qcmin, (size_t)cap2 * 6 * sizeof *qcmin);
-              qcmax = (double *)realloc(qcmax, (size_t)cap2 * 6 * sizeof *qcmax);
-              qcent = (double *)realloc(qcent, (size_t)cap2 * 3 * sizeof *qcent);
-              qmtl = (int32_t *)realloc(qmtl, (size_t)cap2 * sizeof *qmtl);
-              qtri = (int32_t *)realloc(qtri, (size_t)cap2 * sizeof *qtri);
-              qarea = (double *)realloc(qarea, (size_t)cap2 * sizeof *qarea);
-              qparea = (double *)realloc(qparea, (size_t)cap2 * sizeof *qparea);
-              qnrm = (double *)realloc(qnrm, (size_t)cap2 * 3 * sizeof *qnrm);
-              qkd = (double *)realloc(qkd, (size_t)cap2 * sizeof *qkd);
-              qks = (double *)realloc(qks, (size_t)cap2 * sizeof *qks);
-              if (useke) qlep = (double *)realloc(qlep, (size_t)cap2 * sizeof *qlep);
+              /* realloc НЕ в сам указатель: при отказе старый блок терялся бы
+               * (cppcheck memleakOnRealloc ×11). Проверка ниже осталась */
+              void *tmp;
+              tmp = (double *)realloc(qcmin, (size_t)cap2 * 6 * sizeof *qcmin);
+              if (tmp) qcmin = tmp;
+              tmp = (double *)realloc(qcmax, (size_t)cap2 * 6 * sizeof *qcmax);
+              if (tmp) qcmax = tmp;
+              tmp = (double *)realloc(qcent, (size_t)cap2 * 3 * sizeof *qcent);
+              if (tmp) qcent = tmp;
+              tmp = (int32_t *)realloc(qmtl, (size_t)cap2 * sizeof *qmtl);
+              if (tmp) qmtl = tmp;
+              tmp = (int32_t *)realloc(qtri, (size_t)cap2 * sizeof *qtri);
+              if (tmp) qtri = tmp;
+              tmp = (double *)realloc(qarea, (size_t)cap2 * sizeof *qarea);
+              if (tmp) qarea = tmp;
+              tmp = (double *)realloc(qparea, (size_t)cap2 * sizeof *qparea);
+              if (tmp) qparea = tmp;
+              tmp = (double *)realloc(qnrm, (size_t)cap2 * 3 * sizeof *qnrm);
+              if (tmp) qnrm = tmp;
+              tmp = (double *)realloc(qkd, (size_t)cap2 * sizeof *qkd);
+              if (tmp) qkd = tmp;
+              tmp = (double *)realloc(qks, (size_t)cap2 * sizeof *qks);
+              if (tmp) qks = tmp;
+              if (useke) {
+                tmp = (double *)realloc(qlep, (size_t)cap2 * sizeof *qlep);
+                if (tmp) qlep = tmp;
+              }
               if (!qcmin || !qcmax || !qcent || !qmtl || !qtri || !qarea || !qnrm || !qkd || !qks ||
                   !qparea || (useke && !qlep))
                 return 2;
@@ -2330,13 +2348,13 @@ int main(int argc, char **argv) {
     NP = (int32_t)n2;
     /* §911-13-3: прибор потери площади клипа — Σ полосок против Σ tri */
     {
-      double sq = 0.0, st = 0.0;
+      double sq = 0.0, stri = 0.0; /* stri, а не st: внешний st — hz_sw_stat */
       for (i = 0; i < n2; i++)
         sq += qarea[i];
       for (i = 0; i < m.nt; i++)
-        st += area[i];
-      fprintf(stderr, "CLIPAREALOG: strips=%d Sq=%.4f Stri=%.4f ratio=%.4f\n", (int)n2, sq, st,
-              st > 0 ? sq / st : 0.0);
+        stri += area[i];
+      fprintf(stderr, "CLIPAREALOG: strips=%d Sq=%.4f Stri=%.4f ratio=%.4f\n", (int)n2, sq, stri,
+              stri > 0 ? sq / stri : 0.0);
     }
     /* свап: дальше вся программа работает в терминах КУСКОВ */
     free(area);

@@ -17,6 +17,15 @@
 #define HZ_SW_GL_ITMAX 100 /* предел итераций Ньютона: узел Гаусса сходится за ~5 */
 #define HZ_SW_NPHI_MAX 96  /* Чебышёв по φ: шаг ≥ 3.75°, дальше вычислительно бессмысленно */
 #define HZ_SW_NMU_MAX 64   /* Гаусс по μ: nd ≤ 96·64 = 6144 — потолок лестницы §843 */
+/* §896-5: бюджет ног (зеркальных хопов) на направление. Число 2000000 —
+ * из §896-5. Сейчас 0: механизм ног ВЫКЛЮЧЕН, и при нулевом бюджете вся нога
+ * сразу уходит в lost («бюджет исчерпан — остаток в lost»). Проверено 07-10:
+ * значение 2000000 присваивалось ЛОКАЛЬНОЙ переменной в hz_sw_run и в fc не
+ * попадало, а fc обнуляется memset — то есть ноги были выключены НЕЯВНО, а
+ * присваивание было мёртвым (отсюда -Wunused-but-set-variable). Здесь
+ * состояние названо явно. Включение ног — отдельное решение владельца: оно
+ * меняет физику зеркальных хопов (ksf=1 — продакшн-дефолт §875). */
+#define HZ_SW_LEG_BUDGET 0
 
 /* знаки 26 направлений: 6 осей, 12 рёбер (√2), 8 углов (√3); ЦЕЛЫЕ —
  * сравнение с нулём без float-equal, нормировка отдельной таблицей */
@@ -860,18 +869,11 @@ static double front_depden(const front_ctx *fc, int32_t p) {
   return d > FRONT_DEP_MIN_SHARE * cell2 ? d : FRONT_DEP_MIN_SHARE * cell2;
 }
 
-/* §887-d: трассировка одного куска (HZ_TRACE_TRI=<tri>) — читается
- * однократно, печати только для указанного куска, здоровый прогон бесплатен */
-static int tri_trace_id = -1;
-static int tri_trace_init = 0;
-static int tri_trace_on(int32_t p) {
-  if (!tri_trace_init) {
-    const char *e = getenv("HZ_TRACE_TRI");
-    tri_trace_id = e ? atoi(e) : -1;
-    tri_trace_init = 1;
-  }
-  return (int)p == tri_trace_id;
-}
+/* §887-d: трассировщик одного куска (HZ_TRACE_TRI) УДАЛЁН 07-10: он был
+ * объявлен и никогда не вызывался (gcc -Wunused-function), а его состояние
+ * tri_trace_id/tri_trace_init не читал никто, кроме него самого. Если
+ * трассировка понадобится — вернуть из git-истории (коммит с ловлей
+ * -Wunused-function) и вызвать в front_visit, а не держать мёртвым. */
 
 /* §911-6: ограничитель радианса — Lh не превышает кап итерации */
 #define LH_GROWTH (1.0 + 0.25) /* §893: рост радианса не быстрее +25 %/итерацию */
@@ -1983,7 +1985,12 @@ static int sw_levels_build(const hz_pyr *py, const hz_sw_opts *o, const uint8_t 
   static int dbg = -1;
   /* §928: reps_collect — карты построены для СБОРА калибровки, но списки
    * уровней остаются кусочными (мир §923) */
-  const int reps_on = (o->nrep > 0 && o->walk && o->repof != NULL && !o->reps_collect);
+  /* want != NULL в условии — НЕ украшение: при отказе calloc'а rep_want
+   * вызывающий обнуляет указатель и ЖДЁТ возврата в мир без представителей
+   * («fail closed», см. hz_sw_run §924). Без этой проверки ниже (2121, 2245)
+   * было разыменование NULL — clang-analyzer-core.NullDereference, ловля 07-10. */
+  const int reps_on =
+      (want != NULL && o->nrep > 0 && o->walk && o->repof != NULL && !o->reps_collect);
   if (reps_on && g924_minf == 1) { /* §924-матрика: HZ_REPMINF (гибрид (в)) */
     const char *e = getenv("HZ_REPMINF");
     if (e) {
@@ -2385,7 +2392,10 @@ static int sw_levels_build(const hz_pyr *py, const hz_sw_opts *o, const uint8_t 
     {
       int64_t nv = 0;
       for (int32_t li2 = 0; li2 < py->nleaf; li2++)
-        if (leaf_off[li2 + 1] - leaf_off[li2] > 0 && li2 < (1 << 20) && !g_dbg923_vis[li2]) nv++;
+        /* границу g_dbg923_vis[1<<20] проверяем ПЕРВОЙ: cppcheck
+         * arrayIndexThenCheck читал порядок условий как «индекс раньше
+         * проверки» (07-10). Семантика та же — && без побочных эффектов */
+        if (li2 < (1 << 20) && leaf_off[li2 + 1] - leaf_off[li2] > 0 && !g_dbg923_vis[li2]) nv++;
       fprintf(stderr, " unvisited=%lld (nleaf=%d)", (long long)nv, py->nleaf);
       memset(g_dbg923_vis, 0, sizeof g_dbg923_vis);
     }
@@ -2405,7 +2415,7 @@ static void front_descend(front_ctx *fc, int32_t l, int32_t pos, double tin, dou
 static void front_visit(front_ctx *fc, int32_t l, int32_t pos, double tin, double tout, double *a,
                         double *b) {
   const hz_pyr *py = fc->py;
-  double blo[3], bhi[3], bh0c, bh1c;
+  double blo[3], bhi[3];
   if (fc->lvls) { /* §923: раскладка по уровням владения */
     if (l < 0) {  /* лист: только floor-0 куски этой клетки */
       int32_t n = fc->leaf_loff[pos + 1] - fc->leaf_loff[pos];
@@ -2710,10 +2720,15 @@ static void path_collect_list(front_ctx *fc, const int32_t *ps, int32_t n, doubl
       if (!(tt >= tin) || !(tt <= tout)) continue;
       if (fc->pbuf_n == fc->pbuf_cap) {
         int64_t nc = fc->pbuf_cap ? fc->pbuf_cap * 2 : 256;
+        /* Последовательно и с записью владения ДО следующего realloc: при
+         * отказе второго старый блок не теряется (clang-analyzer-unix.Malloc,
+         * «potential leak of np/nt», 07-10). pbuf_cap растёт только когда
+         * удались оба — меньший cap безопасен (индексы < pbuf_n ≤ cap). */
         double *nt = (double *)realloc(fc->pbuf_t, (size_t)nc * sizeof *nt);
-        int32_t *np = (int32_t *)realloc(fc->pbuf_p, (size_t)nc * sizeof *np);
-        if (!nt || !np) return;
+        if (!nt) return;
         fc->pbuf_t = nt;
+        int32_t *np = (int32_t *)realloc(fc->pbuf_p, (size_t)nc * sizeof *np);
+        if (!np) return;
         fc->pbuf_p = np;
         fc->pbuf_cap = nc;
       }
@@ -2758,9 +2773,10 @@ static void path_collect_list(front_ctx *fc, const int32_t *ps, int32_t n, doubl
     if (fc->pbuf_n == fc->pbuf_cap) {
       int64_t nc = fc->pbuf_cap ? fc->pbuf_cap * 2 : 256;
       double *nt = (double *)realloc(fc->pbuf_t, (size_t)nc * sizeof *nt);
-      int32_t *np = (int32_t *)realloc(fc->pbuf_p, (size_t)nc * sizeof *np);
-      if (!nt || !np) return;
+      if (!nt) return;
       fc->pbuf_t = nt;
+      int32_t *np = (int32_t *)realloc(fc->pbuf_p, (size_t)nc * sizeof *np);
+      if (!np) return;
       fc->pbuf_p = np;
       fc->pbuf_cap = nc;
     }
@@ -3050,9 +3066,15 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
     if (!fc->noprop && fc->hop_n == 0 && fc->hop_depth == 0 &&
         fabs(0.0 - fc->depA - a) > 1e-9 * (1.0 + fabs(a)))
       fc->g6viol++;
-    /* §873/T4 шаг 2: зеркальные хопы — LIFO-обработка очереди */
+    /* §873/T4 шаг 2: зеркальные хопы — LIFO-обработка очереди.
+     * §894-c-5: ноги живут в СВОЁМ штамп-пространстве, поэтому перед циклом
+     * сохраняем «основные» pstamp/pkey. Восстановление обязано стоять после
+     * цикла (ниже): без него штампы основной трубки навсегда оставались бы в
+     * пространстве ног — ровно то, что §894-c-5 и разделял. Сейчас не
+     * срабатывает (ноги выключены, HZ_SW_LEG_BUDGET=0), но сохранение без
+     * восстановления — дефект, а не экономия. */
     int64_t *main_pstamp = fc->pstamp;
-    uint64_t main_pkey = fc->pkey;
+    int64_t main_pkey = fc->pkey;                  /* тип как у fc->pkey: иначе -Wsign-conversion */
     fc->in_leg = 1;                                /* §894-c: дальше обрабатываются НОГИ */
     fc->leg_pkey = ((uint64_t)fc->mark << 48) | 1; /* уникальный ключ на ногу */
     while (fc->hop_n > 0) {
@@ -3065,7 +3087,8 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
       }
       fc->leg_budget--;
       fc->pstamp = fc->leg_pstamp;
-      fc->pkey = fc->leg_pkey;
+      fc->pkey = (int64_t)fc->leg_pkey; /* ключ — битовый узор, знак не несёт:
+                                         * явное приведение вместо -Wsign-conversion */
       double ai = fc->hop_lin[fc->hop_n - 1];
       const double *pt = fc->hop_pt[fc->hop_n - 1];
       const double *dir = fc->hop_dir[fc->hop_n - 1];
@@ -3104,6 +3127,9 @@ static void front_tube(front_ctx *fc, const int64_t cc[3], double *lostA, double
       fc->nlostseg++;
     }
     fc->in_leg = 0;
+    /* §894-c-5: возвращаем основное штамп-пространство (см. сохранение выше) */
+    fc->pstamp = main_pstamp;
+    fc->pkey = main_pkey;
   }
   if (a > 0.0 || b > 0.0)
     fc->nlostseg++; /* остаток ушёл за границу домена — в lost, не исчез (А1567) */
@@ -3265,7 +3291,6 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   int32_t *stampv = NULL;     /* §851: штампы визитов линий [ncells] */
   int64_t *pstamp = NULL;     /* §852/А1564: штамп (трубка × кусок) [nt] */
   int64_t *leg_pstamp = NULL; /* §894-c-5: штампы ног (отдельное пространство) */
-  int64_t leg_budget = 0;     /* §896-5: бюджет ног на направление */
   /* §865/раунд 13: кэш «кусок × трубка» (только path=1) */
   pc_rec *pc = NULL; /* §865/раунды 13+15: кэш «кусок × трубка» (только path=1) */
   int32_t *bstart = NULL, *bpids = NULL, *fillb = NULL; /* §852/А1566: bbox-индекс */
@@ -3304,6 +3329,27 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
   int lvls_ready = 0; /* §923: списки собраны хоть раз; до того fc.lvls = NULL
                        * (ловля §923-дым: it=0 шёл по ПУСТЫМ спискам — вся
                        * эмиссия первой итерации терялась, E 0.0000 на it=1) */
+
+  /* ВНИМАНИЕ: эти объявления перенесены сюда 07-10 и должны оставаться ВЫШЕ
+   * первого `goto done` (сейчас это `rc = hz_sw_dir_table(...)` ниже).
+   * Раньше они стояли в теле функции, и прыжок на метку `done:` перескакивал
+   * их инициализаторы: инициализатор блочной переменной выполняется в точке
+   * объявления, поэтому на пути ошибки `done:` делал free() по НЕОПРЕДЕЛЁННЫМ
+   * указателям. Ловилось gcc -Wjump-misses-init и -Wmaybe-uninitialized
+   * (15 указателей), то есть это была настоящая ошибка, а не шум. */
+  double *Linmax_prev = NULL; /* §893-b: пер-кусковый максимум пришедшего
+                               * радианса (принцип максимума); NULL вне mode 3,
+                               * free(NULL) легален */
+  double *Linmax_cur = NULL;
+  /* §932-Б: массивы среды — владелец hz_sw_run, агрегаты пересчитываются
+   * со sw_levels_build (А1711); med_sub — решение замещения куска */
+  uint8_t *med_sub = NULL;
+  double *med_box = NULL, *med_an = NULL, *med_v = NULL, *med_rho = NULL, *med_asum = NULL;
+  int32_t *med_nsub = NULL, *med_koff = NULL, *med_kmem = NULL;
+  int64_t *med_stamp = NULL;
+  double *med_pend = NULL;
+  int med_ready = 0;
+  double *ced = NULL, *casum = NULL; /* §932-Б/Ш9-ЗОНД */
 
   memset(st, 0, sizeof *st);
   if (!py || !area || !nrm || !kd || !o) return 1;
@@ -3358,10 +3404,6 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
 
   Ed = (double *)calloc((size_t)nt, sizeof *Ed);
   Eprev = (double *)calloc((size_t)nt, sizeof *Eprev);
-  /* §893-b: пер-кусковый максимум пришедшего радианса (принцип максимума);
-   * NULL вне mode 3 — free(NULL) легален, использования вне mode 3 нет */
-  double *Linmax_prev = NULL;
-  double *Linmax_cur = NULL;
   order = (int32_t *)calloc(
       (size_t)py->nleaf,
       sizeof *order); /* calloc: анализатор видит инициализацию (FP-класс diam 07-24) */
@@ -3422,15 +3464,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       lvls_loff = NULL;
     }
   }
-  /* §932-Б: массивы среды — владелец hz_sw_run, агрегаты пересчитываются
-   * со sw_levels_build (А1711); med_sub — решение замещения куска */
-  uint8_t *med_sub = NULL;
-  double *med_box = NULL, *med_an = NULL, *med_v = NULL, *med_rho = NULL, *med_asum = NULL;
-  int32_t *med_nsub = NULL, *med_koff = NULL, *med_kmem = NULL;
-  int64_t *med_stamp = NULL;
-  double *med_pend = NULL;
-  int med_ready = 0;
-  double *ced = NULL, *casum = NULL; /* §932-Б/Ш9-ЗОНД (goto done раньше блока) */
+  /* §932-Б: массивы среды объявлены ВЫШЕ (до первого goto done) */
   if (o->medium && o->nrep > 0 && o->repof != NULL) {
     med_sub = (uint8_t *)calloc((size_t)nt, 1);
     med_box = (double *)calloc((size_t)o->nrep * 6, sizeof *med_box);
@@ -3607,7 +3641,11 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         rep_ep[r] = o->rep_area[r] > 0.0 ? s / o->rep_area[r] : 0.0;
       }
     }
-    { /* §893-b: swap пер-кускового максимума пришедшего радианса */
+    if (o->mode == 3) { /* §893-b: swap пер-кускового максимума пришедшего радианса.
+                         * Условие обязательно: Linmax_* выделяются ТОЛЬКО в mode 3
+                         * (см. аллокацию выше), а без него memset(NULL, 0, nt·8) —
+                         * настоящий null-deref для любого mode≠3
+                         * (clang-analyzer-core.NonNullParamChecker, 07-10). */
       double *swp = Linmax_prev;
       Linmax_prev = Linmax_cur;
       Linmax_cur = swp;
@@ -3626,7 +3664,8 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
       }
       lh_cap = LH_GROWTH * lmax;
       lh_seen = 0.0;
-      leg_budget = 2000000; /* §896-5: бюджет ног на направление */
+      /* §896-5: бюджет ног задаётся в fc (HZ_SW_LEG_BUDGET), а не локальной
+       * переменной: локальное присваивание сюда не доходило (ловля 07-10) */
     }
     if (o->mode == 3 && o->agg && ag.ng > 0) { /* §863: ΣEprev·a групп */
       for (int64_t g = 0; g < ag.ng; g++) {
@@ -3701,6 +3740,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
         fc.tau0 = o->tau0;
         fc.pstamp = pstamp;
         fc.leg_pstamp = leg_pstamp;
+        fc.leg_budget = HZ_SW_LEG_BUDGET; /* §896-5: явное состояние ног (0 — выключены) */
         fc.pc = pc;
         fc.bstart = bstart;
         fc.bpids = bpids;
@@ -3793,24 +3833,25 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
           double fuMu = 0, fuE = 0; /* §911-13-3: полные суммы по ВСЕМ кускам */
           double wr[5];
           int32_t wp[5];
-          int32_t p;
+          int32_t pi; /* индекс куска в отчёте: имя НЕ p — внешний p занят
+                       * циклом кусков (была тень, -Wshadow) */
           int ntouch = 0, nunder = 0, nover = 0, nw = 0, q;
           for (q = 0; q < 5; q++) {
             wr[q] = 1.0;
             wp[q] = -1;
           }
-          for (p = 0; p < nt; p++) {
-            double mu = fabs(om[0] * nrm[3 * (int64_t)p] + om[1] * nrm[3 * (int64_t)p + 1] +
-                             om[2] * nrm[3 * (int64_t)p + 2]);
+          for (pi = 0; pi < nt; pi++) {
+            double mu = fabs(om[0] * nrm[3 * (int64_t)pi] + om[1] * nrm[3 * (int64_t)pi + 1] +
+                             om[2] * nrm[3 * (int64_t)pi + 2]);
             double rr;
-            fuMu += area[p] * mu; /* §911-13-3: полный Σa·μ без фильтра touched */
-            fuE += area[p] * cov_e[p];
-            if (covn[p] == 0 || mu < 1e-12) continue;
-            rr = cov[p] / mu;
-            num += area[p] * cov[p];
-            numl += area[p] * cov_lit[p];
-            nume += area[p] * cov_e[p];
-            den += area[p] * mu;
+            fuMu += area[pi] * mu; /* §911-13-3: полный Σa·μ без фильтра touched */
+            fuE += area[pi] * cov_e[pi];
+            if (covn[pi] == 0 || mu < 1e-12) continue;
+            rr = cov[pi] / mu;
+            num += area[pi] * cov[pi];
+            numl += area[pi] * cov_lit[pi];
+            nume += area[pi] * cov_e[pi];
+            den += area[pi] * mu;
             ntouch++;
             if (rr < 0.95) {
               nunder++;
@@ -3819,7 +3860,7 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
             }
             if (fabs(rr - 1.0) > 0.02 && nw < 5) {
               wr[nw] = rr;
-              wp[nw] = p;
+              wp[nw] = pi;
               nw++;
             }
           }
@@ -3835,9 +3876,9 @@ int hz_sw_run(hz_pyr *py, int32_t nt, const double *area, const double *nrm, con
           fprintf(stderr, "\n");
           if (d == 0 && it == 0) { /* доля площади кусков ниже depden-floor */
             double sa = 0.0, sf = 0.0, floor_a = csec * FRONT_DEP_MIN_SHARE;
-            for (p = 0; p < nt; p++) {
-              sa += area[p];
-              if (area[p] < floor_a) sf += area[p];
+            for (pi = 0; pi < nt; pi++) {
+              sa += area[pi];
+              if (area[pi] < floor_a) sf += area[pi];
             }
             fprintf(stderr, "COVDBG small-area frac (a<%.3g): %.4f (nt=%d)\n", floor_a,
                     sa > 0.0 ? sf / sa : 0.0, nt);
@@ -4325,12 +4366,9 @@ done:
   free(lvls_lpids);    /* §923 */
   free(rep_want);      /* §924 */
   free(rep_ep);        /* §924 */
-  {
-    extern long g_kcdbg_pos;
-  } /* tag */
-  free(knum); /* §928 */
-  free(kden); /* §928 */
-  free(fld);  /* §864/Б1 */
+  free(knum);          /* §928 */
+  free(kden);          /* §928 */
+  free(fld);           /* §864/Б1 */
   free(fldok);
   free(Ed);
   free(Linmax_prev);

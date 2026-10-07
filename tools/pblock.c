@@ -76,8 +76,10 @@ int main(int argc, char **argv) {
       lo[ax] = m.lo[ax];
       if (s > maxdim) maxdim = s;
     }
-    cell = maxdim / (double)(1 << lev);
-    nx = (int64_t)(1 << lev);
+    cell = maxdim / (double)((int64_t)1 << lev); /* сдвиг в 64 битах: при lev>30
+                                                  * int-сдвиг переполнялся бы
+                                                  * (bugprone-misplaced-widening-cast) */
+    nx = (int64_t)1 << lev;
     ny = nx;
     nz = nx;
   }
@@ -173,7 +175,9 @@ int main(int argc, char **argv) {
     for (int64_t k = i0[2]; k <= i1[2]; k++)
       for (int64_t j = i0[1]; j <= i1[1]; j++)
         for (int64_t g = i0[0]; g <= i1[0]; g++) {
-          pb_cellrec key;
+          pb_cellrec key = {0}; /* cmp читает только cell, но остальные поля не
+                                 * должны быть мусором: bsearch получает всю
+                                 * структуру (cppcheck uninitvar, 07-10) */
           key.cell = pb_morton3((uint32_t)g, (uint32_t)j, (uint32_t)k);
           pb_cellrec *hit = (pb_cellrec *)bsearch(&key, tab, (size_t)nocc, sizeof *tab, pb_cellcmp);
           if (!hit) {

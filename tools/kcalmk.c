@@ -41,6 +41,49 @@ static double *load_tab(const char *path, int32_t *nrep, int32_t *nw, const char
     fclose(f);
     return NULL;
   }
+  /* Размер выделения задаёт ЗАГОЛОВОК, то есть недоверенный вход: без сверки с
+   * размером файла подделанный/битый дамп просит гигабайты вместо честного
+   * отказа — CWE-789, ловля -fanalyzer 07-10 (-Wanalyzer-tainted-allocation-size).
+   * Сверка ТОЧНАЯ: формат — заголовок + ровно nrep·nw double (см. запись в
+   * src/nstruct/sweep.c, §928), поэтому порога-константы не нужно. */
+  long fsz = -1;
+  if (fseek(f, 0, SEEK_END) != 0 || (fsz = ftell(f)) < 0) {
+    fprintf(stderr, "kcalmk: %s=%s: не определить размер\n", tag, path);
+    fclose(f);
+    return NULL;
+  }
+  /* Границы выражаются сравнением ЯВНО: равенство «need == avail» анализатор
+   * (-Wanalyzer-tainted-allocation-size) границей не считает — ему нужна
+   * проверка вида «need > avail». Сверка та же, форма — та, что он понимает. */
+  int64_t avail = (int64_t)fsz - (int64_t)sizeof h;
+  int64_t need = (int64_t)h.nrep * (int64_t)h.nw * (int64_t)sizeof(double);
+  /* Границу на tainted-величину прибор понимает только как сравнение САМОЙ
+   * величины (не произведения): поэтому h.nrep ограничивается отдельно, а
+   * делитель проверяется на ноль явно (-Wanalyzer-tainted-divisor). */
+  int64_t denom = (int64_t)h.nw * (int64_t)sizeof(double);
+  if (denom <= 0) {
+    fprintf(stderr, "kcalmk: %s=%s: нулевой делитель заголовка\n", tag, path);
+    fclose(f);
+    return NULL;
+  }
+  int64_t nrep_max = avail / denom;
+  if (h.nrep <= 0 || (int64_t)h.nrep > nrep_max || need <= 0 || need > avail) {
+    fprintf(stderr, "kcalmk: %s=%s: заголовок просит больше, чем есть в файле (%ld Б)\n", tag, path,
+            fsz);
+    fclose(f);
+    return NULL;
+  }
+  if (need != avail) {
+    fprintf(stderr, "kcalmk: %s=%s: размер не сходится с заголовком (nrep=%d nw=%d, файл %ld Б)\n",
+            tag, path, (int)h.nrep, (int)h.nw, fsz);
+    fclose(f);
+    return NULL;
+  }
+  if (fseek(f, (long)sizeof h, SEEK_SET) != 0) {
+    fprintf(stderr, "kcalmk: %s=%s: не встать на массив\n", tag, path);
+    fclose(f);
+    return NULL;
+  }
   a = (double *)malloc((size_t)h.nrep * (size_t)h.nw * sizeof *a);
   if (a == NULL ||
       fread(a, sizeof *a, (size_t)h.nrep * (size_t)h.nw, f) != (size_t)h.nrep * (size_t)h.nw) {

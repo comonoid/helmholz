@@ -85,18 +85,26 @@ void harness(void) {
   assert(k >= 1);
 #endif
 
-  /* 2. индексы вершин в пределах виденного */
-  int32_t nv_seen = nondet_i32(), nvn_seen = nondet_i32();
+  /* 2. индексы вершин в пределах виденного.
+   * Обновлено 07-10: у parse_fvert стало ВОСЕМЬ параметров — добавился
+   * nvt_seen/ivt (Ш8 §575: координата текстуры больше не выбрасывается).
+   * Оснастка два месяца вызывала старую сигнатуру и НЕ КОМПИЛИРОВАЛАСЬ, то
+   * есть формальный слой по разборщику недоверенного ввода не запускался. */
+  int32_t nv_seen = nondet_i32(), nvn_seen = nondet_i32(), nvt_seen = nondet_i32();
   __CPROVER_assume(nv_seen >= 0 && nv_seen <= 4);
   __CPROVER_assume(nvn_seen >= 0 && nvn_seen <= 4);
-  int32_t iv = -7, ivn = -7;
+  __CPROVER_assume(nvt_seen >= 0 && nvt_seen <= 4);
+  int32_t iv = -7, ivn = -7, ivt = -7;
   int ok = 0;
-  const char *e = parse_fvert(buf, nv_seen, nvn_seen, &iv, &ivn, &ok);
+  const char *e = parse_fvert(buf, nv_seen, nvn_seen, nvt_seen, &iv, &ivn, &ivt, &ok);
   assert(e >= buf && e <= buf + HZ_BUFN - 1);
   if (ok) {
     assert(iv >= 0);
     assert(iv < nv_seen);
     assert(ivn == -1 || (ivn >= 0 && ivn < nvn_seen));
+    /* то же несущее свойство для текстурной координаты: индекс либо −1, либо
+     * в пределах ВИДЕННОГО числа vt (иначе текстура берётся не оттуда) */
+    assert(ivt == -1 || (ivt >= 0 && ivt < nvt_seen));
   }
 
   /* parse_int: только выход за буфер; ЗНАЧЕНИЕ не ограничивается — потолок

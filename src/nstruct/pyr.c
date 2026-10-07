@@ -241,6 +241,8 @@ int hz_pyr_build(hz_pyr *py, int32_t nt, const double *tri_min, const double *tr
   fill = (int32_t *)malloc((size_t)(py->nleaf + 1) * sizeof *fill);
   if (!py->csr || !fill) {
     free(cnt);
+    free(fill); /* fill мог выделиться при отказе соседнего malloc — как в
+                 * двойнике ниже (стр. ~772); ловля clang-analyzer-unix.Malloc */
     hz_pyr_free(py);
     return 2;
   }
@@ -305,20 +307,38 @@ int hz_pyr_build(hz_pyr *py, int32_t nt, const double *tri_min, const double *tr
       int64_t ix = id % pnx, iy = (id / pnx) % pny, iz = id / (pnx * pny);
       int64_t pid = (ix >> 1) + cnx * ((iy >> 1) + cny * (iz >> 1));
       int32_t pi = pyr_find(par, w, pid);
-      if (pi >= 0)
+      /* pi < w обязателен: выше инициализируются ровно w записей lvl[0..w-1],
+       * поэтому индекс вне диапазона — не «неинициализированное чтение», а
+       * порча соседней памяти (clang-analyzer-core.uninitialized.Assign на 311).
+       * pyr_find возвращает -1 либо попадание в [0,w), но полагаться на это
+       * в горячем построении не будем. */
+      if (pi >= 0 && pi < w)
         lvl[pi].chmask |=
             (uint8_t)(1u << ((int)(ix & 1) | ((int)(iy & 1) << 1) | ((int)(iz & 1) << 2)));
     }
-    py->lev = (hz_pyr_node **)realloc(py->lev, (size_t)(py->nlev + 1) * sizeof *py->lev);
-    py->nlev_nodes =
-        (int32_t *)realloc(py->nlev_nodes, (size_t)(py->nlev + 1) * sizeof *py->nlev_nodes);
-    if (!py->lev || !py->nlev_nodes) {
+    /* realloc НЕ в сам указатель: при отказе старый блок терялся бы
+     * (bugprone-suspicious-realloc-usage, 07-10). ВНИМАНИЕ: удавшийся realloc
+     * УЖЕ освободил старый блок, поэтому указатель переносится во владение py
+     * СРАЗУ — иначе hz_pyr_free ниже освободил бы висячий адрес (двойной free). */
+    hz_pyr_node **nl = (hz_pyr_node **)realloc(py->lev, (size_t)(py->nlev + 1) * sizeof *nl);
+    if (!nl) {
       free(lvl);
       free(par);
       free(cur);
       hz_pyr_free(py);
       return 2;
     }
+    py->lev = nl;
+    /* лишний слот [nlev] в hz_pyr_free не читается: там цикл l < nlev */
+    int32_t *nn = (int32_t *)realloc(py->nlev_nodes, (size_t)(py->nlev + 1) * sizeof *nn);
+    if (!nn) {
+      free(lvl);
+      free(par);
+      free(cur);
+      hz_pyr_free(py);
+      return 2;
+    }
+    py->nlev_nodes = nn;
     py->lev[py->nlev] = lvl;
     py->nlev_nodes[py->nlev] = w;
     py->nlev++;

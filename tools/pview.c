@@ -22,7 +22,7 @@ static const double L[3] = {0.0, 3.05, 0.0}; /* лампа под потолко
 static double iabs(const double *v) {
   return sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
 }
-static int hit(const double o[3], const double d[3], double tmin, double tmax, double *t,
+static int hit(const double o[3], const double d[3], double tmin, double tmax, double *tout,
                double n[3], double col[3], int *mir) {
   double best = tmax;
   int hitid = -1;
@@ -116,7 +116,7 @@ static int hit(const double o[3], const double d[3], double tmin, double tmax, d
       *mir = 0;
     }
   }
-  *t = best;
+  *tout = best;
   return hitid;
 }
 static double shadow(const double p[3]) {
@@ -199,8 +199,17 @@ int main(void) {
   double u[3] = {r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]};
   double tanh_ = 0.75;
   FILE *fp = fopen("img/room_view.ppm", "wb");
+  if (fp == NULL) {
+    fprintf(stderr, "pview: не открыть img/room_view.ppm\n");
+    return 1;
+  }
   fprintf(fp, "P6\n%d %d\n255\n", W, H);
   unsigned char *row = malloc((size_t)W * 3);
+  if (row == NULL) {
+    fclose(fp);
+    fprintf(stderr, "pview: нет памяти\n");
+    return 1;
+  }
   for (int j = 0; j < H; j++) {
     for (int i = 0; i < W; i++) {
       double px = (2.0 * (i + 0.5) / W - 1.0) * 1.0667 * tanh_,
@@ -215,7 +224,8 @@ int main(void) {
       for (int a = 0; a < 3; a++) {
         double v = c[a] / (1.0 + c[a]);
         int q = (int)(255.0 * pow(v, 1.0 / 2.2));
-        row[3 * i + a] = q < 0 ? 0 : (q > 255 ? 255 : q);
+        q = q < 0 ? 0 : (q > 255 ? 255 : q); /* кламп ДО сужения */
+        row[3 * i + a] = (unsigned char)q;
       }
     }
     fwrite(row, 1, (size_t)W * 3, fp);
